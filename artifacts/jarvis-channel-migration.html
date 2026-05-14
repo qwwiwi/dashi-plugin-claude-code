@@ -1,0 +1,733 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Jarvis → Channel — миграция до 15 июня</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,wght@0,400;0,500;1,400&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #080706;
+    --bg-2: #0e0d0b;
+    --surface: #14120f;
+    --line: #2a2620;
+    --line-soft: #1c1916;
+    --ink-1: #ece8df;
+    --ink-2: #b3ac9c;
+    --ink-3: #6a6356;
+    --gold: #c2a878;
+    --gold-hi: #d9bf8a;
+    --gold-soft: rgba(194, 168, 120, 0.08);
+    --gold-line: rgba(194, 168, 120, 0.28);
+    --danger: #d97757;
+    --ok: #8ba888;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--ink-1); margin: 0; }
+  body { font-family: 'Inter', system-ui, sans-serif; font-weight: 400; line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 48px 24px 96px; }
+  @media (max-width: 540px) { .wrap { padding: 32px 20px 64px; } }
+
+  .eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  h1 {
+    font-family: 'Newsreader', serif;
+    font-weight: 400;
+    font-size: clamp(34px, 6vw, 52px);
+    line-height: 1.1;
+    margin: 12px 0 24px;
+    color: var(--ink-1);
+    letter-spacing: -0.01em;
+  }
+  h1 em { font-style: italic; color: var(--gold); }
+  h2 {
+    font-family: 'Newsreader', serif;
+    font-weight: 400;
+    font-size: clamp(24px, 3.5vw, 32px);
+    line-height: 1.2;
+    margin: 0 0 16px;
+    color: var(--ink-1);
+    letter-spacing: -0.005em;
+  }
+  h2 em { font-style: italic; color: var(--gold); }
+  h3 {
+    font-family: 'Newsreader', serif;
+    font-style: italic;
+    font-weight: 400;
+    font-size: 18px;
+    color: var(--gold-hi);
+    margin: 0 0 12px;
+  }
+  p { color: var(--ink-2); margin: 0 0 14px; font-size: 15px; }
+  .lead { font-size: 17px; color: var(--ink-1); }
+
+  section { margin-top: 56px; }
+  section.first { margin-top: 24px; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid var(--gold-line);
+    background: var(--gold-soft);
+    border-radius: 999px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--gold-hi);
+  }
+  .pill.warn { border-color: rgba(217,119,87,0.35); background: rgba(217,119,87,0.08); color: var(--danger); }
+  .pill.ok { border-color: rgba(139,168,136,0.35); background: rgba(139,168,136,0.08); color: var(--ok); }
+
+  .card {
+    border: 1px solid var(--line);
+    background: var(--surface);
+    border-radius: 16px;
+    padding: 24px;
+  }
+  .card + .card { margin-top: 14px; }
+  .card.accent { border-color: var(--gold-line); background: linear-gradient(180deg, rgba(194,168,120,0.06), transparent); }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 720px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+
+  .stat {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--gold);
+    font-size: 14px;
+  }
+  .num {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 500;
+    color: var(--gold-hi);
+  }
+
+  /* Flow diagram */
+  .flow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12.5px;
+    line-height: 1.9;
+    color: var(--ink-2);
+    background: var(--bg-2);
+    border: 1px solid var(--line-soft);
+    border-radius: 12px;
+    padding: 18px 20px;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .flow b { color: var(--gold-hi); font-weight: 500; }
+  .flow .danger { color: var(--danger); }
+  .flow .ok { color: var(--ok); }
+  .flow .dim { color: var(--ink-3); }
+
+  /* Pool visualization */
+  .pools { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+  @media (max-width: 720px) { .pools { grid-template-columns: 1fr; } }
+  .pool {
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 18px;
+    background: var(--bg-2);
+  }
+  .pool-head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px;
+    border-bottom: 1px dashed var(--line);
+    padding-bottom: 10px;
+  }
+  .pool-title {
+    font-family: 'Newsreader', serif; font-style: italic; font-size: 16px;
+    color: var(--ink-1);
+  }
+  .pool-cap {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--gold-hi);
+    font-size: 13px;
+  }
+  .pool ul { margin: 0; padding-left: 0; list-style: none; }
+  .pool li {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    padding: 4px 0;
+    display: flex; gap: 10px; align-items: baseline;
+  }
+  .pool li::before {
+    content: '▸';
+    color: var(--ink-3);
+    font-size: 10px;
+  }
+  .pool li.heavy::before { content: '■'; color: var(--danger); }
+  .pool li.light::before { content: '□'; color: var(--gold); }
+
+  /* Compare */
+  .compare {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+    border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+  }
+  @media (max-width: 720px) { .compare { grid-template-columns: 1fr; } }
+  .compare > div { padding: 18px; background: var(--bg-2); }
+  .compare > div + div { border-left: 1px solid var(--line); }
+  @media (max-width: 720px) { .compare > div + div { border-left: 0; border-top: 1px solid var(--line); } }
+  .compare h3 { margin: 0 0 8px; font-size: 16px; }
+  .compare ul { margin: 0; padding-left: 18px; }
+  .compare li { font-size: 13.5px; color: var(--ink-2); padding: 3px 0; }
+
+  /* Checklist */
+  .check { display: grid; grid-template-columns: 1fr; gap: 8px; }
+  .check-item {
+    display: flex; gap: 12px; align-items: flex-start;
+    padding: 10px 14px; background: var(--bg-2);
+    border: 1px solid var(--line-soft); border-radius: 10px;
+  }
+  .check-item::before {
+    content: '✓';
+    color: var(--gold);
+    font-weight: 600;
+    flex-shrink: 0;
+    width: 16px; text-align: center;
+  }
+  .check-item.bonus::before { content: '✦'; color: var(--gold-hi); }
+  .check-item.warn::before { content: '!'; color: var(--danger); }
+  .check-item .lbl {
+    color: var(--ink-1);
+    font-size: 14px;
+  }
+  .check-item .desc {
+    color: var(--ink-3);
+    font-size: 12.5px;
+    font-family: 'JetBrains Mono', monospace;
+    margin-top: 2px;
+  }
+
+  /* Plan timeline */
+  .timeline { position: relative; padding-left: 32px; }
+  .timeline::before {
+    content: ''; position: absolute; left: 12px; top: 6px; bottom: 6px;
+    width: 1px; background: var(--line);
+  }
+  .phase {
+    position: relative;
+    padding: 12px 16px;
+    margin-bottom: 10px;
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    background: var(--bg-2);
+  }
+  .phase::before {
+    content: ''; position: absolute; left: -26px; top: 18px;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--gold); border: 2px solid var(--bg);
+  }
+  .phase-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    gap: 12px; margin-bottom: 4px;
+  }
+  .phase-title { font-family: 'Newsreader', serif; font-style: italic; color: var(--ink-1); font-size: 16px; }
+  .phase-time { font-family: 'JetBrains Mono', monospace; color: var(--gold-hi); font-size: 12px; }
+  .phase-body { font-size: 13.5px; color: var(--ink-2); }
+
+  footer {
+    margin-top: 80px; padding-top: 24px;
+    border-top: 1px solid var(--line);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--ink-3);
+    letter-spacing: 0.06em;
+  }
+  footer em { font-family: 'Newsreader', serif; font-style: italic; color: var(--gold); letter-spacing: 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- HERO -->
+  <section class="first">
+    <div class="eyebrow">edgelab · orgrimmar · architecture brief</div>
+    <h1>Jarvis → <em>Channel</em>.<br/>Остаёмся внутри подписки.</h1>
+    <p class="lead">15 июня 2026 Anthropic разделит счётчик расходов на два независимых: интерактивный Claude Code и Agent SDK ($200/мес на Max 20x). Если ничего не делать — наши 6 агентов мигрируют в SDK-пул и быстро его исчерпают. Решение — переехать с <code style="font-family:'JetBrains Mono',monospace;color:var(--gold-hi)">claude -p</code> на channels-pattern: расход возвращается в обычный Max-пул, SDK-кошелёк остаётся буфером.</p>
+  </section>
+
+  <!-- PROBLEM -->
+  <section>
+    <span class="pill warn">Что меняется 15.06.2026</span>
+    <h2>Один счётчик станет <em>двумя</em></h2>
+
+    <div class="pools">
+      <div class="pool">
+        <div class="pool-head">
+          <span class="pool-title">Счётчик 1 — Max интерактив</span>
+          <span class="pool-cap">текущий лимит</span>
+        </div>
+        <ul>
+          <li>Claude Code в терминале</li>
+          <li>claude.ai в браузере</li>
+          <li>Claude Desktop приложение</li>
+        </ul>
+      </div>
+      <div class="pool">
+        <div class="pool-head">
+          <span class="pool-title">Счётчик 2 — Agent SDK</span>
+          <span class="pool-cap">$200 / мес</span>
+        </div>
+        <ul>
+          <li>claude -p (headless)</li>
+          <li>SDK через OAuth подписки</li>
+          <li>GitHub Actions с Claude</li>
+          <li>сторонние приложения (Cursor через OAuth)</li>
+        </ul>
+      </div>
+    </div>
+    <p style="margin-top:14px;font-size:13.5px;color:var(--ink-3);font-family:'JetBrains Mono',monospace">Не накапливается. Overage после $200 → оплата по API rates.</p>
+  </section>
+
+  <!-- CURRENT -->
+  <section>
+    <span class="pill">Текущая архитектура — Jarvis (Python daemon)</span>
+    <h2>Каждое сообщение запускает <em>свежий</em> процесс</h2>
+
+    <div class="flow">Ты в Telegram
+  <span class="dim">↓</span> @fridayhumanbot
+gateway.py daemon (launchd, long polling Bot API)
+  <span class="dim">↓ на каждое сообщение</span>
+<b>claude -p</b> "..." --workspace ~/.claude-lab/silvana/.claude   <span class="danger">← SDK-пул после 15.06</span>
+  <span class="dim">↓ headless процесс, новый каждый раз</span>
+Я подгружаю память (recent.md, decisions.md, MEMORY.md)
+  <span class="dim">↓ stdout</span>
+gateway → fetch Bot API sendMessage → твой Telegram</div>
+
+    <div class="grid-2" style="margin-top:18px">
+      <div class="card">
+        <h3>Что хорошо сейчас</h3>
+        <ul style="margin:0;padding-left:18px;color:var(--ink-2);font-size:14px">
+          <li>Stateless → каждый turn свежий, нет drift в long session</li>
+          <li>Один daemon обслуживает 4 ботов параллельно</li>
+          <li>Полный контроль над media-group, reply-injection, allowlist</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>В чём проблема после 15.06</h3>
+        <ul style="margin:0;padding-left:18px;color:var(--ink-2);font-size:14px">
+          <li><b>Каждый turn</b> = headless вызов = SDK расход</li>
+          <li>6 агентов × десятки turns в день → $200 быстро на нуле</li>
+          <li>После исчерпания — overage по API rates (платно, без cap)</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- SOLUTION -->
+  <section>
+    <span class="pill ok">Решение — Jarvis Channel (MCP server)</span>
+    <h2>Push events в <em>running</em> session — остаёмся в Max</h2>
+
+    <div class="flow">launchd: ai.orgrimmar.silvana (фоновый процесс на Mac mini)
+  <span class="dim">↓</span>
+<b>claude --channels plugin:jarvis@orgrimmar-marketplace</b>
+       --workspace ~/.claude-lab/silvana/.claude
+       --dangerously-skip-permissions   <span class="ok">← интерактив, Max-пул</span>
+  <span class="dim">↓ stdio subprocess</span>
+jarvis-channel.ts (MCP server, Bun runtime)
+  ├─ polls Telegram Bot API
+  ├─ allowlist gate (numeric ID)
+  ├─ media-group buffer (2-сек)
+  ├─ reply-injection (untrusted metadata)
+  └─ <b>mcp.notification()</b> → push в running session
+  <span class="dim">↓</span>
+Silvana получает событие как &lt;channel source="jarvis" chat_id="..."&gt;
+Думаю, использую tools, формирую ответ
+  <span class="dim">↓ mcp.callTool("reply", {chat_id, text})</span>
+jarvis-channel → fetch Bot API sendMessage → твой Telegram</div>
+  </section>
+
+  <!-- BILLING COMPARE -->
+  <section>
+    <span class="pill">Биллинг — три состояния</span>
+    <h2>Куда уходят <em>наши</em> расходы</h2>
+
+    <div class="card" style="margin-top:14px">
+      <h3>До 15.06 — всё в одном пуле (сейчас)</h3>
+      <div class="flow">Max 20x пул
+  ├─ Claude Code TUI (мой основной режим работы)
+  ├─ claude.ai web
+  ├─ <b>6 агентов через gateway → claude -p</b>  (~80% расхода)
+  ├─ hooks (capture, reflection cron)
+  └─ GitHub Actions</div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>После 15.06 БЕЗ миграции <span class="pill warn" style="margin-left:8px">риск</span></h3>
+      <div class="flow">Max 20x пул                        SDK кошелёк $200
+  ├─ Claude Code TUI                ├─ <span class="danger">6 агентов claude -p</span>   ← тяжёлая нагрузка
+  ├─ claude.ai web                  ├─ hooks
+  └─ Claude Desktop                 ├─ GitHub Actions
+                                    └─ <span class="danger">overage по API rates</span></div>
+    </div>
+
+    <div class="card accent" style="margin-top:14px">
+      <h3>После 15.06 С миграцией на Jarvis Channel <span class="pill ok" style="margin-left:8px">цель</span></h3>
+      <div class="flow">Max 20x пул                        SDK кошелёк $200
+  ├─ Claude Code TUI                ├─ hooks (reflection cron)
+  ├─ claude.ai web                  ├─ GitHub Actions
+  └─ <b>6 агентов running sessions</b>     └─ другие скрипты
+     ← через channels-pattern         ← <span class="ok">$200 остаётся буфером</span></div>
+    </div>
+  </section>
+
+  <!-- WHAT MOVES -->
+  <section>
+    <span class="pill">Миграция логики</span>
+    <h2>Вся бизнес-логика <em>портируется</em> 1-в-1</h2>
+
+    <div class="check">
+      <div class="check-item">
+        <div>
+          <div class="lbl">Multi-bot per process</div>
+          <div class="desc">один subprocess на агента, изолированные SOUL.md / память</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div>
+          <div class="lbl">Numeric user-ID allowlist</div>
+          <div class="desc">наш формат (один пользователь), не 6-char pairing Anthropic</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div>
+          <div class="lbl">Media-group buffer (2-сек окно)</div>
+          <div class="desc">склейка альбомов фото/видео — gateway.py:1932 → channel.ts</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div>
+          <div class="lbl">Reply-injection (untrusted metadata + JSON)</div>
+          <div class="desc">когда пишешь reply на сообщение бота — кладём контекст в meta</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div>
+          <div class="lbl">Photo download → local path</div>
+          <div class="desc">сохраняем в /tmp/, путь приходит в meta для Read tool</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div>
+          <div class="lbl">Voice transcription (Groq Whisper)</div>
+          <div class="desc">pre-emit transcribe → текст в content notification</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div>
+          <div class="lbl">HTML formatting + split ≤3500 chars</div>
+          <div class="desc">для Telegram message length limit</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div>
+          <div class="lbl">SessionStart / Stop / UserPromptSubmit hooks</div>
+          <div class="desc">recent.md, capture pipeline, dual-write в Cognee/gbrain — без изменений</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- BONUS -->
+  <section>
+    <span class="pill ok">Бонус — фичи от Anthropic из коробки</span>
+    <h2>Чего <em>не было</em> в Jarvis</h2>
+
+    <div class="check">
+      <div class="check-item bonus">
+        <div>
+          <div class="lbl">Permission relay</div>
+          <div class="desc">Claude хочет run rm -rf X → ты получаешь в Telegram: «Reply yes abcde / no abcde» → одобряешь с телефона</div>
+        </div>
+      </div>
+      <div class="check-item bonus">
+        <div>
+          <div class="lbl">React / edit сообщений</div>
+          <div class="desc">не только text reply — Claude может поставить реакцию, отредактировать предыдущий ответ</div>
+        </div>
+      </div>
+      <div class="check-item bonus">
+        <div>
+          <div class="lbl">Stateful session memory</div>
+          <div class="desc">контекст между turns в одной session — более «человеческая» беседа</div>
+        </div>
+      </div>
+      <div class="check-item bonus">
+        <div>
+          <div class="lbl">Auto typing indicator</div>
+          <div class="desc">пока я думаю — Telegram показывает «печатает...»</div>
+        </div>
+      </div>
+      <div class="check-item bonus">
+        <div>
+          <div class="lbl">$200 SDK-credit как буфер</div>
+          <div class="desc">остаётся свободным для GitHub Actions, фоновых cron, экспериментов</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- RISKS -->
+  <section>
+    <span class="pill warn">Что может пойти не так</span>
+    <h2>Риски и <em>митигация</em></h2>
+
+    <div class="check">
+      <div class="check-item warn">
+        <div>
+          <div class="lbl">Research preview статус</div>
+          <div class="desc">Anthropic может поменять контракт channels. Митигация: контракт публичный, MCP-based, изменения отслеживаемые. Готовы патчить.</div>
+        </div>
+      </div>
+      <div class="check-item warn">
+        <div>
+          <div class="lbl">Auto-compact в long-running session</div>
+          <div class="desc">когда context подходит к лимиту, Claude Code пытается ужать. Может портить недавнее. Митигация: агрессивный Stop hook → recent.md (внешняя память).</div>
+        </div>
+      </div>
+      <div class="check-item warn">
+        <div>
+          <div class="lbl">--dangerously-load-development-channels</div>
+          <div class="desc">наш плагин не в Anthropic-managed marketplace. Каждый start session требует флаг. Митигация: launchd unit подаёт автоматически. Долгосрочно — публикация в claude-plugins-official (security review).</div>
+        </div>
+      </div>
+      <div class="check-item warn">
+        <div>
+          <div class="lbl">Один plugin per session</div>
+          <div class="desc">6 параллельных claude процессов на Mac mini ≈ 3 GB RAM. Митигация: ресурс приемлемый. На Thrall (Thrall + Arthas) — 1 GB.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PLAN -->
+  <section>
+    <span class="pill">План работы — Channel migration</span>
+    <h2>~8 часов на Channel · ещё <em>~3 ч</em> на Тиранду (см. ниже)</h2>
+
+    <div class="timeline">
+      <div class="phase">
+        <div class="phase-head">
+          <span class="phase-title">Phase 1 — прототип</span>
+          <span class="phase-time">≈ 2 ч</span>
+        </div>
+        <div class="phase-body">jarvis-channel.ts минимальный: один бот, allowlist, push notification, reply tool. Запуск Сильваны через <code style="font-family:'JetBrains Mono',monospace;color:var(--gold-hi)">claude --channels</code>. End-to-end smoke с Telegram.</div>
+      </div>
+      <div class="phase">
+        <div class="phase-head">
+          <span class="phase-title">Phase 2 — портация логики</span>
+          <span class="phase-time">≈ 3 ч</span>
+        </div>
+        <div class="phase-body">media-group buffer, reply-injection, photo download, HTML formatting, split, voice transcription из gateway.py → в TypeScript.</div>
+      </div>
+      <div class="phase">
+        <div class="phase-head">
+          <span class="phase-title">Phase 3 — permission relay</span>
+          <span class="phase-time">≈ 1 ч</span>
+        </div>
+        <div class="phase-body">claude/channel/permission capability, формат «yes abcde / no abcde», парсинг ответов из Telegram.</div>
+      </div>
+      <div class="phase">
+        <div class="phase-head">
+          <span class="phase-title">Phase 4 — rollout остальных 5 агентов</span>
+          <span class="phase-time">≈ 2 ч</span>
+        </div>
+        <div class="phase-body">Кельтас, Гаррош, Иллидан на Mac mini + Тралл, Артас на Thrall VPS. По launchd unit на каждого.</div>
+      </div>
+      <div class="phase">
+        <div class="phase-head">
+          <span class="phase-title">Phase 5 — decommission gateway.py</span>
+          <span class="phase-time">~ 1 нед.</span>
+        </div>
+        <div class="phase-body">Старый Python daemon в standby первую неделю. Если новая архитектура стабильна — отключаем launchd unit gateway, оставляем код в репо как fallback.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TYRANDE CRON STRATEGY -->
+  <section>
+    <span class="pill ok">Вторая часть стратегии — cron'ы</span>
+    <h2>Часть фоновых задач уходит на <em>Hermes / MiniMax</em></h2>
+    <p>Двойной удар по экономике: real-time общение через Channel остаётся в Max-пуле, а cron-задачи, которые сейчас грызут Anthropic SDK, переезжают на Тиранду с подпиской MiniMax. Anthropic-пул трогается только когда реально нужен Opus 4.7 — Тиранда позовёт через bot-to-bot в общем чате.</p>
+
+    <div class="card" style="margin-top:14px">
+      <h3>Принцип отбора — только Anthropic-зависимые</h3>
+      <p style="margin-bottom:6px">Переносим к Тиранде <b style="color:var(--gold-hi)">только те cron'ы</b>, которые сейчас вызывают <code style="font-family:'JetBrains Mono',monospace;color:var(--gold-hi)">claude -p</code>, SDK через OAuth или иначе тратят Anthropic-кредиты. Они после 15.06 пойдут на $200 SDK-credit — это то, от чего экономим.</p>
+      <p style="margin:0">Cron'ы которые работают через bash, systemd, cognify, git, backup-скрипты, Postgres queries — Anthropic не задевают и так. <b style="color:var(--ok)">Их не трогаем</b>, оставляем как есть.</p>
+    </div>
+
+    <div class="compare" style="margin-top:16px">
+      <div>
+        <h3 style="color:var(--gold)">Переезжают на Тиранду</h3>
+        <ul>
+          <li>Reflection summary recent.md → digest (раз в N часов)</li>
+          <li>Health checks PM2 / gateway / disk / OOM (Артас)</li>
+          <li>Daily digest «что произошло вчера»</li>
+          <li>Capture / weekly summary</li>
+          <li>Cognee usage stats форматирование</li>
+          <li>TG канал listening + триггеры</li>
+          <li>Любой cron где сейчас стоит <code style="font-family:'JetBrains Mono',monospace">claude -p</code></li>
+        </ul>
+      </div>
+      <div>
+        <h3 style="color:var(--ok)">Остаются как есть</h3>
+        <ul>
+          <li>Stop hook capture (привязан к session lifecycle)</li>
+          <li>Vault autosync git timer (Thrall)</li>
+          <li>Daily audit gbrain (systemd + bash + psql)</li>
+          <li>Cognify / curated-sync / backfill (Cognee headless)</li>
+          <li>DO Spaces restic backups</li>
+          <li>Telegram-chip skill API (Telethon, не Claude)</li>
+          <li>PM2 logrotate, pm2-logrotate, log cleanup</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- SLACK-STYLE ORCHESTRATION -->
+  <section>
+    <span class="pill">Тиранда как Slack-координатор</span>
+    <h2>Боты общаются в <em>общем чате</em> — bot-to-bot enabled 2026</h2>
+
+    <p>Telegram с 2026 разрешил bot-to-bot communication (BotFather → enable mode). Теперь Тиранда может писать другим агентам в группе, и они подхватывают её mention как обычное сообщение. Получается рабочий Slack-channel внутри Telegram, где принц — наблюдатель, а боты — сотрудники.</p>
+
+    <div class="flow">Сервер Тиранды (165.245.219.131, Hermes v0.11.0 + <b>MiniMax M2.7</b>)
+  <span class="dim">↓ systemd timer / cron</span>
+@tyrandebot читает: tasks, health metrics, recent.md, gbrain stats
+  <span class="dim">↓ оценивает</span>
+  ┌───────────────────────────────────────────┐
+  │ ПРОСТАЯ задача (мониторинг, summary)      │
+  │   → делает на MiniMax — <span class="ok">не Anthropic-пул</span>     │
+  ├───────────────────────────────────────────┤
+  │ СЛОЖНАЯ (Opus 4.7, Claude Code, deep)     │
+  │   → шлёт в group "Orgrimmar Ops":         │
+  │     <b>@fridayhumanbot собери digest за день</b>      │
+  │   ↓ bot-to-bot mode enabled               │
+  │   Sylvana через Channel session подхватит │
+  │   → отвечает в эту же группу              │
+  │   ← Тиранда видит ответ, продолжает workflow │
+  └───────────────────────────────────────────┘</div>
+
+    <div class="card accent" style="margin-top:18px">
+      <h3>Состав группы «Orgrimmar Ops»</h3>
+      <ul style="margin:0;padding-left:0;list-style:none;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--ink-2);line-height:2">
+        <li><span style="color:var(--gold-hi)">@tyrandebot</span> <span style="color:var(--ink-3)">— Hermes / MiniMax · координатор cron</span></li>
+        <li><span style="color:var(--gold-hi)">@fridayhumanbot</span> <span style="color:var(--ink-3)">— Sylvana / Opus 4.7 · кодер</span></li>
+        <li><span style="color:var(--gold-hi)">@kaelthasproducerbot</span> <span style="color:var(--ink-3)">— Kaelthas / Opus · маркетинг</span></li>
+        <li><span style="color:var(--gold-hi)">@garroshsalebot</span> <span style="color:var(--ink-3)">— Garrosh / Sonnet · продажи</span></li>
+        <li><span style="color:var(--gold-hi)">@Illidandevopsbot</span> <span style="color:var(--ink-3)">— Illidan / Codex GPT-5.5 · Master Reviewer</span></li>
+        <li><span style="color:var(--gold-hi)">(Thrall bot)</span> <span style="color:var(--ink-3)">— Thrall / Opus · архитектор</span></li>
+        <li><span style="color:var(--gold-hi)">(Arthas bot)</span> <span style="color:var(--ink-3)">— Arthas / Sonnet · мониторинг</span></li>
+        <li><span style="color:var(--gold)">@dashieshiev</span> <span style="color:var(--ink-3)">— принц · наблюдатель + override</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- TYRANDE PLAN -->
+  <section>
+    <span class="pill">План работы — Тиранда / cron</span>
+    <h2>3 фазы, <em>~3 часа</em>. Запускается параллельно или после Channel-pilot.</h2>
+
+    <div class="timeline">
+      <div class="phase">
+        <div class="phase-head">
+          <span class="phase-title">Phase A — bot inventory + Orgrimmar Ops group</span>
+          <span class="phase-time">≈ 30 мин</span>
+        </div>
+        <div class="phase-body">Проверить есть ли у Тиранды Telegram-бот (если нет — создать через BotFather). Включить Bot-to-Bot Communication Mode для всех 7 ботов (Tyrande, Sylvana, Kaelthas, Garrosh, Illidan, Thrall, Arthas). Создать приватную группу «Orgrimmar Ops» с принцем + 7 ботами, выставить privacy ON.</div>
+      </div>
+      <div class="phase">
+        <div class="phase-head">
+          <span class="phase-title">Phase B — pilot cron на Тиранде</span>
+          <span class="phase-time">≈ 1 ч</span>
+        </div>
+        <div class="phase-body">Выбрать один тяжёлый Anthropic-зависимый cron (например reflection summary recent.md). Перенести его на Hermes / MiniMax скрипт. Тиранда читает recent.md через API, делает summary, постит в группу. Если триггер требует Opus — пишет mention @fridayhumanbot.</div>
+      </div>
+      <div class="phase">
+        <div class="phase-head">
+          <span class="phase-title">Phase C — миграция остальных Anthropic-cron'ов</span>
+          <span class="phase-time">≈ 1.5 ч</span>
+        </div>
+        <div class="phase-body">Inventory всех cron'ов в Orgrimmar (Mac mini launchd + Thrall systemd + Timeweb). Помечаем какие зависят от Anthropic. Постепенно переносим к Тиранде (или отключаем claude -p обёртку, оставляем чистую логику). Cron'ы без Anthropic не трогаем.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FINAL ARCHITECTURE -->
+  <section>
+    <span class="pill ok">Финальная картина биллинга после обеих миграций</span>
+    <h2>Три пула, <em>каждому своё</em></h2>
+
+    <div class="grid-3" style="margin-top:14px">
+      <div class="card">
+        <div class="pool-head">
+          <span class="pool-title" style="font-size:14px">Max-пул</span>
+        </div>
+        <ul style="margin:0;padding-left:18px;color:var(--ink-2);font-size:13.5px">
+          <li>Claude Code TUI терминал</li>
+          <li>claude.ai web</li>
+          <li>6 агентов running sessions <span style="color:var(--gold)">через Channel</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="pool-head">
+          <span class="pool-title" style="font-size:14px">SDK $200 (буфер)</span>
+        </div>
+        <ul style="margin:0;padding-left:18px;color:var(--ink-2);font-size:13.5px">
+          <li>GitHub Actions с Claude</li>
+          <li>Стop hooks (capture)</li>
+          <li>Опциональные headless tools</li>
+          <li><span style="color:var(--ok)">Большой запас не задействован</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="pool-head">
+          <span class="pool-title" style="font-size:14px">MiniMax (Тиранда)</span>
+        </div>
+        <ul style="margin:0;padding-left:18px;color:var(--ink-2);font-size:13.5px">
+          <li>Все Anthropic-зависимые cron'ы</li>
+          <li>Health monitoring</li>
+          <li>Reflection / digest summaries</li>
+          <li>Delegation router для тяжёлых задач</li>
+        </ul>
+      </div>
+    </div>
+    <p style="margin-top:14px;color:var(--ink-3);font-size:13px;font-family:'JetBrains Mono',monospace">Anthropic-токены тратятся только когда реально нужен Opus 4.7 — Тиранда позовёт через bot-to-bot в group.</p>
+  </section>
+
+  <!-- CTA -->
+  <section>
+    <div class="card accent" style="text-align:center;padding:36px 24px">
+      <h3 style="font-size:20px;margin-bottom:8px">Что дальше</h3>
+      <p style="color:var(--ink-1);font-size:15.5px;max-width:600px;margin:0 auto 12px">
+        Запас по времени: <span class="num">~ 1 месяц</span> до 15.06. Две независимые ветки работы — Channel-pilot Сильваны (Phase 1, ≈ 2 ч) и инвентаризация cron'ов + Phase A Тиранды (≈ 30 мин) можно делать <b>параллельно</b>. По итогам обоих пилотов — раскатка остальных агентов и оставшихся cron'ов.
+      </p>
+      <p style="color:var(--ink-2);font-size:13.5px;max-width:600px;margin:0 auto 14px;font-style:italic;font-family:'Newsreader',serif">
+        Anthropic-пул трогается только когда реально нужен Opus 4.7. Всё остальное — на MiniMax-подписке Тиранды.
+      </p>
+      <p style="color:var(--ink-3);font-family:'JetBrains Mono',monospace;font-size:12px;letter-spacing:0.04em;margin:0">
+        SILVANA · 2026-05-14
+      </p>
+    </div>
+  </section>
+
+  <footer>
+    edgelab · orgrimmar · <em>план безупречен, мой принц</em>
+  </footer>
+
+</div>
+</body>
+</html>

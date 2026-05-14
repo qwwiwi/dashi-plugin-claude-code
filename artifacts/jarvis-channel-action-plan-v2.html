@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Jarvis Channel — финальный план после Codex review</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,wght@0,400;0,500;1,400&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #080706;
+    --bg-2: #0e0d0b;
+    --surface: #14120f;
+    --line: #2a2620;
+    --line-soft: #1c1916;
+    --ink-1: #ece8df;
+    --ink-2: #b3ac9c;
+    --ink-3: #6a6356;
+    --gold: #c2a878;
+    --gold-hi: #d9bf8a;
+    --gold-soft: rgba(194, 168, 120, 0.08);
+    --gold-line: rgba(194, 168, 120, 0.28);
+    --danger: #d97757;
+    --danger-soft: rgba(217, 119, 87, 0.08);
+    --danger-line: rgba(217, 119, 87, 0.32);
+    --ok: #8ba888;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--ink-1); margin: 0; }
+  body { font-family: 'Inter', system-ui, sans-serif; font-weight: 400; line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 48px 24px 96px; }
+  @media (max-width: 540px) { .wrap { padding: 32px 20px 64px; } }
+
+  .eyebrow { font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-3); }
+  h1 { font-family: 'Newsreader', serif; font-weight: 400; font-size: clamp(34px, 6vw, 52px); line-height: 1.1; margin: 12px 0 24px; color: var(--ink-1); letter-spacing: -0.01em; }
+  h1 em { font-style: italic; color: var(--gold); }
+  h2 { font-family: 'Newsreader', serif; font-weight: 400; font-size: clamp(22px, 3.2vw, 28px); line-height: 1.25; margin: 0 0 14px; color: var(--ink-1); letter-spacing: -0.005em; }
+  h2 em { font-style: italic; color: var(--gold); }
+  h3 { font-family: 'Newsreader', serif; font-style: italic; font-weight: 400; font-size: 17px; color: var(--gold-hi); margin: 0 0 10px; }
+  h4 { font-family: 'Inter', sans-serif; font-weight: 500; font-size: 13px; color: var(--ink-1); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: 0.1em; }
+  p { color: var(--ink-2); margin: 0 0 14px; font-size: 15px; }
+  .lead { font-size: 16.5px; color: var(--ink-1); }
+  code { font-family: 'JetBrains Mono', monospace; color: var(--gold-hi); font-size: 0.92em; }
+  .strike { text-decoration: line-through; color: var(--ink-3); }
+
+  section { margin-top: 52px; }
+  section.first { margin-top: 24px; }
+
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid var(--gold-line); background: var(--gold-soft); border-radius: 999px; font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--gold-hi); }
+  .pill.warn { border-color: var(--danger-line); background: var(--danger-soft); color: var(--danger); }
+  .pill.ok { border-color: rgba(139,168,136,0.35); background: rgba(139,168,136,0.08); color: var(--ok); }
+
+  .card { border: 1px solid var(--line); background: var(--surface); border-radius: 16px; padding: 22px; }
+  .card + .card { margin-top: 12px; }
+  .card.accent { border-color: var(--gold-line); background: linear-gradient(180deg, rgba(194,168,120,0.06), transparent); }
+  .card.danger { border-color: var(--danger-line); background: linear-gradient(180deg, var(--danger-soft), transparent); }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 720px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+
+  .flow { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; line-height: 1.85; color: var(--ink-2); background: var(--bg-2); border: 1px solid var(--line-soft); border-radius: 12px; padding: 16px 18px; white-space: pre; overflow-x: auto; }
+  .flow b { color: var(--gold-hi); font-weight: 500; }
+  .flow .danger { color: var(--danger); }
+  .flow .ok { color: var(--ok); }
+  .flow .dim { color: var(--ink-3); }
+  .flow .com { color: var(--ink-3); font-style: italic; }
+
+  .check { display: grid; grid-template-columns: 1fr; gap: 6px; }
+  .check-item { display: flex; gap: 12px; align-items: flex-start; padding: 9px 14px; background: var(--bg-2); border: 1px solid var(--line-soft); border-radius: 10px; }
+  .check-item::before { content: '☐'; color: var(--ink-3); flex-shrink: 0; font-family: monospace; font-size: 14px; line-height: 1.5; }
+  .check-item.done::before { content: '✓'; color: var(--ok); }
+  .check-item.bonus::before { content: '✦'; color: var(--gold-hi); }
+  .check-item.warn::before { content: '!'; color: var(--danger); font-weight: 600; }
+  .check-item .body { flex: 1; }
+  .check-item .lbl { color: var(--ink-1); font-size: 14px; }
+  .check-item .desc { color: var(--ink-3); font-size: 12.5px; font-family: 'JetBrains Mono', monospace; margin-top: 3px; line-height: 1.45; }
+
+  .phase-block { border: 1px solid var(--gold-line); background: linear-gradient(180deg, rgba(194,168,120,0.04), transparent); border-radius: 14px; padding: 22px; margin-bottom: 14px; }
+  .phase-block.tyrande { border-color: rgba(217,119,87,0.25); background: linear-gradient(180deg, rgba(217,119,87,0.04), transparent); }
+  .phase-block.canary { border: 1px solid var(--danger-line); background: linear-gradient(180deg, var(--danger-soft), transparent); }
+  .phase-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px dashed var(--line); }
+  .phase-num { font-family: 'JetBrains Mono', monospace; color: var(--gold); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; }
+  .phase-num.canary { color: var(--danger); }
+  .phase-title { font-family: 'Newsreader', serif; font-style: italic; color: var(--ink-1); font-size: 19px; flex: 1; margin-left: 14px; }
+  .phase-time { font-family: 'JetBrains Mono', monospace; color: var(--gold-hi); font-size: 12px; flex-shrink: 0; }
+  .phase-time.warn { color: var(--danger); }
+  .phase-goal { color: var(--ink-2); font-size: 14px; margin-bottom: 12px; font-style: italic; font-family: 'Newsreader', serif; }
+
+  .timeline-strip { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
+  @media (max-width: 720px) { .timeline-strip { grid-template-columns: 1fr; } }
+  .lane { border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: var(--bg-2); }
+  .lane-head { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.18em; color: var(--gold-hi); text-transform: uppercase; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px dashed var(--line); }
+  .lane-row { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--ink-2); padding: 5px 0; display: flex; gap: 10px; align-items: baseline; }
+  .lane-row .t { color: var(--gold-hi); flex-shrink: 0; min-width: 60px; }
+  .lane-row .d { color: var(--ink-3); flex-shrink: 0; min-width: 56px; }
+  .lane-row .l { color: var(--ink-1); }
+
+  .diff { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .diff-row { padding: 12px 16px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; display: grid; grid-template-columns: 80px 1fr; gap: 14px; align-items: baseline; }
+  .diff-row + .diff-row { border-top: 1px solid var(--line-soft); }
+  .diff-row .tag { letter-spacing: 0.16em; text-transform: uppercase; font-size: 10px; }
+  .diff-row.was { background: var(--bg-2); }
+  .diff-row.was .tag { color: var(--danger); }
+  .diff-row.was .v { color: var(--ink-3); text-decoration: line-through; }
+  .diff-row.now { background: linear-gradient(180deg, rgba(194,168,120,0.04), transparent); }
+  .diff-row.now .tag { color: var(--gold); }
+  .diff-row.now .v { color: var(--ink-1); }
+
+  footer { margin-top: 80px; padding-top: 24px; border-top: 1px solid var(--line); font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ink-3); letter-spacing: 0.06em; }
+  footer em { font-family: 'Newsreader', serif; font-style: italic; color: var(--gold); letter-spacing: 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- HERO -->
+  <section class="first">
+    <div class="eyebrow">edgelab · orgrimmar · action plan v2 · post-codex review</div>
+    <h1>Jarvis <em>Channel</em>.<br/>Финальный план — после ревью.</h1>
+    <p class="lead">Codex GPT-5.5 проверил план — направление верное, не chasing a phantom. Но три критические правки до старта: <b style="color:var(--gold-hi)">Phase 0 canary</b> (без неё риск найти проблему 16 июня), исправленный CLI-синтаксис, и реалистичные оценки (2–4 дня вместо 11 часов). Эта версия — то, что реально шипим.</p>
+  </section>
+
+  <!-- BILLING THESIS -->
+  <section>
+    <span class="pill warn">⚠ единственный недоказанный тезис</span>
+    <h2>Channel под <em>launchd</em> = subscription pool?</h2>
+
+    <div class="card danger">
+      <p style="color:var(--ink-1)">Anthropic support обещает: <code>«interactive Claude Code in the terminal or IDE»</code> остаётся на subscription, <code>claude -p</code> / Agent SDK / GitHub Actions уходят в SDK $200 credit.</p>
+      <p>Channels документированы как MCP-серверы, которые пушат события в живую сессию Claude Code. Технически — это interactive. Но <b style="color:var(--danger)">публично не подтверждено</b>, как биллинг классифицирует Channel-сессию под <code>launchd</code> без человеческого TTY.</p>
+      <p>Решение: <b style="color:var(--gold-hi)">Phase 0 canary до 15.06</b> — реальный launchd-запуск, тестовое событие, проверка дашборда + письмо в Anthropic support. Без канарейки рискуем найти проблему 16 июня, когда уже late.</p>
+    </div>
+  </section>
+
+  <!-- PRE-FLIGHT EXTENDED -->
+  <section>
+    <span class="pill warn">Pre-flight расширенный — 20 мин</span>
+    <h2>10 проверок ДО <em>Phase 0</em></h2>
+
+    <div class="check">
+      <div class="check-item">
+        <div class="body">
+          <div class="lbl">Claude Code 2.1.80+</div>
+          <div class="desc">claude --version. Минимум для channels.</div>
+        </div>
+      </div>
+      <div class="check-item warn">
+        <div class="body">
+          <div class="lbl">CLI synthax verified</div>
+          <div class="desc">claude --help | rg "channels|dangerously-load" — подтвердить актуальные флаги перед скриптами.</div>
+        </div>
+      </div>
+      <div class="check-item warn">
+        <div class="body">
+          <div class="lbl">Hosts scan: где живут `claude -p` и SDK</div>
+          <div class="desc">grep на Mac mini, Thrall, Timeweb, gbrain: claude -p, claude --print, @anthropic-ai/sdk, import anthropic, ANTHROPIC_API_KEY.</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div class="body">
+          <div class="lbl">5 bot tokens доступны</div>
+          <div class="desc">~/.claude-lab/{silvana,kaelthas,garrosh,arthas,...}/secrets/telegram-bot-token. Никакого dual-consumer на один токен.</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div class="body">
+          <div class="lbl">Bun runtime 1.1+</div>
+          <div class="desc">bun --version. Для MCP-сервера на TypeScript.</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div class="body">
+          <div class="lbl">Тиранда / MiniMax доступна</div>
+          <div class="desc">ssh root@165.245.219.131 + curl health. Подтвердить, что Hermes v0.11.0 работает.</div>
+        </div>
+      </div>
+      <div class="check-item bonus">
+        <div class="body">
+          <div class="lbl">Snapshot текущего Max consumption</div>
+          <div class="desc">5 дней пиков по часам — baseline для канарейки и для замера post-15.06.</div>
+        </div>
+      </div>
+      <div class="check-item bonus">
+        <div class="body">
+          <div class="lbl">Project trust + MCP consent — pre-approved</div>
+          <div class="desc">claude trust list. Все проекты, которые открывает Channel-сессия, уже trusted локально (иначе deadlock в launchd).</div>
+        </div>
+      </div>
+      <div class="check-item bonus">
+        <div class="body">
+          <div class="lbl">Reboot test plan</div>
+          <div class="desc">Mac mini рестарт → launchd поднимает сессию → OAuth keychain работает → channel принимает событие. Сценарий проверки заранее.</div>
+        </div>
+      </div>
+      <div class="check-item bonus">
+        <div class="body">
+          <div class="lbl">Backup gateway.py + config.json</div>
+          <div class="desc">cp с timestamp ДО любого изменения. Rollback path всегда открыт.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PHASE 0 — CANARY -->
+  <section>
+    <span class="pill warn">Phase 0 — Critical</span>
+    <h2>Канарейка <em>билинга</em> — без неё не стартуем</h2>
+
+    <div class="phase-block canary">
+      <div class="phase-head">
+        <span class="phase-num canary">phase 0 · canary</span>
+        <span class="phase-title">Доказать, что Channel под launchd = Max pool</span>
+        <span class="phase-time warn">~3 ч + 48 ч observation</span>
+      </div>
+      <div class="phase-goal">Цель: получить hard evidence (дашборд + письмо support), что channel-сессия под launchd биллится как interactive subscription, а не как SDK credit.</div>
+
+      <h4>шаги</h4>
+      <div class="check">
+        <div class="check-item">
+          <div class="body">
+            <div class="lbl">1. Минимальный echo-channel</div>
+            <div class="desc">MCP-сервер на bun, capability claude/channel, единственный event "ping" → выводит timestamp в живую сессию.</div>
+          </div>
+        </div>
+        <div class="check-item">
+          <div class="body">
+            <div class="lbl">2. launchd unit на Mac mini</div>
+            <div class="desc">~/Library/LaunchAgents/ai.orgrimmar.canary.plist. Запускает claude --dangerously-load-development-channels plugin:canary@local --channels canary под user session, без TTY.</div>
+          </div>
+        </div>
+        <div class="check-item">
+          <div class="body">
+            <div class="lbl">3. Внешний триггер каждые 5 мин</div>
+            <div class="desc">Cron / отдельный launchd шлёт ping. 48 часов прогона. Логируем токены, latency, ошибки.</div>
+          </div>
+        </div>
+        <div class="check-item">
+          <div class="body">
+            <div class="lbl">4. Проверка дашборда Anthropic</div>
+            <div class="desc">console.anthropic.com → usage → раздельные счётчики subscription vs SDK credit. Канарейка должна крутить subscription, не credit.</div>
+          </div>
+        </div>
+        <div class="check-item">
+          <div class="body">
+            <div class="lbl">5. Письмо в Anthropic support</div>
+            <div class="desc">Описать: launchd, no TTY, --channels плагин, OAuth Max. Прямой вопрос: подпадает ли под "interactive Claude Code"?</div>
+          </div>
+        </div>
+        <div class="check-item warn">
+          <div class="body">
+            <div class="lbl">6. Gate: PASS / FAIL</div>
+            <div class="desc">PASS = дашборд показывает subscription + support confirm → Phase 1. FAIL = Channel под launchd классифицируется как SDK → пересматриваем стратегию (Tyrande берёт больше).</div>
+          </div>
+        </div>
+      </div>
+
+      <h4>fallback при FAIL</h4>
+      <p style="margin-top: 4px;">Если канарейка показала SDK pool: переезжаем на гибрид — Channel запускается из <code>tmux</code> / <code>screen</code> внутри активной user-сессии (true TTY), а не launchd. Тиранда берёт на себя 100% автоматических крон-сценариев. Latency хуже (нужен active login), но Max pool сохраняется.</p>
+    </div>
+  </section>
+
+  <!-- ROADMAP -->
+  <section>
+    <span class="pill">Roadmap после канарейки</span>
+    <h2>Две параллельные линии — <em>реальные оценки</em></h2>
+
+    <div class="timeline-strip">
+      <div class="lane">
+        <div class="lane-head">line a · channel · 2–4 дня</div>
+        <div class="lane-row"><span class="t">P1</span><span class="d">4 ч</span><span class="l">MVP single-agent (Silvana)</span></div>
+        <div class="lane-row"><span class="t">P2</span><span class="d">1.5–3 дн</span><span class="l">Parity port: streams, media, voice, albums</span></div>
+        <div class="lane-row"><span class="t">P3</span><span class="d">2 ч</span><span class="l">Permission relay + pre-trust</span></div>
+        <div class="lane-row"><span class="t">P4</span><span class="d">3 ч</span><span class="l">Per-token cutover, 5 агентов</span></div>
+        <div class="lane-row"><span class="t">P5</span><span class="d">~1 нед</span><span class="l">Observation + decommission gateway.py</span></div>
+      </div>
+      <div class="lane">
+        <div class="lane-head">line b · tyrande / crons · ~5 ч</div>
+        <div class="lane-row"><span class="t">A</span><span class="d">1 ч</span><span class="l">Inventory всех cron'ов + @tyrandebot + группа</span></div>
+        <div class="lane-row"><span class="t">B</span><span class="d">1 ч</span><span class="l">Pilot: reflection summary через MiniMax</span></div>
+        <div class="lane-row"><span class="t">C</span><span class="d">2–3 ч</span><span class="l">Migrate остальные Anthropic-зависимые крон'ы</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- LINE A PHASES -->
+  <section>
+    <span class="pill">Линия A — Channel</span>
+    <h2>Фазы <em>Jarvis Channel</em></h2>
+
+    <div class="phase-block">
+      <div class="phase-head">
+        <span class="phase-num">phase 1 · mvp</span>
+        <span class="phase-title">Single-agent prototype — Silvana</span>
+        <span class="phase-time">≈ 4 ч</span>
+      </div>
+      <div class="phase-goal">Один бот, один канал, минимум фич — доказать, что Telegram event попадает в живую сессию Claude Code.</div>
+      <div class="check">
+        <div class="check-item"><div class="body"><div class="lbl">Bun + TypeScript MCP server</div><div class="desc">jarvis-channel/src/index.ts. capabilities: claude/channel.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Telegram Bot API long-poll внутри плагина</div><div class="desc">getUpdates с offset, отправка события в Claude Code через MCP transport.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Базовый allowlist user_id 164795011</div><div class="desc">Никаких чужих сообщений в сессию.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Plain text reply через sendMessage</div><div class="desc">Минимум — без HTML, без альбомов, без media. Просто доказать roundtrip.</div></div></div>
+      </div>
+    </div>
+
+    <div class="phase-block">
+      <div class="phase-head">
+        <span class="phase-num">phase 2 · parity</span>
+        <span class="phase-title">Порт логики gateway.py (3 748 строк)</span>
+        <span class="phase-time warn">1.5–3 дня</span>
+      </div>
+      <div class="phase-goal">Перенести всё, что сейчас работает: HTML-стриминг статуса, markdown→TG HTML, media download, voice (Whisper), альбомы (media-group buffer), per-chat workers, /reset, /stop, compact.</div>
+      <div class="check">
+        <div class="check-item"><div class="body"><div class="lbl">Streaming status (печатает / думает / 🔧 tool)</div><div class="desc">editMessageText каждые ~700ms через MCP события.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Markdown → Telegram HTML конвертер</div><div class="desc">Порт md2tg.py логики в TS. Поддержка code, pre, blockquote, links.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Media: photo / document / voice download + attach</div><div class="desc">Telegram file_id → temp file → передача в сессию как attachment context.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Voice → Whisper (Groq) → text</div><div class="desc">Порт groq-voice вызова.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Album buffer (media-group)</div><div class="desc">2-секундное окно агрегации, batch как один turn.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Webhook injection (reply-to-message)</div><div class="desc">Метадата untrusted block, как сейчас в gateway.py:2334-2372.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">OOB commands: /reset, /stop, /status, /compact</div><div class="desc">Управляющие команды через отдельный MCP event-channel.</div></div></div>
+      </div>
+    </div>
+
+    <div class="phase-block">
+      <div class="phase-head">
+        <span class="phase-num">phase 3 · permissions</span>
+        <span class="phase-title">Permission relay + pre-trust</span>
+        <span class="phase-time">≈ 2 ч</span>
+      </div>
+      <div class="phase-goal">Закрыть permission deadlock в headless launchd. Tool approvals через Telegram (5-letter codes), project trust и MCP consent — pre-approved локально.</div>
+      <div class="check">
+        <div class="check-item"><div class="body"><div class="lbl">capability claude/channel/permission</div><div class="desc">MCP сервер слушает запросы Bash/Write/Edit approval.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">5-letter code в Telegram</div><div class="desc">«Approve Bash: rm -rf … — yes abcde / no abcde». Owner-only, TTL 5 мин, replay-protection.</div></div></div>
+        <div class="check-item warn"><div class="body"><div class="lbl">Pre-trust ВСЕХ проектов</div><div class="desc">claude trust add для каждого workspace ДО запуска под launchd. Иначе trust prompt = deadlock.</div></div></div>
+        <div class="check-item warn"><div class="body"><div class="lbl">Pre-approve MCP servers</div><div class="desc">.mcp.json серверы в "approved" state локально перед launchd cutover.</div></div></div>
+      </div>
+    </div>
+
+    <div class="phase-block">
+      <div class="phase-head">
+        <span class="phase-num">phase 4 · cutover</span>
+        <span class="phase-title">Per-token rollout, 5 агентов</span>
+        <span class="phase-time">≈ 3 ч</span>
+      </div>
+      <div class="phase-goal">Каждый bot token — ровно один консьюмер getUpdates. Никакой параллельной работы gateway.py и channel на одном токене (race condition).</div>
+      <div class="check">
+        <div class="check-item"><div class="body"><div class="lbl">Order: silvana → kaelthas → garrosh → arthas → claude</div><div class="desc">Каждый агент по очереди: остановить агент в gateway.py → запустить channel-сессию → smoke test → next.</div></div></div>
+        <div class="check-item warn"><div class="body"><div class="lbl">Cutover protocol per agent</div><div class="desc">1. config.json: disable agent в gateway. 2. launchctl load channel-{agent}.plist. 3. Telegram smoke (Telegram ping → ответ). 4. ack принцу.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Resource ceiling test</div><div class="desc">6 channel сессий одновременно: RSS, log growth, crash loop behavior. Мониторим 4 часа.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Durable event queue + ack</div><div class="desc">Channel events не подтверждаются Claude Code — буфер на диске на случай busy сессии. Backpressure тест (10 событий пока Claude занят).</div></div></div>
+      </div>
+    </div>
+
+    <div class="phase-block">
+      <div class="phase-head">
+        <span class="phase-num">phase 5 · decommission</span>
+        <span class="phase-title">gateway.py в архив</span>
+        <span class="phase-time">~1 неделя observation</span>
+      </div>
+      <div class="phase-goal">7 дней параллельного существования (gateway.py стоит, но не активен) → если zero regressions → backup → удаление launchd unit + commit deprecation.</div>
+      <div class="check">
+        <div class="check-item"><div class="body"><div class="lbl">launchctl unload ai.orgrimmar.gateway</div><div class="desc">Остановить, но файлы оставить.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">7 дней мониторинга</div><div class="desc">Daily reflection: что упало? Что лагает? Что пропустилось?</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">git tag jarvis-pre-channel-final</div><div class="desc">Зафиксировать последнее состояние gateway.py.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Move to archive/</div><div class="desc">gateway.py → archive/. README обновить.</div></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- LINE B PHASES -->
+  <section>
+    <span class="pill">Линия B — Tyrande</span>
+    <h2>Кроны <em>без Anthropic</em></h2>
+
+    <div class="phase-block tyrande">
+      <div class="phase-head">
+        <span class="phase-num">phase a · inventory</span>
+        <span class="phase-title">Найти все Anthropic-зависимые кроны</span>
+        <span class="phase-time">≈ 1 ч</span>
+      </div>
+      <div class="phase-goal">Полная карта: где сейчас гоняется claude -p / claude --print в crontab / launchd / systemd на всех хостах.</div>
+      <div class="check">
+        <div class="check-item"><div class="body"><div class="lbl">Mac mini: launchctl list + crontab -l</div><div class="desc">Все unit'ы, grep claude.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Thrall VPS</div><div class="desc">systemctl list-timers + crontab -u openclaw -l + scripts/*.sh.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Timeweb + gbrain</div><div class="desc">Аналогично.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Создать @tyrandebot + группа «Orgrimmar Ops»</div><div class="desc">BotFather: новый bot, Bot-to-Bot Communication ON. Группа: prince + все 6 ботов.</div></div></div>
+      </div>
+    </div>
+
+    <div class="phase-block tyrande">
+      <div class="phase-head">
+        <span class="phase-num">phase b · pilot</span>
+        <span class="phase-title">Reflection summary через MiniMax</span>
+        <span class="phase-time">≈ 1 ч</span>
+      </div>
+      <div class="phase-goal">Один cron — daily reflection digest — перенести на Tyrande / Hermes / MiniMax M2.7. Доказать, что quality приемлемое для summary-задач.</div>
+      <div class="check">
+        <div class="check-item"><div class="body"><div class="lbl">Tyrande endpoint: POST /summarize</div><div class="desc">Принимает текст последних 24h, отдаёт markdown summary.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Quality A/B vs Claude Sonnet</div><div class="desc">10 примеров. Достаточно для category «summary». Не для category «code».</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Mac mini cron вызывает Tyrande, постит в @fridayhumanbot</div><div class="desc">Никакого Anthropic в этом потоке.</div></div></div>
+      </div>
+    </div>
+
+    <div class="phase-block tyrande">
+      <div class="phase-head">
+        <span class="phase-num">phase c · migrate</span>
+        <span class="phase-title">Остальные крон'ы</span>
+        <span class="phase-time">≈ 2–3 ч</span>
+      </div>
+      <div class="phase-goal">По одному переносим: cognee-cognify summary, weekly digest, learnings audit. Каждый: A/B → cutover → 24h observation.</div>
+      <div class="check">
+        <div class="check-item"><div class="body"><div class="lbl">Cognee post-cognify summary</div><div class="desc">После cognify запускается summary inserted nodes — на MiniMax.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Weekly digest</div><div class="desc">Воскресный отчёт по всем агентам.</div></div></div>
+        <div class="check-item"><div class="body"><div class="lbl">Learnings audit (eженедельный lint)</div><div class="desc">Что устарело, что повторяется, что промоутнуть в правило.</div></div></div>
+        <div class="check-item warn"><div class="body"><div class="lbl">НЕ переносим: code review, architecture, security</div><div class="desc">Tyrande/MiniMax — coordinator для summary/monitoring. Opus/Codex остаются на коде.</div></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- LOOP GUARDS -->
+  <section>
+    <span class="pill warn">новое — bot-to-bot safety</span>
+    <h2>Loop guards для <em>Telegram оркестрации</em></h2>
+
+    <div class="card danger">
+      <p style="color:var(--ink-1)">Telegram официально предупреждает: bot-to-bot communication без guards = риск бесконечного цикла (бот A пишет боту B, B отвечает A, A снова отвечает …). При rate spike → блок API на токен.</p>
+
+      <h4 style="margin-top:18px;">обязательные guards</h4>
+      <div class="check">
+        <div class="check-item warn"><div class="body"><div class="lbl">Depth-limit: max 3 hops в цепочке</div><div class="desc">В каждое bot-to-bot сообщение пишем X-Orgrimmar-Depth header. Channel читает, инкрементит, > 3 → drop + alert принцу.</div></div></div>
+        <div class="check-item warn"><div class="body"><div class="lbl">Dedupe по message hash + TTL 60s</div><div class="desc">Bloom-фильтр / sqlite cache. Тот же текст от того же бота — игнор.</div></div></div>
+        <div class="check-item warn"><div class="body"><div class="lbl">Per-bot rate-limit: 10 msg/min</div><div class="desc">Token bucket. Свыше — queue с экспоненциальным backoff.</div></div></div>
+        <div class="check-item warn"><div class="body"><div class="lbl">Permission codes only from owner</div><div class="desc">approve-codes принимаются ТОЛЬКО от user_id 164795011. Никогда от peer бота.</div></div></div>
+        <div class="check-item bonus"><div class="body"><div class="lbl">Kill-switch команда</div><div class="desc">«/halt» от принца в любую группу — все channel-сессии паузятся.</div></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ROLLBACK -->
+  <section>
+    <span class="pill">Rollback strategy</span>
+    <h2>Если что-то <em>сломалось</em></h2>
+
+    <div class="grid-2">
+      <div class="card">
+        <h3>Phase 0 FAIL</h3>
+        <p style="font-size: 13.5px;">Канарейка показала SDK pool. Переключаемся на гибрид: Channel в tmux/screen (true TTY), Тиранда берёт больше крон-логики. Никаких изменений gateway.py.</p>
+      </div>
+      <div class="card">
+        <h3>Phase 1–2 ошибки</h3>
+        <p style="font-size: 13.5px;">Channel прототип не работает. gateway.py не тронут, продолжаем на нём. Откат — просто <code>launchctl unload</code> канала.</p>
+      </div>
+      <div class="card">
+        <h3>Phase 4 cutover regression</h3>
+        <p style="font-size: 13.5px;">Один из агентов потерял сообщения. Per-agent revert: <code>config.json enable агента в gateway → launchctl unload channel-{agent}</code>. Остальные продолжают на Channel.</p>
+      </div>
+      <div class="card">
+        <h3>Phase 5 observation</h3>
+        <p style="font-size: 13.5px;">Через 5 дней замечен дрейф. <code>launchctl load ai.orgrimmar.gateway</code> вернуть в строй. Channel оставить, parallel-mode 1 день, root-cause, retry.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- SUCCESS -->
+  <section>
+    <span class="pill ok">Success criteria</span>
+    <h2>Что доказываем перед <em>15.06.2026</em></h2>
+
+    <div class="check">
+      <div class="check-item done"><div class="body"><div class="lbl">Anthropic dashboard: zero SDK credit usage за 7 дней</div><div class="desc">Весь traffic Сильваны/Кельтаса/Garrosh — в subscription pool.</div></div></div>
+      <div class="check-item done"><div class="body"><div class="lbl">5/5 агентов отвечают через Channel</div><div class="desc">Smoke per agent: Telegram → ответ ≤ 30s.</div></div></div>
+      <div class="check-item done"><div class="body"><div class="lbl">parity: streams + media + voice + albums работают</div><div class="desc">A/B vs gateway.py на 50 реальных turn'ах.</div></div></div>
+      <div class="check-item done"><div class="body"><div class="lbl">launchd reboot test: сессия поднимается без human input</div><div class="desc">Mac mini рестарт → 2 мин → Channel принимает первый event.</div></div></div>
+      <div class="check-item done"><div class="body"><div class="lbl">Permission relay: 100% approval roundtrip ≤ 60s</div><div class="desc">10 примеров Bash/Write tool approvals.</div></div></div>
+      <div class="check-item done"><div class="body"><div class="lbl">Tyrande берёт 100% крон-логики, ноль Anthropic-вызовов в crons</div><div class="desc">grep на всех хостах: 0 совпадений claude -p / @anthropic-ai/sdk в крон-скриптах.</div></div></div>
+      <div class="check-item done"><div class="body"><div class="lbl">Loop guards: synthetic bot-loop тест → halt после 3 hops</div><div class="desc">Депт-лимит реально срабатывает.</div></div></div>
+      <div class="check-item done"><div class="body"><div class="lbl">Anthropic support письменно подтверждает классификацию</div><div class="desc">Email на руках с явным «yes, this counts as interactive subscription usage».</div></div></div>
+    </div>
+  </section>
+
+  <!-- TIMELINE -->
+  <section>
+    <span class="pill">Timeline до 15.06.2026</span>
+    <h2>Реальные <em>сроки</em> (пост-ревью)</h2>
+
+    <div class="card accent">
+      <pre class="flow"><b>сегодня (14.05)</b>     <span class="dim">pre-flight + Phase 0 canary (3 ч + 48 ч observation)</span>
+<b>17.05 — 18.05</b>      <span class="dim">канарейка крутится, оцениваем дашборд</span>
+<b>18.05</b>             <span class="ok">canary GATE — PASS / FAIL</span>
+<b>19.05 — 24.05</b>      <span class="dim">Phase 1 + Phase 2 (5 дней с буфером)</span>
+<b>25.05</b>             <span class="dim">Phase 3 — permission relay + pre-trust</span>
+<b>26.05 — 27.05</b>      <span class="dim">Phase 4 — per-token cutover, 5 агентов</span>
+<b>параллельно</b>       <span class="dim">Phase A/B Тиранды (день 19–20)</span>
+<b>28.05 — 04.06</b>      <span class="dim">Phase 5 observation + Phase C Тиранды</span>
+<b>05.06 — 14.06</b>      <span class="dim">finetune, мониторинг, edge cases, support письмо</span>
+<b>15.06.2026</b>         <span class="ok">D-day — Anthropic billing split, мы готовы</span></pre>
+    </div>
+    <p style="margin-top: 14px; font-size: 13.5px;">Если канарейка FAIL — таймлайн пересматриваем 18.05 с гибридным планом.</p>
+  </section>
+
+  <!-- CTA -->
+  <section>
+    <div class="card accent">
+      <h3>Скажи «старт»</h3>
+      <p>Начинаю с <b style="color:var(--gold-hi)">Pre-flight расширенный (10 проверок, 20 мин)</b> + <b style="color:var(--gold-hi)">Phase 0 canary</b>. Параллельно — <b style="color:var(--gold-hi)">Phase A Тиранды</b> (inventory + @tyrandebot, ~1 ч).</p>
+      <p>Через 48 часов — гейт PASS / FAIL по канарейке. Дальше — по plan, с буфером до 15.06.</p>
+    </div>
+  </section>
+
+  <footer>
+    <em>Silvana</em> · jarvis-channel migration · action plan v2 · post-Codex review · 14 мая 2026
+  </footer>
+
+</div>
+</body>
+</html>

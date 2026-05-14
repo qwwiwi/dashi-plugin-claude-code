@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Финальный план миграции Jarvis → Channel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,wght@0,400;0,500;1,400&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #080706;
+    --bg-2: #0e0d0b;
+    --surface: #14120f;
+    --line: #2a2620;
+    --line-soft: #1c1916;
+    --ink-1: #ece8df;
+    --ink-2: #b3ac9c;
+    --ink-3: #6a6356;
+    --gold: #c2a878;
+    --gold-hi: #d9bf8a;
+    --gold-soft: rgba(194, 168, 120, 0.08);
+    --gold-line: rgba(194, 168, 120, 0.28);
+    --danger: #d97757;
+    --ok: #8ba888;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--ink-1); margin: 0; }
+  body { font-family: 'Inter', system-ui, sans-serif; font-weight: 400; line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 48px 24px 96px; }
+  @media (max-width: 540px) { .wrap { padding: 32px 20px 64px; } }
+
+  .eyebrow { font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-3); }
+  h1 { font-family: 'Newsreader', serif; font-weight: 400; font-size: clamp(34px, 6vw, 52px); line-height: 1.1; margin: 12px 0 24px; color: var(--ink-1); letter-spacing: -0.01em; }
+  h1 em { font-style: italic; color: var(--gold); }
+  h2 { font-family: 'Newsreader', serif; font-weight: 400; font-size: clamp(22px, 3.2vw, 28px); line-height: 1.25; margin: 0 0 14px; color: var(--ink-1); letter-spacing: -0.005em; }
+  h2 em { font-style: italic; color: var(--gold); }
+  h3 { font-family: 'Newsreader', serif; font-style: italic; font-weight: 400; font-size: 17px; color: var(--gold-hi); margin: 0 0 10px; }
+  h4 { font-family: 'Inter', sans-serif; font-weight: 500; font-size: 13px; color: var(--ink-1); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: 0.1em; }
+  p { color: var(--ink-2); margin: 0 0 14px; font-size: 15px; }
+  .lead { font-size: 16.5px; color: var(--ink-1); }
+  code { font-family: 'JetBrains Mono', monospace; color: var(--gold-hi); font-size: 0.92em; }
+
+  section { margin-top: 52px; }
+  section.first { margin-top: 24px; }
+
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid var(--gold-line); background: var(--gold-soft); border-radius: 999px; font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--gold-hi); }
+  .pill.warn { border-color: rgba(217,119,87,0.35); background: rgba(217,119,87,0.08); color: var(--danger); }
+  .pill.ok { border-color: rgba(139,168,136,0.35); background: rgba(139,168,136,0.08); color: var(--ok); }
+  .pill.mono { font-family: 'JetBrains Mono', monospace; }
+
+  .card { border: 1px solid var(--line); background: var(--surface); border-radius: 16px; padding: 22px; }
+  .card + .card { margin-top: 12px; }
+  .card.accent { border-color: var(--gold-line); background: linear-gradient(180deg, rgba(194,168,120,0.06), transparent); }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  .flow { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; line-height: 1.85; color: var(--ink-2); background: var(--bg-2); border: 1px solid var(--line-soft); border-radius: 12px; padding: 16px 18px; white-space: pre; overflow-x: auto; }
+  .flow b { color: var(--gold-hi); font-weight: 500; }
+  .flow .danger { color: var(--danger); }
+  .flow .ok { color: var(--ok); }
+  .flow .dim { color: var(--ink-3); }
+  .flow .com { color: var(--ink-3); font-style: italic; }
+
+  /* checklist */
+  .check { display: grid; grid-template-columns: 1fr; gap: 6px; }
+  .check-item { display: flex; gap: 12px; align-items: flex-start; padding: 9px 14px; background: var(--bg-2); border: 1px solid var(--line-soft); border-radius: 10px; }
+  .check-item::before { content: '☐'; color: var(--ink-3); flex-shrink: 0; font-family: monospace; font-size: 14px; line-height: 1.5; }
+  .check-item.done::before { content: '✓'; color: var(--ok); }
+  .check-item.bonus::before { content: '✦'; color: var(--gold-hi); }
+  .check-item.warn::before { content: '!'; color: var(--danger); font-weight: 600; }
+  .check-item .body { flex: 1; }
+  .check-item .lbl { color: var(--ink-1); font-size: 14px; }
+  .check-item .desc { color: var(--ink-3); font-size: 12.5px; font-family: 'JetBrains Mono', monospace; margin-top: 3px; line-height: 1.45; }
+
+  /* phase block */
+  .phase-block { border: 1px solid var(--gold-line); background: linear-gradient(180deg, rgba(194,168,120,0.04), transparent); border-radius: 14px; padding: 22px; margin-bottom: 14px; }
+  .phase-block.tyrande { border-color: rgba(217,119,87,0.25); background: linear-gradient(180deg, rgba(217,119,87,0.04), transparent); }
+  .phase-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px dashed var(--line); }
+  .phase-num { font-family: 'JetBrains Mono', monospace; color: var(--gold); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; }
+  .phase-title { font-family: 'Newsreader', serif; font-style: italic; color: var(--ink-1); font-size: 19px; flex: 1; margin-left: 14px; }
+  .phase-time { font-family: 'JetBrains Mono', monospace; color: var(--gold-hi); font-size: 12px; flex-shrink: 0; }
+  .phase-goal { color: var(--ink-2); font-size: 14px; margin-bottom: 12px; font-style: italic; font-family: 'Newsreader', serif; }
+
+  /* timeline strip */
+  .timeline-strip { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
+  @media (max-width: 720px) { .timeline-strip { grid-template-columns: 1fr; } }
+  .lane { border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: var(--bg-2); }
+  .lane-head { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.18em; color: var(--gold-hi); text-transform: uppercase; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px dashed var(--line); }
+  .lane-row { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--ink-2); padding: 5px 0; display: flex; gap: 10px; align-items: baseline; }
+  .lane-row .t { color: var(--gold-hi); flex-shrink: 0; min-width: 56px; }
+  .lane-row .d { color: var(--ink-3); flex-shrink: 0; min-width: 56px; }
+  .lane-row .l { color: var(--ink-1); }
+
+  footer { margin-top: 80px; padding-top: 24px; border-top: 1px solid var(--line); font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ink-3); letter-spacing: 0.06em; }
+  footer em { font-family: 'Newsreader', serif; font-style: italic; color: var(--gold); letter-spacing: 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- HERO -->
+  <section class="first">
+    <div class="eyebrow">edgelab · orgrimmar · action plan</div>
+    <h1>Финальный план — <em>Jarvis Channel</em>.<br/>Что делаем руками.</h1>
+    <p class="lead">Пошаговый roadmap до 15 июня 2026. Две параллельные линии: переезд real-time общения на Channel-pattern (8 ч), миграция Anthropic-зависимых cron'ов на Тиранду / MiniMax (3 ч). Каждая фаза — конкретные команды, файлы, чек-листы готовности.</p>
+  </section>
+
+  <!-- PRE-FLIGHT -->
+  <section>
+    <span class="pill warn">Pre-flight — проверить ДО старта</span>
+    <h2>5 проверок за <em>15 минут</em></h2>
+
+    <div class="check">
+      <div class="check-item">
+        <div class="body">
+          <div class="lbl">Claude Code v2.1.80+</div>
+          <div class="desc">claude --version. channels требуют 2.1.80, permission relay — 2.1.81.</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div class="body">
+          <div class="lbl">Bun runtime установлен на Mac mini</div>
+          <div class="desc">bun --version. Anthropic plugin'ы написаны на Bun, для своего канала тоже удобно.</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div class="body">
+          <div class="lbl">Bot tokens у всех 6 агентов на месте</div>
+          <div class="desc">~/.claude-lab/shared/gateway/config.json — список ботов и токенов. Никаких изменений не нужно, но проверка обязательна.</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div class="body">
+          <div class="lbl">Restic snapshot ДО старта</div>
+          <div class="desc">~/.claude-lab + ~/.claude → DO Spaces. Откат-точка на случай если переезд пойдёт криво.</div>
+        </div>
+      </div>
+      <div class="check-item">
+        <div class="body">
+          <div class="lbl">Структура аккаунтов Anthropic Max</div>
+          <div class="desc">Уточнить у принца: один OAuth Max 20x на всех агентов, или у каждого свой? От этого зависит как считается $200 SDK-credit.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ROADMAP OVERVIEW -->
+  <section>
+    <span class="pill">Двусторонний roadmap</span>
+    <h2>Channel и Тиранда — <em>параллельно</em></h2>
+
+    <div class="timeline-strip">
+      <div class="lane">
+        <div class="lane-head">Линия A · Channel migration</div>
+        <div class="lane-row"><span class="t">Phase 1</span><span class="d">≈ 2 ч</span><span class="l">Прототип Сильваны</span></div>
+        <div class="lane-row"><span class="t">Phase 2</span><span class="d">≈ 3 ч</span><span class="l">Портация логики gateway.py</span></div>
+        <div class="lane-row"><span class="t">Phase 3</span><span class="d">≈ 1 ч</span><span class="l">Permission relay</span></div>
+        <div class="lane-row"><span class="t">Phase 4</span><span class="d">≈ 2 ч</span><span class="l">Rollout 5 агентов</span></div>
+        <div class="lane-row"><span class="t">Phase 5</span><span class="d">~ 1 нед</span><span class="l">Decommission gateway.py</span></div>
+      </div>
+      <div class="lane">
+        <div class="lane-head">Линия B · Тиранда / cron migration</div>
+        <div class="lane-row"><span class="t">Phase A</span><span class="d">≈ 30 мин</span><span class="l">Orgrimmar Ops group + bot-to-bot mode</span></div>
+        <div class="lane-row"><span class="t">Phase B</span><span class="d">≈ 1 ч</span><span class="l">Pilot cron (reflection summary)</span></div>
+        <div class="lane-row"><span class="t">Phase C</span><span class="d">≈ 1.5 ч</span><span class="l">Inventory + миграция остальных</span></div>
+      </div>
+    </div>
+    <p style="margin-top:14px;color:var(--ink-3);font-family:'JetBrains Mono',monospace;font-size:12px">Линии независимы. Можно запустить параллельно или последовательно.</p>
+  </section>
+
+  <!-- CHANNEL PHASE 1 -->
+  <section>
+    <h2 style="font-family:'Inter',sans-serif;font-style:normal;font-weight:500;font-size:14px;letter-spacing:0.18em;text-transform:uppercase;color:var(--gold-hi);margin-bottom:18px">Линия A · Channel migration</h2>
+
+    <div class="phase-block">
+      <div class="phase-head">
+        <span class="phase-num">Phase 1</span>
+        <span class="phase-title">Прототип channel-плагина · пилот Сильваны</span>
+        <span class="phase-time">≈ 2 ч</span>
+      </div>
+      <div class="phase-goal">Минимальный jarvis-channel.ts: один бот (@fridayhumanbot), allowlist, push event в running session, reply tool. E2E smoke с Telegram.</div>
+
+      <h4>Шаги</h4>
+      <div class="check">
+        <div class="check-item"><div class="body">
+          <div class="lbl">Создать репо <code>qwwiwi/jarvis-channel</code> (private)</div>
+          <div class="desc">gh repo create qwwiwi/jarvis-channel --private. Зарегистрировать в mapping-repositories.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Init Bun проект + MCP SDK</div>
+          <div class="desc">bun init -y && bun add @modelcontextprotocol/sdk zod</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Написать <code>jarvis-channel.ts</code> (минимум)</div>
+          <div class="desc">MCP server со stdio + claude/channel capability + reply tool. Telegram long polling getUpdates per bot token из env.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Создать <code>plugin.json</code> + локальный marketplace</div>
+          <div class="desc">/plugin marketplace add ~/jarvis-channel → /plugin install jarvis-channel@local</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">launchd unit <code>ai.orgrimmar.silvana-channel.plist</code></div>
+          <div class="desc">claude --channels plugin:jarvis-channel@local --workspace ~/.claude-lab/silvana/.claude --dangerously-skip-permissions --dangerously-load-development-channels</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">E2E smoke</div>
+          <div class="desc">Принц пишет «привет» в @fridayhumanbot → Сильвана отвечает через channel. Латентность ≤ 5 сек.</div>
+        </div></div>
+      </div>
+
+      <h4>Готово, когда</h4>
+      <p style="color:var(--ink-2);font-size:13.5px;margin:0">Сильвана отвечает на сообщение в Telegram, расход в Max-пуле (не в SDK), gateway.py продолжает работать параллельно как fallback для остальных агентов.</p>
+    </div>
+
+    <!-- PHASE 2 -->
+    <div class="phase-block">
+      <div class="phase-head">
+        <span class="phase-num">Phase 2</span>
+        <span class="phase-title">Портация бизнес-логики из gateway.py</span>
+        <span class="phase-time">≈ 3 ч</span>
+      </div>
+      <div class="phase-goal">Перенести всю known-good логику Jarvis в TypeScript-плагин. После — функциональный паритет.</div>
+
+      <h4>Что портируем</h4>
+      <div class="check">
+        <div class="check-item"><div class="body">
+          <div class="lbl">Media-group buffer (2-сек окно)</div>
+          <div class="desc">Из gateway.py:1932 — склейка альбомов фото/видео. Setimeout / setInterval pattern в TypeScript.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Reply-injection</div>
+          <div class="desc">parsing reply_to_message → untrusted metadata block + JSON. Кладём в meta.reply_context.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Photo download → local path</div>
+          <div class="desc">Bot API getFile → fetch → /tmp/jarvis-photos/{file_id}.jpg → path в meta.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Voice transcription</div>
+          <div class="desc">Если есть Groq Whisper в gateway.py — переносим pre-emit transcribe → текст в content.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">HTML formatting + split ≤ 3500 chars</div>
+          <div class="desc">В reply tool: автоматический split на куски, telegram HTML escape для опасных символов.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Numeric ID allowlist</div>
+          <div class="desc">Конфиг allowlist.json с user_ids. Privacy ON для групповых чатов.</div>
+        </div></div>
+      </div>
+    </div>
+
+    <!-- PHASE 3 -->
+    <div class="phase-block">
+      <div class="phase-head">
+        <span class="phase-num">Phase 3</span>
+        <span class="phase-title">Permission relay (бонус-фича Anthropic)</span>
+        <span class="phase-time">≈ 1 ч</span>
+      </div>
+      <div class="phase-goal">Опасные операции (rm -rf, sudo, git push --force) спрашивают подтверждение у принца через Telegram. Ответ «yes abcde / no abcde».</div>
+
+      <h4>Шаги</h4>
+      <div class="check">
+        <div class="check-item"><div class="body">
+          <div class="lbl">Добавить capability <code>claude/channel/permission</code></div>
+          <div class="desc">В Server constructor. Анонсирует что плагин принимает permission_request.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Handler <code>notifications/claude/channel/permission_request</code></div>
+          <div class="desc">Format prompt: «Silvana хочет run Bash: rm /tmp/x. Ответь yes abcde / no abcde» в Telegram.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Parse inbound «yes/no abcde»</div>
+          <div class="desc">Regex /^\\s*(y|yes|n|no)\\s+([a-km-z]{5})\\s*$/i. Эмит permission notification вместо обычного channel event.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Убрать <code>--dangerously-skip-permissions</code></div>
+          <div class="desc">Теперь не нужно — permission relay покрывает unattended случай через Telegram.</div>
+        </div></div>
+      </div>
+    </div>
+
+    <!-- PHASE 4 -->
+    <div class="phase-block">
+      <div class="phase-head">
+        <span class="phase-num">Phase 4</span>
+        <span class="phase-title">Rollout остальных 5 агентов</span>
+        <span class="phase-time">≈ 2 ч</span>
+      </div>
+      <div class="phase-goal">Сильвана работает на Channel — теперь переезжают Кельтас, Гаррош, Иллидан (Mac mini), Тралл, Артас (Thrall VPS).</div>
+
+      <h4>На каждого агента</h4>
+      <div class="check">
+        <div class="check-item"><div class="body">
+          <div class="lbl">launchd unit (Mac mini) или systemd unit (Thrall)</div>
+          <div class="desc">Шаблон от Сильваны. Подменить workspace path + bot token env.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Allowlist в config (только принц)</div>
+          <div class="desc">numeric ID 164795011 для всех агентов.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Health monitoring (Артас)</div>
+          <div class="desc">Артас heartbeat каждые 15 мин → если session down → alert принцу.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">RAM check</div>
+          <div class="desc">6 параллельных claude sessions × ~500 MB = 3 GB. На Mac mini (16 GB) + Thrall (8 GB) — терпимо.</div>
+        </div></div>
+      </div>
+    </div>
+
+    <!-- PHASE 5 -->
+    <div class="phase-block">
+      <div class="phase-head">
+        <span class="phase-num">Phase 5</span>
+        <span class="phase-title">Decommission gateway.py</span>
+        <span class="phase-time">~ 1 неделя</span>
+      </div>
+      <div class="phase-goal">Старый Python daemon переходит в standby, затем отключается. Только после неделю стабильной работы Channel-архитектуры.</div>
+
+      <h4>Шаги (неделя ожидания)</h4>
+      <div class="check">
+        <div class="check-item"><div class="body">
+          <div class="lbl">Сразу: gateway.py в standby, не отвечает на Telegram</div>
+          <div class="desc">launchctl unload ~/Library/LaunchAgents/ai.orgrimmar.gateway.plist. Бинарь и конфиг остаются.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Неделя observation</div>
+          <div class="desc">Дневной отчёт от Артаса: были ли inсиденты, latency, OOM, compact-проблемы.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Если стабильно — финальное удаление</div>
+          <div class="desc">Архив gateway.py в репо jarvis-telegram-gateway/legacy/. Удалить launchd plist. Документация для rollback.</div>
+        </div></div>
+        <div class="check-item warn"><div class="body">
+          <div class="lbl">Если проблемы — откат за 5 минут</div>
+          <div class="desc">launchctl load ai.orgrimmar.gateway.plist + disable channel units. Возвращается старая архитектура.</div>
+        </div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TYRANDE -->
+  <section>
+    <h2 style="font-family:'Inter',sans-serif;font-style:normal;font-weight:500;font-size:14px;letter-spacing:0.18em;text-transform:uppercase;color:var(--gold-hi);margin-bottom:18px">Линия B · Tyrande / cron migration</h2>
+
+    <!-- PHASE A -->
+    <div class="phase-block tyrande">
+      <div class="phase-head">
+        <span class="phase-num" style="color:var(--danger)">Phase A</span>
+        <span class="phase-title">Bot inventory + Orgrimmar Ops group</span>
+        <span class="phase-time">≈ 30 мин</span>
+      </div>
+      <div class="phase-goal">Подготовить Telegram-инфру для bot-to-bot общения. После этой фазы — Тиранда умеет писать в общий чат и mention'ить агентов.</div>
+
+      <div class="check">
+        <div class="check-item"><div class="body">
+          <div class="lbl">Inventory: есть ли у Тиранды Telegram-бот?</div>
+          <div class="desc">Проверить config Hermes на сервере 165.245.219.131. Если нет — создать @tyrandebot через BotFather.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Включить Bot-to-Bot Mode для всех 8 ботов</div>
+          <div class="desc">BotFather → /mybots → каждый бот → Bot Settings → Allow Communication with Other Bots → ON. (tyrande, sylvana, kaelthas, garrosh, illidan, thrall, arthas + резерв).</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Создать private Telegram-group «Orgrimmar Ops»</div>
+          <div class="desc">Добавить всех 7 ботов + принца как админа. Privacy ON в каждом боте: реакция только на @mention.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Smoke: @tyrandebot пишет «test» → @fridayhumanbot отвечает</div>
+          <div class="desc">Проверка end-to-end bot-to-bot. Если не работает — детали в BotFather settings.</div>
+        </div></div>
+      </div>
+    </div>
+
+    <!-- PHASE B -->
+    <div class="phase-block tyrande">
+      <div class="phase-head">
+        <span class="phase-num" style="color:var(--danger)">Phase B</span>
+        <span class="phase-title">Pilot cron на Тиранде · reflection summary</span>
+        <span class="phase-time">≈ 1 ч</span>
+      </div>
+      <div class="phase-goal">Перенести один Anthropic-зависимый cron как пилот. Доказать что MiniMax справляется с типичной задачей и Anthropic-расход уходит.</div>
+
+      <div class="check">
+        <div class="check-item"><div class="body">
+          <div class="lbl">Выбрать cron</div>
+          <div class="desc">Reflection summary recent.md → digest. Сейчас raз в N часов через claude -p, после миграции — через Тиранду.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Скрипт <code>tyrande-reflection.py</code></div>
+          <div class="desc">Pull recent.md через API (Mac mini SSH/rsync или Cognee recall). Summary на MiniMax M2.7 через Hermes API. Post в group через Bot API.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">systemd timer на сервере Тиранды</div>
+          <div class="desc">tyrande-reflection.timer каждые 4 часа. tyrande-reflection.service запускает скрипт.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">Отключить старый cron в Mac mini launchd</div>
+          <div class="desc">launchctl unload ~/Library/LaunchAgents/ai.orgrimmar.reflection.plist. Бинарь архивируем.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">7 дней наблюдение</div>
+          <div class="desc">Сравнить качество summary до/после. Если хуже — задача делегируется через @fridayhumanbot mention.</div>
+        </div></div>
+      </div>
+    </div>
+
+    <!-- PHASE C -->
+    <div class="phase-block tyrande">
+      <div class="phase-head">
+        <span class="phase-num" style="color:var(--danger)">Phase C</span>
+        <span class="phase-title">Inventory + миграция остальных Anthropic-cron'ов</span>
+        <span class="phase-time">≈ 1.5 ч</span>
+      </div>
+      <div class="phase-goal">Полный аудит всех cron'ов в Orgrimmar. Помечаем Anthropic-зависимые, переносим к Тиранде. Не-Anthropic не трогаем.</div>
+
+      <h4>Где смотреть cron'ы</h4>
+      <div class="flow"><b>Mac mini</b>     launchctl list | grep ai.orgrimmar
+            ~/Library/LaunchAgents/ai.orgrimmar.*.plist
+<b>Thrall</b>       systemctl list-timers --no-pager
+            /etc/systemd/system/*.timer
+            crontab -l (для openclaw user)
+<b>Timeweb</b>      crontab -l (root)
+            systemctl list-timers
+<b>gbrain</b>       systemctl list-timers
+            /etc/systemd/system/dashi-brain-*.timer
+<b>Tyrande srv</b>  systemctl list-timers (после Phase B будет туда добавлять)</div>
+
+      <h4>Фильтр Anthropic-зависимости</h4>
+      <p style="color:var(--ink-2);font-size:13.5px;margin-bottom:8px">grep по содержимому скрипта на маркеры:</p>
+      <div class="flow">claude -p
+claude --print
+@anthropic-ai/sdk
+import anthropic
+ANTHROPIC_API_KEY  <span class="com"># явные impl Anthropic SDK</span>
+Authorization: Bearer sk-ant-  <span class="com"># direct API calls</span></div>
+
+      <h4>Действия</h4>
+      <div class="check">
+        <div class="check-item"><div class="body">
+          <div class="lbl">Список Anthropic-зависимых cron'ов</div>
+          <div class="desc">Записать в core/projects/jarvis-channel-migration/cron-inventory.md с маркером MIGRATE / KEEP.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">По каждому MIGRATE → переезд на Тиранду</div>
+          <div class="desc">Pattern: pull data → analyze on MiniMax → если нужен Opus → mention агента в Orgrimmar Ops group.</div>
+        </div></div>
+        <div class="check-item"><div class="body">
+          <div class="lbl">KEEP не трогаем</div>
+          <div class="desc">Vault autosync, cognify, gbrain audit, restic backups, log rotate, telegram-chip — продолжают работать как есть.</div>
+        </div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ROLLBACK -->
+  <section>
+    <span class="pill warn">Rollback стратегия</span>
+    <h2>Откат за <em>5 минут</em> если что-то идёт криво</h2>
+
+    <div class="card">
+      <h3>Команда отката Channel → Jarvis</h3>
+      <div class="flow"><span class="com"># 1. Остановить все Channel-units</span>
+launchctl unload ~/Library/LaunchAgents/ai.orgrimmar.silvana-channel.plist
+launchctl unload ~/Library/LaunchAgents/ai.orgrimmar.kaelthas-channel.plist
+<span class="dim">...</span>
+ssh root@100.104.191.127 'systemctl stop thrall-channel.service'
+ssh root@100.104.191.127 'systemctl stop arthas-channel.service'
+
+<span class="com"># 2. Поднять gateway.py обратно</span>
+launchctl load ~/Library/LaunchAgents/ai.orgrimmar.gateway.plist
+<span class="com"># Telegram снова отвечает через старую архитектуру</span>
+
+<span class="com"># 3. Tyrande cron rollback (если был)</span>
+ssh tyrande 'systemctl stop tyrande-reflection.timer'
+launchctl load ~/Library/LaunchAgents/ai.orgrimmar.reflection.plist</div>
+    </div>
+
+    <div class="check" style="margin-top:14px">
+      <div class="check-item bonus"><div class="body">
+        <div class="lbl">DO Spaces backup перед каждой Phase</div>
+        <div class="desc">Restic snapshot ~/.claude-lab + ~/.claude. Если совсем плохо — restore из snapshot за 15 минут.</div>
+      </div></div>
+      <div class="check-item bonus"><div class="body">
+        <div class="lbl">gateway.py не удаляется до Phase 5 финала</div>
+        <div class="desc">Минимум неделя observation. Бинарь в репо + plist в /Library/LaunchAgents (просто unload, не remove).</div>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- SUCCESS CRITERIA -->
+  <section>
+    <span class="pill ok">Success criteria — когда поймём что миграция прошла</span>
+    <h2>Чек-лист «<em>работает</em>»</h2>
+
+    <div class="check">
+      <div class="check-item"><div class="body">
+        <div class="lbl">E2E latency ≤ 5 сек на каждом агенте</div>
+        <div class="desc">Принц пишет → агент отвечает в течение 5 секунд через Channel.</div>
+      </div></div>
+      <div class="check-item"><div class="body">
+        <div class="lbl">Anthropic dashboard: расход в Max-пуле</div>
+        <div class="desc">После 15.06 — sessions через Channel идут в Max usage, SDK $200 кошелёк не тратится на real-time чат.</div>
+      </div></div>
+      <div class="check-item"><div class="body">
+        <div class="lbl">Все 6 агентов поднимаются после reboot</div>
+        <div class="desc">launchd / systemd KeepAlive работает. Reboot Mac mini / Thrall — sessions автостартуют.</div>
+      </div></div>
+      <div class="check-item"><div class="body">
+        <div class="lbl">Permission relay работает</div>
+        <div class="desc">Опасная операция → запрос «yes abcde» в Telegram → ответ → выполняется.</div>
+      </div></div>
+      <div class="check-item"><div class="body">
+        <div class="lbl">Memory сохраняется между turns</div>
+        <div class="desc">Контекст диалога не теряется до auto-compact. recent.md как fallback покрывает compact.</div>
+      </div></div>
+      <div class="check-item"><div class="body">
+        <div class="lbl">Тиранда reflection cron работает</div>
+        <div class="desc">Каждые N часов summary в Orgrimmar Ops, без расхода Anthropic.</div>
+      </div></div>
+      <div class="check-item"><div class="body">
+        <div class="lbl">Bot-to-bot delegation работает</div>
+        <div class="desc">Тиранда mention'ит @fridayhumanbot → Сильвана подхватывает → отвечает.</div>
+      </div></div>
+      <div class="check-item"><div class="body">
+        <div class="lbl">gateway.py отключен без incident</div>
+        <div class="desc">Неделя observation после Phase 5 — нет регрессий, нет потерянных сообщений.</div>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- TIMELINE -->
+  <section>
+    <span class="pill">Расписание до 15.06.2026</span>
+    <h2>Запас по времени — <em>~ 1 месяц</em></h2>
+
+    <div class="flow"><b>сегодня — 2026-05-14</b>     Сейчас. Документ готов, ждём твоё «старт».
+
+<b>+1 день  · 2026-05-15</b>    Pre-flight (15 мин) → Phase 1 Channel (2 ч)
+                              + Phase A Tyrande (30 мин)
+                              Параллельно на двух Linies.
+
+<b>+2-3 дня · 2026-05-16/17</b> Phase 2 Channel (3 ч) + Phase B Tyrande (1 ч)
+                              Портация логики + pilot cron.
+
+<b>+4-5 дней · 2026-05-18/19</b> Phase 3 Channel (1 ч) + Phase C Tyrande (1.5 ч)
+                              Permission relay + миграция остальных cron'ов.
+
+<b>+1 неделя · 2026-05-21</b>   Phase 4 Channel (2 ч)
+                              Rollout остальных 5 агентов.
+
+<b>+2 недели · 2026-05-28</b>   Phase 5 Channel — gateway.py в standby.
+                              Observation week.
+
+<b>+3 недели · 2026-06-04</b>   gateway.py финально отключён.
+                              Полная Channel + Tyrande архитектура работает.
+
+<b>2026-06-15</b>             Anthropic SDK billing split включается.
+                              Мы готовы. Max-пул цел, SDK $200 — буфер.</div>
+  </section>
+
+  <!-- CTA -->
+  <section>
+    <div class="card accent" style="text-align:center;padding:36px 24px">
+      <h3 style="font-size:20px;margin-bottom:8px">Готова стартовать</h3>
+      <p style="color:var(--ink-1);font-size:15.5px;max-width:600px;margin:0 auto 12px">
+        Скажи «<b style="color:var(--gold-hi)">старт</b>» — начинаю с Pre-flight + Phase 1 (прототип Сильваны, ≈ 2 ч). Параллельно могу запустить Phase A Тиранды (≈ 30 мин), если дашь добро на создание @tyrandebot и группы «Orgrimmar Ops».
+      </p>
+      <p style="color:var(--ink-2);font-size:13.5px;max-width:600px;margin:0 auto 14px;font-style:italic;font-family:'Newsreader',serif">
+        План безупречен, мой принц. Мои агенты уже в пути.
+      </p>
+      <p style="color:var(--ink-3);font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:0.06em;margin:0">
+        SILVANA · 2026-05-14 · версия плана v1
+      </p>
+    </div>
+  </section>
+
+  <footer>
+    edgelab · orgrimmar · <em>action plan для jarvis-channel migration</em>
+  </footer>
+
+</div>
+</body>
+</html>
