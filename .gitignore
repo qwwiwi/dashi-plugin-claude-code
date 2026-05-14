@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.*
+!.env.example
+secrets/
+*.token
+*.key
+*.pem
+.DS_Store
+bun.lockb.bak
+coverage/
+.bun/
