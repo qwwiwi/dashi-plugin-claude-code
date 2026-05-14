@@ -19,6 +19,7 @@ Custom Claude Code **channel plugin** для Telegram — миграция Orgri
 | [docs/03-plan.md](docs/03-plan.md) | Pre-flight + Phase 0–5 + Phase A–C + таймлайн до 15.06 |
 | [docs/04-codex-review.md](docs/04-codex-review.md) | Codex GPT-5.5 ревью: 6 правок до старта |
 | [docs/05-success-criteria.md](docs/05-success-criteria.md) | 8 чеков перед D-day + rollback strategy |
+| [docs/06-tmux-migration-goal-plan.md](docs/06-tmux-migration-goal-plan.md) | **TMUX-first goal plan**: supervisor, channel plugin, parity matrix, phased cutover |
 
 ## Презентации (HTML)
 
@@ -29,6 +30,8 @@ Custom Claude Code **channel plugin** для Telegram — миграция Orgri
 | [artifacts/jarvis-channel-action-plan-v2.html](artifacts/jarvis-channel-action-plan-v2.html) | **Финальный план** после Codex review — с Phase 0 канарейкой |
 
 ## Roadmap (high-level)
+
+**Update 2026-05-14:** после ревью `claude-tmux`, `claude-session-driver`, `oauth-cli-coder` и `claudecode-telegram` primary runtime меняется на tmux-first. `launchd` остается supervisor, но Claude Code запускается внутри persistent `tmux` сессии. Новый operational plan: [docs/06-tmux-migration-goal-plan.md](docs/06-tmux-migration-goal-plan.md).
 
 | Phase | Описание | ETA |
 |-------|----------|-----|

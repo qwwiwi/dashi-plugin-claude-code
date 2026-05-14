@@ -1,5 +1,7 @@
 # План переезда
 
+> Update 2026-05-14: этот план фиксирует исходный launchd/channel rollout. После ревью tmux-подходов primary operational path перенесен в [06-tmux-migration-goal-plan.md](06-tmux-migration-goal-plan.md): `launchd -> supervisor -> tmux -> claude --channels`. Прямой launchd/no-TTY запуск больше не является preferred path.
+
 ## Pre-flight (20 минут, 10 проверок)
 
 1. **Claude Code 2.1.80+** — `claude --version`. Минимум для channels.
