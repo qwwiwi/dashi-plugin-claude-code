@@ -140,8 +140,12 @@ describe('appendHotEntry', () => {
       if (lines[i]!.startsWith('### ')) { firstEntryIdx = i; break }
     }
     expect(firstEntryIdx).toBeGreaterThanOrEqual(0)
-    // Header is preserved at the top.
-    expect(text.startsWith('# Hot memory')).toBe(true)
+    // Header is preserved at the top — ASCII `--`, byte-parity with
+    // gateway.py:1973 + scripts/trim-hot.sh. NOT em-dash (review HIGH).
+    expect(text.startsWith('# Hot memory -- last 24h rolling journal\n\n')).toBe(true)
+    // Exact-byte check on the first 42 bytes (length of the header).
+    const headerLiteral = '# Hot memory -- last 24h rolling journal\n\n'
+    expect(text.slice(0, headerLiteral.length)).toBe(headerLiteral)
   })
 
   test('trim leaves no orphan .recent.md.tmp.* file in target dir', async () => {
