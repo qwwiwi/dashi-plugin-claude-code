@@ -69,8 +69,10 @@ describe('summarizeToolInput', () => {
     expect(summarizeToolInput('Bash', { command: long }).length).toBeLessThanOrEqual(40)
   })
 
-  test('Grep wraps pattern in quotes', () => {
-    expect(summarizeToolInput('Grep', { pattern: 'TODO' })).toBe('&quot;TODO&quot;')
+  test('Grep wraps pattern in quotes (raw, render escapes)', () => {
+    // summarizeToolInput returns the RAW logical content (no HTML escape).
+    // Escaping happens exactly once in renderActivityBlock.
+    expect(summarizeToolInput('Grep', { pattern: 'TODO' })).toBe('"TODO"')
   })
 
   test('Agent uses subagent_type', () => {
@@ -91,8 +93,9 @@ describe('summarizeToolInput', () => {
     expect(summarizeToolInput('Hypothetical', {})).toBe('')
   })
 
-  test('escapes HTML special chars', () => {
-    expect(summarizeToolInput('Bash', { command: '<script>' })).toBe('&lt;script&gt;')
+  test('returns raw text (renderer escapes once)', () => {
+    // No HTML escape here — render boundary is the only escape site.
+    expect(summarizeToolInput('Bash', { command: '<script>' })).toBe('<script>')
   })
 })
 
@@ -241,5 +244,39 @@ describe('buildActivityDetail', () => {
 
   test('omits summary if empty', () => {
     expect(buildActivityDetail('Read', {})).toBe('read')
+  })
+})
+
+describe('full pipeline escape round-trip (regression)', () => {
+  // Round-trip: mapper builds detail → renderer assembles <pre> body.
+  // Critical bug pre-fix: summarize escaped once, render escaped again,
+  // producing `&amp;quot;recordActivity&amp;quot;` instead of
+  // `&quot;recordActivity&quot;`. This test feeds a Grep pattern containing
+  // a quote through both stages and asserts single escape.
+  test('Grep pattern "recordActivity" survives mapper→renderer as single escape', () => {
+    const detail = buildActivityDetail('Grep', { pattern: 'recordActivity' })
+    const snap: ActivitySnapshot = {
+      startedAtMs: 0,
+      calls: [{ toolName: 'Grep', detail }],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, 0)
+    // Single escape produces &quot; — double escape produces &amp;quot;
+    expect(out).toContain('&quot;recordActivity&quot;')
+    expect(out).not.toContain('&amp;quot;')
+    expect(out).not.toContain('&amp;amp;')
+  })
+
+  test('Bash <script> survives single-escape through full pipeline', () => {
+    const detail = buildActivityDetail('Bash', { command: '<script>alert(1)</script>' })
+    const snap: ActivitySnapshot = {
+      startedAtMs: 0,
+      calls: [{ toolName: 'Bash', detail }],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, 0)
+    expect(out).toContain('&lt;script&gt;')
+    expect(out).not.toContain('&amp;lt;')
+    expect(out).not.toContain('<script>')
   })
 })

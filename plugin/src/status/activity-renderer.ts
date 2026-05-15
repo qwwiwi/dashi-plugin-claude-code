@@ -104,9 +104,10 @@ export function maskSecrets(input: string): string {
 
 /**
  * Compact description of a tool invocation for the rolling activity window.
- * Output is HTML-escaped and capped at 40 chars (gateway.py:1506-1536).
- * Renderer applies `maskSecrets` again to the whole detail string before
- * display — masking here is a belt-and-braces pass for non-`unknown` paths.
+ * Returns the RAW (unescaped) logical content, capped at 40 chars
+ * (gateway.py:1506-1536). HTML escape happens exactly once at render time
+ * in `renderActivityBlock` — applying it here too would double-escape Grep
+ * patterns ("recordActivity" → `&amp;quot;...&amp;quot;`).
  */
 export function summarizeToolInput(toolName: string, toolInput: ToolInput): string {
   let s: string
@@ -173,7 +174,7 @@ export function summarizeToolInput(toolName: string, toolInput: ToolInput): stri
     }
   }
 
-  return escapeHtml(s.slice(0, 40))
+  return s.slice(0, 40)
 }
 
 // ─────────────────────────────────────────────────────────────────────
