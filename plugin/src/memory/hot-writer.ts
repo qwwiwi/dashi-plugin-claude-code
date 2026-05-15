@@ -12,7 +12,7 @@
 // rename()'d into place — same-dir guarantees an atomic move on the
 // agent's workspace filesystem (no EXDEV across /tmp boundaries).
 
-import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import { lockFor } from './_mutex.js'
@@ -42,14 +42,30 @@ export interface AppendHotInput {
   trimKeepLines: number
 }
 
+// Dependency-injection seam for the trim-path fs operations. Production
+// uses node:fs/promises; tests can pass a partial override to force
+// failure modes (e.g. rename throws EBUSY) and assert orphan cleanup.
+export interface TrimFsDeps {
+  writeFile: typeof writeFile
+  rename: typeof rename
+  unlink: typeof unlink
+}
+const defaultTrimDeps: TrimFsDeps = { writeFile, rename, unlink }
+
 /**
  * Append a turn entry. Auto-mkdir's the parent directory on first write
  * so the file can land in a fresh workspace without manual setup. After
  * append, if the file exceeds `maxBytes`, emergency-trim to last
  * `trimKeepLines` lines (advanced to first `### ` header) via a
  * same-dir tmp + rename for atomicity.
+ *
+ * @param _trimDeps internal — test-only injection of fs ops for the
+ *   trim path. Production callers must omit this.
  */
-export async function appendHotEntry(input: AppendHotInput): Promise<void> {
+export async function appendHotEntry(
+  input: AppendHotInput,
+  _trimDeps: TrimFsDeps = defaultTrimDeps,
+): Promise<void> {
   const entry =
     `\n### ${input.ts} [${input.sourceTag}]\n` +
     `**User:** ${input.userSnippet}\n` +
@@ -84,8 +100,21 @@ export async function appendHotEntry(input: AppendHotInput): Promise<void> {
       dirname(input.path),
       `.recent.md.tmp.${process.pid}.${Date.now()}`,
     )
-    await writeFile(tmp, header + kept.join('\n'), 'utf8')
-    await rename(tmp, input.path)
+    // Cleanup orphan tmp on rename failure (review MEDIUM). Pre-fix: if
+    // writeFile succeeded but rename failed (EBUSY, EIO, kill between
+    // awaits) the tmp would stay forever. After enough faulted trims the
+    // agent's core/hot/ would accumulate stale .recent.md.tmp.* files.
+    // unlink swallows ENOENT so a writeFile-side failure (no tmp on
+    // disk) is a no-op.
+    try {
+      await _trimDeps.writeFile(tmp, header + kept.join('\n'), 'utf8')
+      await _trimDeps.rename(tmp, input.path)
+    } catch (err) {
+      await _trimDeps.unlink(tmp).catch(() => {
+        // tmp may not exist if writeFile threw first — fine.
+      })
+      throw err
+    }
   })
 }
 

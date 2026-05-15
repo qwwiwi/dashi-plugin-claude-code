@@ -166,6 +166,59 @@ describe('appendHotEntry', () => {
     }
   })
 
+  test('trim cleans up tmp orphan when rename throws (review MEDIUM)', async () => {
+    // Pre-fix: writeFile + rename had no try/catch. If rename failed
+    // (EBUSY, EIO, kill-between-awaits) the tmp file stayed forever; PID
+    // + ms suffixes meant successive faulted trims would accumulate
+    // distinct .recent.md.tmp.* orphans. After the fix, any throw
+    // between writeFile and rename triggers an unlink on tmp.
+    const fs = await import('node:fs/promises')
+    await fs.mkdir(dirname(hotPath), { recursive: true })
+    const pre = '\n### 2026-05-15 11:00 [tg]\n' +
+      '**User:** ' + 'a'.repeat(180) + '\n' +
+      '**Silvana:** ' + 'b'.repeat(180) + '\n'
+    let seed = ''
+    while (seed.length < 30 * 1024) seed += pre
+    writeFileSync(hotPath, seed, 'utf8')
+
+    // Inject deps: writeFile real, rename throws EBUSY once, unlink real.
+    let renameCalls = 0
+    let unlinkCalls = 0
+    const deps = {
+      writeFile: fs.writeFile,
+      rename: async (..._args: unknown[]) => {
+        renameCalls++
+        const e = new Error('EBUSY: device or resource busy') as Error & { code?: string }
+        e.code = 'EBUSY'
+        throw e
+      },
+      unlink: async (p: string) => {
+        unlinkCalls++
+        return fs.unlink(p)
+      },
+    } as unknown as Parameters<typeof appendHotEntry>[1]
+
+    let caught: unknown
+    try {
+      await appendHotEntry(
+        defaultInput({ maxBytes: 20480, trimKeepLines: 50 }),
+        deps,
+      )
+    } catch (err) {
+      caught = err
+    }
+    // (a) trim threw — the appendHotEntry call propagated the rename error.
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error & { code?: string }).code).toBe('EBUSY')
+    expect(renameCalls).toBe(1)
+    expect(unlinkCalls).toBe(1)
+    // (b) no orphan .recent.md.tmp.* file remains in the directory.
+    const siblings = readdirSync(dirname(hotPath))
+    for (const name of siblings) {
+      expect(name.startsWith('.recent.md.tmp.')).toBe(false)
+    }
+  })
+
   test('newlines in snippets are caller responsibility (writer does not collapse — uses snippet() upstream)', async () => {
     // The hot-writer takes already-flattened snippets; embedding a raw
     // newline produces multi-line entries by design. snippet() is the
