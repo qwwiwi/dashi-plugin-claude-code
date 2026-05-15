@@ -74,7 +74,7 @@ Each test sends a Telegram DM from user `164795011` to `@testmyfirsttmuxbot` and
 | 12 | /reset force | "/reset force" | Ack reply + channel notify `meta.command=reset` |
 | 13 | Permission allow (Bash) | trigger Bash via Claude, then press Allow button | Bash runs |
 | 14 | Permission deny | trigger Bash, press Deny | Bash refused |
-| 15 | Webhook (if enabled) | `curl -X POST http://127.0.0.1:8089/hooks/agent -H 'X-Webhook-Token: ...' -d '{...}'` | `meta.source=webhook` in Claude context |
+| 15 | Webhook (if enabled) | `curl -X POST http://127.0.0.1:8089/hooks/agent -H 'Authorization: Bearer <TELEGRAM_WEBHOOK_TOKEN>' -d '{...}'` | `meta.source=webhook` in Claude context |
 
 For tests 6/7, toggle by exporting `GROQ_API_KEY` before launch or leaving it unset. Restart the tmux session after changing env.
 

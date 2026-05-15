@@ -91,4 +91,49 @@ describe('splitMessage', () => {
     expect(out.length).toBeGreaterThanOrEqual(2)
     for (const c of out) expect(c.length).toBeLessThanOrEqual(4000)
   })
+
+  // M5: PLAN T5 preference order is strict — paragraph break first, even if
+  // it sits below max/2. Previously a `minCut = max/2` floor silently skipped
+  // a low-offset paragraph boundary and hard-cut mid-body.
+  test('prefers paragraph boundary even when it sits below max/2 (M5)', () => {
+    // Short header (50 chars) + \n\n + giant single-line body. Boundary at
+    // offset 52, max=4000 means minCut=2000 under the old code → would
+    // hard-cut at 4000. New code splits at the \n\n (cut=52) so the body
+    // starts cleanly on its own.
+    const header = 'h'.repeat(50)
+    const body = 'b'.repeat(4000)
+    const text = `${header}\n\n${body}`
+    const out = splitMessage(text, 4000)
+    expect(out.length).toBeGreaterThanOrEqual(2)
+    // First chunk is just the header (and any trimmed-or-kept \n\n).
+    expect(out[0]!.startsWith(header)).toBe(true)
+    // The first body chunk does NOT contain header text.
+    expect(out[1]!).not.toContain(header)
+    for (const c of out) expect(c.length).toBeLessThanOrEqual(4000)
+  })
+
+  test('prefers line boundary over hard cut when no paragraph break exists (M5)', () => {
+    const header = 'h'.repeat(30)
+    const body = 'b'.repeat(200)
+    const text = `${header}\n${body}` // single \n, no \n\n
+    const out = splitMessage(text, 100)
+    // First chunk ends at the line boundary (length === 31 with the \n).
+    expect(out[0]!.endsWith('\n')).toBe(true)
+    expect(out[0]!.replace(/\n$/, '')).toBe(header)
+    for (const c of out) expect(c.length).toBeLessThanOrEqual(100)
+  })
+
+  // M6: every chunk emitted by splitMessage stays under `max` even for a
+  // worst-case <pre> block with no internal break points spanning many cuts.
+  test('every chunk respects max for an over-limit single <pre> block (M6 invariant)', () => {
+    const text = `<pre>${'q'.repeat(20_000)}</pre>`
+    const out = splitMessage(text, 4000)
+    expect(out.length).toBeGreaterThan(1)
+    for (const c of out) {
+      expect(c.length).toBeLessThanOrEqual(4000)
+      const opens = (c.match(/<pre>/g) || []).length
+      const closes = (c.match(/<\/pre>/g) || []).length
+      expect(opens).toBe(closes)
+    }
+  })
 })

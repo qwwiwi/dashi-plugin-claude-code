@@ -82,6 +82,42 @@ describe('loadConfig', () => {
     expect(out).toContain('<redacted>')
   })
 
+  // Fix 4 — widened secret redaction.
+  test('redactToken masks Groq API key pattern', () => {
+    const groq = 'gsk_' + 'A'.repeat(50)
+    const out = redactToken(`groq error: GROQ_API_KEY=${groq} failed`)
+    expect(out).not.toContain(groq)
+    expect(out).toContain('<redacted>')
+  })
+
+  test('redactToken masks Authorization: Bearer header value', () => {
+    const bearer = 'abcdef1234567890ABCDEFGHIJK'
+    const out = redactToken(`request failed with Authorization: Bearer ${bearer}`)
+    expect(out).not.toContain(bearer)
+    expect(out).toContain('Bearer <redacted>')
+  })
+
+  test('redactToken masks ?token= and &access_token= query params', () => {
+    const tok = 'qS3cret_value_XYZ-987'
+    const out1 = redactToken(`GET https://x.io/cb?token=${tok}&other=ok`)
+    expect(out1).not.toContain(tok)
+    const out2 = redactToken(`GET https://x.io/cb?a=1&access_token=${tok}`)
+    expect(out2).not.toContain(tok)
+  })
+
+  test('redactToken masks caller-supplied exact substrings', () => {
+    const webhook = 'wh_test_token_32_chars__________'
+    const out = redactToken(`got header value ${webhook} in log`, [webhook])
+    expect(out).not.toContain(webhook)
+    expect(out).toContain('<redacted>')
+  })
+
+  test('redactToken ignores empty / too-short caller secrets', () => {
+    // 3-char strings would match too many substrings — guard refuses them.
+    const out = redactToken('the cat sat on the mat', ['', 'abc'])
+    expect(out).toBe('the cat sat on the mat')
+  })
+
   test('loadConfig throws Zod error without leaking token value', () => {
     // Use a config file that fails validation (negative port) to force a Zod throw
     // after env parsing has already accepted the token.
@@ -97,6 +133,25 @@ describe('loadConfig', () => {
     expect(caught).toBeDefined()
     const message = caught instanceof Error ? caught.message : String(caught)
     expect(message).not.toContain(FAKE_TOKEN)
+  })
+
+  // M7: TELEGRAM_ACCESS_MODE=pairing must fail with a clear scope-aware error.
+  test('loadConfig rejects TELEGRAM_ACCESS_MODE=pairing with a clear scope-aware message', () => {
+    let caught: unknown
+    try {
+      loadConfig(env({ TELEGRAM_ACCESS_MODE: 'pairing' }))
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeDefined()
+    const message = caught instanceof Error ? caught.message : String(caught)
+    expect(message.toLowerCase()).toContain('pairing')
+    expect(message).toMatch(/scope b|not supported|allowlist/i)
+  })
+
+  test('loadConfig accepts TELEGRAM_ACCESS_MODE=static', () => {
+    const cfg = loadConfig(env({ TELEGRAM_ACCESS_MODE: 'static' }))
+    expect(cfg.bot_id).toBe(8507713167)
   })
 
   test('loadConfig reads config.json values when no env override', () => {

@@ -167,15 +167,34 @@ describe('StatusManager.start', () => {
     expect(mgr.isActive('164795011')).toBe(false)
   })
 
-  test('start replaces previous active status for same chat (no extra edit)', async () => {
+  test('start finalises previous active status before opening a new one', async () => {
+    // M3 fix: only one active status per chat. Calling start() twice in a
+    // row must edit the prior message to a terminal label ("Остановлено:
+    // superseded") before sending the new typing message, otherwise the
+    // album path leaks stale pulsing status messages.
+    const { mgr, api } = makeManager()
+    const firstHandle = await mgr.start('164795011', undefined)
+    expect(api.calls.length).toBe(1)
+    await mgr.start('164795011', undefined)
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    expect(edits.length).toBeGreaterThanOrEqual(1)
+    // The cancel-edit targets the FIRST message id and ends with "superseded".
+    const cancelEdit = edits.find((e) => e.messageId === firstHandle.messageId)
+    expect(cancelEdit).toBeDefined()
+    expect(cancelEdit!.text).toContain('Остановлено')
+    expect(cancelEdit!.text).toContain('superseded')
+    // Two distinct send calls — one per start().
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(2)
+  })
+
+  test('start cancel-edit on the previous status survives a "message not modified" error', async () => {
     const { mgr, api } = makeManager()
     await mgr.start('164795011', undefined)
-    expect(api.calls.length).toBe(1)
-    // Second start: previous timers cancel silently, new message goes out.
+    // Force the cancel-edit on the previous status to fail with the
+    // benign "not modified" error — start() must still complete.
+    api.failEditWith = new Error('Bad Request: message is not modified')
     await mgr.start('164795011', undefined)
-    // 1 original send + 1 new send. No "canceled" edit between them.
-    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(2)
-    expect(api.calls.filter((c) => c.kind === 'edit').length).toBe(0)
+    expect(mgr.isActive('164795011')).toBe(true)
   })
 })
 

@@ -249,11 +249,18 @@ async function handleRequest(
   }
   if (payload.agentId !== undefined) metaRaw.agent_id = payload.agentId
 
-  await sendChannelNotification(
+  const delivered = await sendChannelNotification(
     mcpServer,
     { content: payload.message, meta: normalizeMeta(metaRaw) },
     log,
   )
+
+  if (!delivered) {
+    // Transport error already logged inside sendChannelNotification. Surface
+    // 503 so the caller can retry; 200 would let the message be lost silently.
+    reply(res, 503, { error: 'channel unavailable' })
+    return
+  }
 
   reply(res, 200, { status: 'accepted' })
 }
@@ -270,7 +277,10 @@ export async function startWebhookServer(
 
   const webhookToken = process.env.TELEGRAM_WEBHOOK_TOKEN
   const host = config.webhook.host
-  const isLoopback = host === '127.0.0.1' || host === '::1' || host === 'localhost'
+  // L5: only literal loopback IPs count. `localhost` can be redirected to a
+  // non-loopback address by /etc/hosts; operators wanting loopback should
+  // spell it as 127.0.0.1 or ::1.
+  const isLoopback = host === '127.0.0.1' || host === '::1'
   if (!isLoopback && !webhookToken) {
     throw new Error(
       `webhook server refuses to bind ${host}: TELEGRAM_WEBHOOK_TOKEN required for non-loopback host`,

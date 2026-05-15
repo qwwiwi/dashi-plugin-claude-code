@@ -27,11 +27,30 @@ import type { Update } from 'grammy/types'
 
 import type { AppConfig, StatePaths } from '../config.js'
 import type { Logger } from '../log.js'
+import { TelegramUpdateSchema } from '../schemas.js'
 import { readUpdateOffset, writeDeadLetter, writeUpdateOffset } from '../state/store.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // Public types
 // ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Thrown by the poller loop when retry budget for a fatal-class error is
+ * exhausted (409 Conflict — another consumer owns the token; 401 Unauthorized
+ * — token revoked). server.ts's start() wrapper catches this and triggers
+ * shutdown — otherwise the MCP server would stay alive with no active
+ * Telegram consumer, silently dropping every inbound update.
+ */
+export class PollerFatalError extends Error {
+  readonly kind: 'conflict' | 'unauthorized'
+  readonly attempts: number
+  constructor(kind: 'conflict' | 'unauthorized', message: string, attempts: number) {
+    super(message)
+    this.name = 'PollerFatalError'
+    this.kind = kind
+    this.attempts = attempts
+  }
+}
 
 export interface PollerDeps {
   bot: Bot
@@ -158,6 +177,31 @@ function classifyError(err: unknown): ErrorClass {
   return { kind: 'fatal', message: String(err), retriable: false }
 }
 
+/**
+ * Validate one update from the wire against `TelegramUpdateSchema`. Returns
+ * either {ok: true, update_id} so the caller can advance the offset, or
+ * {ok: false, update_id?} when validation fails — in which case the caller
+ * MUST dead-letter the raw update and advance past it (returning to poll
+ * again would loop on the same malformed payload forever).
+ */
+function validateUpdate(
+  raw: unknown,
+): { ok: true; update_id: number } | { ok: false; error: string; update_id: number | undefined } {
+  const parsed = TelegramUpdateSchema.safeParse(raw)
+  if (parsed.success) {
+    return { ok: true, update_id: parsed.data.update_id }
+  }
+  // Best-effort: pull update_id off the raw object for offset bookkeeping
+  // even when the rest of the shape is bad. If we can't, the caller will
+  // skip the update entirely (offset stays put — next poll moves on).
+  let probedId: number | undefined
+  if (raw && typeof raw === 'object' && 'update_id' in raw) {
+    const v = (raw as Record<string, unknown>).update_id
+    if (typeof v === 'number' && Number.isFinite(v)) probedId = v
+  }
+  return { ok: false, error: parsed.error.message, update_id: probedId }
+}
+
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) {
@@ -179,14 +223,24 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 export class TelegramPoller {
   private readonly deps: PollerDeps
   private readonly getUpdates: GetUpdatesFn
+  private readonly sleepFn: (ms: number, signal: AbortSignal) => Promise<void>
   private stopping = false
   private offset: number | undefined
   private readonly stopCtl = new AbortController()
   private runningLoop: Promise<void> | undefined
 
-  constructor(deps: PollerDeps, overrides?: { getUpdates?: GetUpdatesFn }) {
+  constructor(
+    deps: PollerDeps,
+    overrides?: {
+      getUpdates?: GetUpdatesFn
+      // Test seam: replace the backoff sleep so retry-loop tests don't pay
+      // real wall-clock time (1+2+…+7s adds 28s to the 409 fatal test).
+      sleep?: (ms: number, signal: AbortSignal) => Promise<void>
+    },
+  ) {
     this.deps = deps
     this.offset = readUpdateOffset(deps.statePaths)
+    this.sleepFn = overrides?.sleep ?? sleep
     // Default: real grammY API. Test seam: override.
     this.getUpdates = overrides?.getUpdates
       ?? ((params): Promise<Update[]> => {
@@ -269,14 +323,37 @@ export class TelegramPoller {
 
     let handled = 0
     let errors = 0
-    for (const update of updates) {
+    for (const update of updates as unknown[]) {
+      const v = validateUpdate(update)
+      if (!v.ok) {
+        errors++
+        log.error('update failed Zod validation — dead-letter, advancing offset', {
+          update_id: v.update_id,
+          error: v.error,
+        })
+        try {
+          writeDeadLetter(this.deps.statePaths, 'updates', {
+            update,
+            error: `invalid update schema: ${v.error}`,
+          })
+        } catch (dlErr) {
+          log.error('dead-letter write failed', {
+            error: dlErr instanceof Error ? dlErr.message : String(dlErr),
+          })
+        }
+        if (v.update_id !== undefined) {
+          this.offset = v.update_id + 1
+          writeUpdateOffset(this.deps.statePaths, this.offset)
+        }
+        continue
+      }
       try {
-        await this.deps.onUpdate(update)
+        await this.deps.onUpdate(update as Update)
         handled++
       } catch (err) {
         errors++
         log.error('update handler threw — writing to dead-letter, advancing offset', {
-          update_id: update.update_id,
+          update_id: v.update_id,
           error: err instanceof Error ? err.message : String(err),
         })
         try {
@@ -292,7 +369,7 @@ export class TelegramPoller {
       }
       // ALWAYS advance offset, even on handler error. Otherwise a single
       // bad update poisons the queue forever.
-      this.offset = update.update_id + 1
+      this.offset = v.update_id + 1
       writeUpdateOffset(this.deps.statePaths, this.offset)
     }
 
@@ -328,13 +405,35 @@ export class TelegramPoller {
         conflict401Counter = 0
         unauthorizedCounter = 0
 
-        for (const update of updates) {
+        for (const update of updates as unknown[]) {
           if (this.stopping) break
+          const v = validateUpdate(update)
+          if (!v.ok) {
+            log.error('update failed Zod validation — dead-letter, advancing offset', {
+              update_id: v.update_id,
+              error: v.error,
+            })
+            try {
+              writeDeadLetter(this.deps.statePaths, 'updates', {
+                update,
+                error: `invalid update schema: ${v.error}`,
+              })
+            } catch (dlErr) {
+              log.error('dead-letter write failed', {
+                error: dlErr instanceof Error ? dlErr.message : String(dlErr),
+              })
+            }
+            if (v.update_id !== undefined) {
+              this.offset = v.update_id + 1
+              writeUpdateOffset(this.deps.statePaths, this.offset)
+            }
+            continue
+          }
           try {
-            await this.deps.onUpdate(update)
+            await this.deps.onUpdate(update as Update)
           } catch (err) {
             log.error('handler error — dead-letter, advancing offset', {
-              update_id: update.update_id,
+              update_id: v.update_id,
               error: err instanceof Error ? err.message : String(err),
             })
             try {
@@ -348,7 +447,7 @@ export class TelegramPoller {
               })
             }
           }
-          this.offset = update.update_id + 1
+          this.offset = v.update_id + 1
           writeUpdateOffset(this.deps.statePaths, this.offset)
         }
       } catch (err) {
@@ -362,7 +461,13 @@ export class TelegramPoller {
             log.error('409 Conflict persists — another poller owns the token; giving up', {
               attempts: conflict401Counter,
             })
-            return
+            // Throw so server.ts's start() wrapper triggers shutdown. Returning
+            // would leave the MCP server alive with no active consumer.
+            throw new PollerFatalError(
+              'conflict',
+              `409 Conflict persisted across ${conflict401Counter} attempts: ${cls.message}`,
+              conflict401Counter,
+            )
           }
           const delay = Math.min(1000 * attempt, BACKOFF_CAP_MS)
           log.warn('409 Conflict from getUpdates, backing off', {
@@ -370,7 +475,7 @@ export class TelegramPoller {
             delay_ms: delay,
             description: cls.message,
           })
-          await sleep(delay, this.stopCtl.signal)
+          await this.sleepFn(delay, this.stopCtl.signal)
           continue
         }
 
@@ -380,7 +485,13 @@ export class TelegramPoller {
             log.error('401 Unauthorized — token rejected; exiting poller', {
               attempts: unauthorizedCounter,
             })
-            return
+            // Throw so server.ts shuts down rather than running as a zombie
+            // MCP server with a revoked token.
+            throw new PollerFatalError(
+              'unauthorized',
+              `401 Unauthorized after ${unauthorizedCounter} attempts: ${cls.message}`,
+              unauthorizedCounter,
+            )
           }
           const delay = Math.min(1000 * attempt, BACKOFF_CAP_MS)
           log.warn('401 Unauthorized from getUpdates, retrying briefly', {
@@ -388,7 +499,7 @@ export class TelegramPoller {
             delay_ms: delay,
             description: cls.message,
           })
-          await sleep(delay, this.stopCtl.signal)
+          await this.sleepFn(delay, this.stopCtl.signal)
           continue
         }
 
@@ -404,7 +515,7 @@ export class TelegramPoller {
           delay_ms: delay,
           error: cls.message,
         })
-        await sleep(delay, this.stopCtl.signal)
+        await this.sleepFn(delay, this.stopCtl.signal)
       }
     }
   }

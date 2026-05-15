@@ -15,6 +15,10 @@ export interface Logger {
 
 export interface CreateLoggerOptions {
   stream?: NodeJS.WritableStream
+  // Exact-substring secrets to redact alongside the pattern-based ones
+  // (Telegram bot token, Groq key, Bearer/query tokens). Useful for the
+  // configured TELEGRAM_WEBHOOK_TOKEN which has no public pattern.
+  secrets?: ReadonlyArray<string>
 }
 
 const LEVEL_ORDER: Record<LogLevel, number> = {
@@ -30,7 +34,13 @@ function envLevel(): LogLevel {
   return 'info'
 }
 
-function formatLine(name: string, level: LogLevel, msg: string, ctx?: Record<string, unknown>): string {
+function formatLine(
+  name: string,
+  level: LogLevel,
+  msg: string,
+  ctx: Record<string, unknown> | undefined,
+  secrets: ReadonlyArray<string>,
+): string {
   const ts = new Date().toISOString()
   let body = `[${ts}] [${level}] [${name}] ${msg}`
   if (ctx && Object.keys(ctx).length > 0) {
@@ -40,18 +50,19 @@ function formatLine(name: string, level: LogLevel, msg: string, ctx?: Record<str
     } catch (err) {
       serialized = `<unserializable:${err instanceof Error ? err.message : String(err)}>`
     }
-    body += ` ${redactToken(serialized)}`
+    body += ` ${redactToken(serialized, secrets)}`
   }
-  return redactToken(body) + '\n'
+  return redactToken(body, secrets) + '\n'
 }
 
 export function createLogger(name: string, opts: CreateLoggerOptions = {}): Logger {
   const stream: NodeJS.WritableStream = opts.stream ?? process.stderr
   const threshold = LEVEL_ORDER[envLevel()]
+  const secrets: ReadonlyArray<string> = opts.secrets ?? []
   const emit = (level: LogLevel, msg: string, ctx?: Record<string, unknown>): void => {
     if (LEVEL_ORDER[level] < threshold) return
     try {
-      stream.write(formatLine(name, level, msg, ctx))
+      stream.write(formatLine(name, level, msg, ctx, secrets))
     } catch {
       // never let logging throw
     }

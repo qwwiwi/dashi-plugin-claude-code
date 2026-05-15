@@ -32,7 +32,7 @@ function mkStatePaths(): StatePaths {
     root,
     env: join(root, '.env'),
     config: join(root, 'config.json'),
-    allowlist: join(root, 'access.json'),
+    allowlist: join(root, 'allowlist.json'),
     pid: join(root, 'bot.pid'),
     lock: join(root, 'bot.lock'),
     updateOffset: join(root, 'update-offset'),

@@ -40,11 +40,14 @@ export function normalizeMeta(raw: Record<string, unknown>): Record<string, stri
   return out
 }
 
+// Returns true when server.notification accepted the write; false when the
+// transport threw (error already logged). Callers MUST honour false: poller
+// dead-letters the update, webhook returns 503.
 export async function sendChannelNotification(
   server: Server,
   event: ChannelEvent,
   log: Logger,
-): Promise<void> {
+): Promise<boolean> {
   try {
     await server.notification({
       method: 'notifications/claude/channel',
@@ -53,9 +56,11 @@ export async function sendChannelNotification(
         meta: event.meta,
       },
     })
+    return true
   } catch (err) {
     log.error('channel notification failed', {
       error: err instanceof Error ? err.message : String(err),
     })
+    return false
   }
 }

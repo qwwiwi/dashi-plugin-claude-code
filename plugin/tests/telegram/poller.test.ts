@@ -10,7 +10,7 @@ import type { Update } from 'grammy/types'
 import { getStatePaths, loadConfig, type AppConfig, type StatePaths } from '../../src/config.js'
 import { createLogger } from '../../src/log.js'
 import { ensureStateDirs, readUpdateOffset } from '../../src/state/store.js'
-import { TelegramPoller, tokenLock } from '../../src/telegram/poller.js'
+import { PollerFatalError, TelegramPoller, tokenLock } from '../../src/telegram/poller.js'
 
 const FAKE_TOKEN = '123456789:AAH-fake_test_token_with_at_least_thirty_chars'
 
@@ -290,6 +290,135 @@ describe('TelegramPoller.pollOnce', () => {
       },
     )
     await expect(poller.start()).rejects.toThrow(/bot_id mismatch/)
+  })
+
+  // M1: fatal 409 / 401 must throw, not return — server.ts shutdown wrapper
+  // catches the throw and calls shutdown() so the MCP server doesn't stay
+  // alive without an active Telegram consumer.
+  test('start() throws PollerFatalError after MAX_409_ATTEMPTS persistent 409s', async () => {
+    const { bot } = makeBotStub()
+    let calls = 0
+    const poller = new TelegramPoller(
+      {
+        bot,
+        config,
+        statePaths: paths,
+        log: createLogger('test'),
+        onUpdate: async () => undefined,
+      },
+      {
+        getUpdates: async () => {
+          calls++
+          throw new GrammyError(
+            'Conflict: terminated by other getUpdates request',
+            { ok: false, error_code: 409, description: 'Conflict: another consumer' },
+            'getUpdates',
+            {},
+          )
+        },
+        // Zero-delay sleep — we don't want to pay 1+2+…+7s of real backoff.
+        sleep: async () => undefined,
+      },
+    )
+    let caught: unknown
+    try {
+      await poller.start()
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(PollerFatalError)
+    expect((caught as PollerFatalError).kind).toBe('conflict')
+    expect((caught as PollerFatalError).attempts).toBeGreaterThanOrEqual(8)
+    expect(calls).toBeGreaterThanOrEqual(8)
+  })
+
+  test('start() throws PollerFatalError after MAX_401_ATTEMPTS persistent 401s', async () => {
+    const { bot } = makeBotStub()
+    let calls = 0
+    const poller = new TelegramPoller(
+      {
+        bot,
+        config,
+        statePaths: paths,
+        log: createLogger('test'),
+        onUpdate: async () => undefined,
+      },
+      {
+        getUpdates: async () => {
+          calls++
+          throw new GrammyError(
+            'Unauthorized',
+            { ok: false, error_code: 401, description: 'Unauthorized: token revoked' },
+            'getUpdates',
+            {},
+          )
+        },
+        sleep: async () => undefined,
+      },
+    )
+    let caught: unknown
+    try {
+      await poller.start()
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(PollerFatalError)
+    expect((caught as PollerFatalError).kind).toBe('unauthorized')
+    expect((caught as PollerFatalError).attempts).toBeGreaterThanOrEqual(3)
+    expect(calls).toBeGreaterThanOrEqual(3)
+  })
+
+  // M2: Zod validation. Malformed updates go to dead-letter; offset advances
+  // past the bad update_id (or, when missing entirely, the next poll moves on).
+  test('pollOnce dead-letters an update missing update_id, advancing only valid ones', async () => {
+    const { bot } = makeBotStub()
+    const bad = { message: { text: 'no update_id here' } } as unknown as Update
+    const good = makeUpdate(500)
+    const poller = new TelegramPoller(
+      {
+        bot,
+        config,
+        statePaths: paths,
+        log: createLogger('test'),
+        onUpdate: async () => undefined,
+      },
+      {
+        getUpdates: async () => [bad, good],
+      },
+    )
+    const result = await poller.pollOnce()
+    expect(result.errors).toBe(1)
+    expect(result.handled).toBe(1)
+    expect(result.offsetAfter).toBe(501)
+    // Dead-letter contains the bad update with a clear schema error.
+    const dl = readdirSync(paths.deadLetterUpdates)
+    expect(dl.length).toBe(1)
+    const body = JSON.parse(readFileSync(join(paths.deadLetterUpdates, dl[0]!), 'utf8'))
+    expect(body.value.error).toMatch(/invalid update schema/i)
+  })
+
+  test('pollOnce dead-letters an update with non-integer update_id (offset not poisoned)', async () => {
+    const { bot } = makeBotStub()
+    const bad = { update_id: 'not-a-number', message: { text: 'x' } } as unknown as Update
+    const poller = new TelegramPoller(
+      {
+        bot,
+        config,
+        statePaths: paths,
+        log: createLogger('test'),
+        onUpdate: async () => undefined,
+      },
+      {
+        getUpdates: async () => [bad],
+      },
+    )
+    const result = await poller.pollOnce()
+    expect(result.errors).toBe(1)
+    expect(result.handled).toBe(0)
+    // No usable update_id → offset unchanged. Next getUpdates round moves on.
+    expect(result.offsetAfter).toBeUndefined()
+    const dl = readdirSync(paths.deadLetterUpdates)
+    expect(dl.length).toBe(1)
   })
 
   test('uses no offset on first getUpdates when none persisted', async () => {

@@ -19,7 +19,7 @@
 import type { AppConfig } from '../config.js'
 import type { Logger } from '../log.js'
 import type { TelegramApi } from '../channel/tools.js'
-import { escapeHtmlAttr } from '../format/html.js'
+import { escapeHtml } from '../format/html.js'
 
 export type StatusState =
   | { kind: 'typing' }
@@ -80,13 +80,13 @@ function renderState(state: StatusState, tick: number): string {
     case 'thinking':
       return `<i>Думает${dots}</i>`
     case 'tool':
-      return `<i>🔧 ${escapeHtmlAttr(state.toolName)}</i>`
+      return `<i>🔧 ${escapeHtml(state.toolName)}</i>`
     case 'stopped': {
-      const tail = state.reason ? `: ${escapeHtmlAttr(state.reason)}` : ''
+      const tail = state.reason ? `: ${escapeHtml(state.reason)}` : ''
       return `<i>Остановлено${tail}</i>`
     }
     case 'error': {
-      const tail = state.reason ? `: ${escapeHtmlAttr(state.reason)}` : ''
+      const tail = state.reason ? `: ${escapeHtml(state.reason)}` : ''
       return `<i>Ошибка${tail}</i>`
     }
   }
@@ -127,13 +127,13 @@ export class StatusManager {
     replyToMessageId: number | undefined,
     initialState: StatusState = { kind: 'typing' },
   ): Promise<StatusHandle> {
-    // Cancel any previous status silently — the new one supersedes it. We
-    // intentionally do NOT edit the previous message to a "canceled" label
-    // because from the user's perspective the new start IS the cancel.
-    const prev = this.entries.get(chatId)
-    if (prev) {
-      this.stopTimers(prev)
-      this.entries.delete(chatId)
+    // Only one active status per chat at a time: finalise the previous one
+    // (edit the old message to "Остановлено: superseded" and clear timers)
+    // so we don't leak a stale "Печатает…" message on top of the new one.
+    // Album-path callers in handlers.ts call start() once per album item;
+    // without this terminate step the first item's pulse stays forever.
+    if (this.entries.has(chatId)) {
+      await this.cancel(chatId, 'superseded')
     }
 
     const text = renderState(initialState, 0)

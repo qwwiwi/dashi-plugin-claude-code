@@ -79,6 +79,14 @@ export function buildReplyContext(
   // Anti-spoof: id comparison, not is_bot. reply.from.is_bot=true alone would
   // let a user reply to ANY bot and have the agent treat that message as its
   // own previous output. See gateway.py:2786-2793.
+  //
+  // Defence: bot.id===0 is the "identity not yet initialised" sentinel from
+  // server.ts. We MUST NOT treat a reply.from.id===0 as the agent's previous
+  // message (no Telegram user has id 0) and we MUST NOT classify any other
+  // bot reply confidently in that pre-init window — server.ts now awaits
+  // bot.init() before starting the poller/webhook, so this branch is a
+  // belt-and-braces guard for tests and any future call site.
+  if (bot.id === 0) return null
   if (reply.from.id === bot.id) {
     return {
       sender: 'agent_previous_message',

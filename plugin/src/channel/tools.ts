@@ -228,13 +228,14 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'download_attachment',
     description:
-      'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
+      'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Pass chat_id from the SAME inbound <channel> block so the tool can verify the file came from an allowlisted chat. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
     inputSchema: {
       type: 'object',
       properties: {
+        chat_id: { type: 'string', description: 'The chat_id from inbound meta' },
         file_id: { type: 'string', description: 'The attachment_file_id from inbound meta' },
       },
-      required: ['file_id'],
+      required: ['chat_id', 'file_id'],
     },
   },
   {
@@ -379,11 +380,21 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
             }
           }
         } else {
-          const sendOpts: SendMessageOpts = {}
-          if (replyToId !== undefined) sendOpts.reply_to_message_id = replyToId
-          if (args.format === 'markdownv2') sendOpts.parse_mode = 'MarkdownV2'
-          const sent = await telegramApi.sendMessage(args.chat_id, args.text, sendOpts)
-          sentIds.push(sent.message_id)
+          // text / markdownv2 — also chunk at 4000 chars so a 9000-char reply
+          // does not trip Telegram's 4096 sendMessage cap. reply_to threads
+          // only the first chunk so a long answer doesn't quote-spam.
+          // chunk.ts' tag-balancing is HTML-specific; for text/markdownv2 we
+          // still rely on the same paragraph/line/hard-cut preference order
+          // (the tag-balance path is a no-op when no <pre>/<code> tags).
+          const chunks = splitMessage(args.text)
+          for (let i = 0; i < chunks.length; i++) {
+            const chunkOpts: SendMessageOpts = {}
+            if (i === 0 && replyToId !== undefined) chunkOpts.reply_to_message_id = replyToId
+            if (args.format === 'markdownv2') chunkOpts.parse_mode = 'MarkdownV2'
+            const chunk = chunks[i] as string
+            const sent = await telegramApi.sendMessage(args.chat_id, chunk, chunkOpts)
+            sentIds.push(sent.message_id)
+          }
         }
 
         // Attachments. We send the canonical (realpath-resolved) path so a
@@ -434,6 +445,11 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         const parsed = DownloadAttachmentArgsSchema.safeParse(rawArgs)
         if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
         const args = parsed.data
+        try {
+          assertAllowedChat(args.chat_id, config)
+        } catch (err) {
+          return toolError(name, err instanceof Error ? err.message : String(err))
+        }
         const out = await telegramApi.downloadFile(args.file_id, statePaths.inbox)
         return { content: [{ type: 'text', text: out.path }] }
       }

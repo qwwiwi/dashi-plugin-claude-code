@@ -64,7 +64,7 @@ export function gateTelegramMessage(input: GateInput, config: AppConfig): GateDe
 }
 
 // Outbound gate. Mirrors refs/telegram-official/server.ts:194-199 but reads
-// from config instead of the on-disk access.json. Used by reply/react/
+// from config instead of the on-disk allowlist.json. Used by reply/react/
 // edit_message/sendDocument to ensure tool calls cannot leak to chats the
 // inbound gate would never deliver from.
 export function assertAllowedChat(chatId: string, config: AppConfig): void {

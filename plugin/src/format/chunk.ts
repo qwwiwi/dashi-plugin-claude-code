@@ -74,21 +74,27 @@ function openingTagsFor(state: OpenTagState): string {
 
 /**
  * Choose the best cut index within [0, max] for `text`. Returns the cut
- * position (exclusive). Prefers paragraph, then line, then hard cut.
+ * position (exclusive).
+ *
+ * Strict preference order (PLAN.md T5):
+ *   1. last paragraph break (`\n\n`) at any position in [0, max]
+ *   2. last line break (`\n`) at any position in [0, max]
+ *   3. hard cut at exactly `max`
+ *
+ * No `minCut` floor: if the only natural boundary sits low (e.g. a 30-char
+ * header followed by 4000 chars of single-line body), we still prefer it
+ * over a hard cut in the middle of the line. Tiny prefix chunks are an
+ * acceptable cost for honouring the documented preference order.
  */
 function chooseCut(text: string, max: number): number {
   if (text.length <= max) return text.length
 
-  // Look for the LAST paragraph boundary that fits. We search above max/2
-  // so we don't waste a chunk on a tiny prefix.
-  const minCut = Math.floor(max / 2)
-
   const slice = text.slice(0, max)
   const lastPara = slice.lastIndexOf('\n\n')
-  if (lastPara >= minCut) return lastPara + 2 // include the \n\n in the emitted chunk
+  if (lastPara >= 0) return lastPara + 2 // include the \n\n in the emitted chunk
 
   const lastLine = slice.lastIndexOf('\n')
-  if (lastLine >= minCut) return lastLine + 1
+  if (lastLine >= 0) return lastLine + 1
 
   return max
 }
@@ -118,6 +124,15 @@ export function splitMessage(text: string, max: number = DEFAULT_MAX): string[] 
   const hardCap = Math.ceil(text.length / Math.max(1, Math.floor(max / 4))) + 16
   let iterations = 0
 
+  // Per-balanced-tag worst-case suffix length: `</pre>` = 6, `</code>` = 7.
+  // We use the max over BALANCED_TAGS so the per-tag reservation upper-bounds
+  // every closing tag we might emit; max across the set protects against
+  // future tag additions (M6 hardening).
+  const perTagSuffix = BALANCED_TAGS.reduce(
+    (mx, t) => Math.max(mx, (`</${t}>`).length),
+    0,
+  )
+
   while (remaining.length > 0) {
     if (iterations++ > hardCap) {
       // Bail out — emit the rest as a single oversized chunk rather than
@@ -128,9 +143,10 @@ export function splitMessage(text: string, max: number = DEFAULT_MAX): string[] 
 
     const prefix = openingTagsFor(inherited)
     // Budget for the substring we cut from `remaining`. Prefix tags eat
-    // into the budget; we leave a few chars for the closing tags we may
-    // append (`</pre></code>` = 13 chars max for our SAFE_TAGS set).
-    const suffixReserve = inherited.open.length * 7
+    // into the budget; we reserve room only for closing-tags we know are
+    // open RIGHT NOW (inherited stack). Tags opened inside `body` are
+    // handled by the overflow-recovery branch below.
+    const suffixReserve = inherited.open.length * perTagSuffix
     const cut = chooseCut(remaining, Math.max(1, max - prefix.length - suffixReserve))
     const body = remaining.slice(0, cut)
 
@@ -138,10 +154,15 @@ export function splitMessage(text: string, max: number = DEFAULT_MAX): string[] 
     const suffix = closingTagsFor(afterState)
     let chunk = prefix + body + suffix
 
-    // If the chosen cut + tags still overflows, force a smaller hard cut.
+    // Overflow recovery. Triggers when the body itself opens new tags
+    // we didn't budget for. Shrink the cut by the overflow PLUS a full
+    // worst-case suffix budget (all balanced tags open) so the retry can
+    // never overshoot again — this is the M6 hardening: previously we
+    // used a hand-tuned `+8` fudge that could in theory be undersized.
     if (chunk.length > max) {
+      const fullSuffixBudget = BALANCED_TAGS.length * perTagSuffix
       const overflow = chunk.length - max
-      const newCut = Math.max(1, cut - overflow - 8)
+      const newCut = Math.max(1, cut - overflow - fullSuffixBudget)
       const body2 = remaining.slice(0, newCut)
       const afterState2 = openTagsAt(prefix + body2)
       const suffix2 = closingTagsFor(afterState2)
@@ -154,19 +175,10 @@ export function splitMessage(text: string, max: number = DEFAULT_MAX): string[] 
     }
 
     // Trim leading newlines on subsequent chunks (gateway.py paragraph split
-    // does this implicitly — we do it explicitly).
+    // does this implicitly — we do it explicitly). Prefix tags don't start
+    // with \n so the regex is safe to run on the full chunk.
     if (chunks.length > 0) {
-      // Find leading whitespace inside the body portion, after the prefix
-      // tags. We only trim plain \n characters.
-      const trimmed = chunk.replace(
-        new RegExp(`^(${BALANCED_TAGS.map(t => `<${t}>`).join('|')})*`),
-        m => m,
-      )
-      // Simpler: trim leading \n from the chunk directly. Prefix tags
-      // don't start with \n so this is safe.
       chunk = chunk.replace(/^\n+/, '')
-      // (silence unused warning)
-      void trimmed
     }
 
     if (chunk.length > 0) chunks.push(chunk)

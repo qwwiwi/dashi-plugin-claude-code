@@ -68,19 +68,48 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_WEBHOOK_HOST: z.string().optional(),
   TELEGRAM_WEBHOOK_PORT: z.coerce.number().int().min(0).optional(),
   TELEGRAM_WEBHOOK_TOKEN: z.string().optional(),
-  TELEGRAM_ACCESS_MODE: z.enum(['static']).optional(),
+  // PLAN.md Scope A only ships static allowlist mode; `pairing` is reserved
+  // for Scope B. We accept both values at the schema level so we can emit
+  // a clear, scope-aware error message (the bare `z.enum(['static'])` form
+  // gave a cryptic "Invalid enum value" that didn't explain why).
+  TELEGRAM_ACCESS_MODE: z
+    .enum(['static', 'pairing'])
+    .refine((v) => v === 'static', {
+      message:
+        "TELEGRAM_ACCESS_MODE=pairing not supported in this server build (use 'allowlist'); see PLAN.md Scope B",
+    })
+    .optional(),
 })
 export type RuntimeEnv = z.infer<typeof RuntimeEnvSchema>
 
 // ─────────────────────────────────────────────────────────────────────
-// Token redaction. Telegram bot tokens look like `<digits>:<base64ish>`.
-// We mask before letting any error message escape the process.
+// Secret redaction. We mask Telegram bot tokens, Groq API keys, generic
+// bearer/query-string tokens, and any caller-supplied exact-substring
+// secrets BEFORE letting any error/log line escape the process.
 // ─────────────────────────────────────────────────────────────────────
 
-const TOKEN_RE = /\d{8,12}:[A-Za-z0-9_-]{30,}/g
+// Telegram bot token: `<digits>:<base64ish>`.
+const TELEGRAM_TOKEN_RE = /\d{8,12}:[A-Za-z0-9_-]{30,}/g
+// Groq API key: `gsk_` followed by 40+ url-safe base64 chars.
+const GROQ_KEY_RE = /gsk_[A-Za-z0-9]{40,}/g
+// Authorization: Bearer <opaque>. We keep the header label, redact the value.
+const BEARER_RE = /(Bearer\s+)[A-Za-z0-9._\-+/=]{8,}/gi
+// `?token=...` / `&token=...` query params (also access_token, api_key).
+const QUERY_TOKEN_RE = /([?&](?:access_token|api_key|token)=)[^&\s"']+/gi
 
-export function redactToken(message: string): string {
-  return message.replace(TOKEN_RE, '<redacted>')
+export function redactToken(message: string, extraSecrets: ReadonlyArray<string> = []): string {
+  let out = message
+    .replace(TELEGRAM_TOKEN_RE, '<redacted>')
+    .replace(GROQ_KEY_RE, '<redacted>')
+    .replace(BEARER_RE, '$1<redacted>')
+    .replace(QUERY_TOKEN_RE, '$1<redacted>')
+  for (const secret of extraSecrets) {
+    if (!secret || secret.length < 4) continue
+    // Escape regex metachars; replace every exact occurrence with <redacted>.
+    const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    out = out.replace(new RegExp(escaped, 'g'), '<redacted>')
+  }
+  return out
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -210,7 +239,11 @@ export function getStatePaths(_config: AppConfig, env: RuntimeEnv): StatePaths {
     root,
     env: join(root, '.env'),
     config: env.TELEGRAM_CONFIG_FILE ?? join(root, 'config.json'),
-    allowlist: join(root, 'access.json'),
+    // M4 (PLAN.md alignment): the persisted allowlist file is `allowlist.json`.
+    // Earlier code used `access.json` (inherited from the official plugin).
+    // The boot path in server.ts performs a one-shot migration of any stale
+    // `access.json` → `allowlist.json` so existing deployments don't lose state.
+    allowlist: join(root, 'allowlist.json'),
     pid: join(root, 'bot.pid'),
     lock: join(root, 'bot.lock'),
     updateOffset: join(root, 'update-offset'),
@@ -221,7 +254,9 @@ export function getStatePaths(_config: AppConfig, env: RuntimeEnv): StatePaths {
     logs: {
       server: join(root, 'logs', 'server.log'),
       telegram: join(root, 'logs', 'telegram.log'),
-      permissions: join(root, 'logs', 'permissions.log'),
+      // L3 (PLAN.md alignment): the audit log is JSONL, not plain log lines.
+      // Renamed so log shippers configured for *.jsonl pick it up correctly.
+      permissions: join(root, 'logs', 'permissions.jsonl'),
       webhook: join(root, 'logs', 'webhook.log'),
     },
   }

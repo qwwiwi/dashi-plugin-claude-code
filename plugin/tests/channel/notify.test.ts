@@ -1,5 +1,30 @@
 import { describe, expect, test } from 'bun:test'
-import { normalizeMeta } from '../../src/channel/notify.js'
+import { normalizeMeta, sendChannelNotification } from '../../src/channel/notify.js'
+import { createLogger } from '../../src/log.js'
+
+// Silent logger so test output stays clean.
+const silentLog = createLogger('test', {
+  stream: { write: () => true } as unknown as NodeJS.WritableStream,
+})
+
+// Minimal MCP server stub. sendChannelNotification only touches
+// `.notification()`.
+function makeStubServer(behavior: 'ok' | 'throw'): {
+  // Cast to the real Server type at the call-site to avoid pulling in the
+  // SDK's deep types just for a structural stub.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  server: any
+  calls: Array<{ method: string; params: unknown }>
+} {
+  const calls: Array<{ method: string; params: unknown }> = []
+  const server = {
+    notification: async (msg: { method: string; params: unknown }): Promise<void> => {
+      calls.push({ method: msg.method, params: msg.params })
+      if (behavior === 'throw') throw new Error('transport closed')
+    },
+  }
+  return { server, calls }
+}
 
 describe('normalizeMeta', () => {
   test('drops keys with hyphens', () => {
@@ -34,5 +59,29 @@ describe('normalizeMeta', () => {
     expect(out['1starts_with_digit']).toBeUndefined()
     expect(out['has space']).toBeUndefined()
     expect(out['has.dot']).toBeUndefined()
+  })
+})
+
+describe('sendChannelNotification return contract', () => {
+  test('returns true on successful transport write', async () => {
+    const { server, calls } = makeStubServer('ok')
+    const ok = await sendChannelNotification(
+      server,
+      { content: 'hello', meta: { source: 'telegram' } },
+      silentLog,
+    )
+    expect(ok).toBe(true)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.method).toBe('notifications/claude/channel')
+  })
+
+  test('returns false (no rethrow) when server.notification throws', async () => {
+    const { server } = makeStubServer('throw')
+    const ok = await sendChannelNotification(
+      server,
+      { content: 'hello', meta: { source: 'telegram' } },
+      silentLog,
+    )
+    expect(ok).toBe(false)
   })
 })

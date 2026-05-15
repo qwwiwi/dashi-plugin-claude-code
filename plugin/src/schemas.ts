@@ -29,8 +29,12 @@ export const ReactArgsSchema = z.object({
 })
 export type ReactArgs = z.infer<typeof ReactArgsSchema>
 
-// Tool args - download_attachment
+// Tool args - download_attachment. chat_id is required so the tool can
+// gate the download through the chat allowlist — without it, Claude could
+// be tricked into fetching an arbitrary file_id (e.g. one leaked into a
+// prompt) that never originated from an allowlisted chat.
 export const DownloadAttachmentArgsSchema = z.object({
+  chat_id: z.string().min(1),
   file_id: z.string().min(1),
 })
 export type DownloadAttachmentArgs = z.infer<typeof DownloadAttachmentArgsSchema>
@@ -65,6 +69,25 @@ export const WebhookPayloadSchema = z.object({
   agentId: z.string().optional(),
 })
 export type WebhookPayload = z.infer<typeof WebhookPayloadSchema>
+
+// Telegram Update — minimal runtime guard before dispatch.
+// PLAN.md:580 requires runtime validation + dead-letter on validation
+// failure so a malformed update can't crash the dispatcher loop or get
+// looped over forever. We assert only the fields downstream actually
+// reads from (`update_id` required, one of message/edited_message/
+// callback_query present). `.passthrough()` lets unknown fields ride
+// through so future Telegram additions don't trip validation.
+export const TelegramUpdateSchema = z
+  .object({
+    update_id: z.number().int(),
+    message: z.unknown().optional(),
+    edited_message: z.unknown().optional(),
+    channel_post: z.unknown().optional(),
+    edited_channel_post: z.unknown().optional(),
+    callback_query: z.unknown().optional(),
+  })
+  .passthrough()
+export type TelegramUpdate = z.infer<typeof TelegramUpdateSchema>
 
 // Permission notification (incoming from Claude Code)
 export const PermissionRequestParamsSchema = z.object({

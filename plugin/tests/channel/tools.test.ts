@@ -64,7 +64,7 @@ function makeStatePaths(): StatePaths {
     root,
     env: join(root, '.env'),
     config: join(root, 'config.json'),
-    allowlist: join(root, 'access.json'),
+    allowlist: join(root, 'allowlist.json'),
     pid: join(root, 'bot.pid'),
     lock: join(root, 'bot.lock'),
     updateOffset: join(root, 'update-offset'),
@@ -75,7 +75,7 @@ function makeStatePaths(): StatePaths {
     logs: {
       server: join(root, 'logs', 'server.log'),
       telegram: join(root, 'logs', 'telegram.log'),
-      permissions: join(root, 'logs', 'permissions.log'),
+      permissions: join(root, 'logs', 'permissions.jsonl'),
       webhook: join(root, 'logs', 'webhook.log'),
     },
   }
@@ -343,6 +343,100 @@ describe('callTool', () => {
       deps,
     )
     expect(result.isError).toBeUndefined()
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  // Fix 5 — long replies must chunk under all formats (not only html).
+  test('reply text format chunks long messages under 4096 cap', async () => {
+    const captured: Array<{ text: string; opts: SendMessageOpts }> = []
+    const api = makeStubApi({
+      sendMessage: async (_chatId, text, opts) => {
+        captured.push({ text, opts })
+        return { message_id: 800 + captured.length }
+      },
+    })
+    const deps = makeDeps({ telegramApi: api })
+    // 9000 chars of text with paragraph breaks → expect ≥3 chunks.
+    const para = 'y'.repeat(2900)
+    const body = [para, para, para].join('\n\n')
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: body, format: 'text' }),
+      deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(captured.length).toBeGreaterThanOrEqual(3)
+    // Each chunk ≤4000 chars (the default splitMessage budget).
+    for (const c of captured) {
+      expect(c.text.length).toBeLessThanOrEqual(4000)
+      // text format must NOT have a parse_mode applied.
+      expect(c.opts.parse_mode).toBeUndefined()
+    }
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('reply markdownv2 format chunks long messages with parse_mode on every chunk', async () => {
+    const captured: Array<{ text: string; opts: SendMessageOpts }> = []
+    const api = makeStubApi({
+      sendMessage: async (_chatId, text, opts) => {
+        captured.push({ text, opts })
+        return { message_id: 900 + captured.length }
+      },
+    })
+    const deps = makeDeps({ telegramApi: api })
+    const para = 'z'.repeat(2900)
+    const body = [para, para, para].join('\n\n')
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: body, format: 'markdownv2' }),
+      deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(captured.length).toBeGreaterThanOrEqual(3)
+    for (const c of captured) {
+      expect(c.text.length).toBeLessThanOrEqual(4000)
+      expect(c.opts.parse_mode).toBe('MarkdownV2')
+    }
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  // Fix 7 — download_attachment now requires chat_id and gates the chat.
+  test('download_attachment rejects when chat_id missing (zod)', async () => {
+    const deps = makeDeps()
+    const result = await callTool(
+      callReq('download_attachment', { file_id: 'abc' }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(result.content[0]?.text).toContain('chat_id')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('download_attachment rejects when chat_id not allowlisted', async () => {
+    const deps = makeDeps()
+    const result = await callTool(
+      callReq('download_attachment', { chat_id: '99999', file_id: 'abc' }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(result.content[0]?.text).toContain('not allowlisted')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('download_attachment with allowlisted chat_id calls downloadFile', async () => {
+    let captured: { fileId: string; destDir: string } | null = null
+    const api = makeStubApi({
+      downloadFile: async (fileId, destDir) => {
+        captured = { fileId, destDir }
+        return { path: join(destDir, 'fake.bin'), size: 0 }
+      },
+    })
+    const deps = makeDeps({ telegramApi: api })
+    const result = await callTool(
+      callReq('download_attachment', { chat_id: '164795011', file_id: 'AgAD...' }),
+      deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(captured).not.toBeNull()
+    expect(captured!.fileId).toBe('AgAD...')
     rmSync(deps.statePaths.root, { recursive: true, force: true })
   })
 })

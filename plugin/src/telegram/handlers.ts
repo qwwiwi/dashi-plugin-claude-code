@@ -225,7 +225,13 @@ async function gateAndNotify(
   }
 
   deps.log.info('inbound delivered', { kind, chat_id: decision.chatId })
-  await sendChannelNotification(deps.server, event, deps.log)
+  const delivered = await sendChannelNotification(deps.server, event, deps.log)
+  if (!delivered) {
+    // Throw so the poller dead-letters this update AND advances offset (it
+    // does that on every handler throw). We never want infinite redelivery
+    // for a notify-transport failure — the channel may be torn down.
+    throw new Error('channel notify failed — message dead-lettered')
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -371,7 +377,13 @@ export async function sendAlbumNotification(
     media_group_id: ids.mediaGroupId,
     album_size: album.messages.length,
   })
-  await sendChannelNotification(deps.server, event, deps.log)
+  const delivered = await sendChannelNotification(deps.server, event, deps.log)
+  if (!delivered) {
+    deps.log.warn('album notify failed — content lost (no dead-letter for album path)', {
+      media_group_id: ids.mediaGroupId,
+      chat_id: ids.chatId,
+    })
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -386,7 +398,11 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
   // notification. If the id is unknown, fall through so the text still
   // reaches the agent — a normal message like "yes abcde fix it" would
   // otherwise be lost. Mirrors refs/telegram-official/server.ts:412-443.
-  if (deps.permissionHooks && ctx.from?.id !== undefined) {
+  // DM-only guard: permission verdicts (`yes <id>` / `no <id>`) MUST come
+  // from a private chat. In a group/supergroup/channel we fall through to the
+  // normal channel forward so the agent still sees the text — we never emit
+  // a verdict from a non-DM context.
+  if (deps.permissionHooks && ctx.from?.id !== undefined && ctx.chat?.type === 'private') {
     const decision = parsePermissionTextReply(text)
     if (decision && isPermissionApprover(ctx.from.id, deps.config)) {
       if (deps.permissionHooks.isPending(decision.requestId)) {
@@ -430,10 +446,18 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
     const chatId = ctx.chat?.id !== undefined ? String(ctx.chat.id) : undefined
     const senderId = ctx.from?.id !== undefined ? String(ctx.from.id) : undefined
     const senderNum = ctx.from?.id
+    const chatNum = ctx.chat?.id
     const allowedSender =
       senderNum !== undefined
       && deps.config.allowed_user_ids.includes(senderNum)
-    if (chatType === 'private' && chatId && senderId && allowedSender) {
+    // Defence-in-depth: even DM from allowed user must come from a chat in
+    // allowed_chat_ids. The allowlists can drift (chat list tighter than user
+    // list); without this check an OOB command could run from an unverified
+    // chat slot. Coerce config ids to string for comparison since the gate
+    // does the same elsewhere.
+    const allowedChatSet = new Set(deps.config.allowed_chat_ids.map((v) => String(v)))
+    const allowedChat = chatNum !== undefined && allowedChatSet.has(String(chatNum))
+    if (chatType === 'private' && chatId && senderId && allowedSender && allowedChat) {
       const oobCtx: OobContext = {
         chatId,
         senderId,

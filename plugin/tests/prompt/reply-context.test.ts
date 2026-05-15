@@ -110,6 +110,21 @@ describe('buildReplyContext', () => {
     const ctx = buildReplyContext(reply, bot)
     expect(ctx?.body).toBe('photo caption text')
   })
+
+  // Fix 3 — botIdentity race guard. When bot.id is still 0 (the initial
+  // sentinel before bot.init() resolves) the classifier MUST refuse to
+  // attribute any reply, otherwise an early-arriving update would route to
+  // the wrong branch (id===0 cannot meaningfully equal any sender id).
+  // Server.ts now awaits bot.init() before starting consumers; this test
+  // is the belt-and-braces guard inside the classifier itself.
+  test('returns null when bot identity is the zero sentinel', () => {
+    const uninitBot: BotIdentity = { id: 0, username: '' }
+    const reply = mkReply({
+      from: { id: 12345, is_bot: true, username: 'somebot' },
+      text: 'pretend output',
+    })
+    expect(buildReplyContext(reply, uninitBot)).toBeNull()
+  })
 })
 
 describe('renderUntrustedMetadata', () => {

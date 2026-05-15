@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'fs'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { getStatePaths, loadConfig, type StatePaths } from '../src/config.js'
 import {
   ensureStateDirs,
+  migrateLegacyAllowlist,
   readUpdateOffset,
   writeDeadLetter,
   writeUpdateOffset,
@@ -79,6 +80,35 @@ describe('updateOffset', () => {
     } finally {
       spy.mockRestore()
     }
+  })
+})
+
+// M4: legacy access.json → allowlist.json one-shot rename at boot.
+describe('migrateLegacyAllowlist', () => {
+  test('renames access.json to allowlist.json when target absent', () => {
+    const legacy = join(dirname(paths.allowlist), 'access.json')
+    writeFileSync(legacy, JSON.stringify({ allowed: [164795011] }))
+    expect(existsSync(legacy)).toBe(true)
+    expect(existsSync(paths.allowlist)).toBe(false)
+    const did = migrateLegacyAllowlist(paths)
+    expect(did).toBe(true)
+    expect(existsSync(legacy)).toBe(false)
+    expect(existsSync(paths.allowlist)).toBe(true)
+    expect(JSON.parse(readFileSync(paths.allowlist, 'utf8'))).toEqual({ allowed: [164795011] })
+  })
+
+  test('is a no-op when neither file exists', () => {
+    expect(migrateLegacyAllowlist(paths)).toBe(false)
+  })
+
+  test('skips migration when allowlist.json already exists', () => {
+    const legacy = join(dirname(paths.allowlist), 'access.json')
+    writeFileSync(legacy, '"legacy"')
+    writeFileSync(paths.allowlist, '"current"')
+    const did = migrateLegacyAllowlist(paths)
+    expect(did).toBe(false)
+    // Both files left as-is — operator decides what to do with the legacy one.
+    expect(JSON.parse(readFileSync(paths.allowlist, 'utf8'))).toBe('current')
   })
 })
 
