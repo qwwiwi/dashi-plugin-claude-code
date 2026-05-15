@@ -21,6 +21,7 @@
 
 import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 'fs'
 import { dirname, resolve as pathResolve } from 'path'
+import { fileURLToPath } from 'url'
 
 const MARKER = 'dashi-channel-hook'
 // Substring of the dashi helper script path used to identify *markerless*
@@ -144,8 +145,11 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
     process.exit(2)
   }
   if (!helperPath) {
-    // Default to sibling post-hook.ts.
-    helperPath = pathResolve(import.meta.dir, 'post-hook.ts')
+    // Default to sibling post-hook.ts. `import.meta.dir` is a Bun extension;
+    // resolve via `fileURLToPath(import.meta.url)` so the script also works
+    // when invoked under plain Node (review M5).
+    const scriptDir = dirname(fileURLToPath(import.meta.url))
+    helperPath = pathResolve(scriptDir, 'post-hook.ts')
   }
   const opts: PatchOptions = agentId
     ? { settingsPath, chatId, webhookUrl, agentId, helperPath }

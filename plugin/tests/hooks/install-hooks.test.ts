@@ -139,7 +139,45 @@ describe('patchSettingsFile — writeAtomic same-dir staging (regression)', () =
     const orphans = dirEntries.filter((n) => n.includes('.tmp.'))
     expect(orphans).toEqual([])
   })
+
+  test('writeAtomic stages tmp file in same dir as target (cross-volume regression)', async () => {
+    // Asserts the implementation invariant: even on platforms where the
+    // process tmpdir lives on a different fs, the staged tmp file is
+    // never created outside the target's parent directory. We can't fake
+    // a cross-volume mount in a unit test, so we instead inspect the
+    // module source to confirm the staging strategy. The post-fix
+    // patcher derives its temp path from `dirname(settingsPath)`.
+    const src = readFileSync(
+      join(PLUGIN_DIR, 'scripts', 'patch-claude-settings.ts'),
+      'utf8',
+    )
+    expect(src).toContain('dirname(path)')
+    expect(src).toContain('${path}.tmp.')
+    // And the obsolete tmpdir-based staging must be gone.
+    expect(src).not.toContain("mkdtempSync(join(tmpdir()")
+    expect(src).not.toContain("mkdtempSync(tmpdir())")
+  })
 })
+
+describe('default helper path resolution (M5)', () => {
+  test('module exports patchSettingsFile importable under Bun (and resolved post-hook.ts exists)', async () => {
+    const mod = await import('../../scripts/patch-claude-settings.js')
+    expect(typeof mod.patchSettingsFile).toBe('function')
+    // The default helper resolution kicks in only when --helper is omitted
+    // (CLI path). For the unit test we just verify the sibling
+    // post-hook.ts file is present at the path the resolver would land on.
+    expect(existsSyncWrapper(POST_HOOK)).toBe(true)
+  })
+})
+
+function existsSyncWrapper(p: string): boolean {
+  try {
+    readFileSync(p)
+    return true
+  } catch {
+    return false
+  }
+}
 
 describe('applyPatch (pure)', () => {
   test('handles missing hooks section', () => {
