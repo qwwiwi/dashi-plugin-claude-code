@@ -633,4 +633,45 @@ describe('StatusManager.recordActivityByChatId', () => {
     expect(lastEdit.text).not.toContain(longToken)
     expect(lastEdit.text).toContain('abcd***wxyz')
   })
+
+  test('Non-Agent throttle + buffer overflow interaction (coverage gap §3)', async () => {
+    // Fire 12 Bash calls in quick succession. First non-Agent always renders
+    // (sentinel `Number.NEGATIVE_INFINITY`); subsequent calls within the
+    // 5 s throttle are buffered without an extra edit. Buffer cap is 10 →
+    // calls 0 and 1 evict; render window is 5 → on the eventual flush the
+    // edit shows the most recent 5 + a `+5 earlier` summary (10 buffered − 5
+    // shown). Flush via a `reasoning` event since it always renders.
+    const config = makeConfig({ interval_ms: 100_000_000 })
+    const { mgr, api, clock } = makeManager({ config })
+    await mgr.start('164795011', undefined)
+
+    const editsAtStart = api.calls.filter((c) => c.kind === 'edit').length
+    for (let i = 0; i < 12; i++) {
+      await mgr.recordActivityByChatId('164795011', {
+        kind: 'tool_start',
+        toolName: 'Bash',
+        toolInput: { command: `cmd-${i.toString().padStart(2, '0')}` },
+        toolUseId: `u${i}`,
+      })
+      // Stay well within the 5 s throttle window so only the first renders.
+      clock.advance(100)
+    }
+    // Only the first Bash should have triggered an edit (sentinel render);
+    // remaining 11 were throttled.
+    const editsAfterTools = api.calls.filter((c) => c.kind === 'edit').length
+    expect(editsAfterTools - editsAtStart).toBe(1)
+
+    // Flush via reasoning event → always renders.
+    await mgr.recordActivityByChatId('164795011', { kind: 'reasoning' })
+    const last = api.calls.filter((c) => c.kind === 'edit').pop()!
+    // Buffer kept the last 10 (cmd-02..cmd-11). Renderer window is 5 →
+    // show cmd-07..cmd-11 + a `+5 earlier` line (10 buffered − 5 shown).
+    expect(last.text).toContain('+5 earlier')
+    expect(last.text).toContain('cmd-11')
+    expect(last.text).toContain('cmd-07')
+    // cmd-00 and cmd-01 evicted; cmd-02..cmd-06 in the +5 collapse.
+    expect(last.text).not.toContain('cmd-00')
+    expect(last.text).not.toContain('cmd-01')
+    expect(last.text).not.toContain('cmd-06')
+  })
 })
