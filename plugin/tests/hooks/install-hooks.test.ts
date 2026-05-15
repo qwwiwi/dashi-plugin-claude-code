@@ -31,6 +31,12 @@ function readJson(): Record<string, unknown> {
 }
 
 function runInstall(extraArgs: string[] = []): { code: number; stderr: string } {
+  // The install script invokes `bun` to run patch-claude-settings.ts. In some
+  // test runners `~/.bun/bin` is not on PATH, so prepend it explicitly. We
+  // also accept BUN_INSTALL_BIN override for CI.
+  const bunBin =
+    process.env.BUN_INSTALL_BIN ?? join(process.env.HOME ?? '', '.bun', 'bin')
+  const pathPrefix = `${bunBin}:${process.env.PATH ?? ''}`
   const r = spawnSync(
     'bash',
     [
@@ -41,7 +47,7 @@ function runInstall(extraArgs: string[] = []): { code: number; stderr: string } 
       '--agent-id', 'dashi-channel',
       ...extraArgs,
     ],
-    { encoding: 'utf8' },
+    { encoding: 'utf8', env: { ...process.env, PATH: pathPrefix } },
   )
   return { code: r.status ?? -1, stderr: r.stderr }
 }
