@@ -81,15 +81,18 @@ export function buildHookRequest(input: BuildHookRequestInput): BuildHookRequest
 // no-content case (some Claude hooks fire without stdin in dev).
 // ─────────────────────────────────────────────────────────────────────
 
+interface BunGlobal {
+  readonly stdin?: { readonly text?: () => Promise<string> }
+}
+
 async function readStdin(): Promise<string> {
   try {
-    // Bun.stdin is a `Bun.ReadableStream`-like object with `.text()`.
-    const stdin: unknown = (globalThis as Record<string, unknown>).Bun
-    if (stdin && typeof stdin === 'object') {
-      const bunObj = stdin as { stdin?: { text?: () => Promise<string> } }
-      const fn = bunObj.stdin?.text
-      if (typeof fn === 'function') return await fn.call(bunObj.stdin)
-    }
+    // Bun exposes `Bun.stdin.text()`; the global type is opaque under Node
+    // so we narrow through a local interface instead of an `unknown` cast
+    // chain (review L1).
+    const bun = (globalThis as { Bun?: BunGlobal }).Bun
+    const fn = bun?.stdin?.text
+    if (typeof fn === 'function') return await fn.call(bun?.stdin)
   } catch {
     /* fall through to Node-style fallback */
   }
