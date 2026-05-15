@@ -114,6 +114,27 @@ describe('install-hooks.sh — idempotency', () => {
   })
 })
 
+describe('patchSettingsFile — writeAtomic same-dir staging (regression)', () => {
+  test('writes settings.json without leaving *.tmp.* orphans in dir', async () => {
+    const { patchSettingsFile } = await import('../../scripts/patch-claude-settings.js')
+    const target = join(tmp, 'settings.json')
+    patchSettingsFile({
+      settingsPath: target,
+      chatId: '164795011',
+      webhookUrl: 'http://127.0.0.1:8089/hooks/agent',
+      helperPath: '/abs/post-hook.ts',
+    })
+    const entries = readFileSync(target, 'utf8')
+    expect(entries).toContain('dashi-channel-hook')
+    // No leftover *.tmp.* staging file (would imply rename failed silently
+    // or temp lived in a different dir).
+    const { readdirSync } = await import('fs')
+    const dirEntries = readdirSync(tmp)
+    const orphans = dirEntries.filter((n) => n.includes('.tmp.'))
+    expect(orphans).toEqual([])
+  })
+})
+
 describe('applyPatch (pure)', () => {
   test('handles missing hooks section', () => {
     const out = applyPatch(

@@ -19,9 +19,8 @@
 //     [--agent-id dashi-channel] \
 //     [--helper /abs/path/to/post-hook.ts]
 
-import { readFileSync, writeFileSync, mkdtempSync, renameSync, existsSync } from 'fs'
-import { tmpdir } from 'os'
-import { dirname, join, resolve as pathResolve } from 'path'
+import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 'fs'
+import { dirname, resolve as pathResolve } from 'path'
 
 const MARKER = 'dashi-channel-hook'
 const HOOK_EVENTS = [
@@ -149,14 +148,22 @@ function readSettings(path: string): SettingsShape {
 }
 
 function writeAtomic(path: string, contents: string): void {
+  // Stage the temp file in the SAME directory as the target so the final
+  // rename is guaranteed same-filesystem and therefore atomic. Using
+  // os.tmpdir() failed on Linux setups where /tmp is a separate fs
+  // (tmpfs / different mount) — renameSync surfaced as EXDEV (review §5).
   const dir = dirname(path)
-  const stage = mkdtempSync(join(tmpdir(), 'dashi-settings-'))
-  const tmp = join(stage, 'settings.json')
-  writeFileSync(tmp, contents, { mode: 0o600 })
-  // Ensure target dir exists.
-  // (We don't mkdir here — settings.json's parent is created by claude.)
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`
   void dir
-  renameSync(tmp, path)
+  writeFileSync(tmp, contents, { mode: 0o600 })
+  try {
+    renameSync(tmp, path)
+  } catch (err) {
+    // Best-effort cleanup of the staged file so a failed rename doesn't
+    // leave a `*.tmp.<pid>.<ts>` orphan next to settings.json.
+    try { unlinkSync(tmp) } catch { /* ignore */ }
+    throw err
+  }
 }
 
 export function patchSettingsFile(opts: PatchOptions): void {
