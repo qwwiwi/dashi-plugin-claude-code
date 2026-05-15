@@ -114,6 +114,28 @@ describe('validateWebhookPayload', () => {
   test('rejects missing chatId', () => {
     expect(() => validateWebhookPayload({ message: 'x' })).toThrow(/invalid webhook payload/)
   })
+
+  test('discriminator: hook_event_name presence routes to claude_hook (not message)', () => {
+    // Pre-fix: union evaluated message-first; this payload matched message
+    // and the hook fields were silently dropped. Post-fix: hook_event_name
+    // routes to the hook schema even when `message` is present.
+    const p = validateWebhookPayload({
+      message: 'this should NOT win',
+      chatId: 164795011,
+      hook_event_name: 'PreToolUse',
+      session_id: 's1',
+      transcript_path: '/tmp/t.jsonl',
+      cwd: '/tmp',
+      tool_name: 'Read',
+      tool_use_id: 'u1',
+      tool_input: { file_path: '/x/y.ts' },
+    })
+    expect(p.kind).toBe('claude_hook')
+    if (p.kind !== 'claude_hook') throw new Error('unreachable')
+    expect(p.hook_event_name).toBe('PreToolUse')
+    if (p.hook_event_name !== 'PreToolUse') throw new Error('unreachable')
+    expect(p.tool_name).toBe('Read')
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────

@@ -151,17 +151,44 @@ export const ClaudeHookPayloadSchema = z.discriminatedUnion('hook_event_name', [
 export type ClaudeHookPayload = z.infer<typeof ClaudeHookPayloadSchema>
 
 // Unified webhook payload. Transform tags the variant so `server.ts` can
-// branch without re-sniffing fields. The discriminator is presence of
-// `hook_event_name` — message payloads never carry it.
-export const WebhookPayloadSchema = z
-  .union([
-    WebhookMessagePayloadSchema.transform(
-      (p) => ({ kind: 'message' as const, ...p }),
-    ),
-    ClaudeHookPayloadSchema.transform(
-      (p) => ({ kind: 'claude_hook' as const, ...p }),
-    ),
-  ])
+// branch without re-sniffing fields.
+//
+// Discriminator: presence of `hook_event_name` selects the Claude hook
+// schema; everything else falls through to message. We pre-check at the
+// schema boundary instead of relying on `z.union` evaluation order — the
+// message schema has very permissive optional fields, so a payload like
+// `{ message, chatId, hook_event_name }` would otherwise match message
+// first and silently drop the hook fields (review §3).
+export const WebhookPayloadSchema = z.preprocess(
+  (raw) => raw,
+  z.unknown(),
+).transform((value, ctx) => {
+  // Empty / non-object payloads fall through to message validation so the
+  // existing "missing required" 400 path still fires with a helpful summary.
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    const parsed = WebhookMessagePayloadSchema.safeParse(value)
+    if (!parsed.success) {
+      for (const issue of parsed.error.issues) ctx.addIssue(issue)
+      return z.NEVER
+    }
+    return { kind: 'message' as const, ...parsed.data }
+  }
+  const obj = value as Record<string, unknown>
+  if (typeof obj.hook_event_name === 'string') {
+    const parsed = ClaudeHookPayloadSchema.safeParse(obj)
+    if (!parsed.success) {
+      for (const issue of parsed.error.issues) ctx.addIssue(issue)
+      return z.NEVER
+    }
+    return { kind: 'claude_hook' as const, ...parsed.data }
+  }
+  const parsed = WebhookMessagePayloadSchema.safeParse(obj)
+  if (!parsed.success) {
+    for (const issue of parsed.error.issues) ctx.addIssue(issue)
+    return z.NEVER
+  }
+  return { kind: 'message' as const, ...parsed.data }
+})
 export type WebhookPayload = z.infer<typeof WebhookPayloadSchema>
 
 // Telegram Update — minimal runtime guard before dispatch.
