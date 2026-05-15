@@ -25,6 +25,17 @@ describe('maskSecrets', () => {
     expect(maskSecrets('~/.config/secrets/openviking.key')).not.toContain('openviking.key')
   })
 
+  test('masks anchored secrets/<file> after path summarization (regression)', () => {
+    // After lastTwoSegments collapse, an absolute path like
+    // /Users/x/.claude-lab/silvana/secrets/openviking.key becomes
+    // `secrets/openviking.key` — the legacy `~/.foo/secrets/...` rule no
+    // longer matches. Broadened rule must mask the filename.
+    expect(maskSecrets('read secrets/openviking.key')).toContain('secrets/***')
+    expect(maskSecrets('read secrets/openviking.key')).not.toContain('openviking.key')
+    // Bare leading form (no preceding space) — first char of string anchors too.
+    expect(maskSecrets('secrets/foo.key')).toBe('secrets/***')
+  })
+
   test('masks generic long tokens (≥24 chars)', () => {
     const tok = `abcd${'x'.repeat(20)}wxyz`
     const masked = maskSecrets(`bearer ${tok} ok`)
@@ -244,6 +255,24 @@ describe('buildActivityDetail', () => {
 
   test('omits summary if empty', () => {
     expect(buildActivityDetail('Read', {})).toBe('read')
+  })
+})
+
+describe('secret-path leak after summarization (regression)', () => {
+  test('Read of /Users/.../secrets/foo.key never reaches render unmasked', () => {
+    const absPath = '/Users/jasonqwwen/.claude-lab/silvana/secrets/openviking.key'
+    const detail = buildActivityDetail('Read', { file_path: absPath })
+    // Buffer-level: filename must be masked at store time.
+    expect(detail).not.toContain('openviking.key')
+    expect(detail).toContain('secrets/***')
+    const snap: ActivitySnapshot = {
+      startedAtMs: 0,
+      calls: [{ toolName: 'Read', detail }],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, 0)
+    expect(out).not.toContain('openviking.key')
+    expect(out).toContain('secrets/***')
   })
 })
 

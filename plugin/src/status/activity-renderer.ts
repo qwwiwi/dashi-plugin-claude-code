@@ -66,8 +66,14 @@ export function maskSecrets(input: string): string {
     /\b(\d{1,3})\.\d{1,3}\.\d{1,3}\.(\d{1,3})\b/g,
     '$1.***.***.$2',
   )
-  // Secret paths under ~/.foo/secrets/...
+  // Secret paths under ~/.foo/secrets/...  (legacy tilde-anchored form)
   s = s.replace(/(~\/?\.\w+\/)secrets\/\S+/g, '$1secrets/***')
+  // Anchored `secrets/<file>` — catches summarized last-two-segments output
+  // (e.g. `/Users/x/.claude-lab/silvana/secrets/openviking.key` collapses to
+  // `secrets/openviking.key`). Without this the secret filename slips
+  // through summarize → render. Pattern matches at string start or after a
+  // path separator so unrelated occurrences (`my-secrets/x`) are unaffected.
+  s = s.replace(/(^|[\s/])secrets\/\S+/g, '$1secrets/***')
   // Generic long tokens (≥24 chars of [A-Za-z0-9_-]).
   s = s.replace(
     /\b([A-Za-z0-9_-]{4})[A-Za-z0-9_-]{16,}([A-Za-z0-9_-]{4})\b/g,
@@ -301,11 +307,15 @@ export function renderActivityBlock(
 
 /**
  * Combine summarizeToolInput with the lowercase tool name to produce the
- * detail string stored on `ActivityCall.detail`. Renderer applies maskSecrets
- * again on the final string.
+ * detail string stored on `ActivityCall.detail`. Masking happens here —
+ * AFTER path summarization (which can collapse `/abs/.../secrets/foo.key`
+ * to `secrets/foo.key`) and BEFORE the value lands in the activity buffer.
+ * Renderer re-masks defensively but the buffer should never hold raw
+ * secret-shaped strings (review §4).
  */
 export function buildActivityDetail(toolName: string, toolInput: ToolInput): string {
   const summary = summarizeToolInput(toolName, toolInput)
   const lower = toolName.toLowerCase()
-  return summary ? `${lower} ${summary}` : lower
+  const detail = summary ? `${lower} ${summary}` : lower
+  return maskSecrets(detail)
 }
