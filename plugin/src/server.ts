@@ -476,6 +476,7 @@ try {
     config,
     statePaths,
     log,
+    statusManager,
   })
 } catch (err) {
   log.error('webhook server failed to start', {

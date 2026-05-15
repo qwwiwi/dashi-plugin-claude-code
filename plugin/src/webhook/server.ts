@@ -23,15 +23,30 @@ import type { Logger } from '../log.js'
 import { writeDeadLetter } from '../state/store.js'
 import { WebhookPayloadSchema, type WebhookPayload } from '../schemas.js'
 import { sendChannelNotification, normalizeMeta } from '../channel/notify.js'
+import { toActivityEvent } from '../hooks/claude-events.js'
 
 const BODY_LIMIT_BYTES = 256 * 1024
 const DEFAULT_AGENT_ID = 'dashi-channel'
+
+// Structural surface for the hook branch. Avoids importing the full
+// StatusManager type so test stubs can pass a minimal object. The webhook
+// server only needs to push events into the manager — no read APIs.
+export interface StatusManagerForWebhook {
+  recordActivityByChatId(
+    chatId: string,
+    event: ReturnType<typeof toActivityEvent>,
+  ): Promise<void>
+}
 
 export interface WebhookDeps {
   mcpServer: McpServer
   config: AppConfig
   statePaths: StatePaths
   log: Logger
+  // Optional — if absent, hook-event payloads are accepted but no Telegram
+  // status update happens. The 200 path stays open so Claude hooks never
+  // back-pressure on visibility outages.
+  statusManager?: StatusManagerForWebhook
 }
 
 export interface WebhookServerHandle {
@@ -147,7 +162,7 @@ async function handleRequest(
   deps: WebhookDeps,
   webhookToken: string | undefined,
 ): Promise<void> {
-  const { config, statePaths, log, mcpServer } = deps
+  const { config, statePaths, log, mcpServer, statusManager } = deps
   const method = req.method ?? 'GET'
   const url = req.url ?? '/'
 
@@ -242,7 +257,34 @@ async function handleRequest(
     return
   }
 
-  // Forward to MCP channel.
+  // Branch on payload variant. Discriminator was set by the Zod transform
+  // so we don't have to re-sniff fields here.
+  if (payload.kind === 'claude_hook') {
+    if (statusManager) {
+      try {
+        await statusManager.recordActivityByChatId(
+          payload.chatId,
+          toActivityEvent(payload),
+        )
+      } catch (err) {
+        // Visibility failure must not block Claude. Log + 200.
+        log.warn('hook event status update failed (ignored)', {
+          chat_id: payload.chatId,
+          hook: payload.hook_event_name,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    } else {
+      log.debug('hook event accepted without status manager', {
+        chat_id: payload.chatId,
+        hook: payload.hook_event_name,
+      })
+    }
+    reply(res, 200, { status: 'accepted' })
+    return
+  }
+
+  // Forward message payload to MCP channel (existing behaviour).
   const metaRaw: Record<string, unknown> = {
     source: 'webhook',
     chat_id: payload.chatId,
