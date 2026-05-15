@@ -99,4 +99,42 @@ describe('appendVerbose', () => {
     await appendVerbose({ logsDir, record: record({ ts: '2025-01-01T12:00:00.000Z' }) })
     expect(readdirSync(logsDir)).toEqual(['verbose-2025-01-01.jsonl'])
   })
+
+  test('50 concurrent appends with multi-KB records: every line parseable JSON, no interleave (review HIGH)', async () => {
+    // Pre-fix `appendFile` was NOT atomic for buffers > PIPE_BUF on macOS;
+    // multi-KB records under burst load could interleave and produce
+    // corrupt JSONL — exact failure mode the Cognee cron would silently
+    // drop. After the mutex fix every record must round-trip JSON.parse
+    // AND retain its full 10KB user/agent text.
+    const N = 50
+    const tasks: Promise<void>[] = []
+    for (let i = 0; i < N; i++) {
+      tasks.push(
+        appendVerbose({
+          logsDir,
+          record: record({
+            sid: `sess-${i.toString().padStart(4, '0')}`,
+            user: 'U'.repeat(10_000),
+            agent: 'A'.repeat(10_000),
+          }),
+        }),
+      )
+    }
+    await Promise.all(tasks)
+
+    const text = readFileSync(join(logsDir, 'verbose-2026-05-15.jsonl'), 'utf8')
+    const lines = text.split('\n').filter((l) => l.length > 0)
+    expect(lines.length).toBe(N)
+
+    const seen = new Set<string>()
+    for (const l of lines) {
+      // No throw on JSON.parse — every line is well-formed.
+      const parsed = JSON.parse(l) as VerboseRecord
+      expect(parsed.user.length).toBeGreaterThanOrEqual(10_000)
+      expect(parsed.agent.length).toBeGreaterThanOrEqual(10_000)
+      // Every sid is preserved intact, proving no header/body mix-up.
+      if (parsed.sid) seen.add(parsed.sid)
+    }
+    expect(seen.size).toBe(N)
+  })
 })

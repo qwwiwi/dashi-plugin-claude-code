@@ -15,39 +15,11 @@
 import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
-// ─────────────────────────────────────────────────────────────────────
-// Intra-process mutex. Each instance serialises async callers; the
-// `locks` map gives one Mutex per absolute path so different files
-// don't block each other.
-// ─────────────────────────────────────────────────────────────────────
+import { lockFor } from './_mutex.js'
 
-class Mutex {
-  private p: Promise<void> = Promise.resolve()
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    const prev = this.p
-    let release!: () => void
-    this.p = new Promise<void>((r) => {
-      release = r
-    })
-    await prev
-    try {
-      return await fn()
-    } finally {
-      release()
-    }
-  }
-}
-
-const locks = new Map<string, Mutex>()
-
-function lockFor(path: string): Mutex {
-  let m = locks.get(path)
-  if (!m) {
-    m = new Mutex()
-    locks.set(path, m)
-  }
-  return m
-}
+// Intra-process mutex serialisation lives in `_mutex.ts` (shared with
+// verbose-writer). One Mutex per absolute path so different files don't
+// block each other.
 
 // ─────────────────────────────────────────────────────────────────────
 // Public surface
@@ -103,7 +75,7 @@ export async function appendHotEntry(input: AppendHotInput): Promise<void> {
         break
       }
     }
-    const header = '# Hot memory — last 24h rolling journal\n\n'
+    const header = '# Hot memory -- last 24h rolling journal\n\n'
     // Same-dir tmp so rename() is a metadata-only move (no EXDEV when
     // workspace lives on a different filesystem than /tmp). PID + ms
     // disambiguate parallel trims in the unlikely case the mutex is

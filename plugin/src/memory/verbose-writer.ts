@@ -8,15 +8,16 @@
 // rely on key order (some do, even though they shouldn't) see the same
 // shape as the Python gateway.
 //
-// No mutex: each plugin process is the sole writer of its agent's
-// verbose-*.jsonl. `appendFile` issues a single write(2) which is
-// atomic for buffers ≤ PIPE_BUF (4096 B on macOS, 4096 B on Linux);
-// records >4 KB MAY interleave under burst load, which is acceptable
-// — Cognee cron skips malformed lines and we never use this file as
-// a UI artifact. Hot-writer is the place that needs strong ordering.
+// Mutex-serialised: `appendFile` is NOT atomic for buffers > PIPE_BUF
+// (4 KB) on Darwin — concurrent multi-KB writes can interleave and
+// corrupt JSONL. gateway.py uses `fcntl.LOCK_EX`; we reuse the same
+// `lockFor(path)` primitive as hot-writer so a single per-file mutex
+// serialises every append on the plugin process.
 
 import { appendFile, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
+
+import { lockFor } from './_mutex.js'
 
 export interface VerboseRecord {
   // UTC ISO 8601 timestamp; the YYYY-MM-DD prefix is also used to
@@ -68,5 +69,8 @@ export async function appendVerbose(input: AppendVerboseInput): Promise<void> {
     dur_ms: r.dur_ms,
     status: r.status,
   }
-  await appendFile(path, JSON.stringify(ordered) + '\n', 'utf8')
+  const line = JSON.stringify(ordered) + '\n'
+  await lockFor(path).run(async () => {
+    await appendFile(path, line, 'utf8')
+  })
 }
