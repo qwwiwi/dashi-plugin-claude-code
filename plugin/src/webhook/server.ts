@@ -65,9 +65,14 @@ export function validateWebhookPayload(value: unknown): WebhookPayload {
     return WebhookPayloadSchema.parse(value)
   } catch (err) {
     if (err instanceof z.ZodError) {
+      // Cap the issue summary so a deeply-nested or discriminated-union
+      // failure can't return a kilobyte-long error to the caller / dead
+      // letter (review L2). 512 chars is plenty to identify which field
+      // failed without amplifying payload-shaped attacks.
       const summary = err.issues
         .map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`)
         .join('; ')
+        .slice(0, 512)
       throw new Error(redactToken(`invalid webhook payload: ${summary}`))
     }
     throw new Error(redactToken(`invalid webhook payload: ${err instanceof Error ? err.message : String(err)}`))

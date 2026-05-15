@@ -115,6 +115,27 @@ describe('validateWebhookPayload', () => {
     expect(() => validateWebhookPayload({ message: 'x' })).toThrow(/invalid webhook payload/)
   })
 
+  test('Zod issue summary is capped at 512 chars (L2)', () => {
+    // Pre-fix: a deeply-nested or discriminated-union failure could amplify
+    // a single bad request into a kilobyte-long error string that landed in
+    // both the 400 response body and the dead-letter file. Cap is 512 chars
+    // on the appended `summary` slice. Total Error message includes the
+    // `invalid webhook payload: ` prefix (~25 chars), so message ≤ ~540.
+    let caught: unknown
+    try {
+      // Use a payload that's the wrong shape entirely — Zod produces several
+      // issues for the union failure.
+      validateWebhookPayload({ junk: 'x'.repeat(2000), more_junk: 'y'.repeat(2000) })
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeInstanceOf(Error)
+    const msg = (caught as Error).message
+    expect(msg.startsWith('invalid webhook payload: ')).toBe(true)
+    // Prefix + capped summary should be well below 600 chars.
+    expect(msg.length).toBeLessThanOrEqual(600)
+  })
+
   test('discriminator: hook_event_name presence routes to claude_hook (not message)', () => {
     // Pre-fix: union evaluated message-first; this payload matched message
     // and the hook fields were silently dropped. Post-fix: hook_event_name
