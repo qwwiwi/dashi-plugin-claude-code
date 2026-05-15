@@ -25,6 +25,14 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
       bash_only_proof: true,
     },
     commands: { help: true, status: true, stop: true, reset: true, new: true },
+    memory: {
+      enabled: false,
+      source_tag: 'tg',
+      max_hot_bytes: 20480,
+      trim_keep_lines: 600,
+      buffer_ttl_ms: 5 * 60 * 1000,
+      buffer_max_entries: 100,
+    },
     ...overrides,
   }
 }

@@ -165,4 +165,70 @@ describe('loadConfig', () => {
     expect(cfg.allowed_user_ids).toEqual([42, 43])
     expect(cfg.workspace_root).toBe('/tmp/ws')
   })
+
+  // ─── Phase 8 / T1: memory group ──────────────────────────────────────
+
+  test('memory: defaults are off-by-default with sane field values', () => {
+    const cfg = loadConfig(env())
+    expect(cfg.memory.enabled).toBe(false)
+    expect(cfg.memory.workspace_path).toBeUndefined()
+    expect(cfg.memory.logs_path).toBeUndefined()
+    expect(cfg.memory.source_tag).toBe('tg')
+    expect(cfg.memory.max_hot_bytes).toBe(20480)
+    expect(cfg.memory.trim_keep_lines).toBe(600)
+    expect(cfg.memory.buffer_ttl_ms).toBe(5 * 60 * 1000)
+    expect(cfg.memory.buffer_max_entries).toBe(100)
+  })
+
+  test('memory: enabled=true without workspace_path fails refine with explicit message', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      memory: { enabled: true },
+    }))
+    let caught: unknown
+    try { loadConfig(env()) } catch (e) { caught = e }
+    expect(caught).toBeInstanceOf(Error)
+    const msg = (caught as Error).message
+    expect(msg).toMatch(/memory\.workspace_path required when memory\.enabled=true/)
+  })
+
+  test('memory: enabled=true with workspace_path validates', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      memory: { enabled: true, workspace_path: '/tmp/agent-ws' },
+    }))
+    const cfg = loadConfig(env())
+    expect(cfg.memory.enabled).toBe(true)
+    expect(cfg.memory.workspace_path).toBe('/tmp/agent-ws')
+  })
+
+  test('memory: env TELEGRAM_MEMORY_* overrides file config', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      memory: { enabled: false, workspace_path: '/tmp/from-file', source_tag: 'old' },
+    }))
+    const cfg = loadConfig(env({
+      TELEGRAM_MEMORY_ENABLED: 'true',
+      TELEGRAM_MEMORY_WORKSPACE: '/tmp/from-env',
+      TELEGRAM_MEMORY_LOGS_PATH: '/tmp/from-env-logs',
+      TELEGRAM_MEMORY_SOURCE_TAG: 'tg',
+      TELEGRAM_MEMORY_AGENT_LABEL: 'Silvana',
+    }))
+    expect(cfg.memory.enabled).toBe(true)
+    expect(cfg.memory.workspace_path).toBe('/tmp/from-env')
+    expect(cfg.memory.logs_path).toBe('/tmp/from-env-logs')
+    expect(cfg.memory.source_tag).toBe('tg')
+    expect(cfg.memory.agent_label).toBe('Silvana')
+  })
+
+  test('memory: TELEGRAM_MEMORY_ENABLED accepts 1/true/yes/on (case-insensitive); other values → false', () => {
+    for (const truthy of ['1', 'true', 'TRUE', 'yes', 'On']) {
+      const cfg = loadConfig(env({
+        TELEGRAM_MEMORY_ENABLED: truthy,
+        TELEGRAM_MEMORY_WORKSPACE: '/tmp/ws',
+      }))
+      expect(cfg.memory.enabled).toBe(true)
+    }
+    for (const falsy of ['0', 'false', 'no', 'off', '']) {
+      const cfg = loadConfig(env({ TELEGRAM_MEMORY_ENABLED: falsy }))
+      expect(cfg.memory.enabled).toBe(false)
+    }
+  })
 })

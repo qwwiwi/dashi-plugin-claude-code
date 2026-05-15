@@ -154,6 +154,11 @@ const env = RuntimeEnvSchema.parse({
   ...(process.env.TELEGRAM_WEBHOOK_PORT !== undefined ? { TELEGRAM_WEBHOOK_PORT: process.env.TELEGRAM_WEBHOOK_PORT } : {}),
   ...(process.env.TELEGRAM_WEBHOOK_TOKEN !== undefined ? { TELEGRAM_WEBHOOK_TOKEN: process.env.TELEGRAM_WEBHOOK_TOKEN } : {}),
   ...(process.env.TELEGRAM_ACCESS_MODE !== undefined ? { TELEGRAM_ACCESS_MODE: process.env.TELEGRAM_ACCESS_MODE } : {}),
+  ...(process.env.TELEGRAM_MEMORY_ENABLED !== undefined ? { TELEGRAM_MEMORY_ENABLED: process.env.TELEGRAM_MEMORY_ENABLED } : {}),
+  ...(process.env.TELEGRAM_MEMORY_WORKSPACE !== undefined ? { TELEGRAM_MEMORY_WORKSPACE: process.env.TELEGRAM_MEMORY_WORKSPACE } : {}),
+  ...(process.env.TELEGRAM_MEMORY_LOGS_PATH !== undefined ? { TELEGRAM_MEMORY_LOGS_PATH: process.env.TELEGRAM_MEMORY_LOGS_PATH } : {}),
+  ...(process.env.TELEGRAM_MEMORY_SOURCE_TAG !== undefined ? { TELEGRAM_MEMORY_SOURCE_TAG: process.env.TELEGRAM_MEMORY_SOURCE_TAG } : {}),
+  ...(process.env.TELEGRAM_MEMORY_AGENT_LABEL !== undefined ? { TELEGRAM_MEMORY_AGENT_LABEL: process.env.TELEGRAM_MEMORY_AGENT_LABEL } : {}),
 })
 
 const config: AppConfig = loadConfig(process.env)

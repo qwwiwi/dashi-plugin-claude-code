@@ -31,6 +31,14 @@ function makeConfig(overrides: Partial<AppConfig['status']> = {}): AppConfig {
     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
     permission_relay: { enabled: true, allowed_user_ids: [164795011], bash_only_proof: true },
     commands: { help: true, status: true, stop: true, reset: true, new: true },
+    memory: {
+      enabled: false,
+      source_tag: 'tg',
+      max_hot_bytes: 20480,
+      trim_keep_lines: 600,
+      buffer_ttl_ms: 5 * 60 * 1000,
+      buffer_max_entries: 100,
+    },
   }
 }
 

@@ -48,6 +48,37 @@ export const AppConfigSchema = z.object({
     reset: z.boolean().default(true),
     new: z.boolean().default(true),
   }).default({}),
+  // Phase 8: Memory hooks parity with gateway.py:1938-2035. When a Claude
+  // hook (UserPromptSubmit / Stop) fires, the plugin writes a turn entry to
+  // <workspace_path>/core/hot/recent.md and a lossless record to
+  // <workspace_parent>/logs/verbose-YYYY-MM-DD.jsonl.
+  //
+  // Deviation from PLAN.md T1: `enabled` defaults to false (plan said true).
+  // With default-true, parsing the bare default ({}) trips the superRefine
+  // below because workspace_path is required when enabled — that would
+  // break every existing test fixture that calls loadConfig() without a
+  // memory block. enabled=false off-by-default matches the runtime gate
+  // in T7 ("instantiate when enabled=true AND workspace_path set"). The
+  // refine still triggers when enabled is explicitly turned on without a
+  // workspace, which is the only assertion T1's acceptance demands.
+  memory: z.object({
+    enabled: z.boolean().default(false),
+    workspace_path: z.string().optional(),
+    logs_path: z.string().optional(),
+    source_tag: z.string().default('tg'),
+    agent_label: z.string().optional(),
+    max_hot_bytes: z.number().int().positive().default(20480),
+    trim_keep_lines: z.number().int().positive().default(600),
+    buffer_ttl_ms: z.number().int().positive().default(5 * 60 * 1000),
+    buffer_max_entries: z.number().int().positive().default(100),
+  }).default({}).superRefine((m, ctx) => {
+    if (m.enabled && (m.workspace_path === undefined || m.workspace_path === '')) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'memory.workspace_path required when memory.enabled=true',
+      })
+    }
+  }),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
 
@@ -68,6 +99,17 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_WEBHOOK_HOST: z.string().optional(),
   TELEGRAM_WEBHOOK_PORT: z.coerce.number().int().min(0).optional(),
   TELEGRAM_WEBHOOK_TOKEN: z.string().optional(),
+  // Phase 8 memory env overrides. ENABLED accepts the usual truthy strings
+  // (1/true/yes, case-insensitive); anything else parses as false so a
+  // typo doesn't silently turn the feature on.
+  TELEGRAM_MEMORY_ENABLED: z
+    .string()
+    .transform((v) => /^(1|true|yes|on)$/i.test(v))
+    .optional(),
+  TELEGRAM_MEMORY_WORKSPACE: z.string().optional(),
+  TELEGRAM_MEMORY_LOGS_PATH: z.string().optional(),
+  TELEGRAM_MEMORY_SOURCE_TAG: z.string().optional(),
+  TELEGRAM_MEMORY_AGENT_LABEL: z.string().optional(),
   // PLAN.md Scope A only ships static allowlist mode; `pairing` is reserved
   // for Scope B. We accept both values at the schema level so we can emit
   // a clear, scope-aware error message (the bare `z.enum(['static'])` form
@@ -204,6 +246,15 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (parsedEnv.TELEGRAM_WEBHOOK_HOST !== undefined) webhook.host = parsedEnv.TELEGRAM_WEBHOOK_HOST
   if (parsedEnv.TELEGRAM_WEBHOOK_PORT !== undefined) webhook.port = parsedEnv.TELEGRAM_WEBHOOK_PORT
   if (Object.keys(webhook).length > 0) merged.webhook = webhook
+
+  // Phase 8 memory env overrides.
+  const memory = (merged.memory && typeof merged.memory === 'object' ? merged.memory : {}) as Record<string, unknown>
+  if (parsedEnv.TELEGRAM_MEMORY_ENABLED !== undefined) memory.enabled = parsedEnv.TELEGRAM_MEMORY_ENABLED
+  if (parsedEnv.TELEGRAM_MEMORY_WORKSPACE !== undefined) memory.workspace_path = parsedEnv.TELEGRAM_MEMORY_WORKSPACE
+  if (parsedEnv.TELEGRAM_MEMORY_LOGS_PATH !== undefined) memory.logs_path = parsedEnv.TELEGRAM_MEMORY_LOGS_PATH
+  if (parsedEnv.TELEGRAM_MEMORY_SOURCE_TAG !== undefined) memory.source_tag = parsedEnv.TELEGRAM_MEMORY_SOURCE_TAG
+  if (parsedEnv.TELEGRAM_MEMORY_AGENT_LABEL !== undefined) memory.agent_label = parsedEnv.TELEGRAM_MEMORY_AGENT_LABEL
+  if (Object.keys(memory).length > 0) merged.memory = memory
 
   try {
     return AppConfigSchema.parse(merged)
