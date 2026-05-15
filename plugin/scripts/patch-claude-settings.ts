@@ -23,6 +23,12 @@ import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 
 import { dirname, resolve as pathResolve } from 'path'
 
 const MARKER = 'dashi-channel-hook'
+// Substring of the dashi helper script path used to identify *markerless*
+// legacy entries — re-running install over a settings file that was
+// hand-edited (no marker but pointing at our post-hook.ts) used to leave
+// the legacy entry in place + append the marked one, firing the hook
+// twice (review §6).
+const HELPER_PATH_FINGERPRINT = 'post-hook.ts'
 const HOOK_EVENTS = [
   'SessionStart',
   'UserPromptSubmit',
@@ -85,17 +91,33 @@ function buildEntryFor(event: HookEvent, opts: PatchOptions): HookEntry {
   return entry
 }
 
+// True if an entry's command string points at our helper script, even if
+// the marker was hand-stripped or never present. Survives different
+// absolute prefixes (e.g. user moved the plugin between dirs) by matching
+// the trailing `post-hook.ts` filename inside the command string.
+function isLegacyDashiEntry(entry: HookEntry | undefined): boolean {
+  if (!entry || !Array.isArray(entry.hooks)) return false
+  for (const h of entry.hooks) {
+    if (h && typeof h.command === 'string' && h.command.includes(HELPER_PATH_FINGERPRINT)) {
+      return true
+    }
+  }
+  return false
+}
+
 /** Pure patcher — exposed for unit tests. */
 export function applyPatch(settings: SettingsShape, opts: PatchOptions): SettingsShape {
   const hooks: NonNullable<SettingsShape['hooks']> = { ...(settings.hooks ?? {}) }
   for (const event of HOOK_EVENTS) {
     const next = buildEntryFor(event, opts)
     const existing = hooks[event] ?? []
-    // Replace any entry that carries our marker. Append if none exists.
-    const withoutMarker = existing.filter(
-      (e) => !e || e.marker !== MARKER,
+    // Drop anything that's clearly ours: either marker match OR a markerless
+    // entry whose command path resolves to our helper. Unrelated entries
+    // (someone-else marker, unrelated command) survive untouched.
+    const filtered = existing.filter(
+      (e) => !e || (e.marker !== MARKER && !isLegacyDashiEntry(e)),
     )
-    hooks[event] = [...withoutMarker, next]
+    hooks[event] = [...filtered, next]
   }
   return { ...settings, hooks }
 }

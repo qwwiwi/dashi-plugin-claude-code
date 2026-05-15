@@ -149,6 +149,37 @@ describe('applyPatch (pure)', () => {
     expect((out as Record<string, unknown>).hooks).toBeDefined()
   })
 
+  test('removes markerless legacy entries that point at post-hook.ts (regression)', () => {
+    // settings.json hand-edited: marker stripped but the command still
+    // points at our post-hook.ts helper. install must NOT leave both the
+    // legacy entry and the new marked one (double-fire).
+    const legacyCmd = `TELEGRAM_HOOK_CHAT_ID='1' bun '/old/plugin/scripts/post-hook.ts'`
+    const seed: Record<string, unknown> = {
+      hooks: {
+        PreToolUse: [
+          { hooks: [{ type: 'command', command: legacyCmd }] },
+        ],
+        Stop: [
+          { hooks: [{ type: 'command', command: legacyCmd }] },
+        ],
+      },
+    }
+    const out = applyPatch(seed, {
+      settingsPath: '/tmp/x',
+      chatId: '1',
+      webhookUrl: 'http://x',
+      helperPath: '/new/plugin/scripts/post-hook.ts',
+    }) as { hooks: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }
+    for (const ev of ['PreToolUse', 'Stop']) {
+      const arr = out.hooks[ev] ?? []
+      expect(arr.length).toBe(1)
+      expect(arr[0]!.marker).toBe('dashi-channel-hook')
+      expect(arr[0]!.hooks?.[0]?.command).toContain('/new/plugin/scripts/post-hook.ts')
+      // Old legacy command must be gone.
+      expect(arr.find((e) => e.hooks?.[0]?.command === legacyCmd)).toBeUndefined()
+    }
+  })
+
   test('replaces previous dashi-channel-hook entry rather than appending', () => {
     let s: Record<string, unknown> = {}
     s = applyPatch(s, {
