@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# smoke-local — pre-flight verification for the Dashi Channel plugin canary smoke.
+#
+# Runs deterministic local checks (install, typecheck, tests) and prints the
+# launch hint for the operator. Does NOT launch the plugin or touch the
+# Python canary — that step requires an interactive Claude Code session.
+#
+# Usage: ./scripts/smoke-local
+# Exit codes: 0 ok, non-zero on first failing step.
+
+set -euo pipefail
+
+# Resolve plugin root (script lives in plugin/scripts/)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$PLUGIN_DIR"
+
+# Locate bun (prefer ~/.bun/bin/bun, fall back to PATH)
+if [ -x "$HOME/.bun/bin/bun" ]; then
+  BUN="$HOME/.bun/bin/bun"
+elif command -v bun >/dev/null 2>&1; then
+  BUN="$(command -v bun)"
+else
+  echo "ERROR: bun not found. Install from https://bun.sh or place it at ~/.bun/bin/bun" >&2
+  exit 2
+fi
+
+echo "==> plugin dir: $PLUGIN_DIR"
+echo "==> bun:        $BUN ($($BUN --version))"
+echo
+
+echo "==> Step 1/3: bun install"
+"$BUN" install
+echo "    install OK"
+echo
+
+echo "==> Step 2/3: bun run typecheck"
+"$BUN" run typecheck
+echo "    typecheck OK"
+echo
+
+echo "==> Step 3/3: bun test tests/"
+"$BUN" test tests/
+echo "    tests OK"
+echo
+
+cat <<'HINT'
+==> Pre-flight complete.
+
+Next step (operator, interactive):
+
+  1. Stop the Python canary:
+       tmux kill-session -t orgrimmar-canary 2>/dev/null || true
+
+  2. Launch the channel plugin in a tmux session:
+       tmux new-session -d -s orgrimmar-canary-channel \
+         -c /Users/jasonqwwen/qwwiwi-channel-telegram-Claude-code/plugin \
+         'TELEGRAM_BOT_TOKEN=$(cat ~/.claude-lab/shared/channel-runtime/canary/secrets/telegram-bot-token) \
+          TELEGRAM_STATE_DIR=/Users/jasonqwwen/.claude-lab/shared/channel-runtime/canary/telegram \
+          TELEGRAM_WORKSPACE_ROOT=/tmp/dashi-channel-canary-workspace \
+          claude --dangerously-load-development-channels server:dashi-channel'
+
+  3. Walk the 15-row smoke matrix in docs/canary-smoke.md.
+
+Rollback: tmux kill-session -t orgrimmar-canary-channel, then restart the
+Python canary as documented.
+
+Do NOT touch production bot tokens, gateway.py, or production tmux sessions.
+HINT

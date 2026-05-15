@@ -1,0 +1,61 @@
+// MCP `notifications/claude/channel` event helpers.
+//
+// Claude Code drops meta keys with hyphens silently (per RESEARCH.md). We
+// enforce identifier-style snake_case keys and stringify all values so the
+// receiver never has to guess how to render a number/boolean.
+
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
+import type { Logger } from '../log.js'
+
+export type ChannelEvent = {
+  content: string
+  meta: Record<string, string>
+}
+
+const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+export function normalizeMeta(raw: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    if (value === null || value === undefined) continue
+    if (key.includes('-')) continue
+    if (!IDENT_RE.test(key)) continue
+    if (typeof value === 'string') {
+      out[key] = value
+    } else if (typeof value === 'number' && Number.isFinite(value)) {
+      out[key] = String(value)
+    } else if (typeof value === 'boolean') {
+      out[key] = value ? 'true' : 'false'
+    } else if (typeof value === 'bigint') {
+      out[key] = value.toString()
+    } else {
+      // Object/array/symbol/function — drop with a serialized fallback only if JSON works.
+      try {
+        out[key] = JSON.stringify(value)
+      } catch {
+        // skip
+      }
+    }
+  }
+  return out
+}
+
+export async function sendChannelNotification(
+  server: Server,
+  event: ChannelEvent,
+  log: Logger,
+): Promise<void> {
+  try {
+    await server.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: event.content,
+        meta: event.meta,
+      },
+    })
+  } catch (err) {
+    log.error('channel notification failed', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+}

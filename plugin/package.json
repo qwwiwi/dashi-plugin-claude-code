@@ -1,0 +1,22 @@
+{
+  "name": "dashi-channel",
+  "version": "0.0.1",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "bin": "./src/server.ts",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "grammy": "^1.21.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.14",
+    "typescript": "^6.0.3"
+  }
+}
