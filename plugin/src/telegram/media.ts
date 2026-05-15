@@ -288,9 +288,12 @@ export async function maybeTranscribeVoice(
     }
 
     const form = new FormData()
-    // Voice files from Telegram are .ogg/.oga; let the server detect.
-    // We pass a stable filename so multipart parsers don't reject.
-    const filename = downloaded.path.split('/').pop() ?? 'voice.ogg'
+    // Groq Whisper validates by FILENAME extension and rejects `.oga` even
+    // though the bytes are valid Ogg/Opus. Telegram voice messages always
+    // arrive with the `.oga` extension. Normalize to `.ogg` so the server
+    // multipart parser accepts the file.
+    const rawName = downloaded.path.split('/').pop() ?? 'voice.ogg'
+    const filename = rawName.replace(/\.oga$/i, '.ogg')
     const mime = downloaded.mime ?? input.mime ?? 'audio/ogg'
     form.append('file', new Blob([new Uint8Array(bytes)], { type: mime }), filename)
     form.append('model', config.voice.model)

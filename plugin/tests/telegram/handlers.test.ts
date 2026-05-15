@@ -123,6 +123,9 @@ function makeTelegramApi(): {
     setMessageReaction: async (chatId, messageId, emoji): Promise<void> => {
       reactions.push({ chatId, messageId, emoji })
     },
+    sendChatAction: async () => {
+      /* noop — status tests cover this surface */
+    },
     sendDocument: noop as unknown as TelegramApi['sendDocument'],
     sendPhoto: noop as unknown as TelegramApi['sendPhoto'],
     downloadFile: noop as unknown as TelegramApi['downloadFile'],

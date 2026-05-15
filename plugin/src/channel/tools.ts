@@ -99,10 +99,24 @@ export interface DownloadResult {
   size?: number
 }
 
+export type ChatAction =
+  | 'typing'
+  | 'upload_photo'
+  | 'record_video'
+  | 'upload_video'
+  | 'record_voice'
+  | 'upload_voice'
+  | 'upload_document'
+  | 'choose_sticker'
+  | 'find_location'
+  | 'record_video_note'
+  | 'upload_video_note'
+
 export interface TelegramApi {
   sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<{ message_id: number }>
   editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void>
   setMessageReaction(chatId: string, messageId: number, emoji: string): Promise<void>
+  sendChatAction(chatId: string, action: ChatAction): Promise<void>
   sendDocument(chatId: string, filePath: string, opts: SendDocumentOpts): Promise<{ message_id: number }>
   sendPhoto(chatId: string, filePath: string, opts: SendDocumentOpts): Promise<{ message_id: number }>
   downloadFile(fileId: string, destDir: string): Promise<DownloadResult>
@@ -136,6 +150,9 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       await bot.api.setMessageReaction(chatId, messageId, [
         { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
       ])
+    },
+    async sendChatAction(chatId, action) {
+      await bot.api.sendChatAction(chatId, action)
     },
     async sendDocument(chatId, filePath, opts) {
       const other: Record<string, unknown> = {}

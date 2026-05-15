@@ -18,8 +18,28 @@
 
 import type { AppConfig } from '../config.js'
 import type { Logger } from '../log.js'
-import type { TelegramApi } from '../channel/tools.js'
+import type { ChatAction, TelegramApi } from '../channel/tools.js'
 import { escapeHtml } from '../format/html.js'
+
+// Telegram's `sendChatAction` indicator expires after 5 s; re-pulse on a 4 s
+// timer to keep the header animation continuous without spamming the API.
+const CHAT_ACTION_PULSE_MS = 4000
+
+// All active StatusStates map to a single `typing` action. Tool-specific
+// actions (`upload_document`, etc.) are not used today because Telegram's
+// header animation is the same for `typing` and we want to keep the contract
+// simple. Extend here if a per-tool icon becomes worth the noise.
+function chatActionFor(state: StatusState): ChatAction | null {
+  switch (state.kind) {
+    case 'typing':
+    case 'thinking':
+    case 'tool':
+      return 'typing'
+    case 'stopped':
+    case 'error':
+      return null
+  }
+}
 
 export type StatusState =
   | { kind: 'typing' }
@@ -41,6 +61,10 @@ export interface TelegramApiForStatus {
   sendMessage: TelegramApi['sendMessage']
   editMessageText: TelegramApi['editMessageText']
   deleteMessage?: (chatId: string, messageId: number) => Promise<void>
+  // Native Telegram `typing` indicator in the chat header. Optional so unit
+  // tests can stub a minimal surface. Action expires after 5 s on Telegram's
+  // side, so the manager re-pulses on a 4 s timer while a status is active.
+  sendChatAction?: TelegramApi['sendChatAction']
 }
 
 export interface StatusManagerDeps {
@@ -60,6 +84,8 @@ interface InternalEntry {
   lastText: string
   intervalHandle: NodeJS.Timeout | null
   ttlHandle: NodeJS.Timeout | null
+  // Separate cadence from the message edit ticker — see CHAT_ACTION_PULSE_MS.
+  chatActionHandle: NodeJS.Timeout | null
 }
 
 // Reuse Telegram's "message is not modified" detection. We can't import a
@@ -168,8 +194,17 @@ export class StatusManager {
       lastText: text,
       intervalHandle: null,
       ttlHandle: null,
+      chatActionHandle: null,
     }
     this.entries.set(chatId, entry)
+
+    // Fire-and-forget initial chat action so the Telegram header shows
+    // `typing…` immediately, not on the first pulse 4 s in.
+    void this.pulseChatAction(entry)
+    entry.chatActionHandle = this.setTimer(
+      () => this.chatActionTick(chatId, handle.messageId),
+      CHAT_ACTION_PULSE_MS,
+    )
 
     // Periodic tick — re-edit with advanced ellipsis (typing/thinking only)
     // or keep the same text for tool/stopped/error states. Same-text edits
@@ -301,5 +336,37 @@ export class StatusManager {
       this.clearTimer(entry.ttlHandle)
       entry.ttlHandle = null
     }
+    if (entry.chatActionHandle !== null) {
+      this.clearTimer(entry.chatActionHandle)
+      entry.chatActionHandle = null
+    }
+  }
+
+  // Send a single chat action for the entry's current state. Swallows
+  // errors — the header indicator is best-effort and a flaky call must
+  // not derail the message edit path or surface to the agent.
+  private async pulseChatAction(entry: InternalEntry): Promise<void> {
+    if (!this.telegramApi.sendChatAction) return
+    const action = chatActionFor(entry.state)
+    if (action === null) return
+    try {
+      await this.telegramApi.sendChatAction(entry.handle.chatId, action)
+    } catch (err) {
+      this.log.debug('sendChatAction failed (ignored)', {
+        chat_id: entry.handle.chatId,
+        action,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  private chatActionTick(chatId: string, messageId: number): void {
+    const live = this.entries.get(chatId)
+    if (!live || live.handle.messageId !== messageId) return
+    void this.pulseChatAction(live)
+    live.chatActionHandle = this.setTimer(
+      () => this.chatActionTick(chatId, messageId),
+      CHAT_ACTION_PULSE_MS,
+    )
   }
 }

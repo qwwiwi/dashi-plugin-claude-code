@@ -81,11 +81,12 @@ class FakeClock {
 }
 
 interface ApiCall {
-  kind: 'send' | 'edit' | 'delete'
+  kind: 'send' | 'edit' | 'delete' | 'chat_action'
   chatId: string
   messageId?: number
   text?: string
   opts?: unknown
+  action?: string
 }
 
 interface FakeApi {
@@ -116,6 +117,9 @@ function makeFakeApi(): FakeApi {
       state.calls.push({ kind: 'delete', chatId, messageId })
       if (state.failDeleteWith) throw state.failDeleteWith
     },
+    sendChatAction: async (chatId: string, action: string) => {
+      state.calls.push({ kind: 'chat_action', chatId, action })
+    },
   }
   return state
 }
@@ -141,8 +145,10 @@ describe('StatusManager.start', () => {
     const handle = await mgr.start('164795011', undefined)
     expect(handle.chatId).toBe('164795011')
     expect(handle.messageId).toBe(100)
-    expect(api.calls.length).toBe(1)
-    const sent = api.calls[0]!
+    // `sendChatAction` is also called immediately, so filter to the
+    // message-send subset before asserting length.
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(1)
+    const sent = api.calls.find((c) => c.kind === 'send')!
     expect(sent.kind).toBe('send')
     expect(sent.chatId).toBe('164795011')
     expect(sent.text).toContain('Печатает')
@@ -174,7 +180,7 @@ describe('StatusManager.start', () => {
     // album path leaks stale pulsing status messages.
     const { mgr, api } = makeManager()
     const firstHandle = await mgr.start('164795011', undefined)
-    expect(api.calls.length).toBe(1)
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(1)
     await mgr.start('164795011', undefined)
     const edits = api.calls.filter((c) => c.kind === 'edit')
     expect(edits.length).toBeGreaterThanOrEqual(1)
@@ -195,6 +201,32 @@ describe('StatusManager.start', () => {
     api.failEditWith = new Error('Bad Request: message is not modified')
     await mgr.start('164795011', undefined)
     expect(mgr.isActive('164795011')).toBe(true)
+  })
+
+  test('start fires a `typing` sendChatAction immediately and re-pulses on 4 s timer', async () => {
+    // The Telegram-native typing indicator (header animation) expires after
+    // ~5 s. StatusManager pulses it on a 4 s timer, with one immediate call
+    // on start() so the user sees the indicator without a 4 s delay.
+    const { mgr, clock, api } = makeManager()
+    await mgr.start('164795011', undefined)
+    const actions = api.calls.filter((c) => c.kind === 'chat_action')
+    expect(actions.length).toBe(1)
+    expect(actions[0]!.action).toBe('typing')
+    expect(actions[0]!.chatId).toBe('164795011')
+
+    // Advance just under the pulse window — no new action yet.
+    clock.advance(3999)
+    expect(api.calls.filter((c) => c.kind === 'chat_action').length).toBe(1)
+
+    // Cross the boundary — second pulse fires.
+    clock.advance(1)
+    expect(api.calls.filter((c) => c.kind === 'chat_action').length).toBe(2)
+
+    // After complete() the pulse must stop — no further calls even after
+    // multiple windows.
+    await mgr.complete('164795011')
+    clock.advance(20_000)
+    expect(api.calls.filter((c) => c.kind === 'chat_action').length).toBe(2)
   })
 })
 

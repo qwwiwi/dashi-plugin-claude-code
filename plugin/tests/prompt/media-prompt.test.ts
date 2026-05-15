@@ -249,6 +249,34 @@ describe('maybeTranscribeVoice', () => {
     expect(authHeader).toContain('Bearer ')
   })
 
+  test('normalizes .oga filename to .ogg before upload (Groq rejects .oga)', async () => {
+    let observedFilename = ''
+    const r = await maybeTranscribeVoice(
+      {
+        fileId: 'v',
+        size: 1000,
+        mime: 'audio/ogg',
+        downloadFile: async () => ({
+          path: '/tmp/1778868174636-AgADD5kAAr_COEg.oga',
+          size: 1000,
+          mime: 'audio/ogg',
+        }),
+        readFile: async () => new Uint8Array([1, 2, 3, 4]),
+        fetchImpl: (async (_url: string | URL, init?: RequestInit) => {
+          const body = init?.body as FormData
+          const file = body.get('file') as File
+          observedFilename = file.name
+          return new Response('ok transcript', { status: 200 })
+        }) as unknown as typeof fetch,
+      },
+      voiceConfig,
+      { GROQ_API_KEY: 'gsk_test_key' },
+    )
+    expect(r.status).toBe('ok')
+    expect(observedFilename).toMatch(/\.ogg$/)
+    expect(observedFilename).not.toMatch(/\.oga$/)
+  })
+
   test('returns failed on stubbed fetch error', async () => {
     const r = await maybeTranscribeVoice(
       {

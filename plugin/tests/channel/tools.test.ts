@@ -29,6 +29,9 @@ function makeStubApi(overrides: Partial<TelegramApi> = {}): TelegramApi {
     setMessageReaction: async (_chatId: string, _messageId: number, _emoji: string) => {
       /* noop */
     },
+    sendChatAction: async () => {
+      /* noop */
+    },
     sendDocument: async (_chatId: string, _filePath: string, _opts: SendDocumentOpts) => ({ message_id: 2 }),
     sendPhoto: async (_chatId: string, _filePath: string, _opts: SendDocumentOpts) => ({ message_id: 3 }),
     downloadFile: async (_fileId: string, destDir: string): Promise<DownloadResult> => ({

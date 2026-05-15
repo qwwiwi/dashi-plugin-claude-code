@@ -54,6 +54,7 @@ function makeTelegramApi(): TelegramApi {
     setMessageReaction: fail(
       'setMessageReaction',
     ) as TelegramApi['setMessageReaction'],
+    sendChatAction: fail('sendChatAction') as TelegramApi['sendChatAction'],
     sendDocument: fail('sendDocument') as TelegramApi['sendDocument'],
     sendPhoto: fail('sendPhoto') as TelegramApi['sendPhoto'],
     downloadFile: fail('downloadFile') as TelegramApi['downloadFile'],
