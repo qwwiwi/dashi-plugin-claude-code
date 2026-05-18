@@ -23,6 +23,7 @@ import type { TelegramApi } from '../channel/tools.js'
 import type { StatusManager } from '../status/status-manager.js'
 import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
 import { gateTelegramMessage, type GateInput } from './gate.js'
+import { isAddressedToBot } from './addressing.js'
 import {
   buildChannelContent,
   type BotIdentity,
@@ -392,6 +393,20 @@ export async function sendAlbumNotification(
 
 export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promise<void> {
   const text = ctx.message?.text ?? ''
+
+  // Auto-react 👀 on inbound — prince visibility signal, replaces typing indicator.
+  // ONLY for messages addressed to this bot (DM, @mention, or reply to bot).
+  // Without this gate the bot would react to every group message it sees.
+  if (isAddressedToBot(ctx)) {
+    try {
+      const _chatId = ctx.chat?.id
+      const _msgId = ctx.message?.message_id
+      if (_chatId !== undefined && _msgId !== undefined) {
+        await deps.telegramApi.setMessageReaction(String(_chatId), _msgId, '👀')
+      }
+    } catch (_e) { /* react best-effort */ }
+  }
+
   // Permission-text short-circuit. BEFORE the OOB check: when the sender is
   // an approver AND text matches `yes <id>` / `no <id>` AND that id is
   // currently pending, emit the verdict and DO NOT forward as a channel
