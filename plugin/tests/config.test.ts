@@ -79,7 +79,7 @@ describe('loadConfig', () => {
     const msg = `error connecting with TELEGRAM_BOT_TOKEN=${FAKE_TOKEN} oops`
     const out = redactToken(msg)
     expect(out).not.toContain(FAKE_TOKEN)
-    expect(out).toContain('<redacted>')
+    expect(out).toContain('[REDACTED]')
   })
 
   // Fix 4 — widened secret redaction.
@@ -87,14 +87,14 @@ describe('loadConfig', () => {
     const groq = 'gsk_' + 'A'.repeat(50)
     const out = redactToken(`groq error: GROQ_API_KEY=${groq} failed`)
     expect(out).not.toContain(groq)
-    expect(out).toContain('<redacted>')
+    expect(out).toContain('[REDACTED]')
   })
 
   test('redactToken masks Authorization: Bearer header value', () => {
     const bearer = 'abcdef1234567890ABCDEFGHIJK'
     const out = redactToken(`request failed with Authorization: Bearer ${bearer}`)
     expect(out).not.toContain(bearer)
-    expect(out).toContain('Bearer <redacted>')
+    expect(out).toContain('Bearer [REDACTED]')
   })
 
   test('redactToken masks ?token= and &access_token= query params', () => {
@@ -109,7 +109,7 @@ describe('loadConfig', () => {
     const webhook = 'wh_test_token_32_chars__________'
     const out = redactToken(`got header value ${webhook} in log`, [webhook])
     expect(out).not.toContain(webhook)
-    expect(out).toContain('<redacted>')
+    expect(out).toContain('[REDACTED]')
   })
 
   test('redactToken ignores empty / too-short caller secrets', () => {

@@ -41,6 +41,11 @@ const voiceConfig: AppConfig = {
     buffer_ttl_ms: 5 * 60 * 1000,
     buffer_max_entries: 100,
   },
+  progress: {
+    enabled: true,
+    edit_throttle_ms: 3000,
+    recent_buffer: 8,
+  },
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -340,7 +345,7 @@ describe('maybeTranscribeVoice', () => {
     expect(r.status).toBe('failed')
     expect(r.errorMessage).toBeDefined()
     expect(r.errorMessage).not.toContain(secret)
-    expect(r.errorMessage).toContain('<redacted>')
+    expect(r.errorMessage).toContain('[REDACTED]')
   })
 
   test('redacts GROQ_API_KEY from non-OK response body', async () => {

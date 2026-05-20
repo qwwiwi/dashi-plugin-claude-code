@@ -8,13 +8,14 @@
 
 import { describe, expect, test } from 'bun:test'
 import { redactSecrets } from '../../src/safety/redact.js'
+import { validateTelegramHtml } from '../../src/safety/html-validator.js'
 
 describe('redactSecrets — Telegram bot tokens', () => {
   test('masks Telegram bot token shape (digits:base64ish)', () => {
     const token = '123456789:AAH-fake_test_token_with_at_least_thirty_chars'
     const out = redactSecrets(`bot started with ${token}`)
     expect(out).not.toContain(token)
-    expect(out).toContain('<redacted>')
+    expect(out).toContain('[REDACTED]')
   })
 
   test('masks Telegram token embedded in a URL', () => {
@@ -29,7 +30,7 @@ describe('redactSecrets — provider API keys', () => {
     const key = 'gsk_' + 'A'.repeat(50)
     const out = redactSecrets(`GROQ_API_KEY=${key}`)
     expect(out).not.toContain(key)
-    expect(out).toContain('<redacted>')
+    expect(out).toContain('[REDACTED]')
   })
 
   test('masks OpenAI sk-… key', () => {
@@ -68,7 +69,7 @@ describe('redactSecrets — Bearer + query-string', () => {
     const tok = 'abcdef1234567890ABCDEFGHIJK'
     const out = redactSecrets(`Authorization: Bearer ${tok}`)
     expect(out).not.toContain(tok)
-    expect(out).toContain('Bearer <redacted>')
+    expect(out).toContain('Bearer [REDACTED]')
   })
 
   test('masks ?token=, &access_token=, ?api_key=', () => {
@@ -119,7 +120,7 @@ describe('redactSecrets — Firebase service-account JSON', () => {
     const json = '{"private_key":"-----BEGIN PRIVATE KEY-----\\nMIIE...REDACT_ME...IDAQAB\\n-----END PRIVATE KEY-----\\n"}'
     const out = redactSecrets(json)
     expect(out).toContain('"private_key"')
-    expect(out).toContain('"<redacted>"')
+    expect(out).toContain('"[REDACTED]"')
     expect(out).not.toContain('REDACT_ME')
   })
 
@@ -127,7 +128,7 @@ describe('redactSecrets — Firebase service-account JSON', () => {
     const json = '{"private_key_id":"abc123def456ghi789jkl012mno345pqr678stu"}'
     const out = redactSecrets(json)
     expect(out).toContain('"private_key_id"')
-    expect(out).toContain('"<redacted>"')
+    expect(out).toContain('"[REDACTED]"')
     expect(out).not.toContain('abc123def456')
   })
 
@@ -135,7 +136,7 @@ describe('redactSecrets — Firebase service-account JSON', () => {
     const json = '{"client_email":"sa-thrall@orgrimmar.iam.gserviceaccount.com"}'
     const out = redactSecrets(json)
     expect(out).toContain('"client_email"')
-    expect(out).toContain('"<redacted>"')
+    expect(out).toContain('"[REDACTED]"')
     expect(out).not.toContain('sa-thrall@orgrimmar')
   })
 })
@@ -154,7 +155,7 @@ describe('redactSecrets — generic long token + extras', () => {
     const webhook = 'wh_test_token_32_chars__________'
     const out = redactSecrets(`got header ${webhook} in log`, [webhook])
     expect(out).not.toContain(webhook)
-    expect(out).toContain('<redacted>')
+    expect(out).toContain('[REDACTED]')
   })
 
   test('ignores empty / too-short extras', () => {
@@ -199,5 +200,51 @@ describe('redactSecrets — idempotency', () => {
     const once = redactSecrets(input)
     const twice = redactSecrets(once)
     expect(twice).toBe(once)
+  })
+})
+
+describe('redactSecrets — HTML-neutral marker', () => {
+  // Codex L1: the canonical placeholder must not introduce angle brackets,
+  // because redacted output is then handed to the Telegram HTML validator.
+  // If the marker were '[REDACTED]', a perfectly valid <b>…</b> body would
+  // suddenly contain an unknown tag and trip the validator, downgrading
+  // the message to plain text.
+
+  test('marker contains no < or > characters', () => {
+    const out = redactSecrets('sk-proj-' + 'a'.repeat(40))
+    expect(out).not.toContain('<')
+    expect(out).not.toContain('>')
+    expect(out).toContain('[REDACTED]')
+  })
+
+  test('redacted body inside <b>…</b> still passes Telegram HTML validation', () => {
+    const tok = 'sk-proj-abc123def456ghi789jklmno'
+    const redacted = redactSecrets(`<b>${tok}</b>`)
+    // After redaction, the body is `<b>[REDACTED]</b>` — that must pass
+    // validation cleanly so the operator's bold-tag isn't wasted by a
+    // downgrade caused by the redactor's own marker.
+    const validated = validateTelegramHtml(redacted)
+    expect(validated.downgraded).toBe(false)
+  })
+
+  test('Bearer redaction preserves the prefix shape with the new marker', () => {
+    const tok = 'abcdefghijklmnopqrstuvwxyz1234'
+    const out = redactSecrets(`Authorization: Bearer ${tok}`)
+    expect(out).toContain('Bearer [REDACTED]')
+  })
+
+  test('Firebase JSON keys also use the new marker', () => {
+    const json = '{"private_key":"deadbeef"}'
+    const out = redactSecrets(json)
+    expect(out).toContain('"[REDACTED]"')
+    // Legacy '<redacted>' marker must be fully retired.
+    expect(out).not.toContain('<redacted>')
+  })
+
+  test('extras substring uses the new marker too', () => {
+    const webhook = 'wh_test_token_32_chars__________'
+    const out = redactSecrets(`got header ${webhook} in log`, [webhook])
+    expect(out).toContain('[REDACTED]')
+    expect(out).not.toContain('<redacted>')
   })
 })

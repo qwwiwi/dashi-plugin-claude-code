@@ -12,7 +12,7 @@
 // belongs in the constant below.
 //
 // The redactor is IDEMPOTENT: `redactSecrets(redactSecrets(x))` equals
-// `redactSecrets(x)` for every input. The `<redacted>` placeholder itself
+// `redactSecrets(x)` for every input. The `[REDACTED]` placeholder itself
 // contains no characters matched by any pattern (no digits, no slashes,
 // no ≥24-char run), so re-running cannot expand the mask. Tests pin this.
 
@@ -43,14 +43,14 @@ const RESEND_RE = /re_[A-Za-z0-9_]{20,}/g
 const SLACK_BOT_RE = /xoxb-[A-Za-z0-9-]+/g
 
 // Firebase service-account JSON fields: keep the key visible, replace the
-// value with `<redacted>`. Use a tight pattern that matches a JSON string
+// value with `[REDACTED]`. Use a tight pattern that matches a JSON string
 // value (`"…"`) only — we don't want to swallow trailing commas/braces.
 // The (\\.|[^"\\])* body permits escaped quotes/newlines inside the value
 // (Firebase keys have literal `\n` sequences in JSON).
 const FIREBASE_FIELDS = ['private_key', 'private_key_id', 'client_email']
 const FIREBASE_REs: RedactionRule[] = FIREBASE_FIELDS.map((field) => ({
   pattern: new RegExp(`("${field}"\\s*:\\s*)"(?:\\\\.|[^"\\\\])*"`, 'g'),
-  replacement: '$1"<redacted>"',
+  replacement: '$1"[REDACTED]"',
 }))
 
 // Authorization: Bearer <opaque> — preserve the "Bearer " prefix so the
@@ -102,9 +102,9 @@ function supabaseReplacer(host: string): string {
 }
 
 // Telegram bot token (mid-shape variant from activity-renderer.ts): emits
-// `NNN***:AA***` instead of `<redacted>` so the prefix shape stays visible.
+// `NNN***:AA***` instead of `[REDACTED]` so the prefix shape stays visible.
 // We keep this AFTER the canonical TELEGRAM_TOKEN_RE rule because the
-// canonical rule replaces the whole token with `<redacted>` — once that
+// canonical rule replaces the whole token with `[REDACTED]` — once that
 // fires, this regex no longer matches (no digits remain). Order ensures
 // idempotency.
 const TELEGRAM_TOKEN_PARTIAL_RE = /\b(\d{3})\d{7,}:(AA\w{2})\w+/g
@@ -119,18 +119,18 @@ const GENERIC_LONG_TOKEN_RE = /\b([A-Za-z0-9_-]{4})[A-Za-z0-9_-]{16,}([A-Za-z0-9
 
 const RULES: ReadonlyArray<RedactionRule> = [
   // 1. Provider tokens with anchored prefixes — most specific first.
-  { pattern: TELEGRAM_TOKEN_RE, replacement: '<redacted>' },
-  { pattern: GROQ_KEY_RE, replacement: '<redacted>' },
-  { pattern: OPENAI_PROJ_RE, replacement: '<redacted>' },
-  { pattern: OPENAI_RE, replacement: '<redacted>' },
-  { pattern: GITHUB_PAT_RE, replacement: '<redacted>' },
-  { pattern: RESEND_RE, replacement: '<redacted>' },
-  { pattern: SLACK_BOT_RE, replacement: '<redacted>' },
+  { pattern: TELEGRAM_TOKEN_RE, replacement: '[REDACTED]' },
+  { pattern: GROQ_KEY_RE, replacement: '[REDACTED]' },
+  { pattern: OPENAI_PROJ_RE, replacement: '[REDACTED]' },
+  { pattern: OPENAI_RE, replacement: '[REDACTED]' },
+  { pattern: GITHUB_PAT_RE, replacement: '[REDACTED]' },
+  { pattern: RESEND_RE, replacement: '[REDACTED]' },
+  { pattern: SLACK_BOT_RE, replacement: '[REDACTED]' },
   // 2. Firebase JSON fields — value replaced, key preserved.
   ...FIREBASE_REs,
   // 3. Auth header + query params — preserve prefix.
-  { pattern: BEARER_RE, replacement: '$1<redacted>' },
-  { pattern: QUERY_TOKEN_RE, replacement: '$1<redacted>' },
+  { pattern: BEARER_RE, replacement: '$1[REDACTED]' },
+  { pattern: QUERY_TOKEN_RE, replacement: '$1[REDACTED]' },
   // 4. IPv4 — middle-octet mask.
   { pattern: IPV4_RE, replacement: ipv4Replacer },
   // 5. Secret paths.
@@ -168,7 +168,7 @@ export function redactSecrets(
     for (const secret of extras) {
       if (!secret || secret.length < 4) continue
       const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      out = out.replace(new RegExp(escaped, 'g'), '<redacted>')
+      out = out.replace(new RegExp(escaped, 'g'), '[REDACTED]')
     }
   }
   for (const rule of RULES) {

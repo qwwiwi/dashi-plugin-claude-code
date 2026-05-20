@@ -74,7 +74,7 @@ describe('createSafeTelegramApi — secret redaction', () => {
     await safe.sendMessage('123', `oops token ${token} leaked`, {})
     expect(calls).toHaveLength(1)
     expect(calls[0]!.text).not.toContain(token)
-    expect(calls[0]!.text).toContain('<redacted>')
+    expect(calls[0]!.text).toContain('[REDACTED]')
   })
 
   test('redacts in editMessageText too', async () => {
@@ -227,7 +227,7 @@ describe('createSafeTelegramApi — inline keyboard redaction', () => {
     const sentMarkup = (calls[0]!.opts as SendMessageOpts).reply_markup
     const btn = sentMarkup!.inline_keyboard[0]![0]!
     expect(btn.text).not.toContain(tok)
-    expect(btn.text).toContain('<redacted>')
+    expect(btn.text).toContain('[REDACTED]')
   })
 
   test('extraSecrets also masked inside button url and text', async () => {

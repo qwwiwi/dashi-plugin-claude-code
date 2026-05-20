@@ -50,13 +50,15 @@ describe('maskSecrets', () => {
   })
 
   test('hard-redacts Bearer prefix token (regression: unified pipeline)', () => {
-    // Documents the post-PR-A1 behaviour: "Bearer <opaque>" → "Bearer <redacted>".
+    // Documents the post-PR-A1 behaviour: "Bearer <opaque>" → "Bearer [REDACTED]".
     // Legacy maskSecrets only had the generic long-token rule and would have
     // produced `abcd***wxyz`. Unified pipeline is strictly more aggressive.
     const tok = `abcd${'x'.repeat(20)}wxyz`
     const masked = maskSecrets(`bearer ${tok} ok`)
     expect(masked).not.toContain(tok)
-    expect(masked.toLowerCase()).toContain('bearer <redacted>')
+    // The redactor preserves the prefix label but the marker is upper-case
+    // [REDACTED]. Match on the casing the redactor produces.
+    expect(masked).toContain('bearer [REDACTED]')
   })
 
   test('does not mangle short identifiers', () => {
