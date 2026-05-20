@@ -13,19 +13,19 @@ describe('validateTelegramHtml — valid passes', () => {
   test('passes plain text untouched', () => {
     const r = validateTelegramHtml('hello world')
     expect(r.downgraded).toBe(false)
-    expect(r.html).toBe('hello world')
+    expect(r.text).toBe('hello world')
   })
 
   test('passes empty string', () => {
     const r = validateTelegramHtml('')
     expect(r.downgraded).toBe(false)
-    expect(r.html).toBe('')
+    expect(r.text).toBe('')
   })
 
   test('passes simple <b>bold</b>', () => {
     const r = validateTelegramHtml('<b>bold</b>')
     expect(r.downgraded).toBe(false)
-    expect(r.html).toBe('<b>bold</b>')
+    expect(r.text).toBe('<b>bold</b>')
   })
 
   test('passes nested <pre><code>…</code></pre>', () => {
@@ -63,9 +63,9 @@ describe('validateTelegramHtml — invalid downgrades', () => {
   test('unsupported <script> tag → downgrade + escape', () => {
     const r = validateTelegramHtml('<script>alert(1)</script>')
     expect(r.downgraded).toBe(true)
-    expect(r.html).not.toContain('<script>')
+    expect(r.text).not.toContain('<script>')
     // Body must be HTML-escaped so the literal `<script>` lands as &lt;script&gt;.
-    expect(r.html).toContain('&lt;script&gt;')
+    expect(r.text).toContain('&lt;script&gt;')
   })
 
   test('unsupported <div> downgrades', () => {
@@ -102,10 +102,10 @@ describe('validateTelegramHtml — invalid downgrades', () => {
     const r = validateTelegramHtml('<script>1 < 2 & 3 > 0</script>')
     expect(r.downgraded).toBe(true)
     // No tag survives, ampersand/lt/gt all escaped.
-    expect(r.html).not.toMatch(/<[a-zA-Z]/)
-    expect(r.html).toContain('&amp;')
-    expect(r.html).toContain('&lt;')
-    expect(r.html).toContain('&gt;')
+    expect(r.text).not.toMatch(/<[a-zA-Z]/)
+    expect(r.text).toContain('&amp;')
+    expect(r.text).toContain('&lt;')
+    expect(r.text).toContain('&gt;')
   })
 
   test('never throws on malformed input', () => {
@@ -181,7 +181,7 @@ describe('validateTelegramHtml — per-tag attribute allowlist', () => {
     const r = validateTelegramHtml('<b attr="</b>">x</b>')
     expect(r.downgraded).toBe(true)
     // No HTML escape leak — must escape literal '<' in downgraded body.
-    expect(r.html).not.toMatch(/<b[^a-z]/i)
+    expect(r.text).not.toMatch(/<b[^a-z]/i)
   })
 
   test('reasons NEVER include attribute VALUES, hrefs, or input fragments', () => {

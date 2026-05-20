@@ -106,9 +106,9 @@ export function createSafeTelegramApi(
       // ctx — even after redaction it may carry sensitive context the
       // caller didn't whitelist.
       log.warn('telegram html downgrade', { reason: validated.reason ?? 'unknown' })
-      return { text: validated.html, parseMode: undefined }
+      return { text: validated.text, parseMode: undefined }
     }
-    return { text: validated.html, parseMode }
+    return { text: validated.text, parseMode }
   }
 
   return {

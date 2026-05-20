@@ -16,7 +16,10 @@
 // contains no characters matched by any pattern (no digits, no slashes,
 // no ≥24-char run), so re-running cannot expand the mask. Tests pin this.
 
-export interface RedactionRule {
+// Internal rule shape — kept unexported because no caller outside this
+// module composes rules dynamically. If a future caller needs to inject
+// a custom rule, expose this then.
+interface RedactionRule {
   pattern: RegExp
   replacement: string | ((match: string, ...groups: string[]) => string)
 }

@@ -81,7 +81,13 @@ const TAG_ATTR_ALLOWLIST: ReadonlyMap<string, ReadonlySet<string>> = new Map([
 ])
 
 export interface ValidatedHtml {
-  html: string
+  /**
+   * Output text destined for Telegram. When `downgraded` is false, this is
+   * the validated HTML (echoed from the input). When `downgraded` is true,
+   * this is the HTML-escaped body that should ship WITHOUT `parse_mode`,
+   * which is why the field is named `text` rather than `html`.
+   */
+  text: string
   downgraded: boolean
   reason?: string
 }
@@ -274,7 +280,7 @@ function downgrade(input: string, reason: string): ValidatedHtml {
   // The downgrade is meant to ship plain text via Telegram WITHOUT
   // parse_mode, so escaping ensures no entity is re-interpreted later.
   return {
-    html: escapeHtml(input),
+    text: escapeHtml(input),
     downgraded: true,
     reason,
   }
@@ -283,7 +289,7 @@ function downgrade(input: string, reason: string): ValidatedHtml {
 export function validateTelegramHtml(input: string): ValidatedHtml {
   // Empty input is trivially valid.
   if (input.length === 0) {
-    return { html: input, downgraded: false }
+    return { text: input, downgraded: false }
   }
 
   // Tokenize first — the quote-aware walker reports an unclosed `<` by
@@ -361,5 +367,5 @@ export function validateTelegramHtml(input: string): ValidatedHtml {
     return downgrade(input, `unclosed tag <${stack[stack.length - 1]}>`)
   }
 
-  return { html: input, downgraded: false }
+  return { text: input, downgraded: false }
 }
