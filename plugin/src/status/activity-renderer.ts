@@ -6,6 +6,7 @@
 // only public exits are pre-masked strings.
 
 import { escapeHtml } from '../format/html.js'
+import { redactSecrets } from '../safety/redact.js'
 
 // gateway.py:1476-1487 — mirrors SUBAGENT_LABELS.
 const SUBAGENT_LABELS: Record<string, string> = {
@@ -55,61 +56,20 @@ function basename(rawPath: string): string {
 
 /**
  * Mask IPs, secret paths, long tokens, Telegram bot tokens, Supabase hosts.
- * Port of `_mask_secrets` from gateway.py:1539-1563. Order matters — the
- * generic long-token rule would chew through IPs and Supabase hosts if it
- * ran first.
+ *
+ * Thin wrapper over the unified `redactSecrets` (src/safety/redact.ts).
+ * The legacy rule set (IPv4 mid-octet, ~/.foo/secrets/<file>, anchored
+ * `secrets/<file>`, generic ≥24-char token, partial Telegram token shape,
+ * Supabase host) is preserved verbatim in `redactSecrets`; the unified
+ * module adds further provider patterns (sk-, ghp_, re_, xoxb-, Resend,
+ * Slack, Firebase JSON) which are strict supersets of what activity
+ * lines might contain — they cannot expand or relax the legacy output.
+ *
+ * The function name is kept for back-compat with status-manager.ts and
+ * downstream tests.
  */
 export function maskSecrets(input: string): string {
-  let s = input
-  // IPv4 — keep first/last octet so debugging stays possible. Loopback
-  // (`127.*`) and `0.*` placeholders are pure debug noise, never secrets;
-  // masking them just hurts operator readability (review M3).
-  s = s.replace(
-    /\b(\d{1,3})\.\d{1,3}\.\d{1,3}\.(\d{1,3})\b/g,
-    (full, first: string, last: string) => {
-      if (first === '127' || first === '0') return full
-      return `${first}.***.***.${last}`
-    },
-  )
-  // `localhost` / `::1` literals are also debug-friendly; leave untouched.
-  // (Regex above already skips them — IPv6 ::1 and the literal string
-  // `localhost` don't match the IPv4 pattern.)
-  // Secret paths under ~/.foo/secrets/...  (legacy tilde-anchored form)
-  s = s.replace(/(~\/?\.\w+\/)secrets\/\S+/g, '$1secrets/***')
-  // Anchored `secrets/<file>` — catches summarized last-two-segments output
-  // (e.g. `/Users/x/.claude-lab/silvana/secrets/openviking.key` collapses to
-  // `secrets/openviking.key`). Without this the secret filename slips
-  // through summarize → render. Pattern matches at string start or after a
-  // path separator so unrelated occurrences (`my-secrets/x`) are unaffected.
-  s = s.replace(/(^|[\s/])secrets\/\S+/g, '$1secrets/***')
-  // Generic long tokens (≥24 chars of [A-Za-z0-9_-]).
-  s = s.replace(
-    /\b([A-Za-z0-9_-]{4})[A-Za-z0-9_-]{16,}([A-Za-z0-9_-]{4})\b/g,
-    '$1***$2',
-  )
-  // Telegram bot tokens: NNN…:AAxx… → NNN***:AA***
-  s = s.replace(
-    /\b(\d{3})\d{7,}:(AA\w{2})\w+/g,
-    '$1***:$2***',
-  )
-  // Supabase host: <projectid>.supabase.co — mask the project id segment.
-  s = s.replace(/[a-z0-9]{10,}\.supabase\.co/g, (host) => {
-    const parts = host.split('.')
-    if (parts.length === 0) return host
-    const first = parts[0] ?? ''
-    if (first.length > 8) {
-      parts[0] = `${first.slice(0, 4)}*****${first.slice(-4)}`
-    }
-    if (parts.length > 1) {
-      const idx = parts.length - 2
-      const seg = parts[idx] ?? ''
-      if (seg.length > 5) {
-        parts[idx] = `${seg.slice(0, 4)}***`
-      }
-    }
-    return parts.join('.')
-  })
-  return s
+  return redactSecrets(input)
 }
 
 // ─────────────────────────────────────────────────────────────────────
