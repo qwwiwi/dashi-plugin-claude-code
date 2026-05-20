@@ -167,7 +167,7 @@ function maybeTriggerWatcher(ctx: Context, deps: HandlerDeps): void {
   const msgId = ctx.message?.message_id
   if (chatNum === undefined || msgId === undefined) return
   void deps.watcher
-    .maybeAutoReply({ chatId: String(chatNum), messageId: msgId, text: '' })
+    .maybeAutoReply({ chatId: String(chatNum), messageId: msgId })
     .catch((err) => {
       deps.log.warn('watcher auto-reply error (ignored)', {
         chat_id: String(chatNum),

@@ -48,7 +48,6 @@ export interface WatcherDeps {
 export interface AutoReplyInput {
   readonly chatId: string
   readonly messageId: number
-  readonly text: string
 }
 
 export type AutoReplyResult =

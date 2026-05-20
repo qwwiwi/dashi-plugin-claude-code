@@ -160,7 +160,7 @@ describe('InboundWatcher', () => {
     const { watcher, api } = makeWatcher({
       progress: makeFakeProgress({ busy: false }),
     })
-    const res = await watcher.maybeAutoReply({ chatId: '111', messageId: 42, text: 'hi' })
+    const res = await watcher.maybeAutoReply({ chatId: '111', messageId: 42 })
     expect(res).toEqual({ replied: false, reason: 'not-busy' })
     expect(api.calls.length).toBe(0)
   })
@@ -169,7 +169,7 @@ describe('InboundWatcher', () => {
     const { watcher, api } = makeWatcher({
       progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
     })
-    const res = await watcher.maybeAutoReply({ chatId: '111', messageId: 42, text: 'hi' })
+    const res = await watcher.maybeAutoReply({ chatId: '111', messageId: 42 })
     expect(res).toEqual({ replied: true })
     expect(api.calls.length).toBe(1)
     expect(api.calls[0]!.chatId).toBe('111')
@@ -182,11 +182,11 @@ describe('InboundWatcher', () => {
     const { watcher, api, clock } = makeWatcher({
       progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
     })
-    const first = await watcher.maybeAutoReply({ chatId: '111', messageId: 42, text: 'hi' })
+    const first = await watcher.maybeAutoReply({ chatId: '111', messageId: 42 })
     expect(first).toEqual({ replied: true })
 
     clock.advance(5000) // < 10_000 debounce
-    const second = await watcher.maybeAutoReply({ chatId: '111', messageId: 43, text: 'hello again' })
+    const second = await watcher.maybeAutoReply({ chatId: '111', messageId: 43 })
     expect(second).toEqual({ replied: false, reason: 'debounced' })
     expect(api.calls.length).toBe(1)
   })
@@ -195,9 +195,9 @@ describe('InboundWatcher', () => {
     const { watcher, api, clock } = makeWatcher({
       progress: makeFakeProgress({ busy: true, toolName: 'Read' }),
     })
-    await watcher.maybeAutoReply({ chatId: '111', messageId: 42, text: 'hi' })
+    await watcher.maybeAutoReply({ chatId: '111', messageId: 42 })
     clock.advance(10_001)
-    const res = await watcher.maybeAutoReply({ chatId: '111', messageId: 43, text: 'still there?' })
+    const res = await watcher.maybeAutoReply({ chatId: '111', messageId: 43 })
     expect(res).toEqual({ replied: true })
     expect(api.calls.length).toBe(2)
   })
@@ -207,7 +207,7 @@ describe('InboundWatcher', () => {
       config: makeConfig({ enabled: false }),
       progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
     })
-    const res = await watcher.maybeAutoReply({ chatId: '111', messageId: 42, text: 'hi' })
+    const res = await watcher.maybeAutoReply({ chatId: '111', messageId: 42 })
     expect(res).toEqual({ replied: false, reason: 'disabled' })
     expect(api.calls.length).toBe(0)
   })
@@ -219,7 +219,7 @@ describe('InboundWatcher', () => {
       api,
       progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
     })
-    const res = await watcher.maybeAutoReply({ chatId: '111', messageId: 42, text: 'hi' })
+    const res = await watcher.maybeAutoReply({ chatId: '111', messageId: 42 })
     expect(res).toEqual({ replied: false, reason: 'send-failed' })
 
     // Recovery: next call within debounce window must STILL retry, because
@@ -227,7 +227,7 @@ describe('InboundWatcher', () => {
     // (`undefined`, since this was the very first attempt for the chat).
     delete api.failSendWith
     clock.advance(100)
-    const second = await watcher.maybeAutoReply({ chatId: '111', messageId: 43, text: 'retry' })
+    const second = await watcher.maybeAutoReply({ chatId: '111', messageId: 43 })
     expect(second).toEqual({ replied: true })
   })
 
@@ -238,19 +238,19 @@ describe('InboundWatcher', () => {
       progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
     })
     // First call succeeds — establishes lastReplyMs.
-    const first = await watcher.maybeAutoReply({ chatId: '111', messageId: 1, text: 'a' })
+    const first = await watcher.maybeAutoReply({ chatId: '111', messageId: 1 })
     expect(first).toEqual({ replied: true })
     // Advance past the debounce window so the next call would otherwise pass.
     clock.advance(15_000)
     // Second call fails — marker must NOT advance to the failed-call time,
     // it must stay at the timestamp of the prior successful send.
     api.failSendWith = new Error('telegram down')
-    const second = await watcher.maybeAutoReply({ chatId: '111', messageId: 2, text: 'b' })
+    const second = await watcher.maybeAutoReply({ chatId: '111', messageId: 2 })
     expect(second).toEqual({ replied: false, reason: 'send-failed' })
     // Recovery: a third call right after the failure should succeed (the
     // previous successful send is now ~15s old, past the 10s debounce).
     delete api.failSendWith
-    const third = await watcher.maybeAutoReply({ chatId: '111', messageId: 3, text: 'c' })
+    const third = await watcher.maybeAutoReply({ chatId: '111', messageId: 3 })
     expect(third).toEqual({ replied: true })
     // Sanity: api recorded two successful sends.
     expect(api.calls.length).toBe(2)
@@ -288,12 +288,12 @@ describe('InboundWatcher', () => {
     const [r1, r2] = await Promise.all([
       // Kick the parked send.
       watcher
-        .maybeAutoReply({ chatId: 'X', messageId: 1, text: 'a' })
+        .maybeAutoReply({ chatId: 'X', messageId: 1 })
         .finally(() => undefined),
       // Stage the second call in the same tick. Microtask ordering: r2
       // schedules synchronously before the parked send resolves.
       (async () => {
-        const res = await watcher.maybeAutoReply({ chatId: 'X', messageId: 2, text: 'b' })
+        const res = await watcher.maybeAutoReply({ chatId: 'X', messageId: 2 })
         // Release the parked send only after the second result is observed,
         // proving the second call short-circuited without waiting on Telegram.
         resolveSend?.()
@@ -309,12 +309,12 @@ describe('InboundWatcher', () => {
     const { watcher, api, clock } = makeWatcher({
       progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
     })
-    const first = await watcher.maybeAutoReply({ chatId: '111', messageId: 1, text: 'a' })
+    const first = await watcher.maybeAutoReply({ chatId: '111', messageId: 1 })
     expect(first).toEqual({ replied: true })
     // Within debounce window → would normally be blocked.
     clock.advance(100)
     watcher.clearDebounce('111')
-    const second = await watcher.maybeAutoReply({ chatId: '111', messageId: 2, text: 'b' })
+    const second = await watcher.maybeAutoReply({ chatId: '111', messageId: 2 })
     expect(second).toEqual({ replied: true })
     expect(api.calls.length).toBe(2)
   })
@@ -323,7 +323,7 @@ describe('InboundWatcher', () => {
     const { watcher, api } = makeWatcher({
       progress: makeFakeProgress({ busy: true, toolName: '<Bash>&"evil"' }),
     })
-    await watcher.maybeAutoReply({ chatId: '111', messageId: 42, text: 'hi' })
+    await watcher.maybeAutoReply({ chatId: '111', messageId: 42 })
     expect(api.calls[0]!.text).not.toContain('<Bash>')
     expect(api.calls[0]!.text).toContain('&lt;Bash&gt;')
     expect(api.calls[0]!.text).toContain('&amp;')
@@ -334,8 +334,8 @@ describe('InboundWatcher', () => {
     const { watcher, api } = makeWatcher({
       progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
     })
-    const a = await watcher.maybeAutoReply({ chatId: 'A', messageId: 42, text: 'hi' })
-    const b = await watcher.maybeAutoReply({ chatId: 'B', messageId: 99, text: 'hello' })
+    const a = await watcher.maybeAutoReply({ chatId: 'A', messageId: 42 })
+    const b = await watcher.maybeAutoReply({ chatId: 'B', messageId: 99 })
     expect(a).toEqual({ replied: true })
     expect(b).toEqual({ replied: true })
     expect(api.calls.length).toBe(2)
