@@ -41,6 +41,7 @@ import {
   handleOobCommand,
   parseOobCommand,
   type OobContext,
+  type TmuxMirrorControl,
 } from '../commands/oob.js'
 import {
   isPermissionApprover,
@@ -111,6 +112,10 @@ export interface HandlerDeps {
   // AFTER OOB resolution and BEFORE gateAndNotify: OOB still wins, and
   // Claude still receives the channel notification regardless.
   watcher?: InboundWatcher
+  // TmuxMirror control surface, used by /mirror OOB command. Optional —
+  // when tmux_mirror.enabled=false at startup the mirror instance is
+  // never created and the OOB handler replies «disabled in config».
+  tmuxMirror?: TmuxMirrorControl
 }
 
 // Coerce grammY's reply_to_message Message shape into the narrower
@@ -536,6 +541,7 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
               },
             }
           : {}),
+        ...(deps.tmuxMirror ? { tmuxMirror: deps.tmuxMirror } : {}),
       }
       const result = await handleOobCommand(parsed, oobCtx)
       await executeOobResult(result, oobCtx, deps.server)

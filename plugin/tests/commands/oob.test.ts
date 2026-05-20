@@ -258,3 +258,125 @@ describe('handleOobCommand', () => {
     expect(result.replyToTelegram!.text).toContain('force')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// /mirror — toggles the TmuxMirror; falls back to «disabled» when no
+// mirror instance is wired into the context. Subactions: on / off /
+// status (default).
+// ─────────────────────────────────────────────────────────────────────
+
+function makeFakeMirror(): {
+  control: NonNullable<OobContext['tmuxMirror']>
+  log: { start: number; stop: number }
+  state: { enabled: boolean; messageId?: number; lastPollAt?: number; lastError?: string }
+} {
+  const log = { start: 0, stop: 0 }
+  const state: {
+    enabled: boolean
+    messageId?: number
+    lastPollAt?: number
+    lastError?: string
+  } = { enabled: false }
+  const control: NonNullable<OobContext['tmuxMirror']> = {
+    async start() {
+      log.start += 1
+      state.enabled = true
+      state.messageId = 999
+      state.lastPollAt = Date.now()
+    },
+    async stop() {
+      log.stop += 1
+      state.enabled = false
+      delete state.messageId
+    },
+    status() {
+      const out: ReturnType<NonNullable<OobContext['tmuxMirror']>['status']> = {
+        enabled: state.enabled,
+      }
+      if (state.messageId !== undefined) out.messageId = state.messageId
+      if (state.lastPollAt !== undefined) out.lastPollAt = state.lastPollAt
+      if (state.lastError !== undefined) out.lastError = state.lastError
+      return out
+    },
+  }
+  return { control, log, state }
+}
+
+describe('/mirror command', () => {
+  test('/mirror parses with no args', () => {
+    const r = parseOobCommand('/mirror')
+    expect(r).not.toBeNull()
+    expect(r!.name).toBe('mirror')
+    expect(r!.args).toBe('')
+  })
+
+  test('/mirror on parses with args=on', () => {
+    const r = parseOobCommand('/mirror on')
+    expect(r!.name).toBe('mirror')
+    expect(r!.args).toBe('on')
+  })
+
+  test('/mirror without configured mirror replies «disabled in config»', async () => {
+    const parsed = parseOobCommand('/mirror status')!
+    const result = await handleOobCommand(parsed, makeCtx())
+    expect(result.command).toBe('mirror')
+    expect(result.replyToTelegram!.text).toContain('disabled in config')
+    expect(result.notifyChannel).toBeUndefined()
+  })
+
+  test('/mirror on calls start() and reports on', async () => {
+    const mirror = makeFakeMirror()
+    const parsed = parseOobCommand('/mirror on')!
+    const result = await handleOobCommand(parsed, makeCtx({ tmuxMirror: mirror.control }))
+    expect(mirror.log.start).toBe(1)
+    expect(result.replyToTelegram!.text).toContain('on')
+    expect(result.notifyChannel).toBeUndefined()
+  })
+
+  test('/mirror off calls stop() and reports off', async () => {
+    const mirror = makeFakeMirror()
+    // start first so stop has work to do.
+    await mirror.control.start()
+    const parsed = parseOobCommand('/mirror off')!
+    const result = await handleOobCommand(parsed, makeCtx({ tmuxMirror: mirror.control }))
+    expect(mirror.log.stop).toBe(1)
+    expect(result.replyToTelegram!.text).toContain('off')
+  })
+
+  test('/mirror status reports enabled + message_id when active', async () => {
+    const mirror = makeFakeMirror()
+    await mirror.control.start()
+    const parsed = parseOobCommand('/mirror status')!
+    const result = await handleOobCommand(parsed, makeCtx({ tmuxMirror: mirror.control }))
+    const text = result.replyToTelegram!.text
+    expect(text).toContain('mirror status')
+    expect(text).toContain('on')
+    expect(text).toContain('999') // messageId
+  })
+
+  test('/mirror with unknown sub-action shows usage hint', async () => {
+    const mirror = makeFakeMirror()
+    const parsed = parseOobCommand('/mirror blabla')!
+    const result = await handleOobCommand(parsed, makeCtx({ tmuxMirror: mirror.control }))
+    expect(result.replyToTelegram!.text).toContain('usage:')
+  })
+
+  test('/mirror on swallows start() throws without crashing handler', async () => {
+    const failingMirror: NonNullable<OobContext['tmuxMirror']> = {
+      async start() {
+        throw new Error('boom')
+      },
+      async stop() {
+        /* no-op */
+      },
+      status() {
+        return { enabled: false }
+      },
+    }
+    const parsed = parseOobCommand('/mirror on')!
+    // Must NOT throw.
+    const result = await handleOobCommand(parsed, makeCtx({ tmuxMirror: failingMirror }))
+    expect(result.command).toBe('mirror')
+    expect(result.replyToTelegram!.text).toContain('on')
+  })
+})

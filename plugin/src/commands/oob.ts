@@ -30,7 +30,7 @@ import type { TelegramApi } from '../channel/tools.js'
 import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 
-export type OobCommandName = 'help' | 'status' | 'stop' | 'reset' | 'new'
+export type OobCommandName = 'help' | 'status' | 'stop' | 'reset' | 'new' | 'mirror'
 
 const KNOWN_COMMANDS = new Set<OobCommandName>([
   'help',
@@ -38,7 +38,12 @@ const KNOWN_COMMANDS = new Set<OobCommandName>([
   'stop',
   'reset',
   'new',
+  'mirror',
 ])
+
+// Sub-actions for /mirror. We accept the bare command (= same as `status`),
+// plus on/off/status explicit args. Unknown sub-actions render the help line.
+export type MirrorAction = 'on' | 'off' | 'status'
 
 export interface ParsedOobCommand {
   name: OobCommandName
@@ -92,6 +97,19 @@ export function parseOobCommand(
 // Handler context and result shape.
 // ─────────────────────────────────────────────────────────────────────
 
+// Minimal surface of TmuxMirror that the OOB layer needs. Decoupled from
+// the concrete class so tests don't need to spin up the full mirror.
+export interface TmuxMirrorControl {
+  start(): Promise<void>
+  stop(): Promise<void>
+  status(): {
+    enabled: boolean
+    messageId?: number
+    lastError?: string
+    lastPollAt?: number
+  }
+}
+
 export interface OobContext {
   chatId: string
   senderId: string
@@ -106,6 +124,9 @@ export interface OobContext {
     cancel: (chatId: string, reason: string) => Promise<void>
   }
   webhookStatus?: () => { enabled: boolean; port: number }
+  // /mirror control — undefined when tmux_mirror.enabled=false at startup.
+  // The handler then replies «mirror disabled in config».
+  tmuxMirror?: TmuxMirrorControl
   // Identity bits surfaced by /status.
   botId?: number
   stateDir?: string
@@ -130,11 +151,27 @@ function helpText(): string {
     + '<code>/status</code> — plugin and session snapshot\n'
     + '<code>/stop</code> — request Claude to halt current task\n'
     + '<code>/reset force</code> — drop session state (confirm with <code>force</code>)\n'
-    + '<code>/new force</code> — start a fresh session (confirm with <code>force</code>)\n\n'
+    + '<code>/new force</code> — start a fresh session (confirm with <code>force</code>)\n'
+    + '<code>/mirror on|off|status</code> — toggle the rolling tmux mirror\n\n'
     + '<i>note: /stop is best-effort — the plugin signals Claude through '
     + 'the channel, but cannot guarantee interruption mid-tool-call.</i>'
   )
 }
+
+// Public so server.ts can feed the SAME list to bot.api.setMyCommands and
+// Telegram autocomplete stays in sync with what the parser actually accepts.
+export interface BotCommandSpec {
+  command: string
+  description: string
+}
+export const BOT_COMMANDS: ReadonlyArray<BotCommandSpec> = [
+  { command: 'help', description: 'this help' },
+  { command: 'status', description: 'plugin + session snapshot' },
+  { command: 'stop', description: 'ask Claude to halt' },
+  { command: 'reset', description: 'drop session (force)' },
+  { command: 'new', description: 'fresh session (force)' },
+  { command: 'mirror', description: 'tmux mirror: on | off | status' },
+]
 
 function statusText(ctx: OobContext): string {
   const lines: string[] = ['<b>status</b>']
@@ -286,6 +323,85 @@ export async function handleOobCommand(
           parseMode: 'HTML',
         },
         notifyChannel: { content: '/new force', meta: baseMeta },
+      }
+    }
+
+    case 'mirror': {
+      // Sub-action lives in `args`. Empty args → behave like `status`.
+      const action = parsed.args.trim().toLowerCase()
+      const mirror = ctx.tmuxMirror
+      if (!mirror) {
+        return {
+          handled: true,
+          command: 'mirror',
+          replyToTelegram: {
+            text:
+              '<b>mirror</b> — disabled in config\n\n'
+              + 'Set <code>tmux_mirror.enabled = true</code> и рестартить плагин.',
+            parseMode: 'HTML',
+          },
+        }
+      }
+      if (action === 'on') {
+        ctx.log.info('oob /mirror on', { chat_id: ctx.chatId })
+        try {
+          await mirror.start()
+        } catch (err) {
+          ctx.log.warn('oob /mirror on start failed', {
+            chat_id: ctx.chatId,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        }
+        return {
+          handled: true,
+          command: 'mirror',
+          replyToTelegram: {
+            text: '<b>mirror</b> — <code>on</code>',
+            parseMode: 'HTML',
+          },
+        }
+      }
+      if (action === 'off') {
+        ctx.log.info('oob /mirror off', { chat_id: ctx.chatId })
+        try {
+          await mirror.stop()
+        } catch (err) {
+          ctx.log.warn('oob /mirror off stop failed', {
+            chat_id: ctx.chatId,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        }
+        return {
+          handled: true,
+          command: 'mirror',
+          replyToTelegram: {
+            text: '<b>mirror</b> — <code>off</code>',
+            parseMode: 'HTML',
+          },
+        }
+      }
+      // Default / explicit `status` — read-only snapshot.
+      const s = mirror.status()
+      const lines = [
+        '<b>mirror status</b>',
+        `enabled: <code>${s.enabled ? 'on' : 'off'}</code>`,
+      ]
+      if (s.messageId !== undefined) lines.push(`message_id: <code>${s.messageId}</code>`)
+      if (s.lastPollAt !== undefined) {
+        const age = Math.max(0, Math.floor((Date.now() - s.lastPollAt) / 1000))
+        lines.push(`last poll: <code>${age}s ago</code>`)
+      }
+      if (s.lastError) lines.push(`last error: <code>${s.lastError.slice(0, 200)}</code>`)
+      if (action !== '' && action !== 'status') {
+        lines.push('', '<i>usage: /mirror on | off | status</i>')
+      }
+      return {
+        handled: true,
+        command: 'mirror',
+        replyToTelegram: {
+          text: lines.join('\n'),
+          parseMode: 'HTML',
+        },
       }
     }
   }

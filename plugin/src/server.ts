@@ -54,6 +54,7 @@ import {
   type PermissionDeps,
 } from './channel/permissions.js'
 import { TelegramPoller, tokenLock } from './telegram/poller.js'
+import { BOT_COMMANDS } from './commands/oob.js'
 import { startWebhookServer, type WebhookServerHandle } from './webhook/server.js'
 import {
   handleInboundAudio,
@@ -473,6 +474,8 @@ const handlerDeps: HandlerDeps = {
   statusManager,
   albumBuffer,
   watcher: inboundWatcher,
+  // Optional /mirror control surface — undefined when tmux_mirror.enabled=false.
+  ...(tmuxMirror !== null ? { tmuxMirror } : {}),
 }
 
 bot.on('message:text', ctx => handleInboundText(ctx, handlerDeps))
@@ -641,6 +644,22 @@ poller = new TelegramPoller({
     await bot.handleUpdate(update)
   },
 })
+
+// Register the OOB command list with Telegram so they appear in the
+// client autocomplete («/» prefix in chat). Best-effort: a failure here
+// (no internet, token revoked) must not block the poller from starting.
+void (async () => {
+  try {
+    await bot.api.setMyCommands(
+      BOT_COMMANDS.map((c) => ({ command: c.command, description: c.description })),
+    )
+    log.info('telegram commands registered', { count: BOT_COMMANDS.length })
+  } catch (err) {
+    log.warn('setMyCommands failed (ignored)', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+})()
 
 void (async () => {
   try {
