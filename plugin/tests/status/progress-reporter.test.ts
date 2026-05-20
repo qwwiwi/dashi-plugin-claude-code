@@ -452,6 +452,63 @@ describe('ProgressReporter', () => {
     expect(sends[0]!.text).not.toContain('XXXXXXXX')
   })
 
+  // ───────────────────────────────────────────────────────────────────
+  // Public read API for the watcher (PR-A3 prerequisite).
+  // ───────────────────────────────────────────────────────────────────
+
+  test('isBusy returns false for an unknown chat', () => {
+    const { reporter } = makeReporter()
+    expect(reporter.isBusy('unknown-chat')).toBe(false)
+  })
+
+  test('isBusy returns true within busy_threshold_ms after a tool_start', async () => {
+    const { reporter, clock } = makeReporter()
+    await reporter.recordEvent('chat-busy', bashStart('t1'))
+    // Default busy_threshold_ms is 30_000 — at t+10ms we must still be busy.
+    clock.advance(10)
+    expect(reporter.isBusy('chat-busy')).toBe(true)
+  })
+
+  test('isBusy returns false after busy_threshold_ms with no further activity', async () => {
+    const { reporter, clock } = makeReporter()
+    await reporter.recordEvent('chat-cooling', bashStart('t1'))
+    // Default threshold = 30_000ms — at t+30_001ms we must look idle.
+    clock.advance(30_001)
+    expect(reporter.isBusy('chat-cooling')).toBe(false)
+  })
+
+  test('isBusy returns false after session_stop even within the threshold', async () => {
+    const { reporter, clock } = makeReporter()
+    await reporter.recordEvent('chat-stopping', bashStart('t1'))
+    clock.advance(100)
+    await reporter.recordEvent('chat-stopping', STOP)
+    // Entry is fully evicted on stop — same observable outcome as a
+    // never-seen chat.
+    expect(reporter.isBusy('chat-stopping')).toBe(false)
+  })
+
+  test('isBusy accepts an explicit threshold override', async () => {
+    const { reporter, clock } = makeReporter()
+    await reporter.recordEvent('chat-tight', bashStart('t1'))
+    clock.advance(100)
+    // Override to 50ms; we are at t+100, so the chat is past the override.
+    expect(reporter.isBusy('chat-tight', 50)).toBe(false)
+    // Default 30s still considers it busy.
+    expect(reporter.isBusy('chat-tight')).toBe(true)
+  })
+
+  test('getActiveToolName returns the most recent tool', async () => {
+    const { reporter } = makeReporter()
+    await reporter.recordEvent('chat-tools', bashStart('t1'))
+    await reporter.recordEvent('chat-tools', readStart('t2'))
+    expect(reporter.getActiveToolName('chat-tools')).toBe('Read')
+  })
+
+  test('getActiveToolName returns undefined when no entry exists', () => {
+    const { reporter } = makeReporter()
+    expect(reporter.getActiveToolName('nobody')).toBeUndefined()
+  })
+
   test('editMessageText failure is swallowed; next event still produces a successful edit', async () => {
     const api = makeFakeApi()
     const { reporter, clock } = makeReporter({ api })

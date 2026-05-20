@@ -148,6 +148,35 @@ export class ProgressReporter {
   }
 
   /**
+   * Read-only: returns true if a Claude session is actively running tools
+   * for this chat — used by InboundWatcher to decide whether to auto-reply
+   * «Тралл занят». Definition (per PR-A3 spec):
+   *   entry exists AND !entry.stopped AND (now - lastActivityMs) < threshold
+   *
+   * `thresholdMs` defaults to `config.watcher.busy_threshold_ms` so the
+   * watcher can call this without re-resolving the config every time, but
+   * the explicit override remains for tests and future callers.
+   */
+  isBusy(chatId: string, thresholdMs?: number): boolean {
+    const entry = this.chats.get(chatId)
+    if (!entry || entry.stopped) return false
+    const limit = thresholdMs ?? this.config.watcher.busy_threshold_ms
+    return this.now() - entry.lastActivityMs <= limit
+  }
+
+  /**
+   * Read-only: returns the most recent tool name in the rolling activity
+   * window for this chat, or `undefined` if no entry exists / no tools
+   * have been recorded. Used by InboundWatcher to compose the auto-reply
+   * body — «активный инструмент: Bash».
+   */
+  getActiveToolName(chatId: string): string | undefined {
+    const entry = this.chats.get(chatId)
+    if (!entry || entry.calls.length === 0) return undefined
+    return entry.calls[entry.calls.length - 1]?.toolName
+  }
+
+  /**
    * Test-only: wait until any in-flight Telegram operation for the given
    * chat settles AND any follow-up reschedule completes. Used by unit
    * tests to assert on `TelegramApi.calls` after asynchronous
