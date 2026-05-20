@@ -336,7 +336,7 @@ export class TaskMirror {
 
 /**
  * Render a TodoWrite snapshot as Telegram-friendly HTML. Section order:
- *   1. Header — bold «milestones» + counts.
+ *   1. Header — bold «Задачи» + counts.
  *   2. In-progress items — icon ◐.
  *   3. Pending items — icon ◻.
  *   4. Last `collapseCompletedAfter` completed items — icon ☑.
@@ -356,7 +356,7 @@ export function renderTodoList(
   maxChars: number = DEFAULT_MAX_CHARS,
 ): string {
   if (todos.length === 0) {
-    return '<b>milestones</b>\n<i>задач нет</i>'
+    return '<b>Задачи</b>\n<i>задач нет</i>'
   }
 
   let doneCount = 0
@@ -382,7 +382,7 @@ export function renderTodoList(
     }
   }
 
-  const header = '<b>milestones</b>'
+  const header = '<b>Задачи</b>'
   const counts = `${doneCount} done / ${inProgressCount} in progress / ${pendingCount} pending`
 
   // Show only the last N completed items; older ones collapse into a tail

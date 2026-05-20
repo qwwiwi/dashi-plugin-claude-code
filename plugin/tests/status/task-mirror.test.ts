@@ -194,7 +194,7 @@ describe('TaskMirror', () => {
     const sends = api.calls.filter((c) => c.kind === 'send')
     expect(sends.length).toBe(1)
     expect(sends[0]!.chatId).toBe('chat-1')
-    expect(sends[0]!.text).toContain('milestones')
+    expect(sends[0]!.text).toContain('Задачи')
     expect(sends[0]!.text).toContain('Implement feature X')
     expect(sends[0]!.text).toContain('Tests')
   })
@@ -394,7 +394,7 @@ describe('TaskMirror', () => {
 
   test('renderTodoList: empty list renders «задач нет»', () => {
     const text = renderTodoList([], 5)
-    expect(text).toContain('milestones')
+    expect(text).toContain('Задачи')
     expect(text).toContain('задач нет')
   })
 
@@ -459,7 +459,7 @@ describe('TaskMirror', () => {
     const text = renderTodoList(todos, 5)
     expect(text.length).toBeLessThanOrEqual(3500)
     // Must contain at least the header and SOME indication of truncation.
-    expect(text).toContain('milestones')
+    expect(text).toContain('Задачи')
     // No malformed HTML — angle brackets balance via our explicit emission
     // of <b>/<i> only; nothing else should appear.
     const opens = (text.match(/<(b|i)>/g) ?? []).length
