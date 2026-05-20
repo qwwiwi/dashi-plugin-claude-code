@@ -14,6 +14,10 @@ import { join } from 'path'
 import type { Context } from 'grammy'
 
 import { handleInboundText, type HandlerDeps } from '../../src/telegram/handlers.js'
+import {
+  InboundWatcher,
+  type ProgressReporterForWatcher,
+} from '../../src/telegram/watcher.js'
 import type { AppConfig, StatePaths } from '../../src/config.js'
 import { createLogger } from '../../src/log.js'
 import type {
@@ -165,6 +169,7 @@ function makeDeps(
     permissionHooks?: PermissionRelayHooks
     telegramApi?: TelegramApi
     server?: ServerSpy['server']
+    watcher?: InboundWatcher
   } = {},
 ): { deps: HandlerDeps; statePaths: StatePaths } {
   const config = overrides.config ?? makeConfig()
@@ -183,8 +188,19 @@ function makeDeps(
     botToken: 'fake-token',
     env: {},
     ...(overrides.permissionHooks ? { permissionHooks: overrides.permissionHooks } : {}),
+    ...(overrides.watcher ? { watcher: overrides.watcher } : {}),
   }
   return { deps, statePaths }
+}
+
+// Build a fake ProgressReporter view for watcher tests. The watcher only
+// reads two methods; this stub is enough to exercise the busy / not-busy
+// branches end-to-end.
+function makeFakeProgress(busy: boolean, toolName?: string): ProgressReporterForWatcher {
+  return {
+    isBusy: () => busy,
+    getActiveToolName: () => toolName,
+  }
 }
 
 // Build a minimal grammY Context. Handlers read chat, from, message; we
@@ -329,6 +345,136 @@ describe('handleInboundText — OOB allowed_chat_ids gate (Fix 6)', () => {
 
     // OOB handled inline — no channel notify for /help.
     expect(serverSpy.calls.length).toBe(0)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// PR-A3 — InboundWatcher integration
+// ─────────────────────────────────────────────────────────────────────
+
+describe('handleInboundText — InboundWatcher (PR-A3)', () => {
+  test('plain text + busy session → watcher.maybeAutoReply fires and channel notify still runs', async () => {
+    const sendCalls: Array<{ chatId: string; text: string; replyTo?: number }> = []
+    const tg = makeTelegramApi()
+    const api: TelegramApi = {
+      ...tg.api,
+      sendMessage: async (chatId, text, opts) => {
+        const entry: { chatId: string; text: string; replyTo?: number } = { chatId, text }
+        if (opts.reply_to_message_id !== undefined) entry.replyTo = opts.reply_to_message_id
+        sendCalls.push(entry)
+        return { message_id: 999 }
+      },
+    }
+    const watcher = new InboundWatcher({
+      telegramApi: api,
+      config: makeConfig(),
+      log: silentLog,
+      progressReporter: makeFakeProgress(true, 'Bash'),
+    })
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({
+      server: serverSpy.server,
+      telegramApi: api,
+      watcher,
+    })
+    const ctx = makeCtx({
+      text: 'hi there',
+      chatId: 164795011,
+      chatType: 'private',
+      fromId: 164795011,
+    })
+
+    await handleInboundText(ctx, deps)
+    // Drain the fire-and-forget watcher microtask.
+    await new Promise((r) => setTimeout(r, 0))
+
+    // Auto-reply went out via the safe api.
+    expect(sendCalls.length).toBe(1)
+    expect(sendCalls[0]!.replyTo).toBe(42)
+    expect(sendCalls[0]!.text).toContain('Bash')
+    // Channel notification ALSO fired — auto-reply does not replace it.
+    expect(serverSpy.calls.length).toBe(1)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  test('OOB command (/help) bypasses watcher — no auto-reply even when busy', async () => {
+    const sendCalls: Array<{ chatId: string; text: string }> = []
+    const tg = makeTelegramApi()
+    const api: TelegramApi = {
+      ...tg.api,
+      sendMessage: async (chatId, text) => {
+        sendCalls.push({ chatId, text })
+        return { message_id: 100 }
+      },
+    }
+    const watcher = new InboundWatcher({
+      telegramApi: api,
+      config: makeConfig(),
+      log: silentLog,
+      progressReporter: makeFakeProgress(true, 'Bash'),
+    })
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({
+      server: serverSpy.server,
+      telegramApi: api,
+      watcher,
+    })
+    const ctx = makeCtx({
+      text: '/help',
+      chatId: 164795011,
+      chatType: 'private',
+      fromId: 164795011,
+    })
+
+    await handleInboundText(ctx, deps)
+    await new Promise((r) => setTimeout(r, 0))
+
+    // /help replies via sendMessage but the auto-reply «🔧 Тралл занят» must
+    // NOT appear — OOB short-circuits before the watcher hook. The single
+    // sendMessage we see is the /help body itself.
+    expect(sendCalls.length).toBe(1)
+    expect(sendCalls[0]!.text).not.toContain('Тралл занят')
+    // OOB handled inline — no channel notify.
+    expect(serverSpy.calls.length).toBe(0)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  test('plain text + NOT busy → watcher no-ops, channel notify still runs', async () => {
+    const sendCalls: Array<{ chatId: string; text: string }> = []
+    const tg = makeTelegramApi()
+    const api: TelegramApi = {
+      ...tg.api,
+      sendMessage: async (chatId, text) => {
+        sendCalls.push({ chatId, text })
+        return { message_id: 200 }
+      },
+    }
+    const watcher = new InboundWatcher({
+      telegramApi: api,
+      config: makeConfig(),
+      log: silentLog,
+      progressReporter: makeFakeProgress(false),
+    })
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({
+      server: serverSpy.server,
+      telegramApi: api,
+      watcher,
+    })
+    const ctx = makeCtx({
+      text: 'hello',
+      chatId: 164795011,
+      chatType: 'private',
+      fromId: 164795011,
+    })
+
+    await handleInboundText(ctx, deps)
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(sendCalls.length).toBe(0)
+    // Channel notification still fired.
+    expect(serverSpy.calls.length).toBe(1)
     rmSync(statePaths.root, { recursive: true, force: true })
   })
 })

@@ -48,6 +48,7 @@ import {
   type PermissionRelayHooks,
 } from '../channel/permissions.js'
 import { AlbumBuffer, type Album } from './album-buffer.js'
+import type { InboundWatcher } from './watcher.js'
 
 // A single buffered album item — one Telegram update that belongs to an
 // album. We capture everything needed to emit a combined channel notification
@@ -103,6 +104,13 @@ export interface HandlerDeps {
   // tests still compile — when absent, every media message goes through
   // the single-media path (no album merging).
   albumBuffer?: AlbumBuffer<AlbumEntry>
+  // PR-A3 (2026-05-20): InboundWatcher fires an auto-reply «Тралл занят»
+  // when the warchief sends plain text mid-tool. Optional so older tests
+  // compile — when absent, the watcher branch is skipped and behaviour
+  // matches the pre-A3 path. Insertion point in handleInboundText sits
+  // AFTER OOB resolution and BEFORE gateAndNotify: OOB still wins, and
+  // Claude still receives the channel notification regardless.
+  watcher?: InboundWatcher
 }
 
 // Coerce grammY's reply_to_message Message shape into the narrower
@@ -495,6 +503,29 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
       return
     }
   }
+
+  // PR-A3 watcher hook (after OOB resolution, before gate/notify): if Claude
+  // is mid-tool for this chat, auto-reply «Тралл занят». Fire-and-forget via
+  // `void` — channel-notification latency must NOT depend on the auto-reply
+  // round-trip. The watcher itself never throws (it logs send failures and
+  // returns `replied: false`); the `.catch` here is a belt-and-braces guard.
+  // Auto-reply does NOT replace the channel notification — gateAndNotify
+  // still runs below so Claude sees the message normally.
+  if (deps.watcher) {
+    const chatNum = ctx.chat?.id
+    const msgId = ctx.message?.message_id
+    if (chatNum !== undefined && msgId !== undefined) {
+      void deps.watcher
+        .maybeAutoReply({ chatId: String(chatNum), messageId: msgId, text })
+        .catch((err) => {
+          deps.log.warn('watcher auto-reply error (ignored)', {
+            chat_id: String(chatNum),
+            error: err instanceof Error ? err.message : String(err),
+          })
+        })
+    }
+  }
+
   await gateAndNotify(ctx, deps, () => text, undefined, 'text')
 }
 
