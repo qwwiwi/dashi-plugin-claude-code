@@ -61,6 +61,37 @@ bash plugin/scripts/install-hooks.sh \
 
 Env overrides: `TELEGRAM_MEMORY_ENABLED`, `TELEGRAM_MEMORY_WORKSPACE`, `TELEGRAM_MEMORY_LOGS_PATH`, `TELEGRAM_MEMORY_SOURCE_TAG`, `TELEGRAM_MEMORY_AGENT_LABEL`.
 
+## Terminal mirror (PR #15)
+
+`TmuxMirror` мирорит pane агентского tmux session в ОДНО rolling Telegram сообщение через `editMessageText`. Полезно когда оператор хочет видеть raw bash output без SSH доступа.
+
+Default-OFF — opt-in через config:
+
+```json
+{
+  "tmux_mirror": {
+    "enabled": true,
+    "pane_target": "channel-thrall:0.0",
+    "poll_interval_ms": 5000,
+    "line_count": 50
+  }
+}
+```
+
+Поведение:
+- Polls `tmux capture-pane -p -t <pane_target> -S -<line_count>` каждые `poll_interval_ms`
+- ANSI/CSI/OSC/DCS sequences стрипаются, control chars (кроме `\n`, `\t`) удаляются
+- Текст пропускается через `redactSecrets` (тот же что в safe-telegram-api), затем HTML-escape, затем оборачивается в `<pre>`
+- Hash-based dedup: identical poll → нет API call
+- Edit «message to edit not found» (400 с подходящим description) → re-send. Прочие 4xx (403, 413 и т.д.) НЕ триггерят resend, чтобы не было storm
+- Длинный pane обрезается с маркером «[truncated]» (cap 4096 chars)
+- SIGINT/SIGTERM → попытка `deleteMessage` (best-effort cleanup)
+
+Out of scope (отдельные PR'ы):
+- `/mirror on|off|status` OOB команда — пока тогглится через config + рестарт
+- Telegram → tmux `send-keys` (control surface, не view-only)
+- Voice / screenshot capture
+
 ## WARNING
 
 - НЕ использовать production bot токены здесь без явного OK принца. Production боты:
