@@ -236,7 +236,7 @@ function redactGroqKey(message: string, key: string): string {
   // Escape regex metachars in the key so we can build a global pattern.
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const re = new RegExp(escaped, 'g')
-  return message.replace(re, '<redacted>')
+  return message.replace(re, '[REDACTED]')
 }
 
 export async function maybeTranscribeVoice(

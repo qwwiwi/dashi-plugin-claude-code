@@ -346,7 +346,7 @@ describe('maybeTranscribeVoice', () => {
     expect(r.status).toBe('failed')
     expect(r.errorMessage).toBeDefined()
     expect(r.errorMessage).not.toContain(secret)
-    expect(r.errorMessage).toContain('<redacted>')
+    expect(r.errorMessage).toContain('[REDACTED]')
   })
 
   test('redacts GROQ_API_KEY from non-OK response body', async () => {
