@@ -69,6 +69,12 @@ function mkConfig(allowedIds: number[] = [164795011]): AppConfig {
       buffer_ttl_ms: 5 * 60 * 1000,
       buffer_max_entries: 100,
     },
+    progress: {
+      enabled: true,
+      edit_throttle_ms: 3000,
+      recent_buffer: 10,
+      session_ttl_ms: 600000,
+    },
   }
 }
 

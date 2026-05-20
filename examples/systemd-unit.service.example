@@ -1,0 +1,47 @@
+[Unit]
+Description=Dashi Plugin Channel for <agent-name> (Telegram → Claude Code)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Запускайте от непривилегированного пользователя (НЕ root)
+User=<service-user>
+Group=<service-user>
+
+# КРИТИЧНО: WorkingDirectory указывает ВНУТРЬ plugin/ каталога ВНУТРИ workspace.
+# Claude Code при старте поднимется по дереву и найдёт workspace CLAUDE.md.
+# См. docs/02-where-to-place-plugin.md
+WorkingDirectory=/home/<service-user>/.claude-lab/<agent>/.claude/dashi-plugin-claude-code/plugin
+
+# Секреты в отдельном файле, root:agentctl 640
+EnvironmentFile=/etc/dashi-plugin/<agent>/channel.env
+
+# HOME нужен Claude Code для поиска ~/.claude/CLAUDE.md и settings.json
+Environment=HOME=/home/<service-user>
+Environment=PATH=/home/<service-user>/.bun/bin:/home/<service-user>/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=en_US.UTF-8
+
+# Claude Code требует TTY → tmux session
+Type=forking
+ExecStart=/usr/bin/tmux new-session -d -s channel-<agent> \
+  claude --dangerously-load-development-channels server:dashi-channel
+
+# Первый Enter автоматически проходит welcome-промт "Allow external imports".
+# Второй (если есть) — нужно вручную через tmux attach + Enter, или поднять persistent fix
+# в ~/.claude/settings.json — см. docs/03-installation.md → Шаг 7
+ExecStartPost=/bin/sh -c 'sleep 6 && /usr/bin/tmux send-keys -t channel-<agent> Enter && sleep 2 && /usr/bin/tmux send-keys -t channel-<agent> Enter'
+
+# Чистый shutdown
+ExecStop=/usr/bin/tmux kill-session -t channel-<agent>
+
+# Restart на падении, не «всегда» — чтобы welcome-промты не запускали loop
+Restart=on-failure
+RestartSec=15s
+
+# Hardening (опционально, можете убрать если есть проблемы)
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/<service-user>/.claude-lab /home/<service-user>/.claude /tmp
+
+[Install]
+WantedBy=multi-user.target

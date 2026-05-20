@@ -38,6 +38,7 @@ import {
 import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
 import { redactSecrets } from './safety/redact.js'
 import { StatusManager } from './status/status-manager.js'
+import { ProgressReporter } from './status/progress-reporter.js'
 import { MemoryWriter, type MemoryConfig } from './memory/writer.js'
 import { dirname as pathDirname } from 'path'
 import {
@@ -256,6 +257,12 @@ const mcp = new Server(
 // message we edit while Claude is composing a reply. The handler opens it
 // on inbound delivery; the reply tool closes it on successful send.
 const statusManager = new StatusManager({ telegramApi, config, log })
+
+// ProgressReporter (2026-05-18) — separate persistent thread showing
+// per-tool activity in real time. StatusManager owns the transient
+// bubble (cancelled by reply()); ProgressReporter owns a thread that
+// survives. Both fire in parallel from the webhook handler.
+const progressReporter = new ProgressReporter({ telegramApi, config, log })
 
 // Phase 8 / T7: MemoryWriter persists turns to <workspace>/core/hot/recent.md
 // and <workspace_parent>/logs/verbose-YYYY-MM-DD.jsonl. Only instantiated
@@ -538,6 +545,7 @@ try {
     statePaths,
     log,
     statusManager,
+    progressReporter,
     ...(memoryWriter !== undefined ? { memoryWriter } : {}),
   })
 } catch (err) {

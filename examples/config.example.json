@@ -1,0 +1,16 @@
+{
+  "webhook": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8089
+  },
+  "memory": {
+    "enabled": true,
+    "workspace_path": "/home/agentctl/.claude-lab/myagent/.claude",
+    "agent_label": "MyAgent",
+    "source_tag": "tg"
+  },
+  "status": {
+    "enabled": true
+  }
+}

@@ -25,6 +25,7 @@ import { WebhookPayloadSchema, type WebhookPayload } from '../schemas.js'
 import { sendChannelNotification, normalizeMeta } from '../channel/notify.js'
 import { toActivityEvent } from '../hooks/claude-events.js'
 import type { MemoryWriter } from '../memory/writer.js'
+import type { ProgressReporter } from '../status/progress-reporter.js'
 
 const BODY_LIMIT_BYTES = 256 * 1024
 const DEFAULT_AGENT_ID = 'dashi-channel'
@@ -52,6 +53,11 @@ export interface WebhookDeps {
   // hook payload (UserPromptSubmit buffers, Stop writes recent.md +
   // verbose.jsonl). Throws are caught and logged — never block the 200.
   memoryWriter?: MemoryWriter
+  // ProgressReporter (2026-05-18): persistent activity thread sibling
+  // dispatch alongside statusManager. Optional so legacy paths and tests
+  // can omit it. Failures inside the reporter never propagate (it logs
+  // and swallows) so no error handling is required at the call site.
+  progressReporter?: ProgressReporter
 }
 
 export interface WebhookServerHandle {
@@ -174,7 +180,7 @@ async function handleRequest(
   deps: WebhookDeps,
   webhookToken: string | undefined,
 ): Promise<void> {
-  const { config, statePaths, log, mcpServer, statusManager, memoryWriter } = deps
+  const { config, statePaths, log, mcpServer, statusManager, memoryWriter, progressReporter } = deps
   const method = req.method ?? 'GET'
   const url = req.url ?? '/'
 
@@ -286,42 +292,55 @@ async function handleRequest(
       }
     }
 
-    // PLAN.md:173 — when config.status.enabled=false the hook path must
-    // be a no-op. We accept the request (200) so Claude hooks don't
-    // back-pressure on a disabled visibility surface, but skip dispatch
-    // entirely (no statusManager call, no lazy status open).
-    if (config.status.enabled === true && statusManager) {
+    // Two independent visibility surfaces fire from the same hook event.
+    // Both are best-effort: failures are caught and logged, never block
+    // the 200 response (Claude hooks must not back-pressure on visibility).
+    //
+    //   * StatusManager — transient bubble (auto-cancelled by reply()).
+    //     Gate: config.status.enabled.
+    //   * ProgressReporter — persistent activity thread (survives reply).
+    //     Gate: config.progress.enabled (checked inside the reporter).
+    //
+    // The two MUST be dispatched independently so an operator can turn
+    // one off without disabling the other (review C3 fix).
+    const activityEvent = toActivityEvent(payload)
+    const statusDispatched = config.status.enabled === true && statusManager !== undefined
+    if (statusDispatched) {
       try {
-        await statusManager.recordActivityByChatId(
-          payload.chatId,
-          toActivityEvent(payload),
-        )
+        await statusManager!.recordActivityByChatId(payload.chatId, activityEvent)
       } catch (err) {
-        // Visibility failure must not block Claude. Log + 200.
         log.warn('hook event status update failed (ignored)', {
           chat_id: payload.chatId,
           hook: payload.hook_event_name,
           error: err instanceof Error ? err.message : String(err),
         })
       }
-      reply(res, 200, { status: 'accepted' })
-      return
-    }
-
-    if (config.status.enabled !== true) {
-      log.debug('hook event accepted but status disabled', {
+    } else {
+      log.debug('hook event status dispatch skipped (disabled or no manager)', {
         chat_id: payload.chatId,
         hook: payload.hook_event_name,
       })
+    }
+
+    if (progressReporter) {
+      try {
+        await progressReporter.recordEvent(payload.chatId, activityEvent)
+      } catch (err) {
+        log.warn('hook event progress update failed (ignored)', {
+          chat_id: payload.chatId,
+          hook: payload.hook_event_name,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+
+    // Preserve the legacy status_disabled note when status is off so
+    // existing webhook smoke tests can detect the disabled path.
+    if (!statusDispatched && config.status.enabled !== true) {
       reply(res, 200, { status: 'accepted', note: 'status_disabled' })
       return
     }
 
-    // statusManager not wired — visibility outage tolerated.
-    log.debug('hook event accepted without status manager', {
-      chat_id: payload.chatId,
-      hook: payload.hook_event_name,
-    })
     reply(res, 200, { status: 'accepted' })
     return
   }

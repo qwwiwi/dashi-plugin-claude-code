@@ -44,7 +44,8 @@ const voiceConfig: AppConfig = {
   progress: {
     enabled: true,
     edit_throttle_ms: 3000,
-    recent_buffer: 8,
+    recent_buffer: 10,
+    session_ttl_ms: 600000,
   },
 }
 

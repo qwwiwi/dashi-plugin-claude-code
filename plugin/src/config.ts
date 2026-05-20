@@ -79,6 +79,25 @@ export const AppConfigSchema = z.object({
       })
     }
   }),
+  // ProgressReporter (2026-05-18) — persistent Telegram thread that shows
+  // tool-by-tool activity in real time. StatusManager owns the transient
+  // status bubble; ProgressReporter owns a separate, persistent thread
+  // edited via editMessageText. Two surfaces, two concerns. Disable here
+  // to fall back to silent-then-final UX.
+  //
+  // session_ttl_ms guards against stuck entries when a `session_stop`
+  // hook is lost (Claude crash, dropped webhook). After this idle period
+  // the next event for the chat starts a fresh progress thread instead
+  // of editing into the old (now stale) message.
+  //
+  // recent_buffer aligned with StatusManager.ACTIVITY_MAX_BUFFER (10)
+  // so the two surfaces report the same "+N earlier" tail count.
+  progress: z.object({
+    enabled: z.boolean().default(true),
+    edit_throttle_ms: z.number().int().nonnegative().default(3000),
+    recent_buffer: z.number().int().positive().default(10),
+    session_ttl_ms: z.number().int().positive().default(10 * 60 * 1000),
+  }).default({}),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
 
