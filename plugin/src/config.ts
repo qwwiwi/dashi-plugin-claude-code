@@ -127,6 +127,21 @@ export const AppConfigSchema = z.object({
     debounce_ms: z.number().int().nonnegative().default(10_000),
     busy_threshold_ms: z.number().int().positive().default(30_000),
   }).default({}),
+  // TmuxMirror (2026-05-20) — read-only view of the agent's terminal pane
+  // mirrored into one rolling Telegram message via editMessageText. Pulls
+  // `tmux capture-pane` on a timer, dedups by hash, and self-heals when
+  // the message is deleted (re-sends on next poll).
+  //
+  // Default-OFF: pane content can include unexpected secrets, and the
+  // warchief should opt in explicitly. Enable via config.json or env.
+  // pane_target follows the `session:window.pane` syntax — empty string
+  // means «use the session in $TMUX env at startup».
+  tmux_mirror: z.object({
+    enabled: z.boolean().default(false),
+    pane_target: z.string().default(''),
+    poll_interval_ms: z.number().int().min(500).default(5000),
+    line_count: z.number().int().min(5).max(500).default(50),
+  }).default({}),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
 

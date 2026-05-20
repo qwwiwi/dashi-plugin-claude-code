@@ -41,6 +41,7 @@ import { redactSecrets } from './safety/redact.js'
 import { StatusManager } from './status/status-manager.js'
 import { ProgressReporter } from './status/progress-reporter.js'
 import { TaskMirror } from './status/task-mirror.js'
+import { TmuxMirror } from './status/tmux-mirror.js'
 import { InboundWatcher } from './telegram/watcher.js'
 import { MemoryWriter, type MemoryConfig } from './memory/writer.js'
 import { dirname as pathDirname } from 'path'
@@ -279,6 +280,44 @@ const progressReporter = new ProgressReporter({ telegramApi, config, log })
 // above; uses the same safe-wrapped telegramApi so every text/edit goes
 // through redact + HTML validation before leaving the process.
 const taskMirror = new TaskMirror({ telegramApi, config, log })
+
+// TmuxMirror (2026-05-20) — read-only mirror of the agent's terminal pane
+// into ONE rolling Telegram message. Default-OFF in config; the warchief
+// opts in explicitly. When enabled without an explicit pane_target we
+// fall back to `channel-thrall:0.0` — the canonical session for this
+// plugin on Thrall VPS.
+let tmuxMirror: TmuxMirror | null = null
+if (config.tmux_mirror.enabled) {
+  const target = config.tmux_mirror.pane_target || 'channel-thrall:0.0'
+  const mirrorChatId = String(config.allowed_chat_ids[0] ?? '')
+  if (mirrorChatId === '') {
+    log.warn('tmux mirror enabled but no allowed_chat_ids configured — skipping')
+  } else {
+    tmuxMirror = new TmuxMirror({
+      api: telegramApi,
+      log,
+      chatId: mirrorChatId,
+      paneTarget: target,
+      pollIntervalMs: config.tmux_mirror.poll_interval_ms,
+      lineCount: config.tmux_mirror.line_count,
+      redact: (text) => redactSecrets(text, apiSecrets),
+    })
+    void tmuxMirror.start().catch((err: unknown) => {
+      log.warn('tmux mirror start failed', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    })
+    // Best-effort cleanup on process exit: delete the rolling message so
+    // a stale «terminal mirror» card doesn't sit in the chat forever.
+    const shutdownMirror = (): void => {
+      tmuxMirror?.stop().catch(() => {
+        /* already logged inside stop() */
+      })
+    }
+    process.once('SIGINT', shutdownMirror)
+    process.once('SIGTERM', shutdownMirror)
+  }
+}
 
 // InboundWatcher (PR-A3, 2026-05-20) — auto-reply «Тралл занят» when the
 // warchief sends plain text while ProgressReporter says the session is
