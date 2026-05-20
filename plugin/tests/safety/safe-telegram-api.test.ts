@@ -187,3 +187,90 @@ describe('createSafeTelegramApi — pass-through methods', () => {
     await safe.deleteMessage('1', 2)
   })
 })
+
+describe('createSafeTelegramApi — inline keyboard redaction', () => {
+  test('button url containing Bearer token is redacted before transport', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    const tok = 'abcdef1234567890ABCDEFGHIJK'
+    const url = `https://x.example/cb?token=${tok}`
+    // Use a structurally-typed reply_markup; the public InlineKeyboardLike
+    // doesn't formally include `url` buttons but Telegram's wire format does.
+    const reply_markup = {
+      inline_keyboard: [[{ text: 'open', url } as unknown as { text: string }]],
+    }
+    await safe.sendMessage('1', 'see button', { reply_markup })
+    expect(calls).toHaveLength(1)
+    const sentMarkup = (calls[0]!.opts as SendMessageOpts).reply_markup
+    expect(sentMarkup).toBeDefined()
+    const row = sentMarkup!.inline_keyboard[0]!
+    const btn = row[0]! as { text: string; url?: string }
+    expect(btn.url).toBeDefined()
+    expect(btn.url).not.toContain(tok)
+  })
+
+  test('button text containing Telegram bot token is redacted', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    const tok = '8507713167:AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRR'
+    const reply_markup = {
+      inline_keyboard: [[{ text: `leaked ${tok} oops` }]],
+    }
+    await safe.sendMessage('1', 'see button', { reply_markup })
+    const sentMarkup = (calls[0]!.opts as SendMessageOpts).reply_markup
+    const btn = sentMarkup!.inline_keyboard[0]![0]!
+    expect(btn.text).not.toContain(tok)
+    expect(btn.text).toContain('<redacted>')
+  })
+
+  test('extraSecrets also masked inside button url and text', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const webhook = 'wh_strange_webhook_token_value_xyz'
+    const safe = createSafeTelegramApi(api, log, [webhook])
+    const reply_markup = {
+      inline_keyboard: [[
+        { text: `tap to use ${webhook}`, url: `https://x.example/?k=${webhook}` } as unknown as { text: string },
+      ]],
+    }
+    await safe.sendMessage('1', 'see button', { reply_markup })
+    const sent = (calls[0]!.opts as SendMessageOpts).reply_markup
+    const btn = sent!.inline_keyboard[0]![0]! as { text: string; url?: string }
+    expect(btn.text).not.toContain(webhook)
+    expect(btn.url).toBeDefined()
+    expect(btn.url).not.toContain(webhook)
+  })
+
+  test('no reply_markup → no-op (sendMessage works as before)', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    await safe.sendMessage('1', 'plain', {})
+    expect(calls[0]!.text).toBe('plain')
+    expect((calls[0]!.opts as SendMessageOpts).reply_markup).toBeUndefined()
+  })
+
+  test('partial / unknown button shapes survive without throwing', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    // Mix of valid + malformed cells. Should not throw, should leave
+    // unknown fields alone, and should still redact text/url where present.
+    const reply_markup = {
+      inline_keyboard: [
+        // Row 1: well-formed cell
+        [{ text: 'good', callback_data: 'cb' }],
+        // Row 2: empty cell-array (defensive)
+        [],
+        // Row 3: cell with text+url
+        [{ text: 'open', url: 'https://example.com/' } as unknown as { text: string }],
+      ],
+    }
+    await safe.sendMessage('1', 'msg', { reply_markup })
+    const sent = (calls[0]!.opts as SendMessageOpts).reply_markup
+    expect(sent).toBeDefined()
+    expect(sent!.inline_keyboard).toHaveLength(3)
+  })
+})

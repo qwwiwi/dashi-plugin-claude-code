@@ -23,12 +23,55 @@ import type {
   ChatAction,
   DownloadResult,
   EditOpts,
+  InlineKeyboardLike,
   SendDocumentOpts,
   SendMessageOpts,
   TelegramApi,
 } from '../channel/tools.js'
 import { redactSecrets } from './redact.js'
 import { validateTelegramHtml } from './html-validator.js'
+
+/**
+ * Walk an inline keyboard and redact every button's `text` and `url`
+ * fields in place on a freshly cloned object. The structural type
+ * `InlineKeyboardLike` only declares `{ text, callback_data? }` cells,
+ * but Telegram's wire format also accepts `url` (and several other
+ * button kinds). We treat each cell as an open record so an unknown
+ * field — say `web_app.url` or `login_url.url` — survives untouched.
+ *
+ * We don't run HTML validation on button text or url: buttons don't
+ * render markup. We only redact secrets.
+ */
+function redactReplyMarkup(
+  markup: InlineKeyboardLike,
+  extraSecrets: ReadonlyArray<string> | undefined,
+): InlineKeyboardLike {
+  // Defensive: the array may be missing, malformed, or contain unknown
+  // cells. We copy row by row, cell by cell, redacting only string-typed
+  // `text` and `url` fields.
+  const rows = Array.isArray(markup.inline_keyboard) ? markup.inline_keyboard : []
+  const safeRows: { text: string; callback_data?: string }[][] = rows.map((row) => {
+    if (!Array.isArray(row)) return []
+    return row.map((cell) => {
+      // Treat the cell as an open record so we can read/write `url` and
+      // other fields without leaking `any`. Unknown keys are preserved.
+      const c = cell as Record<string, unknown>
+      const next: Record<string, unknown> = { ...c }
+      if (typeof c.text === 'string') {
+        next.text = redactSecrets(c.text, extraSecrets)
+      }
+      if (typeof c.url === 'string') {
+        next.url = redactSecrets(c.url, extraSecrets)
+      }
+      // Cast back to the structural cell type — the unknown extra keys
+      // ride along because TS doesn't widen object literal property sets
+      // through Record-cast. This is intentional: we forward whatever
+      // shape grammY sent us with only text/url sanitised.
+      return next as { text: string; callback_data?: string }
+    })
+  })
+  return { inline_keyboard: safeRows }
+}
 
 /**
  * Wrap the raw TelegramApi so every text-sending call is funneled through
@@ -77,6 +120,9 @@ export function createSafeTelegramApi(
         delete safeOpts.parse_mode
       } else {
         safeOpts.parse_mode = parseMode
+      }
+      if (safeOpts.reply_markup) {
+        safeOpts.reply_markup = redactReplyMarkup(safeOpts.reply_markup, extraSecrets)
       }
       return raw.sendMessage(chatId, safeText, safeOpts)
     },
