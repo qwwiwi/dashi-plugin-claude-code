@@ -7,6 +7,8 @@
 // Telegram or our logs.
 
 import type { ClaudeHookPayload } from '../schemas.js'
+import { TodoWriteInputSchema, type TodoItem } from '../schemas.js'
+import type { Logger } from '../log.js'
 
 // Tool-call lifecycle pair used by the rolling activity window. PreToolUse
 // emits `tool_start`; PostToolUse emits `tool_end`. The renderer collapses
@@ -51,6 +53,28 @@ export type ActivityStatusEvent =
   | SessionStartEvent
   | SessionStopEvent
 
+// ─────────────────────────────────────────────────────────────────────
+// TodoWrite events — consumed by TaskMirror (separate rolling Telegram
+// message showing Claude's milestone list). Deliberately NOT folded into
+// ActivityStatusEvent: StatusManager / ProgressReporter must stay unaware
+// of TodoWrite so the three rolling messages (status bubble, activity
+// thread, todo list) keep independent lifecycles.
+// ─────────────────────────────────────────────────────────────────────
+
+export interface TodoWriteEvent {
+  readonly kind: 'todo_write'
+  readonly todos: ReadonlyArray<TodoItem>
+}
+
+// Session-stop signal for TaskMirror specifically. Renamed from the
+// ActivityStatusEvent variant so the TaskMirror dispatcher does not
+// accidentally consume a non-todo Stop hook.
+export interface TodoSessionStopEvent {
+  readonly kind: 'todo_session_stop'
+}
+
+export type TaskMirrorEvent = TodoWriteEvent | TodoSessionStopEvent
+
 /**
  * Convert a validated Claude hook payload to an ActivityStatusEvent.
  *
@@ -87,4 +111,39 @@ export function toActivityEvent(payload: ClaudeHookPayload): ActivityStatusEvent
     case 'SessionStart':
       return { kind: 'session_start' }
   }
+}
+
+/**
+ * Convert a validated Claude hook payload to a TaskMirrorEvent.
+ *
+ * Returns non-null ONLY for events TaskMirror cares about:
+ *   - PostToolUse with tool_name === 'TodoWrite' → parses tool_input via
+ *     TodoWriteInputSchema. On parse failure, logs a warning and returns
+ *     null (graceful degradation — the rolling activity thread still
+ *     renders correctly because toActivityEvent handles the same payload
+ *     independently).
+ *   - Stop → returns `{ kind: 'todo_session_stop' }` so TaskMirror can
+ *     finalize and evict its per-chat entry.
+ *
+ * Every other hook event returns null so the caller can short-circuit
+ * before touching TaskMirror.
+ */
+export function toTodoWriteEvent(
+  payload: ClaudeHookPayload,
+  log?: Logger,
+): TaskMirrorEvent | null {
+  if (payload.hook_event_name === 'Stop') {
+    return { kind: 'todo_session_stop' }
+  }
+  if (payload.hook_event_name === 'PostToolUse' && payload.tool_name === 'TodoWrite') {
+    const parsed = TodoWriteInputSchema.safeParse(payload.tool_input)
+    if (!parsed.success) {
+      log?.warn('TodoWrite tool_input failed schema validation (ignored)', {
+        issues: parsed.error.issues.map((i) => i.message).slice(0, 5),
+      })
+      return null
+    }
+    return { kind: 'todo_write', todos: parsed.data.todos }
+  }
+  return null
 }
