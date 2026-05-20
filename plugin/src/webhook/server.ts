@@ -27,6 +27,7 @@ import { toActivityEvent, toTodoWriteEvent } from '../hooks/claude-events.js'
 import type { MemoryWriter } from '../memory/writer.js'
 import type { ProgressReporter } from '../status/progress-reporter.js'
 import type { TaskMirror } from '../status/task-mirror.js'
+import type { InboundWatcher } from '../telegram/watcher.js'
 
 const BODY_LIMIT_BYTES = 256 * 1024
 const DEFAULT_AGENT_ID = 'dashi-channel'
@@ -65,6 +66,11 @@ export interface WebhookDeps {
   // logged and swallowed; we still defensively wrap in try/catch here
   // to match the statusManager / progressReporter pattern.
   taskMirror?: TaskMirror
+  // PR-A3 (M3 fix): InboundWatcher — on session_stop the webhook clears
+  // the per-chat debounce marker so a fresh session can auto-reply on its
+  // very first inbound message without waiting for the previous session's
+  // debounce window to expire. Optional so tests/legacy paths can omit.
+  watcher?: InboundWatcher
 }
 
 export interface WebhookServerHandle {
@@ -187,7 +193,17 @@ async function handleRequest(
   deps: WebhookDeps,
   webhookToken: string | undefined,
 ): Promise<void> {
-  const { config, statePaths, log, mcpServer, statusManager, memoryWriter, progressReporter, taskMirror } = deps
+  const {
+    config,
+    statePaths,
+    log,
+    mcpServer,
+    statusManager,
+    memoryWriter,
+    progressReporter,
+    taskMirror,
+    watcher,
+  } = deps
   const method = req.method ?? 'GET'
   const url = req.url ?? '/'
 
@@ -356,6 +372,22 @@ async function handleRequest(
             error: err instanceof Error ? err.message : String(err),
           })
         }
+      }
+    }
+
+    // PR-A3 (M3 fix): on session_stop, clear the watcher's debounce marker
+    // for this chat so the next session can fire its first auto-reply
+    // immediately. Without this, a stale marker from the previous session
+    // would block the auto-reply for up to debounce_ms.
+    if (watcher && payload.hook_event_name === 'Stop') {
+      try {
+        watcher.clearDebounce(payload.chatId)
+      } catch (err) {
+        // clearDebounce is a Map.delete() under the hood — should never throw.
+        log.warn('watcher clearDebounce failed (ignored)', {
+          chat_id: payload.chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
       }
     }
 

@@ -568,6 +568,7 @@ try {
     statusManager,
     progressReporter,
     taskMirror,
+    watcher: inboundWatcher,
     ...(memoryWriter !== undefined ? { memoryWriter } : {}),
   })
 } catch (err) {
