@@ -146,15 +146,15 @@ export interface OobResult {
 
 function helpText(): string {
   return (
-    '<b>commands</b>\n\n'
-    + '<code>/help</code> — this help\n'
-    + '<code>/status</code> — plugin and session snapshot\n'
-    + '<code>/stop</code> — request Claude to halt current task\n'
-    + '<code>/reset force</code> — drop session state (confirm with <code>force</code>)\n'
-    + '<code>/new force</code> — start a fresh session (confirm with <code>force</code>)\n'
-    + '<code>/mirror on|off|status</code> — toggle the rolling tmux mirror\n\n'
-    + '<i>note: /stop is best-effort — the plugin signals Claude through '
-    + 'the channel, but cannot guarantee interruption mid-tool-call.</i>'
+    '<b>команды</b>\n\n'
+    + '<code>/help</code> — эта справка\n'
+    + '<code>/status</code> — снимок плагина и сессии\n'
+    + '<code>/stop</code> — попросить Claude остановить текущую задачу\n'
+    + '<code>/reset force</code> — сбросить состояние сессии (подтверди флагом <code>force</code>)\n'
+    + '<code>/new force</code> — начать новую сессию (подтверди флагом <code>force</code>)\n'
+    + '<code>/mirror on|off|status</code> — управлять rolling-зеркалом терминала (tmux)\n\n'
+    + '<i>примечание: /stop — best-effort: плагин передаёт сигнал остановки через '
+    + 'канал, но не может гарантировать прерывание посреди вызова инструмента.</i>'
   )
 }
 
@@ -165,16 +165,16 @@ export interface BotCommandSpec {
   description: string
 }
 export const BOT_COMMANDS: ReadonlyArray<BotCommandSpec> = [
-  { command: 'help', description: 'this help' },
-  { command: 'status', description: 'plugin + session snapshot' },
-  { command: 'stop', description: 'ask Claude to halt' },
-  { command: 'reset', description: 'drop session (force)' },
-  { command: 'new', description: 'fresh session (force)' },
-  { command: 'mirror', description: 'tmux mirror: on | off | status' },
+  { command: 'help', description: 'справка по командам' },
+  { command: 'status', description: 'снимок плагина и сессии' },
+  { command: 'stop', description: 'попросить Claude остановиться' },
+  { command: 'reset', description: 'сбросить сессию (нужен force)' },
+  { command: 'new', description: 'начать новую сессию (нужен force)' },
+  { command: 'mirror', description: 'зеркало терминала: on | off | status' },
 ]
 
 function statusText(ctx: OobContext): string {
-  const lines: string[] = ['<b>status</b>']
+  const lines: string[] = ['<b>статус</b>']
   if (ctx.botId !== undefined) {
     lines.push(`bot_id: <code>${escapeHtml(String(ctx.botId))}</code>`)
   }
@@ -270,7 +270,7 @@ export async function handleOobCommand(
         handled: true,
         command: 'stop',
         replyToTelegram: {
-          text: '<b>stop</b> requested — Claude will see the halt signal on next channel read.',
+          text: '<b>stop</b> — запрос принят. Claude увидит сигнал остановки при следующем чтении канала.',
           parseMode: 'HTML',
         },
         notifyChannel: {
@@ -286,7 +286,7 @@ export async function handleOobCommand(
           handled: true,
           command: 'reset',
           replyToTelegram: {
-            text: 'Add <code>force</code> to confirm: <code>/reset force</code>',
+            text: 'Для подтверждения добавь <code>force</code>: <code>/reset force</code>',
             parseMode: 'HTML',
           },
         }
@@ -296,7 +296,7 @@ export async function handleOobCommand(
         handled: true,
         command: 'reset',
         replyToTelegram: {
-          text: '<b>session reset (force)</b>\n\nnext message = new session',
+          text: '<b>сессия сброшена (force)</b>\n\nследующее сообщение начнёт новую сессию',
           parseMode: 'HTML',
         },
         notifyChannel: { content: '/reset force', meta: baseMeta },
@@ -309,7 +309,7 @@ export async function handleOobCommand(
           handled: true,
           command: 'new',
           replyToTelegram: {
-            text: 'Add <code>force</code> to confirm: <code>/new force</code>',
+            text: 'Для подтверждения добавь <code>force</code>: <code>/new force</code>',
             parseMode: 'HTML',
           },
         }
@@ -319,7 +319,7 @@ export async function handleOobCommand(
         handled: true,
         command: 'new',
         replyToTelegram: {
-          text: '<b>new session</b>\n\nnext message starts fresh',
+          text: '<b>новая сессия</b>\n\nследующее сообщение начнётся с чистого листа',
           parseMode: 'HTML',
         },
         notifyChannel: { content: '/new force', meta: baseMeta },
@@ -336,8 +336,8 @@ export async function handleOobCommand(
           command: 'mirror',
           replyToTelegram: {
             text:
-              '<b>mirror</b> — disabled in config\n\n'
-              + 'Set <code>tmux_mirror.enabled = true</code> и рестартить плагин.',
+              '<b>зеркало терминала</b> — отключено в конфиге\n\n'
+              + 'Установи <code>tmux_mirror.enabled = true</code> и перезапусти плагин.',
             parseMode: 'HTML',
           },
         }
@@ -356,7 +356,7 @@ export async function handleOobCommand(
           handled: true,
           command: 'mirror',
           replyToTelegram: {
-            text: '<b>mirror</b> — <code>on</code>',
+            text: '<b>зеркало терминала</b> — <code>on</code>',
             parseMode: 'HTML',
           },
         }
@@ -375,7 +375,7 @@ export async function handleOobCommand(
           handled: true,
           command: 'mirror',
           replyToTelegram: {
-            text: '<b>mirror</b> — <code>off</code>',
+            text: '<b>зеркало терминала</b> — <code>off</code>',
             parseMode: 'HTML',
           },
         }
@@ -383,7 +383,7 @@ export async function handleOobCommand(
       // Default / explicit `status` — read-only snapshot.
       const s = mirror.status()
       const lines = [
-        '<b>mirror status</b>',
+        '<b>зеркало терминала — статус</b>',
         `enabled: <code>${s.enabled ? 'on' : 'off'}</code>`,
       ]
       if (s.messageId !== undefined) lines.push(`message_id: <code>${s.messageId}</code>`)

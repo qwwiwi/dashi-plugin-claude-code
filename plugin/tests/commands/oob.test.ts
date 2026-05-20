@@ -231,7 +231,7 @@ describe('handleOobCommand', () => {
     expect(result.command).toBe('reset')
     expect(result.notifyChannel).toBeDefined()
     expect(result.notifyChannel!.meta.command).toBe('reset')
-    expect(result.replyToTelegram!.text).toContain('reset')
+    expect(result.replyToTelegram!.text).toContain('сброшена')
   })
 
   test('/reset (no force) returns reply asking for force flag, no channel notify', async () => {
@@ -316,11 +316,11 @@ describe('/mirror command', () => {
     expect(r!.args).toBe('on')
   })
 
-  test('/mirror without configured mirror replies «disabled in config»', async () => {
+  test('/mirror without configured mirror replies «отключено в конфиге»', async () => {
     const parsed = parseOobCommand('/mirror status')!
     const result = await handleOobCommand(parsed, makeCtx())
     expect(result.command).toBe('mirror')
-    expect(result.replyToTelegram!.text).toContain('disabled in config')
+    expect(result.replyToTelegram!.text).toContain('отключено в конфиге')
     expect(result.notifyChannel).toBeUndefined()
   })
 
@@ -349,7 +349,7 @@ describe('/mirror command', () => {
     const parsed = parseOobCommand('/mirror status')!
     const result = await handleOobCommand(parsed, makeCtx({ tmuxMirror: mirror.control }))
     const text = result.replyToTelegram!.text
-    expect(text).toContain('mirror status')
+    expect(text).toContain('зеркало терминала — статус')
     expect(text).toContain('on')
     expect(text).toContain('999') // messageId
   })
