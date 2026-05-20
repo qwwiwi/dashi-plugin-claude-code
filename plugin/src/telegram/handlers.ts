@@ -559,6 +559,9 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundPhoto(ctx: Context, deps: HandlerDeps): Promise<void> {
+  // PR-A3: same watcher hook as text. Media handlers must surface
+  // «Тралл занят» too — otherwise a busy-session photo/voice silently waits.
+  maybeTriggerWatcher(ctx, deps)
   const buildPhoto = async (): Promise<MediaDescriptor[]> => {
     const sizes = ctx.message?.photo
     if (!sizes || sizes.length === 0) return []
@@ -594,6 +597,7 @@ export async function handleInboundPhoto(ctx: Context, deps: HandlerDeps): Promi
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundDocument(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   const buildDoc = async (): Promise<MediaDescriptor[]> => {
     const doc = ctx.message?.document
     if (!doc) return []
@@ -616,6 +620,7 @@ export async function handleInboundDocument(ctx: Context, deps: HandlerDeps): Pr
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundVoice(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   await gateAndNotify(
     ctx,
     deps,
@@ -666,6 +671,7 @@ export async function handleInboundVoice(ctx: Context, deps: HandlerDeps): Promi
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundAudio(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   const buildAudio = async (): Promise<MediaDescriptor[]> => {
     const audio = ctx.message?.audio
     if (!audio) return []
@@ -690,6 +696,7 @@ export async function handleInboundAudio(ctx: Context, deps: HandlerDeps): Promi
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundVideo(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   const buildVideo = async (): Promise<MediaDescriptor[]> => {
     const video = ctx.message?.video
     if (!video) return []
@@ -715,6 +722,7 @@ export async function handleInboundVideo(ctx: Context, deps: HandlerDeps): Promi
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundVideoNote(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   await gateAndNotify(
     ctx,
     deps,
@@ -739,6 +747,7 @@ export async function handleInboundVideoNote(ctx: Context, deps: HandlerDeps): P
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundSticker(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   await gateAndNotify(
     ctx,
     deps,

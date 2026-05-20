@@ -13,7 +13,13 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import type { Context } from 'grammy'
 
-import { handleInboundText, type HandlerDeps } from '../../src/telegram/handlers.js'
+import {
+  handleInboundText,
+  handleInboundDocument,
+  handleInboundSticker,
+  handleInboundVideoNote,
+  type HandlerDeps,
+} from '../../src/telegram/handlers.js'
 import {
   InboundWatcher,
   type ProgressReporterForWatcher,
@@ -221,6 +227,39 @@ function makeCtx(opts: {
       chat: { id: opts.chatId, type: opts.chatType },
       from: { id: opts.fromId, is_bot: false, first_name: 'x' },
     },
+  } as unknown as Context
+}
+
+// Minimal Context with a media payload — for media handler tests. Mirrors
+// makeCtx but attaches a typed media field instead of `text`.
+function makeMediaCtx(opts: {
+  kind: 'document' | 'sticker' | 'video_note'
+  chatId: number
+  chatType: 'private' | 'group' | 'supergroup'
+  fromId: number
+}): Context {
+  const base = {
+    message_id: 42,
+    date: 1700000000,
+    chat: { id: opts.chatId, type: opts.chatType },
+    from: { id: opts.fromId, is_bot: false, first_name: 'x' },
+  }
+  let payload: Record<string, unknown>
+  switch (opts.kind) {
+    case 'document':
+      payload = { document: { file_id: 'doc-fid', file_name: 'a.txt' } }
+      break
+    case 'sticker':
+      payload = { sticker: { file_id: 'st-fid', emoji: '👍' } }
+      break
+    case 'video_note':
+      payload = { video_note: { file_id: 'vn-fid', duration: 5 } }
+      break
+  }
+  return {
+    chat: base.chat,
+    from: base.from,
+    message: { ...base, ...payload },
   } as unknown as Context
 }
 
@@ -523,6 +562,98 @@ describe('handleInboundText — InboundWatcher (PR-A3)', () => {
     expect(serverSpy.calls.length).toBe(0)
     rmSync(statePaths.root, { recursive: true, force: true })
   })
+
+  test.each([
+    ['document', handleInboundDocument],
+    ['sticker', handleInboundSticker],
+    ['video_note', handleInboundVideoNote],
+  ] as const)(
+    'media %s from allowed sender + busy session → watcher fires',
+    async (kind, handler) => {
+      const sendCalls: Array<{ chatId: string; text: string; replyTo?: number }> = []
+      const tg = makeTelegramApi()
+      const api: TelegramApi = {
+        ...tg.api,
+        sendMessage: async (chatId, text, opts) => {
+          const entry: { chatId: string; text: string; replyTo?: number } = { chatId, text }
+          if (opts.reply_to_message_id !== undefined) entry.replyTo = opts.reply_to_message_id
+          sendCalls.push(entry)
+          return { message_id: 700 }
+        },
+      }
+      const watcher = new InboundWatcher({
+        telegramApi: api,
+        config: makeConfig(),
+        log: silentLog,
+        progressReporter: makeFakeProgress(true, 'Bash'),
+      })
+      const serverSpy = makeServerSpy()
+      const { deps, statePaths } = makeDeps({
+        server: serverSpy.server,
+        telegramApi: api,
+        watcher,
+      })
+      const ctx = makeMediaCtx({
+        kind,
+        chatId: 164795011,
+        chatType: 'private',
+        fromId: 164795011,
+      })
+
+      await handler(ctx, deps)
+      await new Promise((r) => setTimeout(r, 0))
+
+      expect(sendCalls.length).toBe(1)
+      expect(sendCalls[0]!.replyTo).toBe(42)
+      expect(sendCalls[0]!.text).toContain('Bash')
+      // Channel notification also fired — the watcher does not replace it.
+      expect(serverSpy.calls.length).toBe(1)
+      rmSync(statePaths.root, { recursive: true, force: true })
+    },
+  )
+
+  test.each([
+    ['document', handleInboundDocument],
+    ['sticker', handleInboundSticker],
+  ] as const)(
+    'media %s from NOT allowed sender + busy → watcher does NOT fire',
+    async (kind, handler) => {
+      const sendCalls: Array<{ chatId: string; text: string }> = []
+      const tg = makeTelegramApi()
+      const api: TelegramApi = {
+        ...tg.api,
+        sendMessage: async (chatId, text) => {
+          sendCalls.push({ chatId, text })
+          return { message_id: 800 }
+        },
+      }
+      const watcher = new InboundWatcher({
+        telegramApi: api,
+        config: makeConfig(),
+        log: silentLog,
+        progressReporter: makeFakeProgress(true, 'Bash'),
+      })
+      const serverSpy = makeServerSpy()
+      const { deps, statePaths } = makeDeps({
+        server: serverSpy.server,
+        telegramApi: api,
+        watcher,
+      })
+      const ctx = makeMediaCtx({
+        kind,
+        chatId: 164795011,
+        chatType: 'private',
+        fromId: 99999, // NOT in allowlist
+      })
+
+      await handler(ctx, deps)
+      await new Promise((r) => setTimeout(r, 0))
+
+      expect(sendCalls.length).toBe(0)
+      expect(serverSpy.calls.length).toBe(0)
+      rmSync(statePaths.root, { recursive: true, force: true })
+    },
+  )
 
   test('plain text + NOT busy → watcher no-ops, channel notify still runs', async () => {
     const sendCalls: Array<{ chatId: string; text: string }> = []
