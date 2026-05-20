@@ -50,6 +50,36 @@ const VOID_TAGS: ReadonlySet<string> = new Set(['br'])
 // happen to render it, we refuse and downgrade.
 const SAFE_HREF_RE = /^(https?:|tg:|mailto:)/i
 
+// Per-tag attribute allowlist. Source: Telegram's HTML style spec —
+// https://core.telegram.org/bots/api#html-style. The bot API rejects
+// any unknown attribute on a styled tag, so we mirror the contract.
+//
+//   - <a> takes `href` (required, must pass safe-protocol check)
+//   - <code> tolerates `class="language-…"` (rendered inside <pre><code>);
+//     Telegram silently ignores it, but accepts the message.
+//   - every other styled tag takes NO attributes.
+//
+// Empty set means "no attributes allowed". The validator emits a
+// downgrade with the disallowed attribute NAME (never the value) in
+// the reason string so logs stay payload-free.
+const TAG_ATTR_ALLOWLIST: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['a', new Set(['href'])],
+  ['code', new Set(['class'])],
+  ['pre', new Set<string>()],
+  ['tg-spoiler', new Set<string>()],
+  ['blockquote', new Set<string>()],
+  ['b', new Set<string>()],
+  ['strong', new Set<string>()],
+  ['i', new Set<string>()],
+  ['em', new Set<string>()],
+  ['u', new Set<string>()],
+  ['ins', new Set<string>()],
+  ['s', new Set<string>()],
+  ['strike', new Set<string>()],
+  ['del', new Set<string>()],
+  ['br', new Set<string>()],
+])
+
 export interface ValidatedHtml {
   html: string
   downgraded: boolean
@@ -75,7 +105,67 @@ interface ParsedTag {
   attrsRaw: string
 }
 
-const TAG_RE = /<([^>]*)>/g
+interface RawToken {
+  /** Raw substring between `<` and `>` (exclusive). */
+  inner: string
+  /** Position of the opening `<` in the source. */
+  start: number
+  /** Position of the closing `>` in the source. */
+  end: number
+}
+
+/**
+ * Tokenize the input into `<...>` runs, correctly tracking quoted regions
+ * inside attribute values. A naive `<([^>]*)>` regex would terminate the
+ * tag at the first `>`, which is wrong if an attribute value contains a
+ * literal `>` (e.g. `<a href="foo>bar">`). We walk the string with a tiny
+ * state machine: outside a tag, look for `<`; inside a tag, advance one
+ * char at a time, tracking single/double quote nesting; on an unquoted
+ * `>` we close the tag.
+ *
+ * If the input contains an opening `<` without a matching unquoted `>`,
+ * the tokenizer signals an unclosed tag by returning `null`. Callers
+ * downgrade accordingly.
+ */
+function tokenize(input: string): RawToken[] | null {
+  const out: RawToken[] = []
+  let i = 0
+  while (i < input.length) {
+    const lt = input.indexOf('<', i)
+    if (lt === -1) break
+    // Walk through tag interior tracking quote state.
+    let j = lt + 1
+    let quote: '"' | "'" | null = null
+    let closed = false
+    while (j < input.length) {
+      const ch = input[j]
+      if (quote !== null) {
+        if (ch === quote) quote = null
+        j++
+        continue
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch
+        j++
+        continue
+      }
+      if (ch === '>') {
+        closed = true
+        break
+      }
+      if (ch === '<') {
+        // A nested `<` inside an open tag is invalid markup. Treat the
+        // *previous* `<` as unclosed and let downgrade fire.
+        return null
+      }
+      j++
+    }
+    if (!closed) return null
+    out.push({ inner: input.slice(lt + 1, j), start: lt, end: j })
+    i = j + 1
+  }
+  return out
+}
 
 function parseTag(inner: string): ParsedTag | null {
   // `inner` is the substring between `<` and `>`. Whitespace and bogus
@@ -105,6 +195,55 @@ function parseTag(inner: string): ParsedTag | null {
 
   const attrsRaw = wsIdx === -1 ? '' : body.slice(wsIdx + 1).trim()
   return { name, closing, selfClosing, attrsRaw }
+}
+
+/**
+ * Walk an attribute substring and yield each attribute NAME (lowercased).
+ * Handles double-quoted, single-quoted, and unquoted values, as well as
+ * bare-word attributes with no value. Returns null on an unterminated
+ * quoted value — callers downgrade.
+ *
+ * We deliberately do NOT yield values: the caller checks names against
+ * an allowlist and never logs values. The lone exception is the safe-
+ * href check, which uses extractHref() with its own quoted-only parser.
+ */
+function extractAttrNames(attrsRaw: string): string[] | null {
+  const names: string[] = []
+  let i = 0
+  const s = attrsRaw
+  while (i < s.length) {
+    // Skip whitespace.
+    while (i < s.length && /\s/.test(s[i] ?? '')) i++
+    if (i >= s.length) break
+    // Read name.
+    const nameStart = i
+    while (i < s.length && /[A-Za-z0-9_-]/.test(s[i] ?? '')) i++
+    if (i === nameStart) {
+      // Stray non-identifier character — bail out as malformed.
+      return null
+    }
+    const name = s.slice(nameStart, i).toLowerCase()
+    names.push(name)
+    // Skip whitespace before `=` or next attribute.
+    while (i < s.length && /\s/.test(s[i] ?? '')) i++
+    if (i < s.length && s[i] === '=') {
+      i++
+      while (i < s.length && /\s/.test(s[i] ?? '')) i++
+      if (i >= s.length) return null
+      const q = s[i]
+      if (q === '"' || q === "'") {
+        // Quoted value — find the matching quote.
+        i++
+        const valEnd = s.indexOf(q, i)
+        if (valEnd === -1) return null
+        i = valEnd + 1
+      } else {
+        // Unquoted value — read until whitespace.
+        while (i < s.length && !/\s/.test(s[i] ?? '')) i++
+      }
+    }
+  }
+  return names
 }
 
 /**
@@ -147,29 +286,42 @@ export function validateTelegramHtml(input: string): ValidatedHtml {
     return { html: input, downgraded: false }
   }
 
-  // Stray `<` or `>` with no closing bracket → invalid markup. A lone `<`
-  // without a matching `>` confuses Telegram's parser. We detect by
-  // looking for any `<` that isn't followed eventually by `>`.
-  // Easier: tokenize via TAG_RE, then verify the unmatched-bracket
-  // count by counting `<` and `>` raw occurrences.
-  const ltCount = (input.match(/</g) ?? []).length
-  const gtCount = (input.match(/>/g) ?? []).length
-  if (ltCount !== gtCount) {
+  // Tokenize first — the quote-aware walker reports an unclosed `<` by
+  // returning null, which we treat as invalid markup. Stray `>` without
+  // a preceding `<` is harmless from a parse-correctness POV (Telegram
+  // treats it as literal text), so we no longer bail on a raw `>` count
+  // mismatch.
+  const tokens = tokenize(input)
+  if (tokens === null) {
     return downgrade(input, 'unbalanced angle brackets')
   }
 
   // Walk tags with a stack to verify nesting and tag-name validity.
   const stack: string[] = []
-  TAG_RE.lastIndex = 0
-  let m: RegExpExecArray | null
-  while ((m = TAG_RE.exec(input)) !== null) {
-    const inner = m[1] ?? ''
-    const parsed = parseTag(inner)
+  for (const tok of tokens) {
+    const parsed = parseTag(tok.inner)
     if (parsed === null) {
       return downgrade(input, 'malformed tag')
     }
     if (!ALLOWED_TAGS.has(parsed.name)) {
       return downgrade(input, `unsupported tag: ${parsed.name}`)
+    }
+    // Per-tag attribute allowlist. Closing tags must have no attributes.
+    const allowedAttrs = TAG_ATTR_ALLOWLIST.get(parsed.name) ?? new Set<string>()
+    if (parsed.closing) {
+      if (parsed.attrsRaw.length > 0) {
+        return downgrade(input, `closing tag </${parsed.name}> has attributes`)
+      }
+    } else if (parsed.attrsRaw.length > 0) {
+      const names = extractAttrNames(parsed.attrsRaw)
+      if (names === null) {
+        return downgrade(input, 'malformed tag')
+      }
+      for (const attr of names) {
+        if (!allowedAttrs.has(attr)) {
+          return downgrade(input, `disallowed attribute "${attr}" on <${parsed.name}>`)
+        }
+      }
     }
     // Void tag rules: br must NOT have a closing form.
     if (VOID_TAGS.has(parsed.name)) {
@@ -193,7 +345,9 @@ export function validateTelegramHtml(input: string): ValidatedHtml {
         return downgrade(input, '<a> missing href')
       }
       if (!SAFE_HREF_RE.test(href)) {
-        return downgrade(input, `<a> unsafe href: ${href.slice(0, 32)}`)
+        // Reason is payload-free — we never include the href value here.
+        // See M4 commit for further reason-string cleanup across all paths.
+        return downgrade(input, 'unsafe href protocol on <a>')
       }
     }
     if (parsed.selfClosing) {

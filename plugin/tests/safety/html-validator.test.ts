@@ -134,3 +134,81 @@ describe('validateTelegramHtml — invalid downgrades', () => {
     expect(r.reason!.length).toBeGreaterThan(0)
   })
 })
+
+describe('validateTelegramHtml — per-tag attribute allowlist', () => {
+  test('<a target="_blank" href="…"> downgrades with attribute-name reason', () => {
+    const r = validateTelegramHtml('<a target="_blank" href="https://x.com">x</a>')
+    expect(r.downgraded).toBe(true)
+    expect(r.reason).toBe('disallowed attribute "target" on <a>')
+  })
+
+  test('<b class="x">y</b> downgrades because <b> takes no attributes', () => {
+    const r = validateTelegramHtml('<b class="x">y</b>')
+    expect(r.downgraded).toBe(true)
+    expect(r.reason).toContain('disallowed attribute')
+    expect(r.reason).toContain('"class"')
+    expect(r.reason).toContain('<b>')
+  })
+
+  test('<a href="https://x.com">x</a> passes (only href allowed)', () => {
+    const r = validateTelegramHtml('<a href="https://x.com">x</a>')
+    expect(r.downgraded).toBe(false)
+  })
+
+  test('<a href="…" onclick="alert(1)">x</a> downgrades (onclick disallowed)', () => {
+    const r = validateTelegramHtml('<a href="https://x.com" onclick="alert(1)">x</a>')
+    expect(r.downgraded).toBe(true)
+    expect(r.reason).toContain('"onclick"')
+  })
+
+  test('<code class="language-ts">x</code> passes (class allowed on code)', () => {
+    const r = validateTelegramHtml('<code class="language-ts">x</code>')
+    expect(r.downgraded).toBe(false)
+  })
+
+  test('<pre class="x">y</pre> downgrades (pre takes no attrs)', () => {
+    const r = validateTelegramHtml('<pre class="x">y</pre>')
+    expect(r.downgraded).toBe(true)
+    expect(r.reason).toContain('disallowed attribute')
+  })
+
+  test('quoted > inside attribute value does not terminate the tag prematurely', () => {
+    // <b> has no allowed attributes, so this must downgrade. Critically, the
+    // parser must NOT escape via the literal `>` inside the quoted value —
+    // i.e. it must classify the tag correctly (a single <b ...> tag with a
+    // disallowed attr) rather than blow up into "unbalanced angle brackets"
+    // or pass through unsanitised markup.
+    const r = validateTelegramHtml('<b attr="</b>">x</b>')
+    expect(r.downgraded).toBe(true)
+    // No HTML escape leak — must escape literal '<' in downgraded body.
+    expect(r.html).not.toMatch(/<b[^a-z]/i)
+  })
+
+  test('reasons NEVER include attribute VALUES, hrefs, or input fragments', () => {
+    // Attribute name OK in reason, value NEVER.
+    const cases: string[] = [
+      '<a target="_blank" href="https://x.com">x</a>',
+      '<a href="https://x.com" onclick="alert(1)">x</a>',
+      '<b class="leaked-value-12345">y</b>',
+      '<a href="javascript:dangerous_payload_should_not_log()">x</a>',
+      '<script>secret_payload_xyz</script>',
+      '<a>no-href</a>',
+      '<b>unclosed',
+      '<b>oops</i>',
+    ]
+    for (const c of cases) {
+      const r = validateTelegramHtml(c)
+      expect(r.downgraded).toBe(true)
+      const reason = r.reason ?? ''
+      // Attribute *values* must not appear.
+      expect(reason).not.toContain('_blank')
+      expect(reason).not.toContain('alert(1)')
+      expect(reason).not.toContain('leaked-value-12345')
+      expect(reason).not.toContain('dangerous_payload')
+      expect(reason).not.toContain('secret_payload_xyz')
+      expect(reason).not.toContain('javascript:')
+      // No URL fragments — we never log hrefs.
+      expect(reason).not.toMatch(/https?:\/\//)
+    }
+  })
+})
