@@ -265,7 +265,7 @@ describe('TaskMirror', () => {
     expect(edits[0]!.text).toContain('Step C')
   })
 
-  test('session_stop ships final edit and evicts entry; next event starts a fresh thread', async () => {
+  test('session_stop ships final edit with «сессия завершена» marker and evicts entry', async () => {
     const { mirror, clock, api } = makeMirror()
     await mirror.recordEvent('chat-1', todoEvent([
       { content: 'Step A', status: 'in_progress' },
@@ -279,6 +279,11 @@ describe('TaskMirror', () => {
     expect(editsBeforeStop).toBeGreaterThanOrEqual(1)
 
     await mirror.recordEvent('chat-1', STOP)
+    // Final edit contains the «сессия завершена» marker.
+    const editsAfterStop = api.calls.filter((c) => c.kind === 'edit')
+    const finalEdit = editsAfterStop[editsAfterStop.length - 1]
+    expect(finalEdit!.text).toContain('сессия завершена')
+
     // Subsequent event after stop: must send a NEW message (msg_id 201, since
     // 200 was the original send).
     await mirror.recordEvent('chat-1', todoEvent([
@@ -288,6 +293,25 @@ describe('TaskMirror', () => {
     const sends = api.calls.filter((c) => c.kind === 'send')
     expect(sends.length).toBe(2)
     expect(sends[1]!.messageId).toBe(201)
+  })
+
+  test('session_stop on an unchanged snapshot STILL fires a final edit (marker breaks idempotency)', async () => {
+    const { mirror, clock, api } = makeMirror()
+    // One TodoWrite — establishes the message.
+    await mirror.recordEvent('chat-1', todoEvent([
+      { content: 'Solo task', status: 'in_progress' },
+    ]))
+    clock.advance(3000)
+    await mirror._idleForTests('chat-1')
+    // No intermediate edits — snapshot has not changed.
+    expect(api.calls.filter((c) => c.kind === 'edit').length).toBe(0)
+
+    // STOP: even though the snapshot is byte-for-byte the same as the initial
+    // send, the marker guarantees the final text differs, so an edit fires.
+    await mirror.recordEvent('chat-1', STOP)
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    expect(edits.length).toBe(1)
+    expect(edits[0]!.text).toContain('сессия завершена')
   })
 
   test('TTL eviction: idle entry past session_ttl_ms starts a fresh thread', async () => {

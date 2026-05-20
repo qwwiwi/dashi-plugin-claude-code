@@ -259,7 +259,13 @@ export class TaskMirror {
   /**
    * Eviction handler — mirrors ProgressReporter.handleStop. Cancels timers,
    * awaits any in-flight flush, posts a final edit (if a message exists)
-   * with the latest snapshot, then deletes the entry.
+   * with the latest snapshot AND a «сессия завершена» marker line, then
+   * deletes the entry.
+   *
+   * Why the marker: without it, if the last TodoWrite snapshot was already
+   * rendered the idempotency gate (`text === lastRenderedText`) skips the
+   * final edit — the warchief never sees a visual «session ended» signal.
+   * Appending a non-empty marker line guarantees the final text differs.
    */
   private async handleStop(chatId: string): Promise<void> {
     const entry = this.chats.get(chatId)
@@ -280,7 +286,7 @@ export class TaskMirror {
     }
 
     if (entry.messageId !== undefined) {
-      const text = this.safeRender(entry.todos)
+      const text = this.renderFinal(entry)
       if (text && text !== entry.lastRenderedText) {
         try {
           await this.telegramApi.editMessageText(entry.chatId, entry.messageId, text, HTML_OPTS)
@@ -296,6 +302,20 @@ export class TaskMirror {
     }
 
     this.chats.delete(chatId)
+  }
+
+  /**
+   * Final-edit body: current snapshot + «сессия завершена» marker. The
+   * marker ALWAYS differs from any intermediate render so idempotency
+   * never skips this edit (otherwise the warchief might never see a
+   * session-end signal). Same DEFAULT_MAX_CHARS budget applies — if the
+   * snapshot already pushes against the cap, the marker still fits inside
+   * the safety margin renderTodoList reserves.
+   */
+  private renderFinal(entry: ChatTaskEntry): string {
+    const block = this.safeRender(entry.todos)
+    if (!block) return ''
+    return `${block}\n<i>сессия завершена</i>`
   }
 
   private safeRender(todos: ReadonlyArray<TodoItem>): string {
