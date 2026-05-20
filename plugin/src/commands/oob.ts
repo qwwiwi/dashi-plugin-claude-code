@@ -152,7 +152,7 @@ function helpText(): string {
     + '<code>/stop</code> — попросить Claude остановить текущую задачу\n'
     + '<code>/reset force</code> — сбросить состояние сессии (подтверди флагом <code>force</code>)\n'
     + '<code>/new force</code> — начать новую сессию (подтверди флагом <code>force</code>)\n'
-    + '<code>/mirror on|off|status</code> — управлять rolling-зеркалом терминала (tmux)\n\n'
+    + '<code>/mirror on|off|status</code> — управлять зеркалом терминала (tmux, обновляется в реальном времени)\n\n'
     + '<i>примечание: /stop — best-effort: плагин передаёт сигнал остановки через '
     + 'канал, но не может гарантировать прерывание посреди вызова инструмента.</i>'
   )
@@ -319,7 +319,7 @@ export async function handleOobCommand(
         handled: true,
         command: 'new',
         replyToTelegram: {
-          text: '<b>новая сессия</b>\n\nследующее сообщение начнётся с чистого листа',
+          text: '<b>новая сессия</b>\n\nследующее сообщение начнёт новую сессию',
           parseMode: 'HTML',
         },
         notifyChannel: { content: '/new force', meta: baseMeta },
