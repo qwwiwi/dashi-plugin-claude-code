@@ -443,6 +443,257 @@ describe('TmuxMirror — stop()-during-poll race', () => {
   })
 })
 
+describe('TmuxMirror — bump (re-anchor after inbound)', () => {
+  test('bump deletes the current message and immediately sends a new one', async () => {
+    const stub = makeStubApi()
+    const exec = makeExec([ok('first'), ok('first'), ok('first')])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000, // effectively disabled — drive manually
+      lineCount: 50,
+      exec,
+    })
+    await mirror.start()
+    const initialMessageId = mirror.status().messageId
+    expect(initialMessageId).toBeDefined()
+    expect(stub.ops.filter((o) => o.method === 'sendMessage').length).toBe(1)
+    expect(stub.ops.filter((o) => o.method === 'deleteMessage').length).toBe(0)
+
+    await mirror.bump()
+
+    // The bump sequence must produce: deleteMessage of the old id, then
+    // a fresh sendMessage. Edits are NOT acceptable — the warchief asked
+    // for a NEW message at the bottom of the chat, not an in-place edit.
+    expect(stub.ops.filter((o) => o.method === 'deleteMessage').length).toBe(1)
+    expect(stub.ops.filter((o) => o.method === 'sendMessage').length).toBe(2)
+    // The mirror is now tracking a different (fresh) message_id.
+    const newMessageId = mirror.status().messageId
+    expect(newMessageId).toBeDefined()
+    expect(newMessageId).not.toBe(initialMessageId)
+    // And the delete operation targeted the old id.
+    const del = stub.ops.find((o) => o.method === 'deleteMessage')
+    expect(del?.messageId).toBe(initialMessageId)
+    await mirror.stop()
+  })
+
+  test('bump on a disabled mirror is a no-op', async () => {
+    const stub = makeStubApi()
+    const exec = makeExec([ok('first')])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+    })
+    // Never started.
+    await mirror.bump()
+    expect(stub.ops.length).toBe(0)
+    expect(mirror.status().enabled).toBe(false)
+  })
+
+  test('bump swallows deleteMessage errors and still resends', async () => {
+    const stub = makeStubApi()
+    const ops = stub.ops
+    const exec = makeExec([ok('first'), ok('first')])
+    // Wrap deleteMessage to throw once.
+    const baseApi = stub.api
+    let deletesAttempted = 0
+    const flakyApi: typeof baseApi = {
+      ...baseApi,
+      async deleteMessage(chatId, messageId) {
+        deletesAttempted += 1
+        ops.push({ method: 'deleteMessage', chatId, messageId })
+        throw new Error('telegram delete 400')
+      },
+    }
+    const mirror = new TmuxMirror({
+      api: flakyApi,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+    })
+    await mirror.start()
+    await mirror.bump()
+    // Even though delete threw, we must still have sent the new message.
+    expect(deletesAttempted).toBe(1)
+    expect(ops.filter((o) => o.method === 'sendMessage').length).toBe(2)
+    await mirror.stop()
+  })
+})
+
+describe('TmuxMirror — bump debounce + safety', () => {
+  test('rapid double-bump within debounce window collapses to one delete+send', async () => {
+    const stub = makeStubApi()
+    const exec = makeExec([ok('first'), ok('first'), ok('first')])
+    let t = 1_000_000
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+      now: () => t,
+    })
+    await mirror.start() // initial send
+    t += 10 // 10ms later — still within 1500ms debounce window
+    await mirror.bump()
+    t += 50
+    await mirror.bump() // should be skipped
+    t += 50
+    await mirror.bump() // should be skipped
+    // Only one delete+send pair beyond initial send.
+    expect(stub.ops.filter((o) => o.method === 'deleteMessage').length).toBe(1)
+    expect(stub.ops.filter((o) => o.method === 'sendMessage').length).toBe(2)
+    await mirror.stop()
+  })
+
+  test('bump after the debounce window passes goes through', async () => {
+    const stub = makeStubApi()
+    const exec = makeExec([ok('first'), ok('first'), ok('first')])
+    let t = 1_000_000
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+      now: () => t,
+    })
+    await mirror.start()
+    t += 10
+    await mirror.bump() // 1st bump goes through
+    t += 5000 // well past the 1500ms debounce window
+    await mirror.bump() // 2nd bump also goes through
+    expect(stub.ops.filter((o) => o.method === 'deleteMessage').length).toBe(2)
+    expect(stub.ops.filter((o) => o.method === 'sendMessage').length).toBe(3)
+    await mirror.stop()
+  })
+
+  test('bump on a stopped mirror after start (race with stop) does not resurrect', async () => {
+    const stub = makeStubApi()
+    const exec = makeExec([ok('first')])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+    })
+    await mirror.start()
+    await mirror.stop()
+    stub.reset()
+    // After stop, bump must do nothing — neither delete (no messageId)
+    // nor send (enabled=false).
+    await mirror.bump()
+    expect(stub.ops.length).toBe(0)
+  })
+})
+
+describe('TmuxMirror — segment filter integration', () => {
+  test('boot banner is hidden from the rendered body by default', async () => {
+    const stub = makeStubApi()
+    const pane = [
+      '╭─── Claude Code v2.1.144 ─────────────────────────────────────────────────────╮',
+      '│                 Welcome back Dashi!                │ Tips for getting        │',
+      '│       grenkalove@gmail.com\'s Organization          │ /release-notes for more │',
+      '╰──────────────────────────────────────────────────────────────────────────────╯',
+      '',
+      '> live conversation content',
+    ].join('\n')
+    const exec = makeExec([ok(pane)])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+    })
+    await mirror.start()
+    const sent = stub.ops.find((o) => o.method === 'sendMessage')
+    expect(sent).toBeDefined()
+    expect(sent?.text).not.toContain('Claude Code v2.1.144')
+    expect(sent?.text).not.toContain('Welcome back Dashi')
+    expect(sent?.text).not.toContain('grenkalove@gmail.com')
+    expect(sent?.text).toContain('live conversation content')
+    await mirror.stop()
+  })
+
+  test('pane that collapses to empty after filter renders «(no visible output)»', async () => {
+    // Idle pane that only contains banner + footer (no live content):
+    // the filter strips everything, but the mirror must still render
+    // a valid Telegram body — Telegram rejects `<pre></pre>` with
+    // empty inner text as 400 «message text is empty».
+    const stub = makeStubApi()
+    const pane = [
+      '╭─── Claude Code v2.1.144 ──╮',
+      '│  Welcome back            │',
+      '╰───────────────────────────╯',
+      '',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt',
+    ].join('\n')
+    const exec = makeExec([ok(pane)])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+    })
+    await mirror.start()
+    const sent = stub.ops.find((o) => o.method === 'sendMessage')
+    expect(sent).toBeDefined()
+    expect(sent?.text).toContain('(no visible output)')
+    expect(sent?.text).not.toContain('Claude Code v2.1.144')
+    expect(sent?.text).not.toContain('bypass permissions')
+    await mirror.stop()
+  })
+
+  test('explicit empty hideSegments disables filtering (raw pane)', async () => {
+    const stub = makeStubApi()
+    const pane = [
+      '╭─── Claude Code v2.1.144 ───╮',
+      '│       Welcome back        │',
+      '╰────────────────────────────╯',
+      '> hello',
+    ].join('\n')
+    const exec = makeExec([ok(pane)])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+      hideSegments: [],
+    })
+    await mirror.start()
+    const sent = stub.ops.find((o) => o.method === 'sendMessage')
+    expect(sent?.text).toContain('Claude Code v2.1.144')
+    expect(sent?.text).toContain('Welcome back')
+    await mirror.stop()
+  })
+})
+
 describe('TmuxMirror — status accessor', () => {
   test('status reflects last poll outcome', async () => {
     const stub = makeStubApi()

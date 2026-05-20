@@ -99,9 +99,14 @@ export function parseOobCommand(
 
 // Minimal surface of TmuxMirror that the OOB layer needs. Decoupled from
 // the concrete class so tests don't need to spin up the full mirror.
+//
+// `bump` is optional because it's used by the inbound-message handler
+// (not by /mirror commands) — keeping it optional avoids forcing every
+// OOB unit test to stub a method it never exercises.
 export interface TmuxMirrorControl {
   start(): Promise<void>
   stop(): Promise<void>
+  bump?(): Promise<void>
   status(): {
     enabled: boolean
     messageId?: number

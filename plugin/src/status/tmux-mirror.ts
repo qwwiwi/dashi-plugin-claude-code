@@ -35,6 +35,11 @@ import { promisify } from 'util'
 
 import type { Logger } from '../log.js'
 import type { TelegramApi } from '../channel/tools.js'
+import {
+  filterPane,
+  DEFAULT_HIDDEN_SEGMENTS,
+  type SegmentType,
+} from './tmux-pane-filter.js'
 
 export interface TmuxExecResult {
   stdout: string
@@ -69,6 +74,12 @@ export interface TmuxMirrorOptions {
   now?: () => number
   // Telegram body cap. Defaults to 4096 — the hard limit on sendMessage.
   maxBodyChars?: number
+  // Optional: segment types to hide from the rendered mirror. When
+  // omitted, `DEFAULT_HIDDEN_SEGMENTS` from tmux-pane-filter is used —
+  // boot banner, inbound-injection warning, and footer hints — so the
+  // rolling message only carries semantically useful pane content. Pass
+  // an empty array to disable filtering entirely (raw pane mirror).
+  hideSegments?: ReadonlyArray<SegmentType>
 }
 
 export interface TmuxMirrorStatus {
@@ -81,6 +92,17 @@ export interface TmuxMirrorStatus {
 
 // Telegram HTML parse mode keeps `<pre>` formatting intact.
 const HTML_OPTS = { parse_mode: 'HTML' as const }
+
+// Debounce window for bump(). A burst of inbound messages within this
+// window collapses to a single delete+resend, avoiding both Telegram
+// rate-limit pressure and visible flicker for the warchief.
+const BUMP_DEBOUNCE_MS = 1500
+// Max time bump() will wait for a concurrent interval poll to release
+// the inFlight slot before kicking its own poll anyway. 2s is well
+// above a healthy poll round-trip (<200ms) but below the 5s tmux exec
+// timeout, so a stuck poll won't strand the bump caller indefinitely.
+const BUMP_WAIT_MAX_MS = 2000
+const BUMP_WAIT_TICK_MS = 25
 
 // Strip ANSI / vt control sequences and bare control characters. Keep
 // newlines + tabs. Patterns:
@@ -173,6 +195,7 @@ export class TmuxMirror {
   private readonly redact: (text: string) => string
   private readonly now: () => number
   private readonly maxBodyChars: number
+  private readonly hideSegments: ReadonlyArray<SegmentType>
 
   private timer: ReturnType<typeof setInterval> | null = null
   private enabled = false
@@ -180,6 +203,7 @@ export class TmuxMirror {
   private lastHash: string | undefined
   private lastError: string | undefined
   private lastPollAt: number | undefined
+  private lastBumpAt: number | undefined
   // In-flight guard: while a poll is processing (capture + send/edit),
   // overlapping calls return early. Combined with hash-dedup this keeps
   // Telegram traffic O(1) per pane change rather than O(N) per poll.
@@ -196,6 +220,7 @@ export class TmuxMirror {
     this.redact = opts.redact ?? ((s) => s)
     this.now = opts.now ?? ((): number => Date.now())
     this.maxBodyChars = opts.maxBodyChars ?? 4096
+    this.hideSegments = opts.hideSegments ?? DEFAULT_HIDDEN_SEGMENTS
   }
 
   // Pure rendering: turn a tmux exec result into the final body. Side
@@ -209,9 +234,26 @@ export class TmuxMirror {
       return renderBody('(no output)', errMsg, this.maxBodyChars)
     }
     const cleaned = stripAnsi(result.stdout)
+    // Drop boot banner / inbound warning / footer hints BEFORE redaction
+    // — the filter's anchors look at the raw textual structure (box
+    // corners, specific phrases) and must not be perturbed by replaced
+    // tokens. An empty hideSegments list short-circuits to the raw
+    // cleaned text so the mirror can be rendered unfiltered when needed.
+    let filtered =
+      this.hideSegments.length === 0
+        ? cleaned
+        : filterPane(cleaned, { hide: this.hideSegments })
+    // Telegram rejects `<pre></pre>` with no inner text as "message
+    // text is empty" (400). If the filter consumed everything (idle
+    // tmux pane that only renders banner + footer right now), render
+    // a placeholder so the rolling message stays visible and the
+    // self-heal path can still fire on next poll.
+    if (filtered.trim() === '') {
+      filtered = '(no visible output)'
+    }
     let redacted: string
     try {
-      redacted = this.redact(cleaned)
+      redacted = this.redact(filtered)
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err)
       this.log.warn('tmux mirror redact threw (rendered as error)', {
@@ -257,6 +299,64 @@ export class TmuxMirror {
         })
       })
     }, this.pollIntervalMs)
+  }
+
+  // Drop the current rolling message and immediately re-send a fresh
+  // one so the mirror is anchored at the bottom of the chat again.
+  // Triggered by Telegram-side events (e.g. an incoming warchief
+  // message scrolled the mirror up the conversation). The method is
+  // idempotent on a disabled or empty mirror — both states are no-ops.
+  //
+  // Debounce: a burst of inbound messages (multi-part voice replies,
+  // album bursts) would otherwise issue one delete+send per message
+  // and hit safe-telegram-api's per-chat rate limit. We collapse calls
+  // within BUMP_DEBOUNCE_MS to a single bump.
+  //
+  // Concurrency: if an interval poll is already in flight we wait a
+  // bounded amount of time for it to finish before our forced poll
+  // grabs the slot — otherwise the inFlight guard would silently
+  // degrade bump() to "delete now, recreate on next interval tick",
+  // breaking the «immediately re-send» contract (review 2026-05-20).
+  async bump(): Promise<void> {
+    if (!this.enabled) return
+    // Debounce: skip if we just bumped. Note: we DO clear the inbound
+    // signal even when skipping — the goal is just to coalesce.
+    const t = this.now()
+    if (this.lastBumpAt !== undefined && t - this.lastBumpAt < BUMP_DEBOUNCE_MS) {
+      return
+    }
+    this.lastBumpAt = t
+
+    if (this.messageId !== undefined) {
+      const old = this.messageId
+      this.messageId = undefined
+      this.lastHash = undefined
+      try {
+        await this.api.deleteMessage(this.chatId, old)
+      } catch (err) {
+        // Best-effort — Telegram may have already removed it, or the
+        // bot may lack permission in a group. We still want the resend.
+        this.log.warn('tmux mirror bump delete failed (ignored)', {
+          chat_id: this.chatId,
+          message_id: old,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+    // stop() may have flipped `enabled` during the delete await; bail
+    // before sending anything so we don't resurrect a disabled mirror.
+    if (!this.enabled) return
+
+    // Force the next poll to acquire the inFlight slot — wait briefly
+    // for any concurrent interval poll to finish so our send goes
+    // through. Bounded by BUMP_WAIT_MAX_MS to avoid hanging on a stuck
+    // poll (e.g. tmux exec hanging for the full 5s timeout).
+    const waitStart = this.now()
+    while (this.inFlight && this.now() - waitStart < BUMP_WAIT_MAX_MS) {
+      await new Promise<void>((r) => setTimeout(r, BUMP_WAIT_TICK_MS))
+      if (!this.enabled) return
+    }
+    await this.onPoll()
   }
 
   async stop(): Promise<void> {
