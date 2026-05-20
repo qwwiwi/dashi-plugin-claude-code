@@ -35,6 +35,8 @@ import {
   listTools,
   type ToolDeps,
 } from './channel/tools.js'
+import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
+import { redactSecrets } from './safety/redact.js'
 import { StatusManager } from './status/status-manager.js'
 import { MemoryWriter, type MemoryConfig } from './memory/writer.js'
 import { dirname as pathDirname } from 'path'
@@ -218,7 +220,20 @@ if (!tokenLock.acquire(statePaths)) {
 // ─────────────────────────────────────────────────────────────────────
 
 const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
-const telegramApi = createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN)
+// Raw API talks to grammy. Safe wrapper sits in front of every downstream
+// consumer (StatusManager, oob, handlers, poller, webhook). The wrapper:
+//   1. redactSecrets(text, logSecrets) before delegating to raw API.
+//   2. validateTelegramHtml(text) when parse_mode=='HTML'; downgrade on
+//      invalid markup (strip parse_mode, ship escaped plain).
+// No call site can bypass — the raw `telegramApi` reference is shadowed
+// after this line. Anything that imports TelegramApi from channel/tools
+// receives the wrapped instance via toolDeps / handlerDeps / StatusManager.
+const rawTelegramApi = createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN)
+// The bot token itself is included in extraSecrets so any code path that
+// accidentally tries to ship the token (e.g. error message including a
+// URL-with-token from grammy) gets it scrubbed before the bytes leave us.
+const apiSecrets: string[] = [...logSecrets, env.TELEGRAM_BOT_TOKEN]
+const telegramApi = createSafeTelegramApi(rawTelegramApi, log, apiSecrets)
 
 const mcp = new Server(
   { name: 'dashi-channel', version: '1.0.0' },
@@ -331,7 +346,14 @@ bot.on('callback_query:data', async ctx => {
     editMessageText: async (text, opts) => {
       const other: Record<string, unknown> = {}
       if (opts?.reply_markup) other.reply_markup = opts.reply_markup
-      await ctx.editMessageText(text, other)
+      // Permission-card body is built from agent-supplied tool input — that
+      // input can contain secrets (Bash command with a token, HTTP header
+      // value, etc.). Apply the same redaction filter the safe wrapper uses
+      // so an inline-keyboard edit can't ship raw secrets to the chat.
+      // We bypass the HTML validator here because the permission card is
+      // plain text (no parse_mode is set in this code path).
+      const safeText = redactSecrets(text, apiSecrets)
+      await ctx.editMessageText(safeText, other)
     },
   }
   try {
