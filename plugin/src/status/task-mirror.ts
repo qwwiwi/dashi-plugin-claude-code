@@ -63,6 +63,12 @@ interface ChatTaskEntry {
   // Latest TodoWrite snapshot from Claude. Replaced wholesale on each event
   // — TodoWrite is itself the full list, so we never merge incrementally.
   todos: ReadonlyArray<TodoItem>
+  // Incremental task map for the TaskCreate/TaskUpdate path (newer Claude Code
+  // harness). Key is the harness taskId once reconciled from `toolResult`, or
+  // the provisional `toolUseId` until then. `todos` is rebuilt from this map
+  // after every mutation so `scheduleFlush` keeps using the existing renderer.
+  // Insertion-order Map keeps the visual ordering stable across renders.
+  taskMap: Map<string, TodoItem>
   // Last text we actually sent / edited. Idempotency gate.
   lastRenderedText?: string
   // Timestamp of the last successful send or edit. Used for throttle.
@@ -77,6 +83,16 @@ interface ChatTaskEntry {
   pendingTimer: NodeJS.Timeout | null
   // True once todo_session_stop has been processed. Idempotency guard.
   stopped: boolean
+}
+
+// Extract the harness-assigned task id from a TaskCreate PostToolUse
+// `tool_result`. The harness emits `Task #<n> created successfully...`; we
+// pull out the first `#<digits>` token. Returns null if the shape doesn't
+// match — caller falls back to the provisional `toolUseId`.
+function parseCreatedTaskId(toolResult: unknown): string | null {
+  if (typeof toolResult !== 'string') return null
+  const match = toolResult.match(/#(\d+)/)
+  return match ? (match[1] ?? null) : null
 }
 
 export class TaskMirror {
@@ -102,6 +118,15 @@ export class TaskMirror {
    * Main entry point. Called by the webhook handler for every Claude hook
    * that mapped to a TaskMirrorEvent. Never throws — top-level try/catch
    * swallows any failure so the webhook 200 path stays open.
+   *
+   * Three input shapes:
+   *   - `todo_write`: full list snapshot (legacy TodoWrite tool). Replaces
+   *     `todos` wholesale AND clears `taskMap` so a mid-session switch from
+   *     TodoWrite to TaskCreate/Update starts cleanly.
+   *   - `task_create` / `task_update`: incremental events from the newer
+   *     TaskCreate/TaskUpdate tools. Mutate `taskMap`, then synthesise the
+   *     `todos` array from it.
+   *   - `todo_session_stop`: terminal signal, handled separately.
    */
   async recordEvent(chatId: string, event: TaskMirrorEvent): Promise<void> {
     if (!this.config.task_mirror.enabled) return
@@ -113,8 +138,22 @@ export class TaskMirror {
       const entry = this.getOrCreate(chatId)
       if (entry.stopped) return
       entry.lastActivityMs = this.now()
-      // Replace the snapshot wholesale. TodoWrite payloads ARE the full list.
-      entry.todos = event.todos
+
+      switch (event.kind) {
+        case 'todo_write':
+          // Replace the snapshot wholesale. TodoWrite payloads ARE the full list.
+          entry.taskMap.clear()
+          entry.todos = event.todos
+          break
+        case 'task_create':
+          this.applyTaskCreate(entry, event)
+          entry.todos = Array.from(entry.taskMap.values())
+          break
+        case 'task_update':
+          this.applyTaskUpdate(entry, event)
+          entry.todos = Array.from(entry.taskMap.values())
+          break
+      }
       this.scheduleFlush(entry)
     } catch (err) {
       this.log.warn('task mirror recordEvent failed (ignored)', {
@@ -122,6 +161,81 @@ export class TaskMirror {
         error: err instanceof Error ? err.message : String(err),
       })
     }
+  }
+
+  /**
+   * TaskCreate handler. PreToolUse adds the task to `taskMap` keyed on
+   * `toolUseId` (provisional id, always present). The follow-up PostToolUse
+   * carries `toolResult`; if we can parse a real `#<n>` id we re-key the
+   * entry so subsequent `TaskUpdate` events (which use the real id) can find
+   * it. Two arrivals are idempotent — a TaskCreate that has already been
+   * recorded under its provisional id and a matching PostToolUse with the
+   * same toolUseId find the entry and reconcile without duplicating.
+   *
+   * Note: the harness convention is `Task #N created successfully` — see
+   * TaskCreate tool description. `parseCreatedTaskId` extracts the first
+   * `#<digits>` substring and returns null on shape mismatch.
+   */
+  private applyTaskCreate(
+    entry: ChatTaskEntry,
+    event: Extract<TaskMirrorEvent, { kind: 'task_create' }>,
+  ): void {
+    const realId =
+      event.toolResult !== undefined ? parseCreatedTaskId(event.toolResult) : null
+    const provisionalId = event.toolUseId
+    const provisional = entry.taskMap.get(provisionalId)
+    const item: TodoItem = {
+      id: realId ?? provisional?.id ?? provisionalId,
+      content: event.input.subject,
+      status: provisional?.status ?? 'pending',
+      ...(event.input.activeForm !== undefined
+        ? { activeForm: event.input.activeForm }
+        : provisional?.activeForm !== undefined
+          ? { activeForm: provisional.activeForm }
+          : {}),
+    }
+    // Drop the provisional entry, insert under the canonical id. This re-keys
+    // the Map without dropping anything else; insertion-order semantics mean
+    // the task moves to the tail on reconciliation, which is the right place
+    // visually (most recently activated).
+    entry.taskMap.delete(provisionalId)
+    if (realId !== null && realId !== provisionalId) {
+      entry.taskMap.delete(realId)
+    }
+    entry.taskMap.set(item.id ?? provisionalId, item)
+  }
+
+  /**
+   * TaskUpdate handler. `taskId` from the harness is always a string after
+   * the schema coerce. If the entry exists, mutate in place; if not (e.g.
+   * TaskMirror missed the TaskCreate due to a webhook drop), synthesise a
+   * minimal placeholder so the list stays consistent.
+   */
+  private applyTaskUpdate(
+    entry: ChatTaskEntry,
+    event: Extract<TaskMirrorEvent, { kind: 'task_update' }>,
+  ): void {
+    const id = event.input.taskId
+    // Drop 'deleted' before constructing the TodoItem -- the rendered TodoItem
+    // type accepts only pending/in_progress/completed, and the schema-coerced
+    // 'deleted' value would not narrow correctly otherwise.
+    if (event.input.status === 'deleted') {
+      entry.taskMap.delete(id)
+      return
+    }
+    const existing = entry.taskMap.get(id)
+    const status = event.input.status ?? existing?.status ?? 'pending'
+    const next: TodoItem = {
+      id,
+      content: event.input.subject ?? existing?.content ?? `task ${id}`,
+      status,
+      ...(event.input.activeForm !== undefined
+        ? { activeForm: event.input.activeForm }
+        : existing?.activeForm !== undefined
+          ? { activeForm: existing.activeForm }
+          : {}),
+    }
+    entry.taskMap.set(id, next)
   }
 
   /**
@@ -162,6 +276,7 @@ export class TaskMirror {
       startedAtMs: this.now(),
       lastActivityMs: this.now(),
       todos: [],
+      taskMap: new Map(),
       lastEditAtMs: 0,
       flushPromise: null,
       pendingTimer: null,

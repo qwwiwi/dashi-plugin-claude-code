@@ -7,7 +7,14 @@
 // Telegram or our logs.
 
 import type { ClaudeHookPayload } from '../schemas.js'
-import { TodoWriteInputSchema, type TodoItem } from '../schemas.js'
+import {
+  TodoWriteInputSchema,
+  TaskCreateInputSchema,
+  TaskUpdateInputSchema,
+  type TodoItem,
+  type TaskCreateInput,
+  type TaskUpdateInput,
+} from '../schemas.js'
 import type { Logger } from '../log.js'
 
 // Tool-call lifecycle pair used by the rolling activity window. PreToolUse
@@ -66,6 +73,29 @@ export interface TodoWriteEvent {
   readonly todos: ReadonlyArray<TodoItem>
 }
 
+// TaskCreate / TaskUpdate hooks emitted by the newer Claude Code harness.
+// Unlike TodoWrite (which carries the full list per call), these are
+// incremental — TaskMirror accumulates them in an internal Map<taskId, TodoItem>
+// and renders the synthesised snapshot. PreToolUse of TaskCreate fires before
+// the harness assigns a real numeric id, so we pass `toolUseId` as the
+// provisional handle and reconcile with the real id in the PostToolUse pass
+// (Phase 2 — for now the provisional id stays).
+export interface TaskCreateEvent {
+  readonly kind: 'task_create'
+  readonly toolUseId: string
+  readonly input: TaskCreateInput
+  // Populated on PostToolUse when the harness has materialised the task; null
+  // on PreToolUse. Format: usually `Task #<n> created` — TaskMirror runs the
+  // same regex extract as the warchief's terminal renderer.
+  readonly toolResult?: unknown
+}
+
+export interface TaskUpdateEvent {
+  readonly kind: 'task_update'
+  readonly toolUseId: string
+  readonly input: TaskUpdateInput
+}
+
 // Session-stop signal for TaskMirror specifically. Renamed from the
 // ActivityStatusEvent variant so the TaskMirror dispatcher does not
 // accidentally consume a non-todo Stop hook.
@@ -73,7 +103,11 @@ export interface TodoSessionStopEvent {
   readonly kind: 'todo_session_stop'
 }
 
-export type TaskMirrorEvent = TodoWriteEvent | TodoSessionStopEvent
+export type TaskMirrorEvent =
+  | TodoWriteEvent
+  | TaskCreateEvent
+  | TaskUpdateEvent
+  | TodoSessionStopEvent
 
 /**
  * Convert a validated Claude hook payload to an ActivityStatusEvent.
@@ -145,5 +179,48 @@ export function toTodoWriteEvent(
     }
     return { kind: 'todo_write', todos: parsed.data.todos }
   }
+
+  // TaskCreate -- emit on PreToolUse so the milestone shows up the moment the
+  // warchief sees it spawn, and again on PostToolUse with `toolResult` so
+  // TaskMirror can reconcile the provisional id with the harness-assigned one.
+  if (
+    (payload.hook_event_name === 'PreToolUse' || payload.hook_event_name === 'PostToolUse') &&
+    payload.tool_name === 'TaskCreate'
+  ) {
+    const parsed = TaskCreateInputSchema.safeParse(payload.tool_input)
+    if (!parsed.success) {
+      log?.warn('TaskCreate tool_input failed schema validation (ignored)', {
+        issues: parsed.error.issues.map((i) => i.message).slice(0, 5),
+      })
+      return null
+    }
+    const event: TaskCreateEvent = {
+      kind: 'task_create',
+      toolUseId: payload.tool_use_id,
+      input: parsed.data,
+    }
+    return payload.hook_event_name === 'PostToolUse' && payload.tool_result !== undefined
+      ? { ...event, toolResult: payload.tool_result }
+      : event
+  }
+
+  // TaskUpdate -- mutations carry the real taskId in tool_input. We fire on
+  // PostToolUse only: PreToolUse status is what the call WANTS to set, the
+  // harness can still reject, so we wait for the post-call confirmation.
+  if (payload.hook_event_name === 'PostToolUse' && payload.tool_name === 'TaskUpdate') {
+    const parsed = TaskUpdateInputSchema.safeParse(payload.tool_input)
+    if (!parsed.success) {
+      log?.warn('TaskUpdate tool_input failed schema validation (ignored)', {
+        issues: parsed.error.issues.map((i) => i.message).slice(0, 5),
+      })
+      return null
+    }
+    return {
+      kind: 'task_update',
+      toolUseId: payload.tool_use_id,
+      input: parsed.data,
+    }
+  }
+
   return null
 }

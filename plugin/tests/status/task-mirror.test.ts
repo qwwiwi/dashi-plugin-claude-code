@@ -178,6 +178,42 @@ function todoEvent(todos: TodoItem[]): TaskMirrorEvent {
   return { kind: 'todo_write', todos }
 }
 
+function taskCreateEvent(
+  toolUseId: string,
+  subject: string,
+  opts: { activeForm?: string; toolResult?: string } = {},
+): TaskMirrorEvent {
+  const event: Extract<TaskMirrorEvent, { kind: 'task_create' }> = {
+    kind: 'task_create',
+    toolUseId,
+    input: {
+      subject,
+      ...(opts.activeForm !== undefined ? { activeForm: opts.activeForm } : {}),
+    },
+  }
+  return opts.toolResult !== undefined
+    ? { ...event, toolResult: opts.toolResult }
+    : event
+}
+
+function taskUpdateEvent(
+  taskId: string,
+  patch: Partial<{
+    status: 'pending' | 'in_progress' | 'completed' | 'deleted'
+    subject: string
+    activeForm: string
+  }>,
+): TaskMirrorEvent {
+  return {
+    kind: 'task_update',
+    toolUseId: `tu-update-${taskId}`,
+    input: {
+      taskId,
+      ...patch,
+    },
+  }
+}
+
 const STOP: TaskMirrorEvent = { kind: 'todo_session_stop' }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -386,6 +422,88 @@ describe('TaskMirror', () => {
     ]))
     const sends = api.calls.filter((c) => c.kind === 'send')
     expect(sends.length).toBe(1)
+  })
+
+  // ─────────────────────────────────────────────────────────────────────
+  // TaskCreate / TaskUpdate (incremental events, newer Claude Code harness)
+  // ─────────────────────────────────────────────────────────────────────
+
+  test('task_create: PreToolUse adds a pending task to the snapshot', async () => {
+    const { mirror, api } = makeMirror()
+    await mirror.recordEvent('chat-1', taskCreateEvent('tu-1', 'Implement X'))
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(1)
+    expect(sends[0]!.text).toContain('Implement X')
+    expect(sends[0]!.text).toContain('1 pending')
+  })
+
+  test('task_update: status change moves the item from pending to in_progress', async () => {
+    const { mirror, api, clock } = makeMirror()
+    await mirror.recordEvent('chat-1', taskCreateEvent('tu-1', 'Build feature'))
+    clock.advance(10)
+    // PostToolUse of TaskCreate carries the harness-assigned id via toolResult.
+    await mirror.recordEvent(
+      'chat-1',
+      taskCreateEvent('tu-1', 'Build feature', { toolResult: 'Task #7 created successfully' }),
+    )
+    clock.advance(5000)
+    await mirror.recordEvent('chat-1', taskUpdateEvent('7', { status: 'in_progress' }))
+    await mirror._idleForTests('chat-1')
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    expect(edits.length).toBeGreaterThanOrEqual(1)
+    expect(edits[edits.length - 1]!.text).toContain('Build feature')
+    expect(edits[edits.length - 1]!.text).toContain('1 in progress')
+  })
+
+  test('task_update: completing the task moves it to the completed bucket', async () => {
+    const { mirror, api, clock } = makeMirror()
+    await mirror.recordEvent(
+      'chat-1',
+      taskCreateEvent('tu-1', 'Ship it', { toolResult: 'Task #3 created' }),
+    )
+    clock.advance(5000)
+    await mirror.recordEvent('chat-1', taskUpdateEvent('3', { status: 'completed' }))
+    await mirror._idleForTests('chat-1')
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    expect(edits[edits.length - 1]!.text).toContain('1 done')
+    expect(edits[edits.length - 1]!.text).toContain('Ship it')
+  })
+
+  test('task_update: status=deleted removes the entry entirely', async () => {
+    const { mirror, api, clock } = makeMirror()
+    await mirror.recordEvent(
+      'chat-1',
+      taskCreateEvent('tu-1', 'Maybe', { toolResult: 'Task #9 created' }),
+    )
+    clock.advance(5000)
+    await mirror.recordEvent('chat-1', taskUpdateEvent('9', { status: 'deleted' }))
+    await mirror._idleForTests('chat-1')
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    const finalText = edits[edits.length - 1]?.text ?? ''
+    expect(finalText).not.toContain('Maybe')
+    expect(finalText).toContain('задач нет')
+  })
+
+  test('todo_write after task_create wipes the incremental Map (no double-counting)', async () => {
+    const { mirror, api, clock } = makeMirror()
+    await mirror.recordEvent('chat-1', taskCreateEvent('tu-1', 'Stale via Task*'))
+    clock.advance(5000)
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Fresh via TodoWrite', status: 'in_progress' }]))
+    await mirror._idleForTests('chat-1')
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    const finalText = edits[edits.length - 1]?.text ?? ''
+    expect(finalText).toContain('Fresh via TodoWrite')
+    expect(finalText).not.toContain('Stale via Task*')
+  })
+
+  test('task_update: missing TaskCreate synthesises placeholder so the list stays consistent', async () => {
+    const { mirror, api } = makeMirror()
+    // TaskUpdate arrives without preceding TaskCreate (webhook drop scenario).
+    await mirror.recordEvent('chat-1', taskUpdateEvent('42', { status: 'in_progress', subject: 'Recovered' }))
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(1)
+    expect(sends[0]!.text).toContain('Recovered')
+    expect(sends[0]!.text).toContain('1 in progress')
   })
 
   // ─────────────────────────────────────────────────────────────────────

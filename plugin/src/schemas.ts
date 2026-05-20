@@ -121,6 +121,34 @@ export const TodoWriteInputSchema = z
   .passthrough()
 export type TodoWriteInput = z.infer<typeof TodoWriteInputSchema>
 
+// Newer Claude Code harness uses TaskCreate/TaskUpdate/TaskList instead of a
+// single TodoWrite tool. The shapes below capture only the fields TaskMirror
+// renders; passthrough preserves the rest (metadata, owner, etc.) without
+// fragilising the parse on harness version bumps. `taskId` on TaskUpdate is
+// always a string in the harness output but we coerce defensively so a
+// numeric id from a future version still parses.
+export const TaskCreateInputSchema = z
+  .object({
+    subject: z.string().min(1),
+    description: z.string().optional(),
+    activeForm: z.string().optional(),
+  })
+  .passthrough()
+export type TaskCreateInput = z.infer<typeof TaskCreateInputSchema>
+
+export const TaskUpdateInputSchema = z
+  .object({
+    taskId: z.union([z.string(), z.number()]).transform((v) => String(v)),
+    status: z
+      .enum(['pending', 'in_progress', 'completed', 'deleted'])
+      .optional(),
+    subject: z.string().optional(),
+    description: z.string().optional(),
+    activeForm: z.string().optional(),
+  })
+  .passthrough()
+export type TaskUpdateInput = z.infer<typeof TaskUpdateInputSchema>
+
 export const ClaudePreToolUseSchema = z
   .object({
     ...ClaudeHookCommonShape,

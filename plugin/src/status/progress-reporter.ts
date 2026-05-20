@@ -93,6 +93,28 @@ interface ChatProgressEntry {
 // inline tags (<b>, <code>, <pre>) are rendered.
 const HTML_OPTS = { parse_mode: 'HTML' as const }
 
+// Tools that should never appear in the rolling activity card. Reads, greps,
+// globs, and deferred-tool lookups are bookkeeping; the dashi-channel MCP
+// reply tools are the channel itself (mirroring them would recurse), and
+// gbrain-recall is background context fetching the warchief does not need to
+// see. Bash/Edit/Write/WebFetch/WebSearch/Agent and gbrain mutations
+// (memory/swarm/tasks) keep flowing through.
+const NOISY_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'Read',
+  'Grep',
+  'Glob',
+  'ToolSearch',
+])
+const NOISY_TOOL_PREFIXES: ReadonlyArray<string> = [
+  'mcp__dashi-channel__',
+  'mcp__dashi-gbrain-recall__',
+]
+
+export function shouldSkipTool(toolName: string): boolean {
+  if (NOISY_TOOL_NAMES.has(toolName)) return true
+  return NOISY_TOOL_PREFIXES.some((p) => toolName.startsWith(p))
+}
+
 export class ProgressReporter {
   private readonly telegramApi: TelegramApiForProgress
   private readonly config: AppConfig
@@ -247,10 +269,16 @@ export class ProgressReporter {
   /**
    * Mutate `entry.calls` based on the event. tool_start appends; other
    * non-Stop events are render-only (move the elapsed counter forward).
+   *
+   * Noise-filter: tool names in `NOISY_TOOLS` (Read/Grep/Glob/ToolSearch and
+   * the dashi-channel + recall MCP prefixes) update `lastActivityMs` upstream
+   * but never enter `entry.calls`, so the rolling card stays focused on
+   * meaningful actions (Bash, Edit, Write, WebFetch, Agent, gbrain mutations).
    */
   private applyEvent(entry: ChatProgressEntry, event: ActivityStatusEvent): void {
     switch (event.kind) {
       case 'tool_start': {
+        if (shouldSkipTool(event.toolName)) break
         const detail = buildActivityDetail(event.toolName, event.toolInput)
         const humanized = buildHumanizedActivityLine(event.toolName, event.toolInput)
         const call: ActivityCall = { toolName: event.toolName, detail, humanized }
