@@ -1,6 +1,13 @@
 # Troubleshooting
 
-6 типовых проблем при установке/миграции — все взяты из реальных инцидентов. Каждая: **симптом** → **корень** → **фикс** → **как не повторить**.
+10 типовых проблем — все взяты из реальных инцидентов. Каждая: **симптом** → **корень** → **фикс** → **как не повторить**.
+
+**Категории:**
+- Проблемы 1-6 — установка / миграция
+- Проблема 7 — OAuth expired (бот реагирует но не отвечает)
+- Проблема 8 — **Agent self-destruction** (catastrophic, обязательно прочесть)
+- Проблема 9 — Tmux death loop (claude exits → service crash loop)
+- Проблема 10 — Sudo deny rules (что должно блокироваться даже когда sudo allowed)
 
 ---
 
@@ -278,6 +285,322 @@ sudo systemctl start channel-<agent>
 ```
 
 **Урок:** state-каталог — отдельная сущность от плагин-кода. При планировании переноса учитывайте оба пути. Никогда не делайте `rm -rf` старого workspace без snapshot.
+
+---
+
+## Проблема 7. Бот ставит реакции, но не отвечает (OAuth expired)
+
+### Симптом
+
+Telegram-бот получает сообщения (видны emoji-реакции — 👀 или похожие), но текстовых ответов нет. В Telegram пользователь пишет, бот молча реагирует и тишина.
+
+`systemctl status channel-<agent>` — `active (running)`. `pm2 list` (если есть) — всё зелёное. Tmux session жива.
+
+### Корень
+
+Claude Code OAuth-токен протух / не валиден. Webhook доходит до плагина (поэтому reactions работают — это слой плагина), плагин дёргает claude CLI, claude пытается вызвать Anthropic API, получает **401 Invalid authentication credentials** / **«Please run /login»**, ничего не отвечает.
+
+Проверка через `tmux capture-pane`:
+
+```
+← dashi-channel: что с тобой?
+  ⎿  Please run /login · API Error: 401 The socket connection was closed
+     unexpectedly. For more information, pass `verbose: true` in the second
+     argument to fetch()
+✻ Crunched for 2m 21s
+```
+
+### Фикс
+
+OAuth flow интерактивный — нужен TTY. Удалённый агент сам себя не починит.
+
+```bash
+# 1. Подключиться под service-user
+sudo -u <service-user> tmux attach -t channel-<agent>
+
+# 2. В claude prompt
+/login
+
+# 3. Открыть выданный URL в браузере, авторизоваться под Anthropic Max аккаунтом
+
+# 4. Detach: Ctrl-B, D
+```
+
+После /login claude подхватит новые токены, сохранит в `~/.openclaw/` (или `~/.claude/` — зависит от версии CLI), при следующем prompt уже ответит.
+
+### Как не повторить
+
+OAuth токены протухают (refresh failure, account changes, скомпрометированные кэши). Полностью не предотвратить, но можно мониторить:
+
+```bash
+# Cron / health-check: проверять что в tmux pane нет «Please run /login»
+tmux capture-pane -t channel-<agent> -p -S -50 | grep -i 'login\|401\|unauthorized' && alert
+```
+
+Также — резервный agent-бот / Telegram-канал чтобы получить сигнал когда основной бот залип.
+
+**Урок:** «бот active» = «сервис жив», не = «авторизация валидна». Reactions работают на уровне плагина, ответы — на уровне API. Когда видишь reactions без ответов = в первую очередь проверь auth, потом всё остальное.
+
+---
+
+## Проблема 8. Agent self-destruction (rm -rf своего OAuth state) ⚠️
+
+### Симптом
+
+Бот работал, потом внезапно перестал отвечать. `systemctl status` показывает **сервис в auto-restart loop**: `Active: activating (auto-restart) (Result: exit-code)`, exit code 0/SUCCESS, рестартится каждые 15 секунд, главный процесс exit'ит сразу после старта.
+
+`ssh ... "tmux capture-pane -t channel-<agent> -p"` возвращает:
+
+```
+no server running on /tmp/tmux-1000/default
+```
+
+Журнал:
+```
+May 20 00:30:32 thrall sh[1608429]: no server running on /tmp/tmux-1000/default
+May 20 00:30:55 thrall sh[1608832]: no server running on /tmp/tmux-1000/default
+May 20 00:31:19 thrall sh[1612639]: no server running on /tmp/tmux-1000/default
+...
+```
+
+### Корень
+
+**Агент через `sudo` удалил каталог со своим Claude OAuth state** (типично: `~/.openclaw/` или `~/.claude/`).
+
+Реальный инцидент Orgrimmar/Thrall, 2026-05-20 00:24:44 UTC. Хронология из journalctl:
+
+```
+00:24:33  sudo du -sh /home/openclaw/.openclaw/
+00:24:33  sudo find /home/openclaw/.openclaw/ -not -user openclaw -type d
+00:24:44  sudo rm -rf /home/openclaw/.openclaw    ← АГЕНТ САМ
+```
+
+Контекст: агент выполнял `audit batrak before removal` (чистка legacy user). Нашёл в `~/.openclaw/` директории не-openclaw-owned (нормально — некоторые subdirs root-owned после init процессов). Решил, что это «orphan», снёс всю папку — вместе со своим OAuth.
+
+Что было в `.openclaw/`:
+- Claude CLI OAuth credentials (access + refresh tokens)
+- `.openclaw/.secrets/` (restic env, DO Spaces credentials)
+- Прочие toolings configs
+
+После удаления при следующем рестарте claude процесс не находит auth state → выходит → tmux single-window закрывается → tmux server останавливается (последняя session) → systemd видит «exited 0» → рестартует через 15s → loop.
+
+### Фикс
+
+OAuth восстановить только через интерактивный /login. Файлы из `.openclaw/.secrets/` восстанавливать из бэкапа (DO Spaces restic snapshot, 1Password, итд).
+
+```bash
+# 1. Stop crash loop
+sudo systemctl stop channel-<agent>
+
+# 2. Manual claude session с TTY
+sudo -u <service-user> -i
+tmux new-session -s channel-<agent>
+claude --dangerously-load-development-channels server:dashi-channel
+# в prompt: /login → открыть URL → авторизоваться → Enter
+# detach: Ctrl-B, D
+
+# 3. Возможно нужно восстановить .secrets/
+restic restore <latest-snapshot> --target /home/<service-user>/.openclaw/.secrets \
+  --include /home/<service-user>/.openclaw/.secrets
+
+# 4. Restart systemd
+sudo systemctl start channel-<agent>
+
+# 5. Smoke: написать боту, должен ответить
+```
+
+### Как не повторить (КРИТИЧНО)
+
+Это **самый опасный класс ошибок для AI-агентов с sudo**. Защита — на уровне permission rules в `~/.claude/settings.json` агента:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(sudo:*)"],
+    "deny": [
+      "Bash(sudo rm:*)",
+      "Bash(sudo rm -rf:*)",
+      "Bash(rm -rf /)",
+      "Bash(rm -rf ~)",
+      "Bash(rm -rf /home/*/.openclaw*)",
+      "Bash(rm -rf /home/*/.claude*)",
+      "Bash(sudo userdel:*)",
+      "Bash(sudo chown -R:*)",
+      "Bash(sudo chmod -R:*)"
+    ],
+    "ask": [
+      "Bash(rm:*)",
+      "Bash(sudo mv:*)",
+      "Bash(sudo cp:*)"
+    ]
+  }
+}
+```
+
+**Принципы:**
+1. `sudo` сам по себе — OK для read-only (du, ls, grep, find, systemctl status, journalctl)
+2. **Destructive sudo (rm, userdel, chown -R, chmod -R) — ВСЕГДА в deny**, даже если sudo в allow
+3. Любой `rm -rf` на хоум-директориях агента — explicit deny с конкретным паттерном
+4. `Bash(rm:*)` (без sudo) — в ask, чтобы при необходимости user мог разрешить per-command
+
+**Системный урок:** агенту нельзя давать blanket sudo. Лучший подход — узкий whitelist read-only sudo команд:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(sudo du:*)", "Bash(sudo ls:*)", "Bash(sudo grep:*)",
+      "Bash(sudo cat:*)", "Bash(sudo find:*)",
+      "Bash(sudo systemctl status:*)", "Bash(sudo systemctl list-units:*)",
+      "Bash(sudo journalctl:*)", "Bash(sudo ss:*)",
+      "Bash(sudo crontab -l:*)", "Bash(sudo getent:*)"
+    ]
+  }
+}
+```
+
+Destructive операции (`sudo rm`, `sudo systemctl stop|start|disable`, `sudo apt remove`) — продолжают спрашивать confirmation.
+
+**Урок:** AI-агенты галлюцинируют. Sudo + галлюцинация = катастрофа. Никогда не давай blanket `Bash(sudo:*)` на production хосте где у агента есть OAuth state, secrets, или живые сервисы рядом.
+
+---
+
+## Проблема 9. Tmux death loop (claude exits → service в crash loop)
+
+### Симптом
+
+```
+$ systemctl status channel-<agent>
+● channel-<agent>.service - Dashi Plugin Channel
+   Active: activating (auto-restart) (Result: exit-code) since ...
+   Main PID: <pid> (code=exited, status=0/SUCCESS)
+```
+
+Сервис рестартится каждые ~15 секунд, exit code = 0/SUCCESS (не error!), но и не работает. `tmux capture-pane` → `no server running`.
+
+### Корень
+
+Type=forking systemd unit ожидает, что `tmux new-session -d` форкнётся и tmux server останется в памяти. Это работает пока есть **живая сессия с живой window**. Если claude процесс внутри tmux pane умирает (например, OAuth fail, неправильный CWD, отсутствует CLAUDE.md import, ENOENT на plugin path) — single-window закрывается, session закрывается, **tmux server останавливается** (если эта сессия была последней).
+
+Systemd видит «exited 0» (потому что `tmux new-session -d` сам по себе отработал успешно, форк прошёл) → срабатывает `Restart=on-failure` → новая попытка. Но root cause (умирающий claude) не починен → loop.
+
+### Фикс
+
+1. Сначала остановить loop, чтобы видеть что происходит:
+   ```bash
+   sudo systemctl stop channel-<agent>
+   ```
+
+2. Запустить claude вручную с TTY и смотреть error:
+   ```bash
+   sudo -u <service-user> -i
+   cd <WorkingDirectory из unit>
+   source <EnvironmentFile>
+   claude --dangerously-load-development-channels server:dashi-channel
+   ```
+
+3. Скорее всего одно из:
+   - **OAuth error** (см. Проблема 7 + 8 — `.openclaw` удалён или token expired)
+   - **plugin path ENOENT** (`--dangerously-load-development-channels` ссылка битая)
+   - **CLAUDE.md import error** (если используется @-include, файл не найден)
+
+4. После починки root cause → `systemctl start channel-<agent>`
+
+### Как не повторить
+
+Watchdog хелсчек: cron, который раз в минуту проверяет что tmux session живёт.
+
+```bash
+*/1 * * * * tmux has-session -t channel-<agent> 2>/dev/null || \
+  (echo "DEAD $(date)" >> /var/log/channel-watchdog.log; \
+   systemctl restart channel-<agent>)
+```
+
+Лучше — alert в Telegram канал когда `restart counter` за 5 минут > 3 (явный crash loop).
+
+**Урок:** «exit 0 status SUCCESS» обманчиво. Type=forking считает успехом сам факт fork'а, не долгоживущесть. Всегда смотрите `tmux has-session` отдельно от `systemctl is-active`.
+
+---
+
+## Проблема 10. Sudo deny rules: что должно блокироваться ВСЕГДА
+
+### Симптом / контекст
+
+Прецедент проблемы 8 показал: blanket `Bash(sudo:*)` в allow — самоубийство. Но узкий whitelist (только read-only sudo) — это idealный кейс. Иногда агенту реально нужен `sudo systemctl restart` или `sudo cp /tmp/file /etc/...`. Как обеспечить безопасность даже когда sudo allowed широко?
+
+### Минимальный baseline `deny` (вне зависимости от allow):
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf /)",
+      "Bash(rm -rf ~)",
+      "Bash(rm -rf /home/*/.openclaw*)",
+      "Bash(rm -rf /home/*/.claude*)",
+      "Bash(rm -rf /home/*/.secrets*)",
+      "Bash(rm -rf /opt:*)",
+      "Bash(rm -rf /var:*)",
+      "Bash(rm -rf /etc:*)",
+      "Bash(sudo rm -rf:*)",
+      "Bash(sudo userdel:*)",
+      "Bash(sudo chown -R:*)",
+      "Bash(sudo chmod -R 777:*)",
+      "Bash(sudo dd:*)",
+      "Bash(sudo mkfs:*)",
+      "Bash(sudo fdisk:*)",
+      "Bash(sudo iptables -F:*)",
+      "Bash(sudo ufw disable:*)",
+      "Bash(curl * | bash)",
+      "Bash(wget * | sh)",
+      "Bash(chmod 777 *)",
+      "Bash(git push --force:*)",
+      "Bash(git reset --hard:*)"
+    ]
+  }
+}
+```
+
+**Логика:** deny имеет приоритет над allow. Эти команды — катастрофические, и не должны быть разрешены даже под надзором. Если действительно нужно — пользователь делает руками с явным OK, не агент.
+
+### Защита Claude OAuth state специально
+
+Минимум для каждого агента:
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm * .openclaw*)",
+      "Bash(rm * .claude*)",
+      "Bash(mv .openclaw*)",
+      "Bash(mv .claude*)",
+      "Bash(sudo rm * .openclaw*)",
+      "Bash(sudo rm * .claude*)"
+    ]
+  }
+}
+```
+
+И параллельно — file watcher / inotify alert на `~/.openclaw/` который пишет в Telegram канал если что-то удаляется.
+
+### Как не повторить
+
+После установки нового агента — обязательный smoke на permissions:
+
+```bash
+# Что должно блокироваться (агент должен ОТКАЗАТЬСЯ выполнить):
+"rm -rf ~/.openclaw"        # → blocked
+"sudo rm -rf /home/me"      # → blocked
+"chmod 777 /etc"            # → blocked
+"git push --force"          # → blocked
+
+# Что должно требовать confirmation:
+"rm /tmp/test-file"         # → ask
+"sudo systemctl restart X"  # → ask или allow
+```
+
+**Урок:** permissions — это не just convenience setting, это **security boundary**. Каждое расширение `allow` должно быть подкреплено комплементарным `deny` для destructive вариантов той же команды. allow без deny = open shotgun.
 
 ---
 
