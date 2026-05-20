@@ -1,0 +1,591 @@
+# Plan: PR-A2 (TaskMirror) + PR-A3 (Watcher/Auto-Responder)
+
+> Codex GPT-5.5 architectural plan — 2026-05-20
+> Branch: `feature/task-mirror-and-watcher`
+> Shipping as ONE PR on top of merged PR-A1 (`b3ad729`).
+
+---
+
+## 1. AUDIT
+
+### 1.1 `src/status/progress-reporter.ts`
+
+**Architectural model for TaskMirror.** Key findings:
+
+- `ChatProgressEntry` (line 85–107): per-chat state. Fields: `messageId?`, `startedAtMs`, `lastActivityMs`, `calls[]`, `lastRenderedText?`, `lastEditAtMs`, `desiredText?`, `flushPromise`, `pendingTimer`, `stopped`. TaskMirror will mirror this shape exactly (with `todos[]` instead of `calls[]`).
+- `TelegramApiForProgress` (line 47–55): minimal structural interface for `sendMessage` + `editMessageText`. TaskMirror reuses this same interface — no new interface needed.
+- `ProgressReporterDeps` (line 57–65): injectable clock (`now`) + timer (`setTimer`/`clearTimer`) for deterministic tests. TaskMirror copies this pattern.
+- Single-slot queue (line 261–280, `scheduleFlush`): `flushPromise !== null` guard prevents double-flight. Timer slot (`pendingTimer`) for throttle deferral.
+- Idempotency gate (line 265): `text === entry.lastRenderedText` early-return.
+- `handleStop` (line 357–404): cancels timer, awaits in-flight, posts final edit, evicts entry. TaskMirror copies this pattern for session_stop.
+- `_idleForTests` (line 144–156): drain loop for test assertions. TaskMirror must expose the same.
+- `getOrCreate` (line 168–194): TTL eviction via `lastActivityMs`. `session_ttl_ms` from `config.progress`. TaskMirror shares the same TTL value.
+
+**Key invariant:** three independent rolling messages per chat — StatusManager (transient bubble), ProgressReporter (tool activity thread), TaskMirror (todo list thread). They never share state.
+
+### 1.2 `src/hooks/claude-events.ts`
+
+- `ActivityStatusEvent` union (line 49): `ToolStartEvent | ToolEndEvent | ReasoningEvent | SessionStartEvent | SessionStopEvent`.
+- `toActivityEvent` (line 56–86): maps `ClaudeHookPayload` → `ActivityStatusEvent`. **Only `PostToolUse` with `tool_name === 'TodoWrite'` is relevant for TaskMirror** — but `toActivityEvent` currently returns a `ToolEndEvent` for ALL `PostToolUse` events, including `TodoWrite`. The TaskMirror dispatch must happen ALONGSIDE the existing `toActivityEvent` call, not inside it.
+- A **new `TodoWriteEvent`** type must be added to this file. It is NOT a subtype of `ActivityStatusEvent` — it is a parallel union used only by TaskMirror. This keeps StatusManager and ProgressReporter untouched.
+- New export needed: `toTodoWriteEvent(payload: ClaudeHookPayload): TodoWriteEvent | null` — returns non-null only when `hook_event_name === 'PostToolUse'` and `tool_name === 'TodoWrite'` OR `hook_event_name === 'Stop'`.
+
+### 1.3 `src/schemas.ts`
+
+- `ToolInputSchema` (line 119): `z.record(z.unknown())` — already `passthrough`-compatible.
+- `ClaudePostToolUseSchema` (line 121–131): `tool_input: ToolInputSchema`. The `tool_input` for `TodoWrite` carries `{ todos: [...] }` — but `ToolInputSchema` is `z.record(z.unknown())`, so it parses fine.
+- **New export needed:** `TodoWriteInputSchema` — validates `tool_input` when `tool_name === 'TodoWrite'`. Must use `.passthrough()` on the todo item shape. Placement: after `ToolInputSchema` definition (~line 119).
+
+```ts
+// Pseudocode shape:
+const TodoItemSchema = z.object({
+  id: z.string().optional(),
+  content: z.string(),
+  status: z.enum(['pending', 'in_progress', 'completed']),
+  priority: z.enum(['high', 'medium', 'low']).optional(),
+}).passthrough()
+
+export const TodoWriteInputSchema = z.object({
+  todos: z.array(TodoItemSchema),
+}).passthrough()
+export type TodoWriteInput = z.infer<typeof TodoWriteInputSchema>
+export type TodoItem = z.infer<typeof TodoItemSchema>
+```
+
+### 1.4 `src/server.ts` (lines 221–320)
+
+- Line 232: `createSafeTelegramApi(rawTelegramApi, log, apiSecrets)` — the safe-wrapped `telegramApi` is the only reference passed downstream. **TaskMirror must receive this same `telegramApi`.**
+- Line 243: `statusManager = new StatusManager({ telegramApi, config, log })`.
+- Line 249: `progressReporter = new ProgressReporter({ telegramApi, config, log })`.
+- **Insertion point for TaskMirror:** after line 249, same pattern:
+  ```ts
+  const taskMirror = new TaskMirror({ telegramApi, config, log })
+  ```
+- `WebhookDeps` (in `webhook/server.ts` line 47): needs `taskMirror?: TaskMirror` added.
+- `WebhookDeps` instantiation in `server.ts` (~line 300): add `taskMirror`.
+- **Watcher insertion point:** the watcher needs a reference to `progressReporter` to query busy state. It runs in `handlers.ts`, so `progressReporter` must be threaded into `HandlerDeps` or the watcher is a standalone module that receives `progressReporter` via closure in `server.ts` when setting up grammy handlers.
+
+### 1.5 `src/webhook/server.ts`
+
+- `WebhookDeps` (line 47–65): has `statusManager?`, `memoryWriter?`, `progressReporter?`. Needs `taskMirror?: TaskMirror` added.
+- Dispatch block for `claude_hook` (lines 293–338): currently calls `toActivityEvent(payload)` once, then routes to `statusManager` and `progressReporter`. **TaskMirror dispatch** goes after progressReporter dispatch, same try/catch pattern:
+  ```ts
+  if (taskMirror) {
+    const todoEvent = toTodoWriteEvent(payload)
+    if (todoEvent !== null) {
+      try {
+        await taskMirror.recordEvent(payload.chatId, todoEvent)
+      } catch (err) { ... }
+    }
+  }
+  ```
+  Gate: `config.task_mirror.enabled` (checked inside `taskMirror.recordEvent` like ProgressReporter checks `config.progress.enabled`).
+
+### 1.6 `src/telegram/handlers.ts`
+
+- `HandlerDeps` (line 76–111): does NOT currently contain `progressReporter`. The watcher needs to query `progressReporter.isBusy(chatId)`. **Two options:**
+  - Option A: add `progressReporter?: ProgressReporter` to `HandlerDeps` and pass it from `server.ts`.
+  - Option B: inject a narrow `WatcherService` interface into `HandlerDeps` that exposes only `isBusy(chatId): boolean` and `autoReply(chatId, ctx)`.
+  - **Decision: Option B** — keeps HandlerDeps decoupled from ProgressReporter internals. `WatcherService` is a thin structural interface.
+- `handleInboundText` (line 394–503): watcher hook goes **AFTER OOB check returns** but **BEFORE `gateAndNotify`**. Flow:
+  1. Permission-text short-circuit (line 413–452) — unchanged.
+  2. OOB short-circuit (line 453–502) — unchanged, returns early if OOB.
+  3. **NEW: watcher check** — if watcher present AND chat is busy → auto-reply (fire-and-forget) → **fall through to `gateAndNotify`** (do NOT return early; Claude must still get the message).
+  4. `gateAndNotify` (line 503) — unchanged.
+
+### 1.7 `src/commands/oob.ts`
+
+- `parseOobCommand` (line 52): returns a `ParsedOobCommand | null`. When non-null, OOB handling runs and the function returns **before** watcher check (line 458–502 in handlers.ts). This is correct — OOB takes strict priority. Watcher never fires for OOB commands.
+- `OobCommandName` (line 33): `'help' | 'status' | 'stop' | 'reset' | 'new'`. All handled inline; watcher is irrelevant for these.
+- **No changes to oob.ts.**
+
+### 1.8 `src/status/status-manager.ts`
+
+- `isActive(chatId)` (line 176): returns `this.entries.has(chatId)`. This is the StatusManager bubble, separate from ProgressReporter.
+- `cancel(chatId, reason)` (line 466): cancels the transient bubble and edits to a cancelled label. When watcher auto-replies, it should NOT call `statusManager.cancel` — the status bubble follows its own lifecycle. The watcher is read-only w.r.t. StatusManager.
+- `entries: Map<string, InternalEntry>` — private. The watcher must not reach into StatusManager for busy detection; it uses `progressReporter.isBusy(chatId)` instead.
+- **No changes to status-manager.ts.**
+
+---
+
+## 2. ARCHITECTURE
+
+### 2.1 TaskMirror Module
+
+**Location:** `src/status/task-mirror.ts`
+
+**Public API:**
+```ts
+export interface TaskMirrorDeps {
+  telegramApi: TelegramApiForProgress  // reuse existing interface from progress-reporter.ts
+  config: AppConfig
+  log: Logger
+  now?: () => number
+  setTimer?: (cb: () => void, ms: number) => NodeJS.Timeout
+  clearTimer?: (handle: NodeJS.Timeout) => void
+}
+
+export class TaskMirror {
+  constructor(deps: TaskMirrorDeps)
+  async recordEvent(chatId: string, event: TodoWriteEvent): Promise<void>
+  async _idleForTests(chatId: string): Promise<void>  // test drain
+}
+```
+
+**State shape** (per-chat, private):
+```ts
+interface ChatTaskEntry {
+  chatId: string
+  messageId?: number
+  startedAtMs: number
+  lastActivityMs: number
+  todos: TodoItem[]          // latest snapshot from TodoWrite
+  lastRenderedText?: string  // idempotency gate
+  lastEditAtMs: number
+  desiredText?: string       // freshest pending text
+  flushPromise: Promise<void> | null
+  pendingTimer: NodeJS.Timeout | null
+  stopped: boolean
+}
+```
+
+**Config keys** (new in `AppConfigSchema`):
+```ts
+task_mirror: z.object({
+  enabled: z.boolean().default(true),
+  edit_throttle_ms: z.number().int().nonnegative().default(3000),
+  session_ttl_ms: z.number().int().positive().default(10 * 60 * 1000),
+  collapse_completed_after: z.number().int().nonnegative().default(5),
+  max_message_chars: z.number().int().positive().default(3000),
+}).default({})
+```
+
+**Throttle/TTL:** identical pattern to ProgressReporter. `edit_throttle_ms` default 3000ms. `session_ttl_ms` default 10min. Eviction on `session_stop` or TTL breach.
+
+**Render strategy:**
+- Status icons: `◻` pending, `◐` in_progress, `☑` completed.
+- Header: `<b>📋 Задачи</b>` + total count line.
+- Completed tasks: show last `collapse_completed_after` completed items, prepend `+N выполнено` if more exist.
+- In-progress first, then pending, then recent completed.
+- Each todo line: `{icon} {content_escaped}` — `escapeHtml` from `src/format/html.ts`.
+- Content truncation: max 80 chars per todo (append `…`).
+- Total message cap: `max_message_chars` (3000). Truncate with `… (+N more)` at bottom.
+- `parse_mode: 'HTML'` (same as ProgressReporter).
+
+**TodoWriteEvent shape** (new in `claude-events.ts`):
+```ts
+export interface TodoWriteEvent {
+  readonly kind: 'todo_write'
+  readonly todos: TodoItem[]  // from TodoWriteInputSchema
+}
+
+export interface TodoSessionStopEvent {
+  readonly kind: 'session_stop'
+}
+
+export type TaskMirrorEvent = TodoWriteEvent | TodoSessionStopEvent
+```
+
+`toTodoWriteEvent(payload: ClaudeHookPayload): TaskMirrorEvent | null`:
+- `PostToolUse` + `tool_name === 'TodoWrite'`: parse `tool_input` via `TodoWriteInputSchema.safeParse`. If success → `{ kind: 'todo_write', todos }`. If fail → log warn, return null.
+- `Stop` → `{ kind: 'session_stop' }`.
+- All other events → `null`.
+
+**Instantiation in `server.ts`** (after `progressReporter`, ~line 252):
+```ts
+const taskMirror = new TaskMirror({ telegramApi, config, log })
+```
+
+**Routing in `webhook/server.ts`** (after progressReporter dispatch, ~line 330):
+```ts
+if (taskMirror) {
+  const todoEvent = toTodoWriteEvent(payload)
+  if (todoEvent !== null) {
+    try { await taskMirror.recordEvent(payload.chatId, todoEvent) }
+    catch (err) { log.warn('task mirror error (ignored)', ...) }
+  }
+}
+```
+
+### 2.2 Watcher / Auto-Responder Module
+
+**Location:** `src/telegram/watcher.ts`
+
+**Public API:**
+```ts
+export interface WatcherConfig {
+  enabled: boolean
+  busy_threshold_ms: number   // default 30_000 — how recent a tool_start must be to count as busy
+  debounce_ms: number         // default 10_000 — min interval between auto-replies per chat
+}
+
+export interface WatcherDeps {
+  telegramApi: TelegramApi   // full TelegramApi (safe-wrapped, passed from HandlerDeps)
+  progressReporter: ProgressReporterForWatcher
+  log: Logger
+  config: AppConfig
+  now?: () => number
+}
+
+// Narrow read interface — watcher never mutates ProgressReporter
+export interface ProgressReporterForWatcher {
+  isBusy(chatId: string, thresholdMs: number): boolean
+  getActiveToolName(chatId: string): string | null  // last tool in entry.calls, or null
+}
+
+export class Watcher {
+  constructor(deps: WatcherDeps)
+  // Returns true if auto-reply was sent. Does NOT suppress the channel notification.
+  async maybeAutoReply(chatId: string, msgId: number): Promise<boolean>
+}
+```
+
+**`ProgressReporter` additions** (minimal — add to public API):
+```ts
+// Queries lastActivityMs < thresholdMs ago AND entry exists AND !stopped
+isBusy(chatId: string, thresholdMs: number): boolean
+
+// Returns last entry.calls[last].toolName, or null if no calls or no entry
+getActiveToolName(chatId: string): string | null
+```
+
+**Busy definition:**
+```
+entry = chats.get(chatId)
+entry exists AND !entry.stopped AND (now() - entry.lastActivityMs) < thresholdMs
+```
+
+**Auto-reply text composition:**
+```
+🔧 Тралл занят, активный инструмент: <code>{toolName}</code>. Ждать или /stop.
+```
+If no active tool name: `🔧 Тралл занят (думает). Ждать или /stop.`
+
+Uses `parse_mode: 'HTML'`. Goes through the safe-wrapped `telegramApi` from `HandlerDeps.telegramApi`.
+
+**Debounce:** per-chat Map `lastAutoReplyMs: Map<string, number>`. If `now() - lastAutoReplyMs.get(chatId) < debounce_ms`, skip sending but still return false (no-op, not an error).
+
+**Insertion point in `handleInboundText`** (handlers.ts, after OOB block ~line 502, before `gateAndNotify`):
+```ts
+// Watcher: if busy, send auto-reply (fire-and-forget).
+// DO NOT return early — Claude must still receive the message.
+if (deps.watcher) {
+  const chatId = ctx.chat?.id !== undefined ? String(ctx.chat.id) : undefined
+  const msgId = ctx.message?.message_id
+  if (chatId !== undefined && msgId !== undefined) {
+    void deps.watcher.maybeAutoReply(chatId, msgId)
+  }
+}
+await gateAndNotify(...)
+```
+
+**Config keys** (new in `AppConfigSchema`):
+```ts
+watcher: z.object({
+  enabled: z.boolean().default(true),
+  busy_threshold_ms: z.number().int().positive().default(30_000),
+  debounce_ms: z.number().int().nonnegative().default(10_000),
+}).default({})
+```
+
+**`HandlerDeps` addition:**
+```ts
+watcher?: Watcher
+```
+
+**`WatcherService` narrow interface in `handlers.ts`** — since `Watcher` is already narrow enough (one method), inject `Watcher` directly. No extra interface wrapper needed.
+
+**Instantiation in `server.ts`** (after `progressReporter`, ~line 253):
+```ts
+const watcher = new Watcher({ telegramApi, progressReporter, config, log })
+```
+
+Add `watcher` to `handlerDeps` in `server.ts`.
+
+### 2.3 HTML Rendering Details
+
+- Reuse `escapeHtml` from `src/format/html.ts`.
+- Status icon map:
+  ```ts
+  const ICONS = { pending: '◻', in_progress: '◐', completed: '☑' } as const
+  ```
+- Sort order: `in_progress` first, then `pending`, then `completed`.
+- Completed collapse: keep last `collapse_completed_after` completed items from the sorted tail. Show `+N выполнено ранее` above if any were dropped.
+- Per-item line: `{icon} {escapeHtml(content.slice(0, 80))}{content.length > 80 ? '…' : ''}`
+- Full message structure:
+  ```html
+  <b>📋 Задачи</b>
+  Выполнено: {doneCount}/{total}
+
+  {todo lines}
+  ```
+- Total cap: 3000 chars. If render exceeds cap, drop trailing todos and append `… (+N не показано)`.
+
+---
+
+## 3. FILE-LEVEL PLAN
+
+**Dependency order:**
+
+| # | File | Action | Purpose |
+|---|------|---------|---------|
+| 1 | `src/schemas.ts` | Modify | Add `TodoItemSchema`, `TodoWriteInputSchema`, exported types |
+| 2 | `src/hooks/claude-events.ts` | Modify | Add `TodoWriteEvent`, `TodoSessionStopEvent`, `TaskMirrorEvent`, `toTodoWriteEvent` |
+| 3 | `src/config.ts` | Modify | Add `task_mirror` and `watcher` blocks to `AppConfigSchema` |
+| 4 | `src/status/task-mirror.ts` | Create | `TaskMirror` class — owns rolling todo-list message per chat |
+| 5 | `src/status/progress-reporter.ts` | Modify | Add `isBusy(chatId, thresholdMs)` and `getActiveToolName(chatId)` public methods |
+| 6 | `src/telegram/watcher.ts` | Create | `Watcher` class — auto-responder when Claude is busy |
+| 7 | `src/telegram/handlers.ts` | Modify | Add `watcher?: Watcher` to `HandlerDeps`; insert watcher call in `handleInboundText` |
+| 8 | `src/webhook/server.ts` | Modify | Add `taskMirror?: TaskMirror` to `WebhookDeps`; dispatch `toTodoWriteEvent` after progressReporter |
+| 9 | `src/server.ts` | Modify | Instantiate `TaskMirror` and `Watcher`; thread into deps |
+
+---
+
+### File 1 — `src/schemas.ts`
+
+**Purpose:** add TodoWrite input validation schema.
+
+- After `ToolInputSchema` (~line 119): add `TodoItemSchema` with `.passthrough()`.
+- Add `TodoWriteInputSchema = z.object({ todos: z.array(TodoItemSchema) }).passthrough()`.
+- Export `TodoWriteInput`, `TodoItem` types.
+- No changes to existing schemas — `ClaudePostToolUseSchema` stays as-is (`tool_input: ToolInputSchema`). Parsing of `TodoWrite`-specific shape happens in `toTodoWriteEvent`, not in the wire schema.
+
+---
+
+### File 2 — `src/hooks/claude-events.ts`
+
+**Purpose:** add TodoWrite event types and mapper.
+
+- Add `TodoWriteEvent` interface after `SessionStopEvent` (~line 47).
+- Add `TaskMirrorEvent = TodoWriteEvent | SessionStopEvent` union (reuse existing `SessionStopEvent`).
+- Add `toTodoWriteEvent(payload: ClaudeHookPayload): TaskMirrorEvent | null`.
+  - Only handles `PostToolUse` (tool_name === `'TodoWrite'`) and `Stop`.
+  - Parses `payload.tool_input` via `TodoWriteInputSchema.safeParse`. On failure: log warn + return null.
+  - No changes to existing `toActivityEvent` or `ActivityStatusEvent`.
+
+---
+
+### File 3 — `src/config.ts`
+
+**Purpose:** extend config schema with `task_mirror` and `watcher` blocks.
+
+- After `progress` block (~line 101): add `task_mirror` object with `enabled`, `edit_throttle_ms`, `session_ttl_ms`, `collapse_completed_after`, `max_message_chars`.
+- After `task_mirror`: add `watcher` object with `enabled`, `busy_threshold_ms`, `debounce_ms`.
+- Both have `.default({})` so existing config files with no new keys continue to parse.
+
+---
+
+### File 4 — `src/status/task-mirror.ts` (NEW)
+
+**Purpose:** rolling Telegram message showing Claude's todo list.
+
+- Import `TelegramApiForProgress` from `./progress-reporter.js` (structural reuse).
+- Import `TodoItem`, `TaskMirrorEvent` from `../hooks/claude-events.js`.
+- Import `escapeHtml` from `../format/html.js`.
+- `ChatTaskEntry` private interface (fields: `chatId`, `messageId?`, `startedAtMs`, `lastActivityMs`, `todos`, `lastRenderedText?`, `lastEditAtMs`, `desiredText?`, `flushPromise`, `pendingTimer`, `stopped`).
+- `TaskMirror` class: same single-slot queue pattern as `ProgressReporter`.
+- `renderTodoList(todos: TodoItem[], config): string` — private renderer using icons, sort, collapse.
+- `recordEvent(chatId, event)` — fire-and-forget, top-level try/catch.
+- `handleStop(chatId)` — cancel timer, await flush, final edit `☑ Список задач завершён — Ns`, evict.
+- `getOrCreate(chatId)` — TTL eviction via `lastActivityMs` using `config.task_mirror.session_ttl_ms`.
+- `_idleForTests(chatId)` — drain loop, same as ProgressReporter.
+
+---
+
+### File 5 — `src/status/progress-reporter.ts`
+
+**Purpose:** expose narrow read API for the watcher.
+
+- Add `isBusy(chatId: string, thresholdMs: number): boolean` — public method.
+  - Returns `(entry exists) AND (!entry.stopped) AND ((now() - entry.lastActivityMs) < thresholdMs)`.
+- Add `getActiveToolName(chatId: string): string | null` — public method.
+  - Returns `entry?.calls[entry.calls.length - 1]?.toolName ?? null`.
+- No changes to existing behavior.
+
+---
+
+### File 6 — `src/telegram/watcher.ts` (NEW)
+
+**Purpose:** auto-responder when Claude is busy.
+
+- `ProgressReporterForWatcher` interface: `isBusy(chatId, thresholdMs): boolean`, `getActiveToolName(chatId): string | null`.
+- `WatcherDeps` interface: `telegramApi: TelegramApi`, `progressReporter: ProgressReporterForWatcher`, `log: Logger`, `config: AppConfig`, `now?: () => number`.
+- `Watcher` class.
+  - Private `lastAutoReplyMs: Map<string, number>`.
+  - `maybeAutoReply(chatId: string, msgId: number): Promise<boolean>`:
+    1. Check `config.watcher.enabled`. If false → return false.
+    2. Check `progressReporter.isBusy(chatId, config.watcher.busy_threshold_ms)`. If not busy → return false.
+    3. Check debounce: `now() - (lastAutoReplyMs.get(chatId) ?? 0) < config.watcher.debounce_ms` → return false (suppress, no-op).
+    4. Compose text (see §2.2).
+    5. `await telegramApi.sendMessage(chatId, text, { parse_mode: 'HTML', reply_to_message_id: msgId })`.
+    6. Update `lastAutoReplyMs.set(chatId, now())`.
+    7. Return true. Errors: catch, log warn, return false.
+
+---
+
+### File 7 — `src/telegram/handlers.ts`
+
+**Purpose:** wire watcher into inbound text path.
+
+- Import `Watcher` from `./watcher.js`.
+- Add `watcher?: Watcher` to `HandlerDeps` interface (~line 110, after `albumBuffer?`).
+- In `handleInboundText` (~line 502, after OOB block, before `gateAndNotify`): insert watcher call (fire-and-forget via `void`, never delays channel notification).
+
+---
+
+### File 8 — `src/webhook/server.ts`
+
+**Purpose:** dispatch `TodoWrite` events to `TaskMirror`.
+
+- Import `TaskMirror` from `../status/task-mirror.js`.
+- Import `toTodoWriteEvent` from `../hooks/claude-events.js`.
+- Add `taskMirror?: TaskMirror` to `WebhookDeps` interface (~line 65).
+- In `handleRequest`, after `progressReporter` dispatch (~line 330): add TaskMirror dispatch block (call `toTodoWriteEvent(payload)`, dispatch if non-null).
+
+---
+
+### File 9 — `src/server.ts`
+
+**Purpose:** instantiate and wire TaskMirror + Watcher.
+
+- Import `TaskMirror` from `./status/task-mirror.js`.
+- Import `Watcher` from `./telegram/watcher.js`.
+- After `progressReporter` instantiation (~line 250): instantiate `taskMirror` and `watcher`.
+- Add to `webhookDeps`: `taskMirror`.
+- Add to `handlerDeps`: `watcher`.
+
+---
+
+## 4. TEST PLAN
+
+### 4.1 `tests/status/task-mirror.test.ts` (NEW)
+
+Mirrors `tests/status/progress-reporter.test.ts` structure.
+
+| Test case | What it verifies |
+|-----------|-----------------|
+| happy path — todo_write event | `sendMessage` called with rendered HTML on first event |
+| idempotency | same todos snapshot → no second `sendMessage`/`editMessageText` |
+| update — new snapshot | `editMessageText` called when todos change |
+| throttle | second event within `edit_throttle_ms` does not fire Telegram immediately; fires after timer |
+| session TTL | event after `session_ttl_ms` idle starts fresh entry, does not edit old `messageId` |
+| session_stop — eviction | `handleStop` posts final edit, evicts entry; subsequent event starts fresh thread |
+| malformed input (bad todos shape) | `toTodoWriteEvent` returns null; no error thrown, no Telegram call |
+| multi-chat isolation | chat A stop does not affect chat B's entry |
+| collapse_completed_after | more than N completed items shows `+M выполнено ранее` prefix |
+| max_message_chars | oversized render is truncated with `… (+N не показано)` |
+| disabled config | `config.task_mirror.enabled = false` → no Telegram calls |
+| `_idleForTests` drain | confirms flush settles before assertions |
+
+### 4.2 `tests/telegram/watcher.test.ts` (NEW)
+
+| Test case | What it verifies |
+|-----------|-----------------|
+| busy + auto-reply | `progressReporter.isBusy` returns true → `sendMessage` called with correct text |
+| not busy + no auto-reply | `isBusy` returns false → no `sendMessage` |
+| OOB takes priority | OOB handler returns before watcher is called (integration: watcher not present in OOB path) |
+| channel notification still emitted | `gateAndNotify` called even after auto-reply (use spy on `gateAndNotify`) |
+| auto-reply uses safe API | `sendMessage` is called on the injected `telegramApi`, not a bypassed raw instance |
+| debounce | two rapid messages in same chat → only one `sendMessage` within `debounce_ms` |
+| debounce expires | message after `debounce_ms` → new `sendMessage` |
+| disabled config | `config.watcher.enabled = false` → no auto-reply |
+| sendMessage failure is swallowed | `telegramApi.sendMessage` throws → `maybeAutoReply` returns false, no uncaught |
+| active tool name in message | when `getActiveToolName` returns `'Bash'`, auto-reply text includes `Bash` |
+| no active tool name | when `getActiveToolName` returns null, text says `(думает)` |
+
+### 4.3 `tests/status/progress-reporter.test.ts` (REGRESSION)
+
+- Add two new test cases for the new public methods:
+  - `isBusy` — returns true within threshold, false after threshold, false when stopped.
+  - `getActiveToolName` — returns last tool name or null.
+- All existing tests must continue to pass unchanged.
+
+---
+
+## 5. ROLLOUT
+
+**One PR** with 5 commits:
+
+| # | Commit | Files |
+|---|--------|-------|
+| 1 | `feat(schemas): add TodoWriteInputSchema + TodoItem types` | `src/schemas.ts` |
+| 2 | `feat(hooks): add TodoWriteEvent + toTodoWriteEvent mapper` | `src/hooks/claude-events.ts` |
+| 3 | `feat(config): add task_mirror and watcher config blocks` | `src/config.ts` |
+| 4 | `feat(status): TaskMirror — rolling todo-list message (PR-A2)` | `src/status/task-mirror.ts`, `tests/status/task-mirror.test.ts`, `src/status/progress-reporter.ts` (isBusy + getActiveToolName), `tests/status/progress-reporter.test.ts` (regression additions) |
+| 5 | `feat(telegram): Watcher auto-responder when busy (PR-A3)` | `src/telegram/watcher.ts`, `tests/telegram/watcher.test.ts`, `src/telegram/handlers.ts`, `src/webhook/server.ts`, `src/server.ts` |
+
+**Dual review required (rules.md §Model role split 2026-04-24):**
+- Codex GPT-5.5 audit pass (adversarial-review on the PR diff).
+- Opus review pass (code correctness + Russian comment quality).
+- Both must approve before `task-board review`.
+
+---
+
+## 6. RISKS / OPEN QUESTIONS
+
+### 6.1 Auto-reply debounce — recommendation: YES, debounce per chat
+
+If the warchief sends 5 messages in 10 seconds while Claude is working, the watcher should send only ONE auto-reply (the first) and suppress the next 4 until `debounce_ms` elapses. Rationale: 5 auto-replies in 5 seconds is noise that buries the actual conversation. Recommended `debounce_ms = 10_000` (10 seconds). This means the warchief gets instant acknowledgement on the first message, then silence for 10s even if he keeps typing.
+
+**Action required from warchief:** confirm `debounce_ms = 10_000` or adjust.
+
+### 6.2 /stop while busy — recommendation: no special coupling
+
+When the warchief types `/stop` while Claude is working:
+- `/stop` is an OOB command → handled before watcher (see §1.6 above, OOB short-circuit at line 453).
+- Watcher is never reached for `/stop`.
+- Result: `/stop` cancels the StatusManager bubble and emits the Stop hook; Claude receives it and stops. No auto-reply is sent.
+- TaskMirror receives `session_stop` via the webhook path (Claude hooks fire `Stop`) and finalizes its message.
+- No explicit coupling between `/stop` and the watcher debounce map needed — they operate on different code paths.
+
+### 6.3 TaskMirror completed task collapse — recommendation: N=5
+
+After `collapse_completed_after = 5` completed items, older ones are replaced with `+N выполнено ранее`. This keeps the message short during long pipelines. The warchief explicitly wants to see where Thrall is; completed items beyond the last 5 are noise.
+
+**Action required from warchief:** confirm N=5 or adjust.
+
+### 6.4 `task_mirror.enabled` default — confirmed TRUE
+
+Warchief explicitly said «enable by default». `enabled: z.boolean().default(true)`.
+
+### 6.5 `watcher.enabled` default — recommendation: TRUE
+
+Rationale: the warchief's primary pain point (silence during long pipelines) is exactly what the watcher solves. Debounce prevents noise. Auto-reply goes through safe-wrapped API so no safety regression. Recommendation: `enabled: z.boolean().default(true)`.
+
+**Action required from warchief:** confirm or flip to false if he prefers opt-in.
+
+### 6.6 `TelegramApiForProgress` reuse in TaskMirror
+
+`TelegramApiForProgress` is defined in `progress-reporter.ts` (line 47–55). TaskMirror needs the same interface. Options:
+- Option A: import `TelegramApiForProgress` from `./progress-reporter.js` (creates cross-dep between two status modules).
+- Option B: move `TelegramApiForProgress` to a shared `src/status/types.ts` and import from both.
+- Option C: re-declare a structurally identical interface in `task-mirror.ts` (TS structural typing makes it compatible; avoids coupling).
+
+**Recommendation: Option B** — move to `src/status/types.ts`. Avoids duplication and coupling, makes it clear the interface is shared infrastructure. One additional file but cleaner dependency graph.
+
+### 6.7 `sendMessage` reply_to_message_id in auto-reply
+
+The watcher calls `telegramApi.sendMessage(chatId, text, { parse_mode: 'HTML', reply_to_message_id: msgId })`. This makes the auto-reply visually quote the warchief's message in Telegram — helpful signal. Confirm with warchief: **quote-reply the original message** (recommended) or plain reply without quote?
+
+### 6.8 TaskMirror final edit text on session_stop
+
+On `session_stop`, TaskMirror should post a final edit. Two options:
+- Keep the last rendered todo list as-is (static, shows completion state).
+- Append `☑ Список задач завершён — Ns` as a suffix line inside the message.
+
+**Recommendation: append suffix** (mirrors ProgressReporter's `done -- Ns` pattern, consistent UX).
+
+---
+
+## Summary
+
+| Feature | New files | Modified files |
+|---------|-----------|----------------|
+| TodoWrite schema | — | `src/schemas.ts` |
+| TaskMirrorEvent | — | `src/hooks/claude-events.ts` |
+| Config extension | — | `src/config.ts` |
+| TaskMirror class | `src/status/task-mirror.ts` + `tests/status/task-mirror.test.ts` | `src/status/progress-reporter.ts` (2 methods), `src/status/types.ts` (new shared interface) |
+| Watcher class | `src/telegram/watcher.ts` + `tests/telegram/watcher.test.ts` | `src/telegram/handlers.ts`, `src/webhook/server.ts`, `src/server.ts` |
+| Tests (regression) | — | `tests/status/progress-reporter.test.ts` |
+
+Total: **4 new files**, **7 modified files**, **5 commits**, **1 PR**.
