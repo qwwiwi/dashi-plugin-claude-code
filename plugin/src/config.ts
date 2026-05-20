@@ -125,33 +125,16 @@ export const RuntimeEnvSchema = z.object({
 export type RuntimeEnv = z.infer<typeof RuntimeEnvSchema>
 
 // ─────────────────────────────────────────────────────────────────────
-// Secret redaction. We mask Telegram bot tokens, Groq API keys, generic
-// bearer/query-string tokens, and any caller-supplied exact-substring
-// secrets BEFORE letting any error/log line escape the process.
+// Secret redaction. Thin wrapper over the unified `redactSecrets` (see
+// src/safety/redact.ts). Kept here for back-compat with src/log.ts and
+// src/server.ts — those still import `redactToken` by name. Anything
+// new should import `redactSecrets` directly.
 // ─────────────────────────────────────────────────────────────────────
 
-// Telegram bot token: `<digits>:<base64ish>`.
-const TELEGRAM_TOKEN_RE = /\d{8,12}:[A-Za-z0-9_-]{30,}/g
-// Groq API key: `gsk_` followed by 40+ url-safe base64 chars.
-const GROQ_KEY_RE = /gsk_[A-Za-z0-9]{40,}/g
-// Authorization: Bearer <opaque>. We keep the header label, redact the value.
-const BEARER_RE = /(Bearer\s+)[A-Za-z0-9._\-+/=]{8,}/gi
-// `?token=...` / `&token=...` query params (also access_token, api_key).
-const QUERY_TOKEN_RE = /([?&](?:access_token|api_key|token)=)[^&\s"']+/gi
+import { redactSecrets } from './safety/redact.js'
 
 export function redactToken(message: string, extraSecrets: ReadonlyArray<string> = []): string {
-  let out = message
-    .replace(TELEGRAM_TOKEN_RE, '<redacted>')
-    .replace(GROQ_KEY_RE, '<redacted>')
-    .replace(BEARER_RE, '$1<redacted>')
-    .replace(QUERY_TOKEN_RE, '$1<redacted>')
-  for (const secret of extraSecrets) {
-    if (!secret || secret.length < 4) continue
-    // Escape regex metachars; replace every exact occurrence with <redacted>.
-    const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    out = out.replace(new RegExp(escaped, 'g'), '<redacted>')
-  }
-  return out
+  return redactSecrets(message, extraSecrets)
 }
 
 // ─────────────────────────────────────────────────────────────────────
