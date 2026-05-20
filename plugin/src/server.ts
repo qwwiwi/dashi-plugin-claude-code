@@ -36,6 +36,7 @@ import {
   type ToolDeps,
 } from './channel/tools.js'
 import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
+import { createRateLimitedTelegramApi } from './safety/rate-limited-telegram-api.js'
 import { redactSecrets } from './safety/redact.js'
 import { StatusManager } from './status/status-manager.js'
 import { ProgressReporter } from './status/progress-reporter.js'
@@ -232,11 +233,18 @@ const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
 // after this line. Anything that imports TelegramApi from channel/tools
 // receives the wrapped instance via toolDeps / handlerDeps / StatusManager.
 const rawTelegramApi = createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN)
+// Composition: caller → safeTelegramApi (sanitize) → rateLimitedTelegramApi
+// (queue + 429 retry) → rawTelegramApi (grammY). Sanitize runs FIRST so the
+// queue holds already-redacted/validated payloads (no secret leak if a
+// queued op gets logged; no time wasted enqueueing text that would later be
+// downgraded). A burst of replies now paces itself instead of surfacing as
+// a 429 to the agent.
+const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log)
 // The bot token itself is included in extraSecrets so any code path that
 // accidentally tries to ship the token (e.g. error message including a
 // URL-with-token from grammy) gets it scrubbed before the bytes leave us.
 const apiSecrets: string[] = [...logSecrets, env.TELEGRAM_BOT_TOKEN]
-const telegramApi = createSafeTelegramApi(rawTelegramApi, log, apiSecrets)
+const telegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSecrets)
 
 const mcp = new Server(
   { name: 'dashi-channel', version: '1.0.0' },
