@@ -301,6 +301,7 @@ if (config.tmux_mirror.enabled) {
       paneTarget: target,
       pollIntervalMs: config.tmux_mirror.poll_interval_ms,
       lineCount: config.tmux_mirror.line_count,
+      hideSegments: config.tmux_mirror.hide_segments,
       redact: (text) => redactSecrets(text, apiSecrets),
     })
     void tmuxMirror.start().catch((err: unknown) => {

@@ -141,6 +141,23 @@ export const AppConfigSchema = z.object({
     pane_target: z.string().default(''),
     poll_interval_ms: z.number().int().min(500).default(5000),
     line_count: z.number().int().min(5).max(500).default(50),
+    // Segments to drop from the rendered mirror. Default hides the boot
+    // banner (Claude Code splash + email + path), the inbound-injection
+    // warning, and the footer hints (bypass-perms reminder, auto-update
+    // failure, tmux focus-events note). Pass an empty list to mirror
+    // raw pane content. Validated against the SegmentType enum to keep
+    // typos out of production — bad values fail config load loud.
+    hide_segments: z
+      .array(
+        z.enum([
+          'boot_banner',
+          'inbound_warning',
+          'channel_status',
+          'conversation',
+          'footer_hints',
+        ]),
+      )
+      .default(['boot_banner', 'inbound_warning', 'footer_hints']),
   }).default({}),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
