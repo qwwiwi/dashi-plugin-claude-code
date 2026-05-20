@@ -214,10 +214,13 @@ function bashStart(toolUseId = 'tool-1', command = 'echo hi'): ActivityStatusEve
   }
 }
 
+// Editing is on the kept-tools list (Read is skipped by the noise filter
+// added 2026-05-20); these tests rely on the second tool_start actually
+// landing in `entry.calls`, so we use Edit as the "second tool" stand-in.
 function readStart(toolUseId = 'tool-2', file_path = '/abs/path/foo.ts'): ActivityStatusEvent {
   return {
     kind: 'tool_start',
-    toolName: 'Read',
+    toolName: 'Edit',
     toolInput: { file_path },
     toolUseId,
   }
@@ -513,7 +516,7 @@ describe('ProgressReporter', () => {
     const { reporter } = makeReporter()
     await reporter.recordEvent('chat-tools', bashStart('t1'))
     await reporter.recordEvent('chat-tools', readStart('t2'))
-    expect(reporter.getActiveToolName('chat-tools')).toBe('Read')
+    expect(reporter.getActiveToolName('chat-tools')).toBe('Edit')
   })
 
   test('getActiveToolName returns undefined when no entry exists', () => {

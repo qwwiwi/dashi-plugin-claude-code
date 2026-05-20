@@ -8,7 +8,7 @@ import {
   WebhookMessagePayloadSchema,
   type WebhookPayload,
 } from '../../src/schemas.js'
-import { toActivityEvent } from '../../src/hooks/claude-events.js'
+import { toActivityEvent, toTodoWriteEvent } from '../../src/hooks/claude-events.js'
 
 function parse(value: unknown): WebhookPayload {
   return WebhookPayloadSchema.parse(value)
@@ -239,5 +239,81 @@ describe('toActivityEvent mapping', () => {
       hook_event_name: 'SessionStart',
     })
     expect(event.kind).toBe('session_start')
+  })
+})
+
+describe('toTodoWriteEvent mapping', () => {
+  const common = {
+    chatId: '1',
+    session_id: 's',
+    transcript_path: '/t',
+    cwd: '/',
+  } as const
+
+  test('PreToolUse TaskCreate → task_create event (no toolResult yet)', () => {
+    const event = toTodoWriteEvent({
+      ...common,
+      hook_event_name: 'PreToolUse',
+      tool_name: 'TaskCreate',
+      tool_use_id: 'tu-create-1',
+      tool_input: { subject: 'Implement X', description: 'why', activeForm: 'Implementing X' },
+    })
+    expect(event?.kind).toBe('task_create')
+    if (event?.kind !== 'task_create') throw new Error('unreachable')
+    expect(event.toolUseId).toBe('tu-create-1')
+    expect(event.input.subject).toBe('Implement X')
+    expect(event.input.activeForm).toBe('Implementing X')
+    expect('toolResult' in event).toBe(false)
+  })
+
+  test('PostToolUse TaskCreate → task_create event with toolResult', () => {
+    const event = toTodoWriteEvent({
+      ...common,
+      hook_event_name: 'PostToolUse',
+      tool_name: 'TaskCreate',
+      tool_use_id: 'tu-create-1',
+      tool_input: { subject: 'Implement X' },
+      tool_result: 'Task #7 created successfully',
+    })
+    expect(event?.kind).toBe('task_create')
+    if (event?.kind !== 'task_create') throw new Error('unreachable')
+    expect(event.toolResult).toBe('Task #7 created successfully')
+  })
+
+  test('PostToolUse TaskUpdate → task_update event with coerced string taskId', () => {
+    const event = toTodoWriteEvent({
+      ...common,
+      hook_event_name: 'PostToolUse',
+      tool_name: 'TaskUpdate',
+      tool_use_id: 'tu-update-1',
+      // Pass numeric taskId to exercise the union+transform path in the schema.
+      tool_input: { taskId: 7, status: 'in_progress' },
+    })
+    expect(event?.kind).toBe('task_update')
+    if (event?.kind !== 'task_update') throw new Error('unreachable')
+    expect(event.input.taskId).toBe('7')
+    expect(event.input.status).toBe('in_progress')
+  })
+
+  test('PreToolUse TaskUpdate → null (we only mirror PostToolUse for updates)', () => {
+    const event = toTodoWriteEvent({
+      ...common,
+      hook_event_name: 'PreToolUse',
+      tool_name: 'TaskUpdate',
+      tool_use_id: 'tu-update-1',
+      tool_input: { taskId: '7', status: 'in_progress' },
+    })
+    expect(event).toBeNull()
+  })
+
+  test('non-Task tools still return null (Bash, Edit, etc.)', () => {
+    const event = toTodoWriteEvent({
+      ...common,
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_use_id: 'tu-bash-1',
+      tool_input: { command: 'ls' },
+    })
+    expect(event).toBeNull()
   })
 })
