@@ -374,6 +374,58 @@ describe('callTool', () => {
     rmSync(deps.statePaths.root, { recursive: true, force: true })
   })
 
+  test('reply without explicit format defaults to html (markdown auto-converts)', async () => {
+    // Regression: when the caller omits `format`, the schema defaults to
+    // 'html'. The body should be markdown-converted and sent with
+    // parse_mode='HTML'. Before this change, the default was 'text' and
+    // markdown leaked through to the user as literal `**bold**`.
+    const captured: Array<{ text: string; opts: SendMessageOpts }> = []
+    const api = makeStubApi({
+      sendMessage: async (_chatId, text, opts) => {
+        captured.push({ text, opts })
+        return { message_id: 600 + captured.length }
+      },
+    })
+    const deps = makeDeps({ telegramApi: api })
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: 'Hello **bold** world' }),
+      deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(captured.length).toBe(1)
+    expect(captured[0]!.opts.parse_mode).toBe('HTML')
+    expect(captured[0]!.text).toContain('<b>bold</b>')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('reply default html auto-escapes raw &, <, > in plain text', async () => {
+    // Regression: with default='html', callers who send literal &/</> in
+    // ordinary text (URLs with query strings, code snippets in plain prose)
+    // must not break Telegram's HTML parser. markdownToTelegramHtml escapes
+    // them on the way out (& → &amp;, < → &lt;, > → &gt;) so the message
+    // remains valid HTML and ships with parse_mode='HTML'.
+    const captured: Array<{ text: string; opts: SendMessageOpts }> = []
+    const api = makeStubApi({
+      sendMessage: async (_chatId, text, opts) => {
+        captured.push({ text, opts })
+        return { message_id: 700 + captured.length }
+      },
+    })
+    const deps = makeDeps({ telegramApi: api })
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: 'curl https://x.com?a=1&b=2 < y > z' }),
+      deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(captured.length).toBe(1)
+    expect(captured[0]!.opts.parse_mode).toBe('HTML')
+    expect(captured[0]!.text).toContain('a=1&amp;b=2')
+    expect(captured[0]!.text).toContain('&lt; y &gt; z')
+    // No raw ampersand survives outside an entity.
+    expect(captured[0]!.text).not.toMatch(/&(?!amp;|lt;|gt;|quot;|#)/)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
   // Fix 5 — long replies must chunk under all formats (not only html).
   test('reply text format chunks long messages under 4096 cap', async () => {
     const captured: Array<{ text: string; opts: SendMessageOpts }> = []

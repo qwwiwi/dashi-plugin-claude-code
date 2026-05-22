@@ -17,7 +17,12 @@ export const ReplyArgsSchema = z.object({
   text: z.string().min(1),
   reply_to: z.string().optional(),
   files: z.array(z.string()).optional(),
-  format: z.enum(['text', 'markdownv2', 'html']).optional(),
+  // Default 'html' — markdown (**bold**, headings, tables, ```code```) is
+  // converted to Telegram's HTML subset via markdownToTelegramHtml. Plain
+  // text without markdown markers passes through unchanged. Pass 'text'
+  // explicitly only when the caller needs a literal `<` / `>` / `&` in
+  // the body (rare). Inspired by openclaw/extensions/telegram (MIT).
+  format: z.enum(['text', 'markdownv2', 'html']).default('html'),
 })
 export type ReplyArgs = z.infer<typeof ReplyArgsSchema>
 

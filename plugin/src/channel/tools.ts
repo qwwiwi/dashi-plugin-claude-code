@@ -221,8 +221,9 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         format: {
           type: 'string',
           enum: ['text', 'markdownv2', 'html'],
+          default: 'html',
           description:
-            "Rendering mode. 'html' converts markdown (**bold**, *italic*, `code`, ```fenced```, [text](url), tables, headings) to Telegram's HTML subset and auto-chunks at 4000 chars. 'markdownv2' passes raw — caller escapes per Telegram rules. Default: 'text' (plain).",
+            "Rendering mode. Default: 'html' — markdown (**bold**, *italic*, `code`, ```fenced```, [text](url), tables, # headings) is auto-converted to Telegram's HTML subset and auto-chunked at 4000 chars. Plain `<`, `>`, `&` in regular text are safe — they get auto-escaped before sending. On parse error the chunk re-sends as plain text so the reply still ships. Use 'text' only to bypass markdown conversion entirely (e.g. sending pre-built Telegram entity strings verbatim). 'markdownv2' passes raw — caller escapes per Telegram rules.",
         },
       },
       required: ['chat_id', 'text'],
