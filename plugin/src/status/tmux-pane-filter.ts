@@ -27,6 +27,17 @@ export type SegmentType =
   | 'channel_status'
   | 'conversation'
   | 'footer_hints'
+  | 'input_box'
+  | 'inbound_preview'
+
+// Render mode: `full_pane` keeps all non-hidden segments as today.
+// `latest_inbound_only` (introduced 2026-05-22 for the iPhone mirror)
+// anchors on the last inbound preview line that Claude Code emits when
+// the dashi-channel MCP pushes a notification (`← <channel>: …`). All
+// segments before AND the anchor itself are dropped — only what came
+// AFTER the warchief's last message remains. If no preview is present
+// (fresh session) the mode degrades to `full_pane`.
+export type RenderMode = 'full_pane' | 'latest_inbound_only'
 
 export interface PaneSegment {
   type: SegmentType
@@ -37,17 +48,25 @@ export interface FilterOptions {
   // Segments to drop from the rendered output. Order does not matter; an
   // empty list disables filtering.
   hide?: ReadonlyArray<SegmentType> | ReadonlySet<SegmentType>
+  // Anchor mode (see `RenderMode`). Default `full_pane` so existing
+  // callers / tests keep their behaviour. The Telegram mirror passes
+  // `latest_inbound_only` explicitly.
+  mode?: RenderMode
 }
 
-// Default hide-list. Mirrors the warchief's spec on 2026-05-20: hide the
-// boot banner (splash + email + path), hide the inbound-injection
-// warning, hide the footer hints (bypass-perms reminder, auto-update
-// failure, tmux focus-events note). Keep channel_status + conversation
-// (which includes the input prompt by design).
+// Default hide-list. Mirrors the warchief's spec on 2026-05-20 + 05-22:
+// boot banner (splash + email + path), inbound-injection warning,
+// footer hints (bypass-perms reminder, auto-update failure, tmux
+// focus-events note, /btw tip) AND the input box (the bordered prompt
+// area at the bottom of the pane — long ─ separators + ❯/> cursor).
+// `inbound_preview` is intentionally kept visible by default: it is the
+// anchor for `latest_inbound_only` mode and must survive the segmentize
+// pass even when callers drop it from the rendered output later.
 export const DEFAULT_HIDDEN_SEGMENTS: readonly SegmentType[] = [
   'boot_banner',
   'inbound_warning',
   'footer_hints',
+  'input_box',
 ]
 
 // ─── Line-level anchors ──────────────────────────────────────────────
@@ -95,13 +114,66 @@ const CHANNEL_STATUS_FOLLOW_RE = /^\s*server:\S/
 
 // Footer-hint phrases. Picked because each is a complete, specific
 // sentence — short tokens like «doctor» or «Auto-update» on their own
-// would cause false positives in conversation text. All three patterns
+// would cause false positives in conversation text. All patterns
 // must remain word-anchored.
+//
+// 2026-05-22: added the «Tip: Use /…» footer line. Claude Code v2.1.144
+// renders rotating tips below the input box (e.g. «Tip: Use /btw to ask
+// a quick side question without interrupting Claude's current work»);
+// they slipped past the previous footer set because the original three
+// phrases were specific to the bypass-permissions / auto-update /
+// focus-events lines. The Tip pattern is line-start anchored and
+// requires `Use /` literally — a conversation phrase like «Tip: try X»
+// or «Tip: use indexes» will NOT match.
 const FOOTER_LINE_RES: readonly RegExp[] = [
   /bypass permissions on\s*\(shift\+tab to cycle\)/i,
   /Auto-update failed\s*[·•]\s*Try claude doctor/i,
   /tmux focus-events off\s*[·•]\s*add /i,
+  /^\s*Tip:\s+Use\s*\//i,
 ]
+
+// ─── Input box + inbound-preview anchors ────────────────────────────
+
+// Inbound preview: Claude Code emits one such line when an MCP channel
+// (e.g. dashi-channel) pushes a notification mid-session — `← <name>:
+// <preview>`. The arrow is U+2190; the channel name is a kebab-case
+// identifier in our world (`dashi-channel`, `orgrimmar-inbox`, etc.).
+//
+// Codex review 2026-05-22 flagged the earlier `\S+:` form as too loose
+// — a tool that prints «← github: issue title» at column zero would
+// hijack the `latest_inbound_only` pivot and hide everything before
+// it. We now require:
+//   • leading `← ` (U+2190 + space) at column zero (no indent / diff)
+//   • channel name starts with a lowercase ASCII letter
+//   • channel name is lowercase letters / digits / `-_` only
+//   • terminated by a literal `:`
+// This matches every real MCP channel id we emit and rules out
+// «← Some Channel: …», «← Foo Bar:» and other free-text imposters.
+const INBOUND_PREVIEW_RE = /^← [a-z][a-z0-9_-]*:/
+
+// Input separator. Claude Code v2 renders the bottom input area as a
+// pair of long U+2500 ── horizontals bracketing a `❯` (U+276F) or `>`
+// cursor line. We require at least 20 separator glyphs on a line so a
+// short ── used inline (e.g. «section ──» in a tool output) does not
+// accidentally open an input box.
+const INPUT_SEPARATOR_RE = /^─{20,}\s*$/
+
+// Cursor line inside the input box. Accepts both `❯` (current Claude
+// Code v2.1.144 cursor glyph) and the legacy `>` ASCII fallback.
+// Critically, the line must be EMPTY after the cursor: matching just
+// `>` or `❯` would false-positive on conversation text like
+// «> Что у нас по EdgeLab?» (a quoted reply). Trailing whitespace is
+// fine — the cursor pads with spaces to the column count.
+const INPUT_PROMPT_RE = /^\s*[>❯]\s*$/
+
+// Cap on input box accumulation. Real boxes are 3 lines (sep + prompt
+// + sep), sometimes padded with one or two blanks. Ten lines INCLUDING
+// the opener gives generous headroom for future multi-line input UI
+// without letting a stray separator swallow the rest of the pane.
+// (Codex review 2026-05-22 flagged the earlier "10 after the opener"
+// off-by-one: the opener was pushed before the counter started, so the
+// effective cap was 11. The scanner now counts the opener too.)
+const INPUT_BOX_LINE_CAP = 10
 
 function isFooterLine(line: string): boolean {
   return FOOTER_LINE_RES.some((re) => re.test(line))
@@ -115,7 +187,9 @@ function isBoundaryLine(line: string): boolean {
     BANNER_OPEN_RE.test(line) ||
     INBOUND_OPEN_RE.test(line) ||
     CHANNEL_STATUS_OPEN_RE.test(line) ||
-    isFooterLine(line)
+    isFooterLine(line) ||
+    INBOUND_PREVIEW_RE.test(line) ||
+    INPUT_SEPARATOR_RE.test(line)
   )
 }
 
@@ -271,7 +345,55 @@ export function segmentizePane(text: string): PaneSegment[] {
       continue
     }
 
-    // 5) Conversation (default). Accumulate until we hit a boundary or
+    // 5) Inbound preview — single-line segment. Emitted by Claude Code
+    //    when an MCP channel pushes a notification. Kept as its own
+    //    segment type so `latest_inbound_only` mode can pivot on it
+    //    without re-scanning the text downstream.
+    if (INBOUND_PREVIEW_RE.test(line)) {
+      out.push({ type: 'inbound_preview', text: line })
+      i += 1
+      continue
+    }
+
+    // 6) Input box — separator-anchored. Opens on a long ── line, then
+    //    greedily collects separators, blank lines, and cursor lines
+    //    (`>` or `❯` followed only by whitespace). Closes on the first
+    //    non-matching line so a stray separator inside tool output can
+    //    only consume the matching tail, not the rest of the pane.
+    //    Capped at INPUT_BOX_LINE_CAP (counting the opener) for the
+    //    same safety reason as BANNER_LINE_CAP / INBOUND_LINE_CAP.
+    //
+    //    Codex review 2026-05-22 [high]: a STANDALONE long ── line in
+    //    tool output (a markdown divider, a separator in a help dump)
+    //    must not be hidden as an input box. We now require at least
+    //    one cursor line in the collected block — without that
+    //    confirmation we emit the lines as a conversation segment
+    //    instead, so legitimate dividers remain visible.
+    if (INPUT_SEPARATOR_RE.test(line)) {
+      const box: string[] = [line]
+      i += 1
+      let consumed = 1 // opener already counted
+      let hasCursor = false
+      while (i < lines.length && consumed < INPUT_BOX_LINE_CAP) {
+        const inner = lines[i]!
+        const isSep = INPUT_SEPARATOR_RE.test(inner)
+        const isPrompt = INPUT_PROMPT_RE.test(inner)
+        const isBlank = inner.trim() === ''
+        if (!isSep && !isPrompt && !isBlank) break
+        if (isPrompt) hasCursor = true
+        box.push(inner)
+        i += 1
+        consumed += 1
+      }
+      // Reclassify when the block lacks a cursor — almost certainly a
+      // standalone divider in tool output rather than a real prompt.
+      const type: SegmentType = hasCursor ? 'input_box' : 'conversation'
+      const seg = joinSegment(type, box)
+      if (seg !== null) out.push(seg)
+      continue
+    }
+
+    // 7) Conversation (default). Accumulate until we hit a boundary or
     //    the end of input.
     const conv: string[] = []
     while (i < lines.length) {
@@ -299,11 +421,56 @@ function asSet(
 
 export function filterPane(text: string, opts?: FilterOptions): string {
   const hide = asSet(opts?.hide)
-  const segs = segmentizePane(text)
+  const mode: RenderMode = opts?.mode ?? 'full_pane'
+  let segs = segmentizePane(text)
+  // Mode is applied BEFORE the hide list. If hide were applied first,
+  // an aggressive config that hides `inbound_preview` would erase the
+  // anchor and turn `latest_inbound_only` into a silent no-op. Order
+  // matters: pivot first, then drop.
+  if (mode === 'latest_inbound_only') {
+    let lastIdx = -1
+    for (let k = segs.length - 1; k >= 0; k -= 1) {
+      if (segs[k]!.type === 'inbound_preview') {
+        lastIdx = k
+        break
+      }
+    }
+    // Fresh session with no preview line at all → degrade to full_pane.
+    if (lastIdx >= 0) {
+      // Drop the anchor itself AND every segment before it. The mirror
+      // wants only what happened AFTER the warchief's last message, so
+      // the preview (which echoes that message) is not part of "after".
+      segs = segs.slice(lastIdx + 1)
+    }
+  }
   const kept = segs.filter((s) => !hide.has(s.type))
   if (kept.length === 0) return ''
   // Join with a blank line between segments to keep them visually
   // separated in the Telegram `<pre>` block. Each segment body is
   // already inner-trimmed.
   return kept.map((s) => s.text).join('\n\n')
+}
+
+// ─── Line cap ───────────────────────────────────────────────────────
+
+// capLines — keep at most `maxLines` lines, truncating from the TOP
+// (oldest content) so the rendered tail stays visible. When the input
+// is taller than the cap, the first kept line is replaced with a
+// `… +N lines` marker; the marker counts toward `maxLines`, so the
+// returned string has at most `maxLines` lines on any input.
+//
+// `maxLines === 0` disables capping (caller wants full filtered text).
+// `maxLines === 1` is degenerate but well-defined: returns only the
+// marker, no tail.
+export function capLines(text: string, maxLines: number): string {
+  if (maxLines <= 0) return text
+  if (text.length === 0) return text
+  const lines = text.split('\n')
+  if (lines.length <= maxLines) return text
+  // Reserve 1 line for the marker; the rest goes to the tail.
+  const keep = Math.max(0, maxLines - 1)
+  const dropped = lines.length - keep
+  const tail = lines.slice(lines.length - keep)
+  const marker = `… +${dropped} lines`
+  return [marker, ...tail].join('\n')
 }

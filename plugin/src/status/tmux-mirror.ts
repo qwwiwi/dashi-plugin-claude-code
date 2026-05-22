@@ -37,7 +37,9 @@ import type { Logger } from '../log.js'
 import type { TelegramApi } from '../channel/tools.js'
 import {
   filterPane,
+  capLines,
   DEFAULT_HIDDEN_SEGMENTS,
+  type RenderMode,
   type SegmentType,
 } from './tmux-pane-filter.js'
 
@@ -76,10 +78,21 @@ export interface TmuxMirrorOptions {
   maxBodyChars?: number
   // Optional: segment types to hide from the rendered mirror. When
   // omitted, `DEFAULT_HIDDEN_SEGMENTS` from tmux-pane-filter is used —
-  // boot banner, inbound-injection warning, and footer hints — so the
-  // rolling message only carries semantically useful pane content. Pass
-  // an empty array to disable filtering entirely (raw pane mirror).
+  // boot banner, inbound-injection warning, footer hints, AND the input
+  // box — so the rolling message only carries semantically useful pane
+  // content. Pass an empty array to disable filtering entirely (raw
+  // pane mirror).
   hideSegments?: ReadonlyArray<SegmentType>
+  // Optional: anchor mode for the mirror (see `RenderMode`). Default
+  // `latest_inbound_only` — show only the activity that came AFTER the
+  // warchief's last inbound message. Use `full_pane` for the legacy
+  // whole-pane mirror (debugging or wide-terminal screenshots).
+  mode?: RenderMode
+  // Optional: cap on the number of lines surfaced into the rendered
+  // body. Default 14 (≈70% of an iPhone Telegram screen at the moment).
+  // Set to 0 to disable. Trimming removes from the top (oldest content)
+  // and prepends a `… +N lines` marker; see `capLines`.
+  maxLines?: number
 }
 
 export interface TmuxMirrorStatus {
@@ -196,6 +209,8 @@ export class TmuxMirror {
   private readonly now: () => number
   private readonly maxBodyChars: number
   private readonly hideSegments: ReadonlyArray<SegmentType>
+  private readonly mode: RenderMode
+  private readonly maxLines: number
 
   private timer: ReturnType<typeof setInterval> | null = null
   private enabled = false
@@ -221,6 +236,8 @@ export class TmuxMirror {
     this.now = opts.now ?? ((): number => Date.now())
     this.maxBodyChars = opts.maxBodyChars ?? 4096
     this.hideSegments = opts.hideSegments ?? DEFAULT_HIDDEN_SEGMENTS
+    this.mode = opts.mode ?? 'latest_inbound_only'
+    this.maxLines = opts.maxLines ?? 14
   }
 
   // Pure rendering: turn a tmux exec result into the final body. Side
@@ -234,20 +251,30 @@ export class TmuxMirror {
       return renderBody('(no output)', errMsg, this.maxBodyChars)
     }
     const cleaned = stripAnsi(result.stdout)
-    // Drop boot banner / inbound warning / footer hints BEFORE redaction
-    // — the filter's anchors look at the raw textual structure (box
-    // corners, specific phrases) and must not be perturbed by replaced
-    // tokens. An empty hideSegments list short-circuits to the raw
-    // cleaned text so the mirror can be rendered unfiltered when needed.
-    let filtered =
-      this.hideSegments.length === 0
-        ? cleaned
-        : filterPane(cleaned, { hide: this.hideSegments })
+    // Drop banner / warning / footer / input-box BEFORE redaction — the
+    // filter's anchors look at the raw textual structure (box corners,
+    // specific phrases, U+2500 separators) and must not be perturbed by
+    // token replacement. We also need the `latest_inbound_only` mode to
+    // see the verbatim `← <channel>:` pivot line. Empty hide list +
+    // `full_pane` mode short-circuits to raw cleaned text (raw mirror
+    // debug path).
+    const needsFilter = this.hideSegments.length > 0 || this.mode !== 'full_pane'
+    let filtered = needsFilter
+      ? filterPane(cleaned, { hide: this.hideSegments, mode: this.mode })
+      : cleaned
+    // Line cap runs AFTER the segment filter so the warchief's iPhone
+    // sees a tidy ~14-line tail of the post-filter content, not a
+    // 14-line slice of raw tmux output that includes hidden segments.
+    // `capLines(_, 0)` is a no-op — keeps the existing 4096-char body
+    // cap as the only safety net for callers that opt out.
+    if (this.maxLines > 0) {
+      filtered = capLines(filtered, this.maxLines)
+    }
     // Telegram rejects `<pre></pre>` with no inner text as "message
-    // text is empty" (400). If the filter consumed everything (idle
-    // tmux pane that only renders banner + footer right now), render
-    // a placeholder so the rolling message stays visible and the
-    // self-heal path can still fire on next poll.
+    // text is empty" (400). If the filter (or line cap, or mode pivot)
+    // consumed everything (idle pane / fresh session / over-aggressive
+    // hide list), render a placeholder so the rolling message stays
+    // visible and the self-heal path can still fire on next poll.
     if (filtered.trim() === '') {
       filtered = '(no visible output)'
     }

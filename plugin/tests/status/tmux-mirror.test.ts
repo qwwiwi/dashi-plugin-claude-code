@@ -320,7 +320,7 @@ describe('TmuxMirror — tmux unavailable', () => {
 })
 
 describe('TmuxMirror — length cap', () => {
-  test('large pane is truncated to fit Telegram body cap', async () => {
+  test('large pane is line-capped (default maxLines=14) then char-capped to fit Telegram body', async () => {
     const stub = makeStubApi()
     // Generate 5000 chars of text (over 4096 cap).
     const bigLine = 'X'.repeat(120)
@@ -334,13 +334,155 @@ describe('TmuxMirror — length cap', () => {
       pollIntervalMs: 1000,
       lineCount: 50,
       exec,
+      // No maxLines override → default 14 from constructor applies and
+      // capLines shrinks 50 lines → 14 with a `… +N lines` marker BEFORE
+      // renderBody char-truncation has anything left to do.
     })
     await mirror.start()
     const sent = stub.ops.find((o) => o.method === 'sendMessage')
     expect(sent).toBeDefined()
     expect(sent!.text!.length).toBeLessThanOrEqual(4096)
-    // Truncation must keep the END (newest output) and mark the head.
+    // Line cap marker (matches `… +N lines`). Char-cap `[truncated]`
+    // header is only emitted when the body STILL exceeds 4096 after the
+    // line cap — with the default cap that path is unreachable here.
+    expect(sent!.text).toMatch(/… \+\d+ lines/)
+    // Tail of the original blob survives.
+    expect(sent!.text).toContain('49:')
+    await mirror.stop()
+  })
+
+  test('maxLines=0 disables the line cap; renderBody char truncation kicks in instead', async () => {
+    const stub = makeStubApi()
+    const bigLine = 'X'.repeat(120)
+    const blob = Array.from({ length: 50 }, (_, i) => `${i}: ${bigLine}`).join('\n')
+    const exec = makeExec([ok(blob)])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1000,
+      lineCount: 50,
+      exec,
+      maxLines: 0,
+    })
+    await mirror.start()
+    const sent = stub.ops.find((o) => o.method === 'sendMessage')
+    expect(sent).toBeDefined()
+    expect(sent!.text!.length).toBeLessThanOrEqual(4096)
     expect(sent!.text).toContain('truncated')
+    await mirror.stop()
+  })
+})
+
+describe('TmuxMirror — latest_inbound_only (default)', () => {
+  test('default mode pivots on the last `← <channel>:` preview and drops earlier history', async () => {
+    const stub = makeStubApi()
+    const pane = [
+      '● Old turn from yesterday',
+      '← dashi-channel: stale-voice-1',
+      '● Reply to stale voice 1',
+      '← dashi-channel: latest-voice',
+      '● Live agent activity after the warchief\'s last message',
+    ].join('\n')
+    const exec = makeExec([ok(pane)])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1000,
+      lineCount: 50,
+      exec,
+    })
+    await mirror.start()
+    const sent = stub.ops.find((o) => o.method === 'sendMessage')
+    expect(sent).toBeDefined()
+    // Pre-pivot content must not leak into the iPhone view.
+    expect(sent!.text).not.toContain('Old turn from yesterday')
+    expect(sent!.text).not.toContain('stale-voice-1')
+    expect(sent!.text).not.toContain('latest-voice')
+    // Tail survives.
+    expect(sent!.text).toContain('Live agent activity')
+    await mirror.stop()
+  })
+
+  test('explicit mode=full_pane preserves the entire pane (legacy behaviour)', async () => {
+    const stub = makeStubApi()
+    const pane = [
+      '● Old turn',
+      '← dashi-channel: preview',
+      '● New turn',
+    ].join('\n')
+    const exec = makeExec([ok(pane)])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1000,
+      lineCount: 50,
+      exec,
+      mode: 'full_pane',
+    })
+    await mirror.start()
+    const sent = stub.ops.find((o) => o.method === 'sendMessage')
+    expect(sent).toBeDefined()
+    expect(sent!.text).toContain('Old turn')
+    expect(sent!.text).toContain('preview')
+    expect(sent!.text).toContain('New turn')
+    await mirror.stop()
+  })
+
+  test('fresh session with no preview line falls back to full_pane and stays visible', async () => {
+    const stub = makeStubApi()
+    const pane = '● First turn of a fresh session, nothing inbound yet'
+    const exec = makeExec([ok(pane)])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1000,
+      lineCount: 50,
+      exec,
+      // default mode = latest_inbound_only
+    })
+    await mirror.start()
+    const sent = stub.ops.find((o) => o.method === 'sendMessage')
+    expect(sent).toBeDefined()
+    expect(sent!.text).toContain('First turn')
+    expect(sent!.text).not.toContain('no visible output')
+    await mirror.stop()
+  })
+
+  test('input box (── + ❯ + ──) and Tip footer are hidden by default', async () => {
+    const stub = makeStubApi()
+    const pane = [
+      '● Live agent line',
+      '────────────────────────────────────────',
+      '❯                                       ',
+      '────────────────────────────────────────',
+      'Tip: Use /btw to ask a quick side question',
+    ].join('\n')
+    const exec = makeExec([ok(pane)])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1000,
+      lineCount: 50,
+      exec,
+      mode: 'full_pane', // disable pivot so we test ONLY the hide list
+    })
+    await mirror.start()
+    const sent = stub.ops.find((o) => o.method === 'sendMessage')
+    expect(sent).toBeDefined()
+    expect(sent!.text).toContain('Live agent line')
+    expect(sent!.text).not.toContain('────')
+    expect(sent!.text).not.toContain('❯')
+    expect(sent!.text).not.toContain('Tip: Use /btw')
     await mirror.stop()
   })
 })

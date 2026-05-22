@@ -143,8 +143,13 @@ export const AppConfigSchema = z.object({
     line_count: z.number().int().min(5).max(500).default(50),
     // Segments to drop from the rendered mirror. Default hides the boot
     // banner (Claude Code splash + email + path), the inbound-injection
-    // warning, and the footer hints (bypass-perms reminder, auto-update
-    // failure, tmux focus-events note). Pass an empty list to mirror
+    // warning, the footer hints (bypass-perms, auto-update, focus-events,
+    // /btw Tip line) AND the input box (the bordered prompt area —
+    // ── separators + ❯/> cursor). `inbound_preview` stays visible by
+    // default because `latest_inbound_only` mode anchors on it; hiding
+    // it would silently turn the mode into a no-op (filter applies mode
+    // BEFORE hide, but only `latest_inbound_only` survives that order —
+    // see tmux-pane-filter.filterPane). Pass an empty list to mirror
     // raw pane content. Validated against the SegmentType enum to keep
     // typos out of production — bad values fail config load loud.
     hide_segments: z
@@ -155,9 +160,36 @@ export const AppConfigSchema = z.object({
           'channel_status',
           'conversation',
           'footer_hints',
+          'input_box',
+          'inbound_preview',
         ]),
       )
-      .default(['boot_banner', 'inbound_warning', 'footer_hints']),
+      .default(['boot_banner', 'inbound_warning', 'footer_hints', 'input_box']),
+    // Anchor mode for the rolling mirror. `latest_inbound_only` (default,
+    // 2026-05-22) drops every pane segment up to and including the last
+    // `← <channel>: …` preview Claude Code emitted — only what the agent
+    // is doing AFTER the warchief's most recent message remains. Falls
+    // back to `full_pane` automatically when no preview exists in the
+    // current capture (fresh session). Set to `full_pane` to mirror the
+    // whole pane (pre-2026-05-22 behaviour).
+    mode: z.enum(['full_pane', 'latest_inbound_only']).default('latest_inbound_only'),
+    // Max lines kept in the rendered mirror, post-filter. Default 14 —
+    // empirically that fits one iPhone-screen worth of Telegram <pre>
+    // content (the warchief asked for ≤70% screen height on 2026-05-22).
+    // Truncation removes from the TOP (oldest), preserving the live
+    // tail, and prepends a `… +N lines` marker that counts toward the
+    // cap. Set to 0 to disable (uncapped, only the 4096-char body cap
+    // in renderBody still applies). Codex review 2026-05-22 [medium]
+    // tightened the allowed range to `0` or `4..100` — values 1..3
+    // render only the marker plus 0..2 lines, which is degenerate and
+    // not useful in production.
+    max_lines: z
+      .number()
+      .int()
+      .refine((n) => n === 0 || (n >= 4 && n <= 100), {
+        message: 'max_lines must be 0 (disabled) or an integer in 4..100',
+      })
+      .default(14),
   }).default({}),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>

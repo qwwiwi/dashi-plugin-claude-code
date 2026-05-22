@@ -15,6 +15,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   segmentizePane,
   filterPane,
+  capLines,
   DEFAULT_HIDDEN_SEGMENTS,
   type SegmentType,
 } from '../../src/status/tmux-pane-filter.js'
@@ -132,11 +133,14 @@ describe('segmentizePane — classification', () => {
   test('full pane: types appear in the canonical order', () => {
     const types = typesOf(FULL_PANE)
     // The exact list (no extraneous segments, no swapped order).
+    // `input_box` was promoted from "lives inside conversation" to its
+    // own segment on 2026-05-22 — see scanner branch 6 in the filter.
     expect(types).toEqual([
       'boot_banner',
       'channel_status',
       'inbound_warning',
       'conversation',
+      'input_box',
       'footer_hints',
     ])
   })
@@ -153,11 +157,13 @@ describe('segmentizePane — classification', () => {
     expect(segs[0]?.type).toBe('conversation')
   })
 
-  test('input prompt box (─ line + > line + ─ line) stays inside conversation segment', () => {
-    // Input prompt is NOT a separate type in v1 — it lives inside the
-    // surrounding conversation. The mirror should keep it visible.
+  test('input prompt box (─ line + > line + ─ line) classifies as input_box', () => {
+    // 2026-05-22: input box was promoted to its own segment so the
+    // warchief's mirror can hide it. A conversation line that follows
+    // («> hello», not all-whitespace after >) breaks out of the box.
     const segs = segmentizePane(INPUT_PROMPT_BOX + '\n> hello\n')
     const types = segs.map((s) => s.type)
+    expect(types).toContain('input_box')
     expect(types).toContain('conversation')
     expect(types).not.toContain('footer_hints')
   })
@@ -184,9 +190,16 @@ describe('filterPane — applies hide-list', () => {
     expect(out).toContain('Сделано. Порядок восстановлен.')
   })
 
-  test('DEFAULT_HIDDEN_SEGMENTS lists exactly the three groups we hide by default', () => {
+  test('DEFAULT_HIDDEN_SEGMENTS lists the four groups we hide by default', () => {
+    // 2026-05-22: `input_box` joined the default hide list — the
+    // warchief's iPhone mirror should not surface the prompt area.
     expect(new Set(DEFAULT_HIDDEN_SEGMENTS)).toEqual(
-      new Set<SegmentType>(['boot_banner', 'inbound_warning', 'footer_hints']),
+      new Set<SegmentType>([
+        'boot_banner',
+        'inbound_warning',
+        'footer_hints',
+        'input_box',
+      ]),
     )
   })
 
@@ -205,6 +218,8 @@ describe('filterPane — applies hide-list', () => {
         'channel_status',
         'conversation',
         'footer_hints',
+        'input_box',
+        'inbound_preview',
       ],
     })
     expect(out.trim()).toBe('')
@@ -346,5 +361,291 @@ describe('segmentizePane — robustness', () => {
     const dt = Date.now() - t0
     expect(out.length).toBeGreaterThan(0)
     expect(dt).toBeLessThan(2000)
+  })
+})
+
+// ─── input_box segment (added 2026-05-22) ────────────────────────────
+
+describe('segmentizePane — input_box', () => {
+  test('separator + > cursor + separator classifies as one input_box segment', () => {
+    const segs = segmentizePane(INPUT_PROMPT_BOX)
+    expect(segs.length).toBe(1)
+    expect(segs[0]?.type).toBe('input_box')
+    expect(segs[0]?.text).toContain('─')
+  })
+
+  test('separator + ❯ (U+276F) + separator classifies as input_box', () => {
+    // Claude Code v2.1.144 emits U+276F as the cursor glyph; the legacy
+    // ASCII `>` and the new ❯ must both classify as cursor lines.
+    const box = [
+      '────────────────────────────────────────',
+      '❯                                       ',
+      '────────────────────────────────────────',
+    ].join('\n')
+    const segs = segmentizePane(box)
+    expect(segs.length).toBe(1)
+    expect(segs[0]?.type).toBe('input_box')
+  })
+
+  test('input_box absorbs interleaved blank lines between separators and cursor', () => {
+    const box = [
+      '────────────────────────────────────────',
+      '',
+      '❯                                       ',
+      '',
+      '────────────────────────────────────────',
+    ].join('\n')
+    const segs = segmentizePane(box)
+    expect(segs.length).toBe(1)
+    expect(segs[0]?.type).toBe('input_box')
+  })
+
+  test('input_box closes on the first non-matching line; later conversation survives', () => {
+    const text = [
+      INPUT_PROMPT_BOX,
+      '',
+      '● Conversation line that must NOT be eaten by the box',
+    ].join('\n')
+    const types = segmentizePane(text).map((s) => s.type)
+    expect(types).toEqual(['input_box', 'conversation'])
+  })
+
+  test('short ── inline (under 20 chars) is NOT an input_box', () => {
+    // A diff line or a heading like «section ──» must stay in
+    // conversation; the 20-glyph threshold rules that out.
+    const text = [
+      '+ section ──── short separator',
+      '● another bullet',
+    ].join('\n')
+    const types = segmentizePane(text).map((s) => s.type)
+    expect(types).toEqual(['conversation'])
+  })
+
+  test('conversation line «> Что у нас по EdgeLab?» is NOT a cursor (text after >)', () => {
+    // The cursor anchor is `^\s*[>❯]\s*$` — line must be empty after
+    // the cursor glyph. A quoted reply like `> Что у нас` has content
+    // after `>` and stays in conversation. The lone separator above it
+    // lacks a cursor confirmation (Codex 2026-05-22 [high] fix), so it
+    // reclassifies as conversation rather than a fake input_box.
+    const text = [
+      '────────────────────────────────────────',
+      '> Что у нас по EdgeLab?',
+    ].join('\n')
+    const segs = segmentizePane(text)
+    const types = segs.map((s) => s.type)
+    expect(types).not.toContain('input_box')
+    expect(types).toContain('conversation')
+    const conv = segs.find((s) => s.type === 'conversation' && s.text.includes('Что у нас'))
+    expect(conv).toBeDefined()
+  })
+
+  test('standalone long ── line without cursor is NOT an input_box (markdown divider)', () => {
+    // Codex review 2026-05-22 [high]: a long ── separator in tool
+    // output (a markdown divider, a help-dump rule) must not vanish
+    // from the mirror. Reclassified as conversation when the block
+    // contains no cursor line.
+    const text = [
+      '● Some tool output',
+      '────────────────────────────────────────',
+      '● Continued output below the divider',
+    ].join('\n')
+    const types = segmentizePane(text).map((s) => s.type)
+    expect(types).not.toContain('input_box')
+    expect(types.every((t) => t === 'conversation')).toBe(true)
+  })
+
+  test('input_box stops at the 10-line cap (including opener) so a stray real box does not swallow scrollback', () => {
+    // 8 separators + cursor + 20 more separators — the cap fires
+    // before the trailing run is absorbed. Cursor is present so the
+    // block IS classified as input_box. After the cap, remaining
+    // separators end up reclassified individually (no cursor) as
+    // conversation.
+    const lines: string[] = []
+    for (let k = 0; k < 8; k += 1) lines.push('────────────────────────────────────────')
+    lines.push('❯                                       ')
+    for (let k = 0; k < 20; k += 1) lines.push('────────────────────────────────────────')
+    lines.push('● later content')
+    const segs = segmentizePane(lines.join('\n'))
+    const boxSegs = segs.filter((s) => s.type === 'input_box')
+    expect(boxSegs.length).toBeGreaterThanOrEqual(1)
+    // Cap is inclusive of opener — at most 10 lines per input_box.
+    const firstBox = boxSegs[0]!.text.split('\n')
+    expect(firstBox.length).toBeLessThanOrEqual(10)
+    expect(segs.some((s) => s.type === 'conversation' && s.text.includes('later content'))).toBe(true)
+  })
+})
+
+// ─── inbound_preview segment (added 2026-05-22) ──────────────────────
+
+describe('segmentizePane — inbound_preview', () => {
+  test('«← dashi-channel: …» line is a single-line inbound_preview segment', () => {
+    const text = '← dashi-channel: <media kind="voice" file_id="AwAC***SpDA"'
+    const segs = segmentizePane(text)
+    expect(segs.length).toBe(1)
+    expect(segs[0]?.type).toBe('inbound_preview')
+    expect(segs[0]?.text).toContain('dashi-channel')
+  })
+
+  test('indented or quoted «← …» does NOT classify as inbound_preview', () => {
+    // Anchor requires `^← ` at column zero — a quoted line with
+    // leading whitespace stays in conversation. Same for diff lines.
+    const text = [
+      '  ← github: oops quoted in conversation',
+      '+ ← diff: added by patch',
+    ].join('\n')
+    const segs = segmentizePane(text)
+    const types = segs.map((s) => s.type)
+    expect(types).not.toContain('inbound_preview')
+    expect(types).toEqual(['conversation'])
+  })
+
+  test('uppercase / mixed-case channel name does NOT classify as inbound_preview', () => {
+    // Codex review 2026-05-22 [medium]: the original `\S+:` form was
+    // too loose — a tool printing «← GitHub: …» or «← Some Channel: …»
+    // would hijack the latest_inbound_only pivot. Channel names must
+    // now start with a lowercase ASCII letter and contain only
+    // [a-z0-9_-].
+    const text = [
+      '← GitHub: issue title',
+      '← Some Channel: free text label',
+      '← 1bad: starts with digit',
+    ].join('\n')
+    const types = segmentizePane(text).map((s) => s.type)
+    expect(types).not.toContain('inbound_preview')
+  })
+
+  test('multiple inbound previews in a row each get their own segment', () => {
+    const text = [
+      '← dashi-channel: msg one',
+      '← dashi-channel: msg two',
+      '● conversation between two messages',
+      '← dashi-channel: msg three',
+    ].join('\n')
+    const types = segmentizePane(text).map((s) => s.type)
+    expect(types).toEqual([
+      'inbound_preview',
+      'inbound_preview',
+      'conversation',
+      'inbound_preview',
+    ])
+  })
+})
+
+// ─── Tip footer line (added 2026-05-22) ──────────────────────────────
+
+describe('segmentizePane — Tip footer', () => {
+  test('«Tip: Use /btw …» is hidden as a footer_hints segment', () => {
+    const text = 'Tip: Use /btw to ask a quick side question without interrupting Claude\'s current work'
+    const segs = segmentizePane(text)
+    expect(segs.length).toBe(1)
+    expect(segs[0]?.type).toBe('footer_hints')
+  })
+
+  test('conversation phrase «Tip: try X» is NOT classified as footer', () => {
+    // Anchor requires `Use /` literal — generic «Tip:» without `/`
+    // command suffix must stay in conversation.
+    const text = 'Tip: try indexing before that join, it cut p99 by 4x.'
+    const segs = segmentizePane(text)
+    expect(segs.length).toBe(1)
+    expect(segs[0]?.type).toBe('conversation')
+  })
+})
+
+// ─── filterPane mode='latest_inbound_only' ───────────────────────────
+
+describe('filterPane — mode latest_inbound_only', () => {
+  test('drops every segment up to AND INCLUDING the last inbound preview', () => {
+    const text = [
+      '● Earlier conversation about EdgeLab',
+      '← dashi-channel: first voice from warchief',
+      '● Reply to first voice',
+      '← dashi-channel: second voice from warchief',
+      '● Reply still in progress',
+    ].join('\n')
+    const out = filterPane(text, { hide: [], mode: 'latest_inbound_only' })
+    // Nothing from before the second preview should leak.
+    expect(out).not.toContain('Earlier conversation')
+    expect(out).not.toContain('first voice')
+    expect(out).not.toContain('Reply to first voice')
+    expect(out).not.toContain('second voice') // anchor itself dropped
+    // Only the activity AFTER the last preview remains.
+    expect(out).toContain('Reply still in progress')
+  })
+
+  test('falls back to full_pane when no inbound preview is present', () => {
+    const text = [
+      '● Conversation without any inbound preview',
+      '● Another line',
+    ].join('\n')
+    const out = filterPane(text, { hide: [], mode: 'latest_inbound_only' })
+    expect(out).toContain('Conversation without any inbound preview')
+    expect(out).toContain('Another line')
+  })
+
+  test('mode applies BEFORE hide list so hide cannot erase the anchor', () => {
+    // Even if a misconfigured caller tries to hide inbound_preview,
+    // the pivot still finds it (mode runs first), then hide drops it.
+    const text = [
+      '● Old turn',
+      '← dashi-channel: PIVOT_LINE',
+      '● New turn',
+    ].join('\n')
+    const out = filterPane(text, {
+      hide: ['inbound_preview'],
+      mode: 'latest_inbound_only',
+    })
+    expect(out).not.toContain('Old turn')
+    expect(out).not.toContain('PIVOT_LINE')
+    expect(out).toContain('New turn')
+  })
+
+  test('default mode is full_pane (backwards-compatible with existing callers)', () => {
+    // No `mode` arg → existing behaviour preserved.
+    const text = [
+      '● Earlier turn',
+      '← dashi-channel: preview',
+      '● Later turn',
+    ].join('\n')
+    const out = filterPane(text, { hide: [] })
+    expect(out).toContain('Earlier turn')
+    expect(out).toContain('preview')
+    expect(out).toContain('Later turn')
+  })
+})
+
+// ─── capLines (added 2026-05-22) ─────────────────────────────────────
+
+describe('capLines', () => {
+  test('returns input unchanged when line count ≤ maxLines', () => {
+    const text = ['a', 'b', 'c'].join('\n')
+    expect(capLines(text, 3)).toBe(text)
+    expect(capLines(text, 10)).toBe(text)
+  })
+
+  test('truncates from the TOP and prepends `… +N lines` marker', () => {
+    const text = ['l1', 'l2', 'l3', 'l4', 'l5'].join('\n')
+    const out = capLines(text, 3)
+    const lines = out.split('\n')
+    expect(lines.length).toBe(3)
+    expect(lines[0]).toMatch(/^… \+\d+ lines$/)
+    // Tail preserved: last `maxLines - 1` lines from input.
+    expect(lines[1]).toBe('l4')
+    expect(lines[2]).toBe('l5')
+    // Dropped count is `inputLen - (maxLines - 1)` = 5 - 2 = 3.
+    expect(lines[0]).toBe('… +3 lines')
+  })
+
+  test('maxLines = 0 disables capping', () => {
+    const text = ['l1', 'l2', 'l3', 'l4', 'l5'].join('\n')
+    expect(capLines(text, 0)).toBe(text)
+  })
+
+  test('empty input returns empty', () => {
+    expect(capLines('', 5)).toBe('')
+  })
+
+  test('negative maxLines is a no-op (defensive)', () => {
+    const text = 'a\nb\nc'
+    expect(capLines(text, -1)).toBe(text)
   })
 })

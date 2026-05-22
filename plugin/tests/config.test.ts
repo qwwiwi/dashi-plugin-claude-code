@@ -231,4 +231,47 @@ describe('loadConfig', () => {
       expect(cfg.memory.enabled).toBe(false)
     }
   })
+
+  // ─── tmux_mirror schema (added 2026-05-22) ─────────────────────────
+
+  test('tmux_mirror defaults: mode=latest_inbound_only, max_lines=14, hide_segments includes input_box', () => {
+    const cfg = loadConfig(env())
+    expect(cfg.tmux_mirror.mode).toBe('latest_inbound_only')
+    expect(cfg.tmux_mirror.max_lines).toBe(14)
+    expect(cfg.tmux_mirror.hide_segments).toContain('input_box')
+    expect(cfg.tmux_mirror.hide_segments).toContain('boot_banner')
+    expect(cfg.tmux_mirror.hide_segments).toContain('inbound_warning')
+    expect(cfg.tmux_mirror.hide_segments).toContain('footer_hints')
+  })
+
+  test('tmux_mirror.max_lines rejects degenerate values 1..3 (Codex 2026-05-22 [medium])', () => {
+    // Spec: 0 = disabled, otherwise 4..100. Smaller values render only
+    // the marker plus a handful of lines — not useful.
+    for (const bad of [1, 2, 3, -1, 101]) {
+      writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+        tmux_mirror: { max_lines: bad },
+      }))
+      expect(() => loadConfig(env())).toThrow(/max_lines must be 0 \(disabled\) or an integer in 4..100/)
+    }
+  })
+
+  test('tmux_mirror.max_lines accepts 0 (disabled) and 4..100', () => {
+    for (const good of [0, 4, 14, 50, 100]) {
+      writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+        tmux_mirror: { max_lines: good },
+      }))
+      const cfg = loadConfig(env())
+      expect(cfg.tmux_mirror.max_lines).toBe(good)
+    }
+  })
+
+  test('tmux_mirror.mode accepts both full_pane and latest_inbound_only', () => {
+    for (const mode of ['full_pane', 'latest_inbound_only'] as const) {
+      writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+        tmux_mirror: { mode },
+      }))
+      const cfg = loadConfig(env())
+      expect(cfg.tmux_mirror.mode).toBe(mode)
+    }
+  })
 })
