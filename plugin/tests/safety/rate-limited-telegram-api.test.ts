@@ -357,7 +357,7 @@ describe('createRateLimitedTelegramApi — 429 retry-after', () => {
     expect(stub.calls.length).toBe(0)
   })
 
-  test('429 on editMessageText also retries (lighter bucket)', async () => {
+  test('429 on editMessageText retries after backoff', async () => {
     const clock = new FakeClock()
     const stub = makeStubApi(clock)
     const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
@@ -371,15 +371,17 @@ describe('createRateLimitedTelegramApi — 429 retry-after', () => {
 })
 
 describe('createRateLimitedTelegramApi — retry_after clamp & edge values', () => {
-  test('retry_after over 60s is clamped to 60s', async () => {
+  test('retry_after over 900s is clamped to 900s', async () => {
     const clock = new FakeClock()
     const stub = makeStubApi(clock)
     const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
-    stub.queueError('sendMessage', make429Error(300))
+    stub.queueError('sendMessage', make429Error(1200))
     const p = api.sendMessage('100', 'hi', {})
     await flushMicrotasks()
-    // Even though Telegram said 300s, we should retry after 60s.
-    await clock.tick(60_000)
+    // Telegram said 1200s; we clamp to the 900s ceiling. Retrying before the
+    // real window elapses is counted as continued flooding and extends the
+    // ban, so the cap only guards against absurd / hostile-shaped values.
+    await clock.tick(900_000)
     await p
     expect(stub.calls.length).toBe(1)
   })
@@ -415,7 +417,7 @@ describe('createRateLimitedTelegramApi — retry_after clamp & edge values', () 
   })
 })
 
-describe('createRateLimitedTelegramApi — pass-through methods', () => {
+describe('createRateLimitedTelegramApi — per-method bucketing', () => {
   test('downloadFile is not rate-limited', async () => {
     const clock = new FakeClock()
     const stub = makeStubApi(clock)
@@ -428,32 +430,70 @@ describe('createRateLimitedTelegramApi — pass-through methods', () => {
     expect(stub.calls.every((c) => c.ts === 0)).toBe(true)
   })
 
-  test('editMessageText does not consume the per-chat send bucket', async () => {
+  test('editMessageText is paced through the per-chat bucket', async () => {
     const clock = new FakeClock()
     const stub = makeStubApi(clock)
     const opts = defaultOpts(clock)
     opts.perChatBurstCapacity = 1
     const api = createRateLimitedTelegramApi(stub.api, stubLog, opts)
-    // Use up the per-chat send bucket.
-    await api.sendMessage('100', 'a', {})
-    // Now do many edits — they must not be throttled by the send bucket.
-    await Promise.all(
-      Array.from({ length: 5 }, () => api.editMessageText('100', 42, 'edit', {})),
+    // Status-bubble edits fire every few seconds during a turn; leaving them
+    // unpaced let them trip Telegram's per-chat flood limit on their own.
+    // Burst 1: the first edit fires at t=0, the rest wait for refill.
+    const p = Promise.all(
+      Array.from({ length: 3 }, (_, i) => api.editMessageText('100', 42, `e${i}`, {})),
     )
-    expect(stub.calls.filter((c) => c.method === 'editMessageText').length).toBe(5)
+    await flushMicrotasks()
+    expect(stub.calls.length).toBe(1)
+    await clock.tick(1000)
+    expect(stub.calls.length).toBe(2)
+    await clock.tick(1000)
+    await p
+    expect(stub.calls.length).toBe(3)
   })
 
-  test('setMessageReaction is not gated by send bucket', async () => {
+  test('setMessageReaction is paced through the per-chat bucket', async () => {
     const clock = new FakeClock()
     const stub = makeStubApi(clock)
     const opts = defaultOpts(clock)
     opts.perChatBurstCapacity = 1
     const api = createRateLimitedTelegramApi(stub.api, stubLog, opts)
-    await api.sendMessage('100', 'a', {})
-    await Promise.all(
-      Array.from({ length: 5 }, () => api.setMessageReaction('100', 42, 'eyes')),
+    const p = Promise.all(
+      Array.from({ length: 3 }, () => api.setMessageReaction('100', 42, 'eyes')),
     )
-    expect(stub.calls.filter((c) => c.method === 'setMessageReaction').length).toBe(5)
+    await flushMicrotasks()
+    expect(stub.calls.length).toBe(1)
+    await clock.tick(1000)
+    expect(stub.calls.length).toBe(2)
+    await clock.tick(1000)
+    await p
+    expect(stub.calls.length).toBe(3)
+  })
+
+  test('sendChatAction is best-effort: dropped when the bucket is empty', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const opts = defaultOpts(clock)
+    opts.perChatBurstCapacity = 1
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, opts)
+    // Spend the one token on a real send.
+    await api.sendMessage('100', 'a', {})
+    // Bucket empty → the chat action is dropped, never queued or retried.
+    await api.sendChatAction('100', 'typing')
+    expect(stub.calls.filter((c) => c.method === 'sendChatAction').length).toBe(0)
+    // After refill there is a token → it goes through.
+    await clock.tick(1000)
+    await api.sendChatAction('100', 'typing')
+    expect(stub.calls.filter((c) => c.method === 'sendChatAction').length).toBe(1)
+  })
+
+  test('sendChatAction swallows a 429 instead of throwing', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    stub.queueError('sendChatAction', make429Error(5))
+    // Must resolve, not reject — a missed typing indicator is cosmetic.
+    await api.sendChatAction('100', 'typing')
+    expect(stub.calls.filter((c) => c.method === 'sendChatAction').length).toBe(0)
   })
 
   test('sendDocument and sendPhoto share the per-chat send bucket', async () => {

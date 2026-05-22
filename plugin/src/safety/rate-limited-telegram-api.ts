@@ -15,12 +15,16 @@
 //      throughput across all chats under Telegram's 30/sec bot-wide limit.
 //   3. 429 retry: on a grammY-shaped 429 (`error_code: 429`, optional
 //      `parameters.retry_after`), sleep the requested seconds + a small
-//      jitter and retry the SAME call. Bounded by `maxRetries` (default 3).
+//      jitter and retry the SAME call. Bounded by `maxRetries` (default 2).
 //
-// Methods that don't consume the send-bucket: editMessageText (Telegram's
-// edit limits are far more lenient), setMessageReaction, sendChatAction,
-// deleteMessage, downloadFile. They still get the 429 retry wrapper so a
-// stray 429 on an edit can recover without the caller seeing it.
+// Every Telegram-bound text / edit / reaction / delete call runs through the
+// per-chat bucket + FIFO queue — including editMessageText and
+// setMessageReaction. Leaving edits unpaced let a busy session's status
+// bubbles + reactions trip Telegram's per-chat flood limit on their own.
+// sendChatAction is the one exception: a "typing…" pulse is worthless once
+// stale, so it is best-effort — dropped when the chat has no token, never
+// queued or retried (queuing chat actions is pure flood pressure).
+// downloadFile is inbound and untouched.
 //
 // Test seams: `opts.now` and `opts.sleep` replace the real clock and
 // setTimeout-based sleep, so tests can run instantly with deterministic
@@ -104,13 +108,16 @@ interface Grammy429 {
   parameters?: { retry_after?: number }
 }
 
-// Cap retry_after so one giant value from Telegram (or a hostile-shaped
-// error) can't lock a chat's FIFO queue for minutes on end. The per-chat
-// tail-promise chain blocks all subsequent sends to the same chat until the
-// in-flight op finishes, so worst-case stall = maxRetries × MAX_RETRY_AFTER_S.
-// With defaults (3 × 60s) that's a 3-minute ceiling; if Telegram really
-// needs longer, the bounded retries exhaust and the caller sees the 429.
-const MAX_RETRY_AFTER_S = 60
+// Cap retry_after so a giant or hostile-shaped value can't pin a chat's
+// FIFO queue indefinitely. The cap must still be large enough to honour a
+// real Telegram flood-wait (135s and 503s observed in prod): retrying
+// BEFORE the window elapses is counted as continued flooding and extends
+// the ban. The per-chat tail-promise chain blocks subsequent sends to the
+// same chat until the in-flight op finishes, so worst-case stall =
+// maxRetries × MAX_RETRY_AFTER_S. With defaults (2 × 900s) that is a
+// 30-minute ceiling — reached only if Telegram re-bans on the retry, which
+// the pacing above is designed to prevent.
+const MAX_RETRY_AFTER_S = 900
 
 function parse429(err: unknown): { retryAfter: number } | null {
   if (typeof err !== 'object' || err === null) return null
@@ -135,7 +142,7 @@ export function createRateLimitedTelegramApi(
     perChatBurstCapacity: opts.perChatBurstCapacity ?? 3,
     globalRefillPerSec: opts.globalRefillPerSec ?? 25,
     globalBurstCapacity: opts.globalBurstCapacity ?? 25,
-    maxRetries: opts.maxRetries ?? 3,
+    maxRetries: opts.maxRetries ?? 2,
     jitterMaxMs: opts.jitterMaxMs ?? 150,
   }
   const now = opts.now ?? ((): number => Date.now())
@@ -183,7 +190,7 @@ export function createRateLimitedTelegramApi(
 
   // `maxRetries` is the MAX NUMBER OF ATTEMPTS including the initial call.
   // Semantically: budget of how many times we hit Telegram for this op.
-  // maxRetries=3 → up to 3 attempts (2 retries after the first failure).
+  // maxRetries=2 → up to 2 attempts (1 retry after the first failure).
   async function withRetry<T>(method: string, op: () => Promise<T>): Promise<T> {
     let attempt = 0
     let lastErr: unknown
@@ -244,7 +251,9 @@ export function createRateLimitedTelegramApi(
       text: string,
       editOpts: EditOpts,
     ): Promise<void> {
-      return withRetry('editMessageText', () =>
+      // Paced through the per-chat bucket: status-bubble edits fire every
+      // few seconds during a turn and used to bypass the limiter entirely.
+      return enqueueSend(chatId, () =>
         raw.editMessageText(chatId, messageId, text, editOpts),
       )
     },
@@ -254,13 +263,26 @@ export function createRateLimitedTelegramApi(
       messageId: number,
       emoji: string,
     ): Promise<void> {
-      return withRetry('setMessageReaction', () =>
+      return enqueueSend(chatId, () =>
         raw.setMessageReaction(chatId, messageId, emoji),
       )
     },
 
     async sendChatAction(chatId: string, action: ChatAction): Promise<void> {
-      return withRetry('sendChatAction', () => raw.sendChatAction(chatId, action))
+      // Best-effort, fire-and-forget. A "typing…" pulse is worthless once
+      // stale, so it is never queued or retried — queuing/retrying chat
+      // actions is pure flood pressure. Drop it when either bucket is out
+      // of tokens; swallow any error (a missed indicator is cosmetic).
+      const state = getChatState(chatId)
+      const t = now()
+      if (waitMs(state.bucket, t) > 0 || waitMs(globalBucket, t) > 0) return
+      consume(state.bucket)
+      consume(globalBucket)
+      try {
+        await raw.sendChatAction(chatId, action)
+      } catch {
+        /* cosmetic — ignore (incl. 429) */
+      }
     },
 
     async sendDocument(
