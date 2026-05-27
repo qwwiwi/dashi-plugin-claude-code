@@ -1,0 +1,57 @@
+# /etc/sudoers.d/thrall — NOPASSWD whitelist для sa-thrall (Claude Code agent)
+#
+# Установка (от warchief):
+#   sudo cp ops/sudoers/thrall.sudoers /etc/sudoers.d/thrall
+#   sudo chmod 0440 /etc/sudoers.d/thrall
+#   sudo visudo -c   # syntax check
+#
+# Применяется к пользователю openclaw на Thrall VPS.
+# Любая команда вне whitelist всё равно требует пароль -- whitelist аддитивный.
+
+# systemd services -- управление основными сервисами без пароля
+openclaw ALL=(root) NOPASSWD: /bin/systemctl restart channel-thrall
+openclaw ALL=(root) NOPASSWD: /bin/systemctl restart channel-thrall-webhook
+openclaw ALL=(root) NOPASSWD: /bin/systemctl restart thrall-gateway.service
+openclaw ALL=(root) NOPASSWD: /bin/systemctl restart iel-bot
+openclaw ALL=(root) NOPASSWD: /bin/systemctl restart edgelab-api
+openclaw ALL=(root) NOPASSWD: /bin/systemctl restart edgelab-staging
+openclaw ALL=(root) NOPASSWD: /bin/systemctl start channel-thrall
+openclaw ALL=(root) NOPASSWD: /bin/systemctl start channel-thrall-webhook
+openclaw ALL=(root) NOPASSWD: /bin/systemctl start iel-bot
+openclaw ALL=(root) NOPASSWD: /bin/systemctl start edgelab-api
+openclaw ALL=(root) NOPASSWD: /bin/systemctl start edgelab-staging
+openclaw ALL=(root) NOPASSWD: /bin/systemctl stop channel-thrall
+openclaw ALL=(root) NOPASSWD: /bin/systemctl stop channel-thrall-webhook
+openclaw ALL=(root) NOPASSWD: /bin/systemctl stop iel-bot
+openclaw ALL=(root) NOPASSWD: /bin/systemctl stop edgelab-api
+openclaw ALL=(root) NOPASSWD: /bin/systemctl stop edgelab-staging
+openclaw ALL=(root) NOPASSWD: /bin/systemctl status *
+openclaw ALL=(root) NOPASSWD: /bin/systemctl is-active *
+openclaw ALL=(root) NOPASSWD: /bin/systemctl daemon-reload
+
+# Логи -- read-only, безопасно
+openclaw ALL=(root) NOPASSWD: /bin/journalctl
+openclaw ALL=(root) NOPASSWD: /bin/journalctl *
+
+# sudoers self-management через tee (нужно для добавления новых правил без интерактивного visudo)
+openclaw ALL=(root) NOPASSWD: /usr/bin/tee /etc/sudoers.d/*
+openclaw ALL=(root) NOPASSWD: /usr/sbin/visudo -c
+openclaw ALL=(root) NOPASSWD: /usr/sbin/visudo -c -f /etc/sudoers.d/*
+
+# pm2 process manager (используется на staging и в некоторых local services)
+openclaw ALL=(root) NOPASSWD: /usr/bin/pm2 *
+openclaw ALL=(root) NOPASSWD: /usr/local/bin/pm2 *
+
+# Caddy reload (HTTPS gateway)
+openclaw ALL=(root) NOPASSWD: /usr/bin/caddy reload *
+openclaw ALL=(root) NOPASSWD: /usr/bin/caddy validate *
+
+# apt-get -- non-interactive package updates
+openclaw ALL=(root) NOPASSWD: /usr/bin/apt-get update
+openclaw ALL=(root) NOPASSWD: /usr/bin/apt-get install -y *
+openclaw ALL=(root) NOPASSWD: /usr/bin/apt-get upgrade -y
+
+# Защитные deny (даже whitelist не обходит)
+Defaults!ALL    !visiblepw
+Defaults:openclaw env_reset
+Defaults:openclaw timestamp_timeout=5

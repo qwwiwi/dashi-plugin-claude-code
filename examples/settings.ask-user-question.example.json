@@ -1,0 +1,27 @@
+{
+  "_comment_1": "PreToolUse hook, который перехватывает встроенный инструмент AskUserQuestion и пробрасывает выбор варианта в Telegram через dashi-channel плагин (порт 8093 по умолчанию).",
+  "_comment_2": "Скопируй блок hooks в свой ~/.claude-lab/<agent>/.claude/settings.json (НЕ в settings.local.json), либо смерджи через scripts/install-hooks.sh (см. docs).",
+  "_comment_3": "Замени <repo> на абсолютный путь к этому репозиторию (например /home/openclaw/.claude-lab/thrall/.claude/jarvis-channel).",
+  "_comment_4": "ВАЖНО: убери \"AskUserQuestion\" из permissions.deny в settings.local.json.example, иначе Claude Code зарежет инструмент ещё до того, как PreToolUse сработает.",
+  "_comment_5": "ВАЖНО: плагин dashi-channel должен слушать на 127.0.0.1:8093. Если он не запущен — wrapper тихо отдаёт пустой stdout, и Claude Code откроет нативный терминальный UI как fallback.",
+  "_comment_6": "ВАЖНО: TELEGRAM_WEBHOOK_TOKEN — bearer плагина, его НИКОГДА не пишем в settings.json. Экспортируется в env самого Claude-агента (через wrapper-скрипт запуска или systemd EnvironmentFile).",
+  "_comment_7": "Маркер \"dashi-channel-ask-user-question\" позволяет install-hooks.sh идемпотентно обновить запись, не плодя дубликаты.",
+  "_comment_8": "Hook timeout 310 секунд = 300 (ask_user_question.timeout_ms) + 5с маржа wrapper'а + 5с маржа Claude Code. Если меняешь ask_user_question.timeout_ms в config.json — пересчитай и эту цифру, иначе Claude Code убьёт hook раньше, чем плагин успеет отрезолвить таймаут чисто.",
+  "_comment_9": "После правки settings.json — рестарт сессии Claude Code обязателен, hooks подхватываются только при старте.",
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "marker": "dashi-channel-ask-user-question",
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TELEGRAM_WEBHOOK_URL='http://127.0.0.1:8093/hooks/ask-user-question/request' bun '<repo>/plugin/scripts/ask-user-question-hook.ts'",
+            "timeout": 310
+          }
+        ]
+      }
+    ]
+  }
+}
