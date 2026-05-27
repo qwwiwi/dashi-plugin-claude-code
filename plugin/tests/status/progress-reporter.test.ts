@@ -50,6 +50,7 @@ function makeConfig(overrides: Partial<AppConfig['progress']> = {}): AppConfig {
       interval_ms: 700,
       ttl_ms: 300_000,
       delete_on_complete: true,
+      suppress_typing_bubble: false,
     },
     album: { flush_ms: 2000 },
     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },

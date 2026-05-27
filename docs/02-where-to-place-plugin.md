@@ -157,7 +157,7 @@ ExecStart=/usr/bin/tmux new-session -d -s channel-<agent> \
 
 ### macOS — launchd
 
-Полный пример plist — [examples/launchd-plist.example.plist](../examples/launchd-plist.example.plist). Критичная часть:
+Полный пример plist — [examples/launchd-plist.example.plist](../examples/launchd-plist.example.plist), wrapper-скрипт — [examples/launchd-wrapper.sh.example](../examples/launchd-wrapper.sh.example). Критичная часть:
 
 ```xml
 <key>WorkingDirectory</key>
@@ -165,11 +165,11 @@ ExecStart=/usr/bin/tmux new-session -d -s channel-<agent> \
 
 <key>ProgramArguments</key>
 <array>
-    <string>/bin/sh</string>
-    <string>-c</string>
-    <string>set -a; . /Users/&lt;you&gt;/.claude-lab/&lt;agent&gt;/secrets/channel.env; set +a; exec /opt/homebrew/bin/tmux new-session -d -s channel-&lt;agent&gt; claude --dangerously-load-development-channels server:dashi-channel; ...</string>
+    <string>/Users/&lt;you&gt;/.claude-lab/&lt;agent&gt;/scripts/launchd-wrapper.sh</string>
 </array>
 ```
+
+Wrapper-скрипт source-ит env и держит foreground supervisor pid для launchd. Inline-вариант `sh -c "exec tmux new-session -d ...; sleep; send-keys"` НЕ работает — `exec` подменяет shell, далее sleep/send-keys не запускаются. См. [03-installation-macos.md → Шаг 6](03-installation-macos.md#шаг-6-wrapper-скрипт-и-launchd-plist).
 
 `WorkingDirectory=` (или `WorkingDirectory` в plist) — это и есть CWD процесса. Если опечатаетесь в этом пути — Claude Code не найдёт workspace `CLAUDE.md`, и агент потеряет identity.
 

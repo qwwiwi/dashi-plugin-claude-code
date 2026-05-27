@@ -15,12 +15,15 @@
 //     give up (another consumer holds the token — operator action required).
 //   - 401 Unauthorized: backoff briefly, give up after 3 attempts (token
 //     revoked — no point retrying).
+//   - 429 Too Many Requests: honour Telegram's `parameters.retry_after`
+//     (seconds); sleep that long + 100..500ms jitter, capped at 600s. Falls
+//     back to linear backoff when the field is missing.
 //   - Network / transient: backoff and retry indefinitely; attempt counter
 //     resets after any successful getUpdates round.
 //   - Handler errors NEVER stop polling. Each thrown handler goes to
 //     dead-letter/updates/ and offset advances past the bad update.
 
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { constants as fsConstants, closeSync, openSync, readFileSync, rmSync, unlinkSync, writeSync } from 'fs'
 import type { Bot } from 'grammy'
 import { GrammyError, HttpError } from 'grammy'
 import type { Update } from 'grammy/types'
@@ -80,6 +83,11 @@ const LONG_POLL_TIMEOUT_SEC = 25
 const MAX_409_ATTEMPTS = 8
 const MAX_401_ATTEMPTS = 3
 const BACKOFF_CAP_MS = 15_000
+// Cap honour-retry_after at 10 minutes. If Telegram asks for longer the
+// answer is "operator action" rather than "sleep for hours".
+const FLOOD_BACKOFF_CAP_MS = 600_000
+const FLOOD_JITTER_MIN_MS = 100
+const FLOOD_JITTER_MAX_MS = 500
 
 // Update types we want from Telegram. Anything else is silently dropped
 // by the API. Mirrors the grammY default plus what canary handlers use.
@@ -114,35 +122,144 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-export const tokenLock: TokenLock = {
-  acquire(statePaths: StatePaths): boolean {
-    if (existsSync(statePaths.pid)) {
-      try {
-        const raw = readFileSync(statePaths.pid, 'utf8').trim()
-        const existing = Number.parseInt(raw, 10)
-        if (Number.isFinite(existing) && existing !== process.pid && pidAlive(existing)) {
-          return false
-        }
-        // Stale (dead pid or our own previous entry) — overwrite below.
-      } catch {
-        // Unreadable pid file — treat as stale, overwrite.
+// Try to atomically create `path` with `O_WRONLY|O_CREAT|O_EXCL` ('wx') and
+// write `pid` into it. Returns true on success, false if the file already
+// exists (EEXIST). Any other error is rethrown — disk/perm issues must not
+// be silently treated as "lock acquired".
+function tryExclusiveCreate(path: string, pid: number): boolean {
+  let fd: number
+  try {
+    fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false
+    throw err
+  }
+  try {
+    writeSync(fd, String(pid))
+  } finally {
+    closeSync(fd)
+  }
+  return true
+}
+
+// FIX-B: Replace stale via unlink + O_EXCL retry loop instead of
+// renameSync(tmp, path). renameSync is atomic but DOES NOT fail when the
+// target exists — two processes that both observed the same dead pid would
+// each rename their own tmp file over the lock and BOTH return true.
+//
+// The unlink + O_EXCL pattern narrows the race to a tight CAS-like window:
+//   1. unlinkSync(path) — may ENOENT if a competitor already unlinked; that
+//      is fine.
+//   2. tryExclusiveCreate(path, pid) — exactly one process wins O_EXCL; the
+//      other sees EEXIST and must re-inspect (someone else now holds the
+//      lock, and if THAT pid is alive we refuse).
+//
+// Bounded by MAX_REPLACE_ATTEMPTS=3: after 3 EEXIST collisions we give up
+// and return false instead of livelocking. In practice 1 attempt is enough;
+// 3 is generous slack for pathological scheduling.
+const MAX_REPLACE_ATTEMPTS = 3
+
+// Filesystem seams. Production passes real fs functions; tests inject
+// interleaving stubs to drive the hard-race scenario deterministically.
+export interface AcquireHooks {
+  tryExclusiveCreate: (path: string, pid: number) => boolean
+  readPidFile: (path: string) => number
+  unlinkLock: (path: string) => void
+  pidAlive: (pid: number) => boolean
+  selfPid: number
+}
+
+const realHooks: AcquireHooks = {
+  tryExclusiveCreate,
+  readPidFile(path: string): number {
+    try {
+      const raw = readFileSync(path, 'utf8').trim()
+      return Number.parseInt(raw, 10)
+    } catch {
+      return NaN
+    }
+  },
+  unlinkLock(path: string): void {
+    try {
+      unlinkSync(path)
+    } catch (err) {
+      // ENOENT: a competitor already unlinked it — fine, fall through to
+      // tryExclusiveCreate which will either succeed or report EEXIST.
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') return
+      throw err
+    }
+  },
+  pidAlive,
+  get selfPid(): number {
+    return process.pid
+  },
+}
+
+// Core acquire algorithm, parameterised over fs hooks for testability.
+// Returns true iff WE hold the lock (file contains our pid) on return.
+export function acquireWithHooks(statePaths: StatePaths, hooks: AcquireHooks): boolean {
+  // Fast path: no lock file at all → atomically create it. The 'wx' flag
+  // guarantees that two competing acquire() calls cannot both succeed:
+  // exactly one openSync returns a fd, the other gets EEXIST.
+  if (hooks.tryExclusiveCreate(statePaths.pid, hooks.selfPid)) return true
+
+  for (let attempt = 0; attempt < MAX_REPLACE_ATTEMPTS; attempt++) {
+    const existing = hooks.readPidFile(statePaths.pid)
+
+    // Our own pid (re-acquire in the same process) → no-op success: we
+    // already hold the lock.
+    if (Number.isFinite(existing) && existing === hooks.selfPid) {
+      return true
+    }
+    // Live foreign pid → refuse.
+    if (Number.isFinite(existing) && hooks.pidAlive(existing)) {
+      return false
+    }
+
+    // Stale (dead pid or unparseable). Unlink and try to claim.
+    try {
+      hooks.unlinkLock(statePaths.pid)
+    } catch (err) {
+      // Permission or other IO error on unlink — we can't prove we own
+      // anything; bail safely.
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') {
+        // Already gone; fall through to tryExclusiveCreate.
+      } else {
+        return false
       }
     }
-    writeFileSync(statePaths.pid, String(process.pid), { mode: 0o600 })
-    return true
+
+    if (hooks.tryExclusiveCreate(statePaths.pid, hooks.selfPid)) return true
+    // EEXIST: another process beat us to the create. Re-inspect: if its
+    // pid is alive we refuse; if it's also stale we try again, up to
+    // MAX_REPLACE_ATTEMPTS.
+  }
+
+  // All retries exhausted — give up. Refusing here is safe: another
+  // process either holds the lock or is racing us so aggressively that
+  // we cannot prove ownership.
+  return false
+}
+
+export const tokenLock: TokenLock = {
+  acquire(statePaths: StatePaths): boolean {
+    return acquireWithHooks(statePaths, realHooks)
   },
 
   release(statePaths: StatePaths): void {
-    if (!existsSync(statePaths.pid)) return
     try {
       const raw = readFileSync(statePaths.pid, 'utf8').trim()
       const owner = Number.parseInt(raw, 10)
       if (owner === process.pid) {
         rmSync(statePaths.pid)
       }
-      // Foreign pid — leave it, not ours to delete.
-    } catch {
-      // Already gone or unreadable — nothing to do.
+      // Foreign pid -- leave it, not ours to delete.
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') return // Already gone -- nothing to do.
+      // Unreadable for another reason -- swallow; release is best-effort.
     }
   },
 }
@@ -152,9 +269,13 @@ export const tokenLock: TokenLock = {
 // ─────────────────────────────────────────────────────────────────────
 
 interface ErrorClass {
-  kind: 'conflict' | 'unauthorized' | 'transient' | 'fatal'
+  kind: 'conflict' | 'unauthorized' | 'flood' | 'transient' | 'fatal'
   message: string
   retriable: boolean
+  // Populated only for 'flood': Telegram's parameters.retry_after, in
+  // seconds. May be undefined when Telegram omitted the hint and we still
+  // got a 429 -- caller falls back to linear backoff.
+  retryAfterSec?: number
 }
 
 function classifyError(err: unknown): ErrorClass {
@@ -164,6 +285,18 @@ function classifyError(err: unknown): ErrorClass {
     }
     if (err.error_code === 401) {
       return { kind: 'unauthorized', message: err.description, retriable: true }
+    }
+    if (err.error_code === 429) {
+      const raw = err.parameters?.retry_after
+      const retryAfterSec =
+        typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined
+      const cls: ErrorClass = {
+        kind: 'flood',
+        message: `429 ${err.description}`,
+        retriable: true,
+      }
+      if (retryAfterSec !== undefined) cls.retryAfterSec = retryAfterSec
+      return cls
     }
     return { kind: 'transient', message: `${err.error_code} ${err.description}`, retriable: true }
   }
@@ -175,6 +308,24 @@ function classifyError(err: unknown): ErrorClass {
     return { kind: 'transient', message: err.message, retriable: true }
   }
   return { kind: 'fatal', message: String(err), retriable: false }
+}
+
+// Compute the actual sleep duration for a 429 response. Adds 100..500ms
+// jitter so concurrent retries don't dogpile, caps at FLOOD_BACKOFF_CAP_MS.
+// When `retryAfterSec` is undefined (Telegram omitted the hint), falls back
+// to the existing linear backoff so behaviour is purely additive.
+function floodSleepMs(
+  retryAfterSec: number | undefined,
+  attempt: number,
+  rng: () => number = Math.random,
+): number {
+  const jitter =
+    FLOOD_JITTER_MIN_MS + Math.floor(rng() * (FLOOD_JITTER_MAX_MS - FLOOD_JITTER_MIN_MS))
+  if (retryAfterSec !== undefined) {
+    const base = Math.max(0, retryAfterSec) * 1000
+    return Math.min(base + jitter, FLOOD_BACKOFF_CAP_MS)
+  }
+  return Math.min(1000 * Math.max(1, attempt), BACKOFF_CAP_MS)
 }
 
 /**
@@ -385,6 +536,10 @@ export class TelegramPoller {
     let attempt = 0
     let conflict401Counter = 0
     let unauthorizedCounter = 0
+    // Track sequential 429s separately from `attempt` so the linear-backoff
+    // fallback only kicks in when Telegram omits `retry_after`. Counter
+    // resets on any successful getUpdates round below.
+    let floodCounter = 0
 
     while (!this.stopping) {
       try {
@@ -404,6 +559,7 @@ export class TelegramPoller {
         attempt = 0
         conflict401Counter = 0
         unauthorizedCounter = 0
+        floodCounter = 0
 
         for (const update of updates as unknown[]) {
           if (this.stopping) break
@@ -497,6 +653,19 @@ export class TelegramPoller {
           log.warn('401 Unauthorized from getUpdates, retrying briefly', {
             attempt: unauthorizedCounter,
             delay_ms: delay,
+            description: cls.message,
+          })
+          await this.sleepFn(delay, this.stopCtl.signal)
+          continue
+        }
+
+        if (cls.kind === 'flood') {
+          floodCounter++
+          const delay = floodSleepMs(cls.retryAfterSec, floodCounter)
+          log.warn('429 Too Many Requests from getUpdates, honouring retry_after', {
+            attempt: floodCounter,
+            delay_ms: delay,
+            retry_after_sec: cls.retryAfterSec,
             description: cls.message,
           })
           await this.sleepFn(delay, this.stopCtl.signal)

@@ -11,8 +11,36 @@ import { z } from 'zod'
 // AppConfig — the merged, validated runtime config.
 // ─────────────────────────────────────────────────────────────────────
 
+// Multichat config — opt-in fleet of per-chat tmux sessions routed by
+// the MultichatRouter. Default OFF: the entire feature is gated behind
+// `multichat.enabled = true` so existing deployments keep their legacy
+// single-DM behaviour without touching wiring. When enabled, the policy
+// file (`chats/policy.yaml`) defines per-chat allowlists, streaming
+// modes, persona files, and deny rules — see src/chats/policy-loader.ts.
+//
+// Path defaults:
+//   policy_path  -> `{workspace_dir}/chats/policy.yaml`
+//   state_dir    -> `{workspace_dir}/state/multichat`
+//   workspace_dir -> $CLAUDE_WORKSPACE_DIR, else `path.resolve(cwd, '..')`
+// All three are pure strings here so unit tests can assert what the
+// caller passed without invoking server.ts. The resolution itself
+// happens inside server.ts where `path` is already imported.
+export const MultichatConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  policy_path: z.string().optional(),
+  state_dir: z.string().optional(),
+  workspace_dir: z.string().optional(),
+})
+export type MultichatConfig = z.infer<typeof MultichatConfigSchema>
+
 export const AppConfigSchema = z.object({
   bot_id: z.number().int().positive().default(8507713167),
+  // `dm_only` predates the multichat router. With `multichat.enabled=false`
+  // (default) the legacy gate.ts behaviour is preserved: DM-only with
+  // hardcoded drop in the gate. With `multichat.enabled=true` the gate
+  // consults the loaded policy instead and this flag is effectively
+  // ignored. Kept here for backward compatibility with existing
+  // config.json files; do NOT remove without a migration pass.
   dm_only: z.boolean().default(true),
   allowed_user_ids: z.array(z.number().int().positive()).min(1).default([164795011]),
   allowed_chat_ids: z.array(z.union([z.number(), z.string()])).default([164795011]),
@@ -22,6 +50,12 @@ export const AppConfigSchema = z.object({
     interval_ms: z.number().int().positive().default(700),
     ttl_ms: z.number().int().positive().default(300_000),
     delete_on_complete: z.boolean().default(true),
+    // Warchief request 2026-05-27: the bare «Печатает...» bubble is visual
+    // noise on top of the TmuxMirror status card. When true, StatusManager
+    // skips the initial sendMessage while state is `typing` — the bubble is
+    // created lazily on the first thinking/tool/activity transition. Native
+    // sendChatAction (header animation) is unaffected.
+    suppress_typing_bubble: z.boolean().default(true),
   }).default({}),
   album: z.object({
     flush_ms: z.number().int().positive().default(2000),
@@ -191,6 +225,11 @@ export const AppConfigSchema = z.object({
       })
       .default(14),
   }).default({}),
+  // Multichat router (Phase 3, 2026-05-23). Default OFF. When enabled,
+  // server.ts loads `chats/policy.yaml`, instantiates TmuxSessionPool +
+  // MultichatRouter, and routes inbound traffic through them. Schema
+  // declared above AppConfigSchema so the type can be re-exported.
+  multichat: MultichatConfigSchema.default({}),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
 
@@ -233,6 +272,17 @@ export const RuntimeEnvSchema = z.object({
         "TELEGRAM_ACCESS_MODE=pairing not supported in this server build (use 'allowlist'); see PLAN.md Scope B",
     })
     .optional(),
+  // Multichat (Phase 3, 2026-05-23). ENABLED accepts the same truthy
+  // strings as TELEGRAM_MEMORY_ENABLED so the two flags share a mental
+  // model. Paths are passed through verbatim — server.ts resolves
+  // defaults relative to workspace_dir.
+  TELEGRAM_MULTICHAT_ENABLED: z
+    .string()
+    .transform((v) => /^(1|true|yes|on)$/i.test(v))
+    .optional(),
+  TELEGRAM_MULTICHAT_POLICY_PATH: z.string().optional(),
+  TELEGRAM_MULTICHAT_STATE_DIR: z.string().optional(),
+  TELEGRAM_MULTICHAT_WORKSPACE_DIR: z.string().optional(),
 })
 export type RuntimeEnv = z.infer<typeof RuntimeEnvSchema>
 
@@ -350,6 +400,17 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (parsedEnv.TELEGRAM_MEMORY_SOURCE_TAG !== undefined) memory.source_tag = parsedEnv.TELEGRAM_MEMORY_SOURCE_TAG
   if (parsedEnv.TELEGRAM_MEMORY_AGENT_LABEL !== undefined) memory.agent_label = parsedEnv.TELEGRAM_MEMORY_AGENT_LABEL
   if (Object.keys(memory).length > 0) merged.memory = memory
+
+  // Multichat env overrides (Phase 3, 2026-05-23). Same pattern as the
+  // memory block: take an existing config.json sub-object if present,
+  // layer env on top, and only emit the sub-object when something is set
+  // — leaving it undefined lets Zod apply schema defaults cleanly.
+  const multichat = (merged.multichat && typeof merged.multichat === 'object' ? merged.multichat : {}) as Record<string, unknown>
+  if (parsedEnv.TELEGRAM_MULTICHAT_ENABLED !== undefined) multichat.enabled = parsedEnv.TELEGRAM_MULTICHAT_ENABLED
+  if (parsedEnv.TELEGRAM_MULTICHAT_POLICY_PATH !== undefined) multichat.policy_path = parsedEnv.TELEGRAM_MULTICHAT_POLICY_PATH
+  if (parsedEnv.TELEGRAM_MULTICHAT_STATE_DIR !== undefined) multichat.state_dir = parsedEnv.TELEGRAM_MULTICHAT_STATE_DIR
+  if (parsedEnv.TELEGRAM_MULTICHAT_WORKSPACE_DIR !== undefined) multichat.workspace_dir = parsedEnv.TELEGRAM_MULTICHAT_WORKSPACE_DIR
+  if (Object.keys(multichat).length > 0) merged.multichat = multichat
 
   try {
     return AppConfigSchema.parse(merged)

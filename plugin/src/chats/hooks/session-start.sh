@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Claude Code SessionStart hook for multichat-thrall.
+#
+# Reads $CHAT_ID (set by tmux-session-pool when spawning the session),
+# loads {WORKSPACE}/chats/{CHAT_ID}/persona.md and the chat's
+# system_reminder from {WORKSPACE}/chats/policy.yaml, and emits the
+# Claude Code SessionStart hook JSON:
+#   {"hookSpecificOutput":{"hookEventName":"SessionStart",
+#                          "additionalContext":"<persona>\n\n---\n\n<reminder>"}}
+#
+# Failure modes (graceful degradation — do not block the session):
+#   * CHAT_ID empty / unset      -> log to stderr, exit 0 (no injection).
+#   * persona.md missing         -> log to stderr, exit 0.
+#   * policy.yaml unreadable     -> log to stderr, exit 0.
+#   * python3 unavailable        -> log to stderr, exit 0.
+#
+# Injection-safety: persona content and policy reminder are read into
+# files and loaded by python3 via env-passed paths. Nothing from those
+# files is interpolated into shell. The JSON is built by json.dumps.
+
+set -euo pipefail
+
+# Sentinel: this hook is multichat-specific. If MULTICHAT_STATE_DIR is unset
+# the hook is running outside a per-chat tmux session (e.g. accidentally
+# registered into the master Thrall workspace). Exit cleanly without emitting
+# any additionalContext so the master session is not polluted with a chat
+# persona it never asked for.
+if [[ -z "${MULTICHAT_STATE_DIR:-}" ]]; then
+  exit 0
+fi
+
+if [[ -z "${CHAT_ID:-}" ]]; then
+  echo "session-start: CHAT_ID not set, skipping persona injection" >&2
+  exit 0
+fi
+
+WORKSPACE="${CLAUDE_WORKSPACE_DIR:-${HOME}/.claude-lab/thrall/.claude}"
+POLICY_PATH="${WORKSPACE}/chats/policy.yaml"
+PERSONA_PATH="${WORKSPACE}/chats/${CHAT_ID}/persona.md"
+
+if [[ ! -f "$PERSONA_PATH" ]]; then
+  echo "session-start: persona file not found at ${PERSONA_PATH}" >&2
+  exit 0
+fi
+
+if [[ ! -f "$POLICY_PATH" ]]; then
+  echo "session-start: policy file not found at ${POLICY_PATH}" >&2
+  exit 0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "session-start: python3 not available, skipping injection" >&2
+  exit 0
+fi
+
+# Python loads persona + policy, emits SessionStart JSON. All paths
+# arrive via env vars — no shell interpolation into the payload.
+CHAT_ID="$CHAT_ID" \
+POLICY_PATH="$POLICY_PATH" \
+PERSONA_PATH="$PERSONA_PATH" \
+python3 - <<'PYEOF'
+import json
+import os
+import sys
+
+chat_id = os.environ.get('CHAT_ID', '')
+policy_path = os.environ.get('POLICY_PATH', '')
+persona_path = os.environ.get('PERSONA_PATH', '')
+
+try:
+    import yaml  # type: ignore
+except ImportError:
+    print('session-start: PyYAML not available, skipping reminder', file=sys.stderr)
+    yaml = None
+
+persona = ''
+try:
+    with open(persona_path, 'r', encoding='utf-8') as f:
+        persona = f.read()
+except OSError as e:
+    print(f'session-start: persona read failed: {e}', file=sys.stderr)
+    sys.exit(0)
+
+reminder = ''
+if yaml is not None:
+    try:
+        with open(policy_path, 'r', encoding='utf-8') as f:
+            policy = yaml.safe_load(f) or {}
+        chat_cfg = (policy.get('chats') or {}).get(chat_id) or {}
+        reminder = chat_cfg.get('system_reminder') or ''
+    except Exception as e:  # noqa: BLE001 — best-effort
+        print(f'session-start: policy parse failed: {e}', file=sys.stderr)
+
+parts = [persona.rstrip()]
+if reminder:
+    parts.append('---')
+    parts.append(reminder.strip())
+additional_context = '\n\n'.join(parts)
+
+payload = {
+    'hookSpecificOutput': {
+        'hookEventName': 'SessionStart',
+        'additionalContext': additional_context,
+    }
+}
+print(json.dumps(payload, ensure_ascii=False))
+PYEOF

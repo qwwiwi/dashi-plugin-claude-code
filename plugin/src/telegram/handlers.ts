@@ -21,6 +21,9 @@ import type { AppConfig, StatePaths } from '../config.js'
 import type { Logger } from '../log.js'
 import type { TelegramApi } from '../channel/tools.js'
 import type { StatusManager } from '../status/status-manager.js'
+import type { MultichatPolicy } from '../chats/policy-loader.js'
+import type { MultichatRouter } from '../router/multichat-router.js'
+import type { InboundMessage } from '../router/inbox-bridge.js'
 import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
 import { gateTelegramMessage, type GateInput } from './gate.js'
 import { isAddressedToBot } from './addressing.js'
@@ -49,6 +52,13 @@ import {
   type PermissionRelayHooks,
 } from '../channel/permissions.js'
 import { AlbumBuffer, type Album } from './album-buffer.js'
+import {
+  compositeAlbumKey,
+  dropAlbumDir,
+  moveToAlbumDeadLetter,
+  persistFragment,
+  type PersistedAlbumMeta,
+} from './album-persistence.js'
 import type { InboundWatcher } from './watcher.js'
 
 // A single buffered album item — one Telegram update that belongs to an
@@ -57,12 +67,27 @@ import type { InboundWatcher } from './watcher.js'
 export interface AlbumEntry {
   /** Pre-rendered `<media .../>` descriptor strings for this item. */
   descriptors: string[]
+  /** Local filesystem paths for downloaded media in this item (router path).
+   *  Empty when no media in this item was downloaded inline (only `photo`
+   *  triggers an immediate download today). */
+  mediaPaths: string[]
   /** Trimmed caption text for this item ('' when no caption). */
   caption: string
   /** Per-item message_id — used to surface first message_id in meta. */
   messageId: number | undefined
   /** Reply context, if this item was a reply. First non-null wins on flush. */
   reply: TelegramReplyMessage | undefined
+  /** FIX-D B1 (2026-05-27): whether `isAddressedToBot` returned true for
+   *  THIS fragment at push time. Telegram only carries the caption/@mention
+   *  on one fragment of an album — sibling fragments arrive bare. We must
+   *  buffer them anyway and aggregate at flush: any fragment with
+   *  `addressedAtPush=true` ⇒ the whole album is addressed. In DMs the
+   *  flag is always true (private chat ⇒ addressed unconditionally).
+   *  Optional for back-compat with disk-recovered entries written by
+   *  pre-FIX-D versions; the album dispatch treats `undefined` as true
+   *  (those builds dropped unaddressed fragments at the gate, so anything
+   *  on disk was addressed at the time). */
+  addressedAtPush?: boolean
 }
 
 // Album-level dispatch deps. Subset of HandlerDeps used by sendAlbumNotification.
@@ -73,6 +98,11 @@ export interface AlbumDispatchDeps {
   bot: BotIdentity
   telegramApi: TelegramApi
   statusManager?: StatusManager
+  // Multichat router + policy. When both present, album flushes are
+  // dispatched as a single InboundMessage (captions merged, media_paths
+  // concatenated). Otherwise the legacy MCP notify path runs.
+  router?: MultichatRouter
+  policy?: MultichatPolicy
 }
 
 export interface HandlerDeps {
@@ -116,6 +146,17 @@ export interface HandlerDeps {
   // when tmux_mirror.enabled=false at startup the mirror instance is
   // never created and the OOB handler replies «disabled in config».
   tmuxMirror?: TmuxMirrorControl
+  // Multichat router. When present together with `policy`, all gated
+  // inbound traffic is dispatched to the per-chat tmux session via
+  // `router.dispatch(InboundMessage)` instead of the legacy
+  // sendChannelNotification path. Absent in legacy single-chat
+  // deployments — handlers fall back to the historical MCP notify path.
+  router?: MultichatRouter
+  // Multichat policy. Drives gate.ts group-chat allowlist, addressing
+  // mention_allowlist, and per-chat behaviour. MUST be paired with
+  // `router` to flip the dispatch path; passing one without the other
+  // is a wiring bug at the server.ts level (Batch 5 enforces this).
+  policy?: MultichatPolicy
 }
 
 // Coerce grammY's reply_to_message Message shape into the narrower
@@ -149,10 +190,22 @@ function adaptReply(
 // allowed_chat_ids — defence in depth even when the gate lets the message
 // through). DM-only is NOT required here; auto-reply makes sense in any
 // allowlisted chat. Returns true when the watcher is permitted to fire.
-function watcherAllowed(ctx: Context, config: AppConfig): boolean {
+function watcherAllowed(
+  ctx: Context,
+  config: AppConfig,
+  policy?: MultichatPolicy,
+): boolean {
   const senderNum = ctx.from?.id
   const chatNum = ctx.chat?.id
   if (senderNum === undefined || chatNum === undefined) return false
+  // Multichat: defer to policy.allowlist for both user and chat. Symmetric
+  // with the gate's group branch — a sender allowed by policy in a
+  // policy-listed chat may trigger the auto-reply even in a group.
+  if (policy) {
+    const userOk = policy.allowlist.users.includes(String(senderNum))
+    const chatOk = policy.allowlist.chats.includes(String(chatNum))
+    return userOk && chatOk
+  }
   if (!config.allowed_user_ids.includes(senderNum)) return false
   // allowed_chat_ids may be a mix of strings and numbers — coerce both
   // sides to string for comparison, same as the OOB block does.
@@ -161,13 +214,42 @@ function watcherAllowed(ctx: Context, config: AppConfig): boolean {
   return true
 }
 
+// Bug #3 (TASK-4, 2026-05-27) — addressed-only side effects.
+//
+// `watcherAllowed` checks who the sender/chat are, but in groups any
+// allowed sender's message would trigger auto-reply and tmux-mirror
+// bump even when the bot was not addressed. That leaks bot activity
+// (typing bubble, status edits, mirror re-anchor) on every normal
+// group message — the warchief and other speakers would see the bot
+// "react" to traffic that wasn't directed at it.
+//
+// Composite gate: allowlist-pass (chat/sender) AND addressing-pass
+// (DM, or group with @mention / reply-to-bot). DMs pass addressing
+// unconditionally because `isAddressedToBot` returns true for private
+// chat regardless of mention_allowlist. We reuse the existing
+// `isAddressedToBot` helper so addressing semantics stay in one place
+// (DM vs group rules, mention_allowlist for groups) and side-effect
+// triggers can never disagree with the reaction gate.
+function isSideEffectAllowed(
+  ctx: Context,
+  config: AppConfig,
+  policy?: MultichatPolicy,
+): boolean {
+  if (!watcherAllowed(ctx, config, policy)) return false
+  // Addressing gate. mention_allowlist defends groups; DM passes through.
+  return isAddressedToBot(ctx, policy?.mention_allowlist)
+}
+
 // Fire-and-forget watcher trigger. Encapsulates the allowlist gate +
 // `void`/`.catch` boilerplate so every inbound handler (text + media) can
 // invoke the watcher with one call. Optional `deps.watcher` makes this a
 // no-op when the watcher isn't configured — older tests stay compatible.
+//
+// Bug #3 (TASK-4): use `isSideEffectAllowed` (allowlist AND addressing)
+// so a non-addressed group message never triggers «Тралл занят».
 function maybeTriggerWatcher(ctx: Context, deps: HandlerDeps): void {
   if (!deps.watcher) return
-  if (!watcherAllowed(ctx, deps.config)) return
+  if (!isSideEffectAllowed(ctx, deps.config, deps.policy)) return
   const chatNum = ctx.chat?.id
   const msgId = ctx.message?.message_id
   if (chatNum === undefined || msgId === undefined) return
@@ -188,9 +270,12 @@ function maybeTriggerWatcher(ctx: Context, deps: HandlerDeps): void {
 // the same allowlist gate as the watcher so a non-allowed message never
 // disturbs the mirror. `bump` is optional on TmuxMirrorControl, so when
 // the wired mirror predates this method we silently skip.
+//
+// Bug #3 (TASK-4): use `isSideEffectAllowed` so a non-addressed group
+// message never re-anchors the mirror.
 function maybeBumpMirror(ctx: Context, deps: HandlerDeps): void {
   if (!deps.tmuxMirror?.bump) return
-  if (!watcherAllowed(ctx, deps.config)) return
+  if (!isSideEffectAllowed(ctx, deps.config, deps.policy)) return
   const chatNum = ctx.chat?.id
   if (chatNum === undefined) return
   void deps.tmuxMirror.bump().catch((err) => {
@@ -199,6 +284,38 @@ function maybeBumpMirror(ctx: Context, deps: HandlerDeps): void {
       error: err instanceof Error ? err.message : String(err),
     })
   })
+}
+
+// FIX-D M1 (2026-05-27): chat-type detection from a stringified Telegram
+// chat id. Telegram uses negative ids for groups, supergroups, and
+// channels; positive ids are user/bot DMs. We rely on this convention so
+// the album-dispatch path can enforce the policy+router XOR check even
+// when it only has `ids.chatId` to work with (the original ctx is gone
+// by flush time). Defensively coerced — non-numeric ids return false.
+function isGroupChatId(chatId: string): boolean {
+  if (chatId === '') return false
+  return chatId.startsWith('-')
+}
+
+// FIX-D M1 (2026-05-27): defence-in-depth wiring check.
+//
+// The server boots with `policy` and `router` together (or both absent).
+// A wiring bug that supplies only one half would otherwise let group
+// traffic past gate.ts (because the policy unlocks the group branch)
+// and into `sendChannelNotification` (because no router exists), which
+// leaks chat-specific traffic into the master legacy session.
+//
+// Returns true when the current dispatch is in the BAD half of the XOR
+// AND the chat is non-private (DMs are unaffected — they use the legacy
+// notify path even in multichat builds).
+function isPolicyRouterMisconfig(
+  hasPolicy: boolean,
+  hasRouter: boolean,
+  isGroup: boolean,
+): boolean {
+  if (!isGroup) return false
+  // XOR: exactly one of policy/router is set.
+  return (hasPolicy && !hasRouter) || (!hasPolicy && hasRouter)
 }
 
 // Extract the four fields the gate cares about from a grammY Context. Kept
@@ -247,7 +364,9 @@ async function gateAndNotify(
   kind: string,
 ): Promise<void> {
   const input = gateInputFromContext(ctx)
-  const decision = gateTelegramMessage(input, deps.config)
+  // Multichat-aware gate: policy unlocks group/supergroup paths. Without
+  // policy the legacy "DM-only or drop" behaviour is preserved by gate.ts.
+  const decision = gateTelegramMessage(input, deps.config, deps.policy)
   if (decision.kind === 'drop') {
     deps.log.debug('inbound dropped', {
       reason: decision.reason,
@@ -260,6 +379,52 @@ async function gateAndNotify(
     return
   }
 
+  // Group/supergroup addressing gate: only senders in `mention_allowlist`
+  // (typically just the warchief) may summon the bot via @-mention or
+  // reply-to-bot. Silent drop — no reaction, no notify, no router dispatch.
+  // DM passes through unchanged because isAddressedToBot returns true for
+  // private chats regardless of the allowlist parameter.
+  if (deps.policy && input.chatType !== 'private') {
+    const addressed = isAddressedToBot(ctx, deps.policy.mention_allowlist)
+    if (!addressed) {
+      deps.log.debug('handlers.not_addressed', {
+        chat_id: decision.chatId,
+        user_id: decision.senderId,
+        kind,
+      })
+      return
+    }
+  }
+
+  // FIX-D M1 (2026-05-27) — policy/router XOR defence-in-depth.
+  //
+  // The server is supposed to wire `policy` and `router` together. A
+  // wiring bug that supplies only `policy` would otherwise let group
+  // traffic past the gate (policy unlocks the group branch) and into
+  // `sendChannelNotification` (no router → fall through to legacy),
+  // which leaks chat-specific traffic into the master legacy session.
+  // The symmetric case (`router` without `policy`) is benign in
+  // practice — gate.ts keeps the legacy DM-only behaviour — but we
+  // still flag it as a wiring error so the operator notices.
+  //
+  // DM dispatch is unaffected: legacy notify of DMs is intentional in
+  // single-chat builds.
+  const hasPolicy = deps.policy !== undefined
+  const hasRouter = deps.router !== undefined
+  const isGroup = input.chatType === 'group' || input.chatType === 'supergroup'
+  if (isPolicyRouterMisconfig(hasPolicy, hasRouter, isGroup)) {
+    deps.log.error('handlers.policy_router_misconfig — dropping group dispatch', {
+      chat_id: decision.chatId,
+      user_id: decision.senderId,
+      kind,
+      has_policy: hasPolicy,
+      has_router: hasRouter,
+      chat_type: input.chatType,
+      hint: 'policy and router MUST be wired together; configure both or neither',
+    })
+    return
+  }
+
   // Media build runs ONLY after the gate allows the message — never download
   // or transcribe for un-allowlisted senders. Mirrors gateway.py: download
   // path is guarded by allowlist check at 2117+ (auto_transcribe_group_voice
@@ -267,6 +432,85 @@ async function gateAndNotify(
   const descriptors = buildMedia ? await buildMedia() : []
   const renderedMedia = descriptors.map(renderMediaDescriptor)
 
+  // Router path: when wired, dispatch to the per-chat tmux session via
+  // file-based inbox instead of MCP-notifying the master session. The
+  // router takes full ownership — no fallback to sendChannelNotification
+  // so the master Claude session never sees traffic that belongs to a
+  // different chat (defence in depth, persona isolation).
+  if (deps.router && deps.policy) {
+    // Open a status before dispatch — symmetric with the legacy path so
+    // the user sees "Печатает..." within a tick. Streaming is per-chat
+    // gated inside StatusManager.start via shouldStreamForChat(policy,
+    // chatId) — chats with `streaming: 'off'` (or chats absent from
+    // policy) get a sentinel handle and no Telegram traffic.
+    if (deps.statusManager && deps.config.status.enabled) {
+      try {
+        await deps.statusManager.start(decision.chatId, ctx.message?.message_id)
+      } catch (err) {
+        deps.log.warn('status start failed (continuing without status)', {
+          chat_id: decision.chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+
+    // Extract media local paths from descriptors. Only `photo` carries
+    // localPath today (downloaded inline in handleInboundPhoto); the
+    // rest are pure metadata — the tmux session can call
+    // `download_attachment` if it wants the bytes. We filter to defined
+    // strings so the DTO never holds `undefined` entries.
+    const mediaPaths = descriptors
+      .map((m) =>
+        m.kind === 'photo' && typeof m.localPath === 'string' ? m.localPath : undefined,
+      )
+      .filter((p): p is string => p !== undefined)
+
+    // Reply-context payload: serialise via the same buildChannelContent
+    // helper so the tmux side sees the identical `<reply>` block format
+    // the master session would have received. Cheap defence against
+    // schema drift between the two paths.
+    const replyContext = ctx.message?.reply_to_message
+      ? buildChannelContent({
+          text: '',
+          bot: deps.bot,
+          reply: adaptReply(ctx.message.reply_to_message)!,
+        })
+      : undefined
+
+    const inboundMsg: InboundMessage = {
+      text: buildText(),
+      chat_id: decision.chatId,
+      user_id: decision.senderId,
+      user:
+        ctx.from?.username !== undefined
+          ? ctx.from.username
+          : ctx.from?.first_name !== undefined
+            ? ctx.from.first_name
+            : 'unknown',
+      timestamp: new Date().toISOString(),
+      ...(replyContext !== undefined ? { reply_context: replyContext } : {}),
+      ...(mediaPaths.length > 0 ? { media_paths: mediaPaths } : {}),
+    }
+
+    deps.log.info('inbound dispatched to router', { kind, chat_id: decision.chatId })
+    try {
+      await deps.router.dispatch(inboundMsg)
+    } catch (err) {
+      // Router errors are logged and swallowed inside dispatch() for the
+      // pool/spawn/inbox-write branches, but a top-level throw is still
+      // possible (e.g. policy mutation mid-flight). Surface as throw so
+      // the poller dead-letters the update — symmetric with the legacy
+      // sendChannelNotification path.
+      throw new Error(
+        `router dispatch failed — ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+    return
+  }
+
+  // Legacy path: MCP-notify the master Claude session. Kept for the
+  // single-chat (DM-only) wiring; will be removed once all deployments
+  // run multichat.
   const content = buildChannelContent({
     text: buildText(),
     bot: deps.bot,
@@ -317,6 +561,20 @@ async function gateAndNotify(
 // item was buffered (caller MUST NOT continue with single-media path).
 // Returns false when the message has no media_group_id or no buffer
 // configured — caller proceeds with the existing gateAndNotify flow.
+//
+// Bug #1 (TASK-4): the buffer key is `${chatId}:${media_group_id}`, not
+// the raw mgid. Telegram can re-use mgids across chats, so two chats
+// sending an album within the same time window would otherwise merge —
+// captions/media from chat B would dispatch under chat A's identity.
+//
+// Bug #2 (TASK-4): every fragment is persisted to disk BEFORE the buffer
+// receives it. The poller advances its offset cursor as soon as the
+// handler returns, so without this any of (a) plugin crash before the
+// flush timer fires, (b) router/MCP failure inside the flush callback,
+// (c) shutdown drain that fails — would silently lose fragments. The
+// on-disk dir is the source of truth: the flush callback walks it,
+// dispatches once, and only then drops the dir. On flush failure the
+// dir is moved into `<state>/albums/dead-letter/`.
 async function tryRouteToAlbumBuffer(
   ctx: Context,
   deps: HandlerDeps,
@@ -331,7 +589,7 @@ async function tryRouteToAlbumBuffer(
   // and never start an album buffer entry for a dropped sender either
   // (otherwise allowlisted noise could be merged into a denied bucket).
   const input = gateInputFromContext(ctx)
-  const decision = gateTelegramMessage(input, deps.config)
+  const decision = gateTelegramMessage(input, deps.config, deps.policy)
   if (decision.kind === 'drop') {
     deps.log.debug('inbound dropped', {
       reason: decision.reason,
@@ -343,24 +601,77 @@ async function tryRouteToAlbumBuffer(
     return true // we *handled* it (by dropping) — do NOT fall through
   }
 
+  // FIX-D M1 (2026-05-27) — policy/router XOR defence-in-depth, mirrors
+  // the same check in gateAndNotify. A group album buffered without a
+  // router wired alongside policy would otherwise fall through to the
+  // legacy notify path at flush time, leaking traffic into the master
+  // session. Drop the whole album silently (no buffer entry, no
+  // persistence) so even one bad fragment never enters the pipeline.
+  const hasPolicy = deps.policy !== undefined
+  const hasRouter = deps.router !== undefined
+  const isGroup = input.chatType === 'group' || input.chatType === 'supergroup'
+  if (isPolicyRouterMisconfig(hasPolicy, hasRouter, isGroup)) {
+    deps.log.error('handlers.album.policy_router_misconfig — dropping group album', {
+      chat_id: decision.chatId,
+      user_id: decision.senderId,
+      kind,
+      has_policy: hasPolicy,
+      has_router: hasRouter,
+      chat_type: input.chatType,
+      media_group_id: mgid,
+      hint: 'policy and router MUST be wired together; configure both or neither',
+    })
+    return true
+  }
+
+  // FIX-D B1 (2026-05-27) — album aggregate addressing.
+  //
+  // Pre-FIX-D: a group fragment that wasn't itself addressed was dropped
+  // here. That broke real albums: Telegram puts the caption/@mention on
+  // ONE fragment (typically the first), and the rest arrive bare. The
+  // captioned fragment would pass; siblings dropped silently → the agent
+  // saw a one-photo "album" while the user thought they had sent 5.
+  //
+  // Post-FIX-D: buffer ALL allowlisted-sender fragments and record
+  // per-fragment `addressedAtPush`. At flush time the dispatcher
+  // aggregates with `.some(...)` — any addressed fragment ⇒ whole album
+  // dispatches; zero addressed fragments ⇒ silent drop of the whole
+  // album (legitimate group post, NOT an error → no dead-letter).
+  //
+  // DMs always evaluate to `true` (isAddressedToBot returns true for
+  // private chat regardless of mention_allowlist), so private albums
+  // behave exactly as before.
+  const addressedAtPush = isAddressedToBot(ctx, deps.policy?.mention_allowlist)
+
   const descriptors = await buildDescriptors()
   const rendered = descriptors.map(renderMediaDescriptor)
   const caption = (ctx.message?.caption ?? '').trim()
   const reply = ctx.message?.reply_to_message
     ? adaptReply(ctx.message.reply_to_message)
     : undefined
+  const mediaPaths = descriptors
+    .map((m) => (m.kind === 'photo' && typeof m.localPath === 'string' ? m.localPath : undefined))
+    .filter((p): p is string => p !== undefined)
   const entry: AlbumEntry = {
     descriptors: rendered,
+    mediaPaths,
     caption,
     messageId: ctx.message?.message_id,
     reply,
+    addressedAtPush,
   }
 
   // Open the status transient on first inbound — gateway.py does this
   // on EVERY message but for albums one "Печатает..." per album is more
   // honest about what's happening. We attempt on every push; status
   // manager dedups via isActive check internally (best-effort).
-  if (deps.statusManager && deps.config.status.enabled) {
+  //
+  // FIX-D B1: gate on addressedAtPush. Unaddressed group fragments must
+  // stay silent (no "Печатает..." in the chat). If ALL fragments turn
+  // out unaddressed the album will be dropped at flush — flashing a
+  // typing bubble for it would leak bot activity into a chat that did
+  // not summon us.
+  if (deps.statusManager && deps.config.status.enabled && addressedAtPush) {
     try {
       await deps.statusManager.start(decision.chatId, ctx.message?.message_id)
     } catch (err) {
@@ -378,23 +689,130 @@ async function tryRouteToAlbumBuffer(
     bot: deps.bot,
     telegramApi: deps.telegramApi,
     ...(deps.statusManager !== undefined ? { statusManager: deps.statusManager } : {}),
+    ...(deps.router !== undefined ? { router: deps.router } : {}),
+    ...(deps.policy !== undefined ? { policy: deps.policy } : {}),
   }
   const chatIdAtPush = decision.chatId
   const senderIdAtPush = decision.senderId
+  // Capture sender's display handle at push time — by the time the album
+  // flushes the ctx is long gone, and the router DTO requires a `user`.
+  const userAtPush =
+    ctx.from?.username !== undefined
+      ? ctx.from.username
+      : ctx.from?.first_name !== undefined
+        ? ctx.from.first_name
+        : 'unknown'
 
-  deps.albumBuffer.push(mgid, entry, (album) => {
-    void sendAlbumNotification(
-      album,
-      { chatId: chatIdAtPush, senderId: senderIdAtPush, mediaGroupId: mgid, kind },
-      dispatchDeps,
-    )
+  // Composite buffer key — see Bug #1 above. The same string is the
+  // on-disk dir name for persistence.
+  const bufferKey = compositeAlbumKey(chatIdAtPush, mgid)
+
+  // Bug #2 — durability. Persist the fragment to disk BEFORE the
+  // poller's offset advances past this update. If anything below this
+  // line fails (timer cancellation, crash, flush failure), the
+  // on-disk fragment is replayed by `recoverPendingAlbums` at the
+  // next startup. Failure to persist degrades to "in-memory only,
+  // same as pre-fix behaviour" — we still buffer + log the warning
+  // so operators see persistence regressions, but we do not refuse
+  // delivery: losing the fragment from disk is strictly worse than
+  // losing it from memory (the user still wants their photo to
+  // arrive when things are green).
+  const meta: PersistedAlbumMeta = {
+    chatId: chatIdAtPush,
+    senderId: senderIdAtPush,
+    user: userAtPush,
+    mediaGroupId: mgid,
+    kind,
+    firstAt: Date.now(),
+  }
+  if (deps.statePaths?.root) {
+    try {
+      await persistFragment(deps.statePaths.root, bufferKey, meta, entry)
+    } catch (err) {
+      deps.log.warn('album persist failed (continuing in-memory only)', {
+        kind,
+        media_group_id: mgid,
+        chat_id: chatIdAtPush,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  deps.albumBuffer.push(bufferKey, entry, (album) => {
+    // Flush callback — dispatch once, then either drop the on-disk dir
+    // (success) or move it to dead-letter (failure inside dispatch).
+    // We fire-and-forget here because the buffer's timer is sync; the
+    // actual delivery / cleanup races the next inbound but cannot
+    // double-fire (the buffer entry is already deleted by the time
+    // this callback runs).
+    void (async () => {
+      // `flushOk` is true for either real dispatch OR intentional
+      // silent-drop (FIX-D B1: unaddressed group album, FIX-D M1:
+      // wiring misconfig). Both are non-errors → drop the on-disk
+      // dir. Only a thrown exception escalates to dead-letter.
+      let flushOk = true
+      try {
+        await sendAlbumNotification(
+          album,
+          {
+            chatId: chatIdAtPush,
+            senderId: senderIdAtPush,
+            user: userAtPush,
+            mediaGroupId: mgid,
+            kind,
+          },
+          dispatchDeps,
+        )
+      } catch (err) {
+        flushOk = false
+        deps.log.warn('album dispatch failed — moving to dead-letter', {
+          kind,
+          media_group_id: mgid,
+          chat_id: chatIdAtPush,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+      if (!deps.statePaths?.root) return
+      if (flushOk) {
+        await dropAlbumDir(deps.statePaths.root, bufferKey).catch((rmErr: unknown) => {
+          deps.log.warn('album cleanup failed (dir lingers; harmless)', {
+            key: bufferKey,
+            error: rmErr instanceof Error ? rmErr.message : String(rmErr),
+          })
+        })
+      } else {
+        await moveToAlbumDeadLetter(
+          deps.statePaths.root,
+          bufferKey,
+          'sendAlbumNotification threw during flush',
+        ).catch((dlErr: unknown) => {
+          deps.log.warn('album dead-letter move failed', {
+            key: bufferKey,
+            error: dlErr instanceof Error ? dlErr.message : String(dlErr),
+          })
+        })
+      }
+    })()
   })
   deps.log.debug('album buffered', {
     kind,
     media_group_id: mgid,
     chat_id: decision.chatId,
+    buffer_key: bufferKey,
   })
   return true
+}
+
+/** Outcome of {@link sendAlbumNotification}. The flush wrapper uses it
+ *  to decide disk cleanup: `dispatched=true` ⇒ delivery succeeded, drop
+ *  the dir. `dispatched=false` with `silentDrop` set ⇒ intentional drop
+ *  (e.g. unaddressed group album, wiring misconfig), drop the dir
+ *  without dead-lettering. A throw ⇒ delivery failed, dead-letter. */
+export interface AlbumDispatchOutcome {
+  dispatched: boolean
+  /** Reason string when `dispatched=false`. Helps observability and
+   *  lets tests assert the specific silent-drop branch that fired. */
+  silentDrop?: string
 }
 
 // Build one combined channel notification from a flushed Album. Captions
@@ -404,9 +822,65 @@ async function tryRouteToAlbumBuffer(
 // single album rather than a deluge of photos.
 export async function sendAlbumNotification(
   album: Album<AlbumEntry>,
-  ids: { chatId: string; senderId: string; mediaGroupId: string; kind: string },
+  ids: {
+    chatId: string
+    senderId: string
+    user: string
+    mediaGroupId: string
+    kind: string
+  },
   deps: AlbumDispatchDeps,
-): Promise<void> {
+): Promise<AlbumDispatchOutcome> {
+  const isGroup = isGroupChatId(ids.chatId)
+
+  // FIX-D M1 (2026-05-27) — policy/router XOR defence-in-depth at the
+  // dispatch site. If we somehow buffered a group album despite the
+  // wiring being broken (e.g. recovery from a previous bad-build run),
+  // silently drop instead of falling into legacy notify. The dir is
+  // dropped by the flush wrapper because this is not a delivery
+  // failure, just a wiring refusal.
+  const hasPolicy = deps.policy !== undefined
+  const hasRouter = deps.router !== undefined
+  if (isPolicyRouterMisconfig(hasPolicy, hasRouter, isGroup)) {
+    deps.log.error('album.policy_router_misconfig — dropping group album', {
+      kind: ids.kind,
+      chat_id: ids.chatId,
+      media_group_id: ids.mediaGroupId,
+      album_size: album.messages.length,
+      has_policy: hasPolicy,
+      has_router: hasRouter,
+      hint: 'policy and router MUST be wired together; configure both or neither',
+    })
+    return { dispatched: false, silentDrop: 'policy_router_misconfig' }
+  }
+
+  // FIX-D B1 (2026-05-27) — aggregate addressing.
+  //
+  // Telegram puts the @mention/caption on exactly one fragment of an
+  // album. Pre-FIX-D we filtered per-fragment at the gate, which dropped
+  // every sibling and broke real albums. Now we buffer every allowlisted
+  // fragment with a per-fragment `addressedAtPush` flag and aggregate
+  // here: if ANY fragment was addressed at push time, the whole album
+  // dispatches. If NONE were addressed (group post the user did not
+  // direct at the bot), the album drops silently — legitimate content,
+  // not an error, so no dead-letter.
+  //
+  // Back-compat with disk-recovered entries: `addressedAtPush` may be
+  // undefined on entries written by pre-FIX-D builds. We treat undefined
+  // as true (those builds only persisted addressed fragments at the gate).
+  const aggregateAddressed = album.messages.some(
+    (m) => m.addressedAtPush === undefined || m.addressedAtPush === true,
+  )
+  if (!aggregateAddressed) {
+    deps.log.debug('album.not_addressed_aggregate — dropping silently', {
+      kind: ids.kind,
+      chat_id: ids.chatId,
+      media_group_id: ids.mediaGroupId,
+      album_size: album.messages.length,
+    })
+    return { dispatched: false, silentDrop: 'aggregate_not_addressed' }
+  }
+
   // Merge captions: non-empty in order, joined by blank line. This matches
   // gateway.py's `"\n\n".join(captions)`. When every caption is empty the
   // merged text is empty — buildChannelContent skips it correctly.
@@ -422,6 +896,40 @@ export async function sendAlbumNotification(
   // First non-null reply wins. Albums rarely contain replies, but if the
   // user replied with the first photo of the album we forward that context.
   const reply = album.messages.find((m) => m.reply !== undefined)?.reply
+
+  // Router path: synthesise one InboundMessage that carries the merged
+  // caption + every downloaded media path. Symmetric with the single-
+  // message router branch in gateAndNotify so the tmux side sees a
+  // consistent DTO shape regardless of album vs solo arrival.
+  if (deps.router && deps.policy) {
+    const combinedMediaPaths: string[] = []
+    for (const m of album.messages) {
+      for (const p of m.mediaPaths) combinedMediaPaths.push(p)
+    }
+    const replyContext = reply
+      ? buildChannelContent({ text: '', bot: deps.bot, reply })
+      : undefined
+    const inboundMsg: InboundMessage = {
+      text: mergedText,
+      chat_id: ids.chatId,
+      user_id: ids.senderId,
+      user: ids.user,
+      timestamp: new Date().toISOString(),
+      ...(replyContext !== undefined ? { reply_context: replyContext } : {}),
+      ...(combinedMediaPaths.length > 0 ? { media_paths: combinedMediaPaths } : {}),
+    }
+    deps.log.info('album dispatched to router', {
+      kind: ids.kind,
+      chat_id: ids.chatId,
+      media_group_id: ids.mediaGroupId,
+      album_size: album.messages.length,
+    })
+    // Bug #2 (TASK-4): throw on router failure so the caller's
+    // flush-callback can move the on-disk album dir into dead-letter
+    // instead of silently logging "content lost".
+    await deps.router.dispatch(inboundMsg)
+    return { dispatched: true }
+  }
 
   const content = buildChannelContent({
     text: mergedText,
@@ -452,11 +960,14 @@ export async function sendAlbumNotification(
   })
   const delivered = await sendChannelNotification(deps.server, event, deps.log)
   if (!delivered) {
-    deps.log.warn('album notify failed — content lost (no dead-letter for album path)', {
-      media_group_id: ids.mediaGroupId,
-      chat_id: ids.chatId,
-    })
+    // Bug #2 (TASK-4): throw so the caller dead-letters the on-disk
+    // album dir. Pre-fix this logged "content lost"; now persistence
+    // gives us a recovery path.
+    throw new Error(
+      `album notify failed — channel transport refused delivery (mgid=${ids.mediaGroupId})`,
+    )
   }
+  return { dispatched: true }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -467,9 +978,22 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
   const text = ctx.message?.text ?? ''
 
   // Auto-react 👀 on inbound — prince visibility signal, replaces typing indicator.
-  // ONLY for messages addressed to this bot (DM, @mention, or reply to bot).
-  // Without this gate the bot would react to every group message it sees.
-  if (isAddressedToBot(ctx)) {
+  // ONLY for messages that pass BOTH the allowlist gate AND the addressing
+  // check (DM, @mention from a mention_allowlist sender, or reply to bot).
+  //
+  // Bug #4 (TASK-4): historically reaction ran before the allowlist gate,
+  // so an unallowed DM sender, or a group sender whose mention WAS allowed
+  // by mention_allowlist but whose chat/user was NOT in the gate
+  // allowlist, could force visible bot activity (and burn 429 budget on
+  // setMessageReaction). Gating on `gateTelegramMessage` + addressing
+  // pulls reactions back behind the same fence reply/notify already sit
+  // behind.
+  const reactionInput = gateInputFromContext(ctx)
+  const reactionDecision = gateTelegramMessage(reactionInput, deps.config, deps.policy)
+  if (
+    reactionDecision.kind === 'allow'
+    && isAddressedToBot(ctx, deps.policy?.mention_allowlist)
+  ) {
     try {
       const _chatId = ctx.chat?.id
       const _msgId = ctx.message?.message_id

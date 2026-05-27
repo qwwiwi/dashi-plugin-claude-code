@@ -1,13 +1,15 @@
 # Canary smoke runbook
 
-Live verification of the Dashi Channel plugin against test bot `@testmyfirsttmuxbot` (id `8507713167`).
+Live verification of the Dashi Channel plugin against a dedicated test bot you own (referred to below as `<test-bot-id>`).
 
-This runbook is for the human operator (prince at the keyboard). The plugin runs as a Claude Code development channel; tests rely on real Telegram messages sent from user `164795011`.
+This runbook is for the human operator at the keyboard. The plugin runs as a Claude Code development channel; tests rely on real Telegram messages sent from your own user account, referred to below as `<your-telegram-user-id>` (your numeric Telegram user id — find it via [@userinfobot](https://t.me/userinfobot)).
+
+> Use a separate test bot — never run the canary against a production bot token. Production traffic must stay on the production deployment.
 
 ## Pre-flight (run once)
 
 ```bash
-cd /Users/jasonqwwen/qwwiwi-channel-telegram-Claude-code/plugin
+cd ~/path/to/your/.claude-lab/dashi-plugin-claude-code/plugin
 ~/.bun/bin/bun install
 ~/.bun/bin/bun run typecheck
 ~/.bun/bin/bun test tests/
@@ -17,30 +19,32 @@ Expected: zero typecheck errors, 212+ tests pass.
 
 Shortcut: `./scripts/smoke-local` runs all three steps and prints the launch hint.
 
-## Stop the Python canary (one token, one consumer)
+## Stop any pre-cutover Python canary (one token, one consumer)
 
-Telegram delivers each update to exactly one long-poll consumer. Before launching the channel plugin, stop the Python ACK canary so the bot token is free.
+Telegram delivers each update to exactly one long-poll consumer. Before launching the channel plugin, stop any other process consuming this bot's updates so the bot token is free.
+
+> Pre-cutover (Python `gateway.py`) — applicable only if you are migrating from the legacy Python gateway; skip this section if you are installing fresh.
 
 ```bash
-# Confirm Python canary is up
-tmux ls | grep orgrimmar-canary || echo "no canary tmux session"
+# Confirm any pre-cutover Python canary is up
+tmux ls | grep channel-canary || echo "no canary tmux session"
 
 # Stop it
-tmux kill-session -t orgrimmar-canary 2>/dev/null || true
+tmux kill-session -t channel-canary 2>/dev/null || true
 
 # Verify no leftover python process holding the token
 pgrep -af dashi-telegram-canary-bot || echo "clean"
 ```
 
-Do NOT touch the production tmux sessions: `orgrimmar-silvana`, `orgrimmar-kaelthas`, `orgrimmar-garrosh`, `orgrimmar-arthas`, `orgrimmar-claude`. Those run the Python `claude -p` gateway against production tokens and stay up during canary work.
+Do NOT touch any other production tmux sessions you operate (for example `channel-<your-agent>` sessions running production bot tokens). Those should stay up during canary work.
 
 ## Launch the channel plugin
 
 ```bash
-tmux new-session -d -s orgrimmar-canary-channel \
-  -c /Users/jasonqwwen/qwwiwi-channel-telegram-Claude-code/plugin \
+tmux new-session -d -s channel-canary-test \
+  -c ~/path/to/your/.claude-lab/dashi-plugin-claude-code/plugin \
   'TELEGRAM_BOT_TOKEN=$(cat ~/.claude-lab/shared/channel-runtime/canary/secrets/telegram-bot-token) \
-   TELEGRAM_STATE_DIR=/Users/jasonqwwen/.claude-lab/shared/channel-runtime/canary/telegram \
+   TELEGRAM_STATE_DIR=~/path/to/your/.claude-lab/shared/channel-runtime/canary/telegram \
    TELEGRAM_WORKSPACE_ROOT=/tmp/dashi-channel-canary-workspace \
    claude --dangerously-load-development-channels server:dashi-channel'
 ```
@@ -48,15 +52,15 @@ tmux new-session -d -s orgrimmar-canary-channel \
 Verify the session is alive:
 
 ```bash
-tmux ls | grep orgrimmar-canary-channel
-tmux capture-pane -t orgrimmar-canary-channel -p -S -50
+tmux ls | grep channel-canary-test
+tmux capture-pane -t channel-canary-test -p -S -50
 ```
 
-Expected: Claude Code prints channel-connected line; plugin stderr shows `telegram channel up, bot_id=8507713167`.
+Expected: Claude Code prints channel-connected line; plugin stderr shows `telegram channel up, bot_id=<test-bot-id>`.
 
 ## Smoke matrix
 
-Each test sends a Telegram DM from user `164795011` to `@testmyfirsttmuxbot` and verifies the plugin response. Run them sequentially; do not parallelize.
+Each test sends a Telegram DM from your test account (`<your-telegram-user-id>`) to your test bot and verifies the plugin response. Run them sequentially; do not parallelize.
 
 | # | Test | Send | Expected |
 |---|------|------|----------|
@@ -84,7 +88,7 @@ For test 15, only run if the canary launch includes `TELEGRAM_WEBHOOK_PORT` and 
 
 ```bash
 # Live tail of plugin stderr
-tmux capture-pane -t orgrimmar-canary-channel -p -S -200
+tmux capture-pane -t channel-canary-test -p -S -200
 
 # Permission audit log
 tail -f ~/.claude-lab/shared/channel-runtime/canary/telegram/logs/permissions.jsonl
@@ -101,34 +105,35 @@ cat ~/.claude-lab/shared/channel-runtime/canary/telegram/state/status.json 2>/de
 - All 15 rows produce the expected behavior with no plugin crash.
 - `permissions.jsonl` shows one `allow` entry for test 13 and one `deny` for test 14.
 - Dead-letter queue empty (or contains only deliberate failures).
-- No production bot received traffic during the run (check production tmux capture).
+- No production bot received traffic during the run (check any production tmux capture for your own deployment).
 
-If any row fails: stop the plugin, snapshot logs to `loop-coding-runs/2026-05-15-canary-gateway-full-parity/T15-smoke-evidence/`, file the issue against the relevant T-task, and roll back to the Python canary.
+If any row fails: stop the plugin, snapshot logs to a dated evidence folder under `loop-coding-runs/<date>-canary/T15-smoke-evidence/`, file an issue against the relevant T-task, and roll back to the previous known-good launcher.
 
-## Rollback to Python canary
+## Rollback to the pre-cutover Python canary
+
+> Applicable only if you are migrating from the legacy Python gateway. Skip this section if you are installing fresh.
 
 ```bash
 # Stop channel plugin
-tmux kill-session -t orgrimmar-canary-channel
+tmux kill-session -t channel-canary-test
 
-# Restart Python ACK canary
-tmux new-session -d -s orgrimmar-canary \
-  -c /Users/jasonqwwen/qwwiwi-channel-telegram-Claude-code \
-  'env DASHI_CHANNEL_RUNTIME_ROOT=/Users/jasonqwwen/.claude-lab/shared/channel-runtime PYTHONUNBUFFERED=1 \
+# Restart pre-cutover Python ACK canary
+tmux new-session -d -s channel-canary \
+  -c ~/path/to/your/.claude-lab/dashi-plugin-claude-code \
+  'env DASHI_CHANNEL_RUNTIME_ROOT=~/path/to/your/.claude-lab/shared/channel-runtime PYTHONUNBUFFERED=1 \
    scripts/dashi-telegram-canary-bot --reply-mode claude --claude-max-budget-usd 0.20 --poll-timeout 20'
 
 # Verify
-tmux capture-pane -t orgrimmar-canary -p -S -30
+tmux capture-pane -t channel-canary -p -S -30
 ```
 
 Rollback should take under 30 seconds and is the standard recovery path for any plugin regression.
 
 ## Do NOT touch
 
-- Production tokens for `sa-silvana`, `sa-kaelthas`, `sa-garrosh`, `sa-arthas`, `sa-claude`
-- `~/.claude-lab/shared/gateway/gateway.py`
-- `~/.claude-lab/shared/gateway/config.json`
-- any `ai.orgrimmar.gateway` launchd job
-- production tmux sessions (`orgrimmar-silvana`, `orgrimmar-kaelthas`, `orgrimmar-garrosh`, `orgrimmar-arthas`, `orgrimmar-claude`)
+- Production bot tokens for any of your operator deployments
+- The legacy Python gateway path (`~/path/to/your/.claude-lab/shared/gateway/`) and its `config.json`
+- any production launchd / systemd job that runs the legacy gateway
+- production tmux sessions (anything matching `channel-<your-agent>` that is running a production bot token)
 
-Phase 4 production cutover requires explicit prince approval and proven rollback. Until then, the canary smoke is the only live exercise of this plugin.
+Production cutover requires explicit operator approval and a proven rollback path. Until then, the canary smoke described here is the only live exercise of this plugin.

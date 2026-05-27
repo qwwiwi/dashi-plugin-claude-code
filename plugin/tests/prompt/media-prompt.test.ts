@@ -27,7 +27,7 @@ const voiceConfig: AppConfig = {
   dm_only: true,
   allowed_user_ids: [1],
   allowed_chat_ids: [1],
-  status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true },
+  status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
   album: { flush_ms: 2000 },
   voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
   webhook: { enabled: false, host: '127.0.0.1', port: 0 },

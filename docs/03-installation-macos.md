@@ -30,6 +30,7 @@ Anthropic Max subscription нужна для агента (Claude.app login). У
 ```bash
 mkdir -p ~/.claude-lab/myagent/.claude
 mkdir -p ~/.claude-lab/myagent/secrets
+mkdir -p ~/.claude-lab/myagent/scripts
 mkdir -p ~/.claude-lab/shared/state/myagent/telegram
 mkdir -p ~/Library/Logs/dashi-plugin
 ```
@@ -119,9 +120,102 @@ AGENT_ID=myagent
 
 ---
 
-## Шаг 6. launchd plist
+## Шаг 6. Wrapper-скрипт и launchd plist
 
-Скопируйте example:
+**Почему два файла, а не один inline `sh -c` в plist:** Claude Code требует TTY (поэтому tmux), а tmux-сессию нужно запустить **detached** (`new-session -d`), чтобы launchd не висел на foreground tmux client. При этом launchd должен супервизить **живой** PID — иначе KeepAlive/Restart работают неправильно. Прежний inline-вариант (`exec tmux new-session -d ...; sleep; send-keys`) был сломан: `exec` подменяет shell процессом tmux client, который сразу завершается с success после detach, и команды `sleep; send-keys` после `exec` никогда не запускаются. Wrapper-скрипт решает обе проблемы: source-ит env, стартует tmux, шлёт Enter в welcome-промты, и блокируется на polling пока tmux-сессия жива.
+
+### 6.1. Wrapper-скрипт
+
+Скопируйте example и подставьте свои значения:
+
+```bash
+cp ~/.claude-lab/myagent/.claude/dashi-plugin-claude-code/examples/launchd-wrapper.sh.example \
+   ~/.claude-lab/myagent/scripts/launchd-wrapper.sh
+chmod +x ~/.claude-lab/myagent/scripts/launchd-wrapper.sh
+$EDITOR ~/.claude-lab/myagent/scripts/launchd-wrapper.sh
+```
+
+В скрипте замените `<you>` на ваш macOS username, `<agent>` на имя агента, и проверьте `TMUX_BIN` (Apple Silicon: `/opt/homebrew/bin/tmux`, Intel: `/usr/local/bin/tmux`).
+
+Минимальный рабочий wrapper:
+
+```sh
+#!/bin/sh
+set -eu
+
+AGENT="myagent"
+USER_HOME="/Users/<you>"
+ENV_FILE="${USER_HOME}/.claude-lab/${AGENT}/secrets/channel.env"
+TMUX_SESSION="channel-${AGENT}"
+TMUX_BIN="/opt/homebrew/bin/tmux"
+CLAUDE_CMD="claude --dangerously-load-development-channels server:dashi-channel"
+
+log() { printf '[%s] launchd-wrapper: %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
+
+# Source secrets без коммита в plist
+if [ -f "${ENV_FILE}" ]; then
+  set -a; . "${ENV_FILE}"; set +a
+else
+  log "FATAL: env file not found: ${ENV_FILE}"
+  exit 78
+fi
+
+# Кill stale session если предыдущий запуск не сделал cleanup
+if "${TMUX_BIN}" has-session -t "${TMUX_SESSION}" 2>/dev/null; then
+  "${TMUX_BIN}" kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+fi
+
+# EXPECTED_SHUTDOWN: ставится в 1 при operator-initiated stop (SIGTERM от launchctl)
+# Используется ниже чтобы различить graceful stop и unexpected tmux death.
+EXPECTED_SHUTDOWN=0
+
+# Trap для graceful shutdown по SIGTERM от launchctl
+cleanup() {
+  EXPECTED_SHUTDOWN=1
+  log "cleanup: killing tmux session (operator-initiated)"
+  "${TMUX_BIN}" kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+  exit 0
+}
+trap cleanup TERM INT
+
+# Стартуем claude в detached tmux
+"${TMUX_BIN}" new-session -d -s "${TMUX_SESSION}" "${CLAUDE_CMD}"
+
+# Welcome-промты (фоном, безвредны если persistent approvals уже записаны)
+(
+  sleep 6
+  "${TMUX_BIN}" send-keys -t "${TMUX_SESSION}" Enter 2>/dev/null || true
+  sleep 2
+  "${TMUX_BIN}" send-keys -t "${TMUX_SESSION}" Enter 2>/dev/null || true
+) &
+
+# Foreground supervisor: блокируемся пока tmux session жива
+log "supervising tmux session '${TMUX_SESSION}' (pid wrapper=$$)"
+while "${TMUX_BIN}" has-session -t "${TMUX_SESSION}" 2>/dev/null; do
+  sleep 5
+done
+
+# Различаем operator-stop (exit 0, мы здесь не окажемся — cleanup сделал exit 0)
+# и unexpected tmux death (exit 1 → launchd KeepAlive.SuccessfulExit=false respawn-ит).
+if [ "${EXPECTED_SHUTDOWN}" = "1" ]; then
+  log "tmux session ended (expected), wrapper exiting 0"
+  exit 0
+fi
+log "tmux session died unexpectedly, wrapper exiting 1 (launchd will respawn)"
+exit 1
+```
+
+**Exit-code matrix (важно для launchd):**
+
+| Сценарий | EXPECTED_SHUTDOWN | Exit | Действие launchd |
+|---|---|---|---|
+| `launchctl kill SIGTERM` (operator stop) | 1 (trap) | 0 | НЕ respawn |
+| Claude crash / kill-session / OOM | 0 | 1 | respawn через ThrottleInterval |
+| Отсутствует `channel.env` | n/a | 78 | respawn (лечить env, не плагином) |
+
+Полная версия с дополнительными комментариями — `examples/launchd-wrapper.sh.example`.
+
+### 6.2. Plist (вызывает wrapper)
 
 ```bash
 mkdir -p ~/Library/LaunchAgents
@@ -144,9 +238,7 @@ $EDITOR ~/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/sh</string>
-        <string>-c</string>
-        <string>set -a; . /Users/&lt;you&gt;/.claude-lab/myagent/secrets/channel.env; set +a; exec /usr/local/bin/tmux new-session -d -s channel-myagent claude --dangerously-load-development-channels server:dashi-channel; sleep 6; /usr/local/bin/tmux send-keys -t channel-myagent Enter; sleep 2; /usr/local/bin/tmux send-keys -t channel-myagent Enter; wait</string>
+        <string>/Users/&lt;you&gt;/.claude-lab/myagent/scripts/launchd-wrapper.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -167,28 +259,40 @@ $EDITOR ~/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist
 
     <key>KeepAlive</key>
     <dict>
-        <key>Crashed</key>
-        <true/>
+        <key>SuccessfulExit</key>
+        <false/>
     </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
 
     <key>StandardOutPath</key>
     <string>/Users/&lt;you&gt;/Library/Logs/dashi-plugin/channel-myagent.out.log</string>
 
     <key>StandardErrorPath</key>
     <string>/Users/&lt;you&gt;/Library/Logs/dashi-plugin/channel-myagent.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
 </dict>
 </plist>
 ```
 
 **Различия от systemd-варианта:**
 
-- `ProgramArguments` — массив, не одна строка. Запускаем через `sh -c "..."` потому что нужен source env-файла
-- `EnvironmentVariables` — dict внутри plist, а не отдельный файл (но **секреты вытаскиваем через `source ... channel.env`**, иначе bot token попал бы в plist, который читается любым процессом вашего user)
-- `KeepAlive.Crashed=true` — рестарт только на crash, не на graceful exit (аналог `Restart=on-failure` в systemd)
-- `RunAtLoad=true` — запуск при загрузке plist (вход в систему GUI user)
+- `ProgramArguments` — путь к wrapper-скрипту (один аргумент). Wrapper делает то, что в systemd делают `ExecStart` + `ExecStartPost` + `ExecStop` вместе.
+- `EnvironmentVariables` — dict внутри plist для non-secret. Bot token и т.п. wrapper source-ит из `channel.env` (плeist читается любым процессом этого user).
+- `KeepAlive.SuccessfulExit=false` — respawn только если предыдущий exit был НЕ 0. Wrapper выходит с exit 0 при operator-initiated stop (SIGTERM от `launchctl kill` → trap cleanup) и с exit 1 при unexpected tmux death (claude crash, manual `tmux kill-session`, OOM). Так launchd корректно различает: оператор остановил → НЕ респавнить; tmux умер сам по себе → респавнить через ThrottleInterval.
+- `RunAtLoad=true` — запуск при загрузке plist (вход в систему GUI user).
+- `ExitTimeOut=30` — даём wrapper-у 30 сек на trap-cleanup перед SIGKILL.
 - `WorkingDirectory` — критично, как и в systemd. **Внутрь `plugin/`**.
 
-> **Tmux путь:** Homebrew на Apple Silicon ставит в `/opt/homebrew/bin/tmux`, на Intel — в `/usr/local/bin/tmux`. Проверьте `which tmux` и подставьте.
+> **Tmux путь:** Homebrew на Apple Silicon ставит в `/opt/homebrew/bin/tmux`, на Intel — в `/usr/local/bin/tmux`. Проверьте `which tmux` в обоих файлах (wrapper и `PATH` в plist).
+
+> **Migration note (от `Crashed=true` к `SuccessfulExit=false`):** Если вы устанавливали плагин ДО этого изменения, ваш plist содержит `<key>Crashed</key><true/>`. Эта семантика **не покрывала** случай, когда wrapper детектил мёртвую tmux и сам выходил с exit 1 (не сигналом) — launchd считал это «штатным завершением» и НЕ перезапускал agent. После claude crash вы получали тихо лежащий сервис. Новая семантика `SuccessfulExit=false` респавнит на ЛЮБОМ non-zero exit. Чтобы мигрировать: замените блок `KeepAlive` в `~/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist` на новый, обновите wrapper из `examples/launchd-wrapper.sh.example`, затем `launchctl bootout ... && launchctl bootstrap ...` для перезагрузки plist.
 
 ---
 

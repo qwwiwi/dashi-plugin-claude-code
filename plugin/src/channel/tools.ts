@@ -18,6 +18,7 @@ import { z } from 'zod'
 
 import type { AppConfig, StatePaths } from '../config.js'
 import type { Logger } from '../log.js'
+import type { MultichatPolicy } from '../chats/policy-loader.js'
 import type { StatusManager, StatusState } from '../status/status-manager.js'
 import {
   DownloadAttachmentArgsSchema,
@@ -317,6 +318,9 @@ export interface ToolDeps {
   telegramApi: TelegramApi
   log: Logger
   statusManager: StatusManager
+  // H4 fix (2026-05-23): when multichat is enabled, the policy is the
+  // authoritative outbound allowlist. Omitted in legacy DM-only mode.
+  policy?: MultichatPolicy
 }
 
 function toolError(name: string, message: string): CallToolResult {
@@ -342,7 +346,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
         const args = parsed.data
         try {
-          assertAllowedChat(args.chat_id, config)
+          assertAllowedChat(args.chat_id, config, deps.policy)
         } catch (err) {
           return toolError(name, err instanceof Error ? err.message : String(err))
         }
@@ -451,7 +455,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
         const args = parsed.data
         try {
-          assertAllowedChat(args.chat_id, config)
+          assertAllowedChat(args.chat_id, config, deps.policy)
         } catch (err) {
           return toolError(name, err instanceof Error ? err.message : String(err))
         }
@@ -464,7 +468,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
         const args = parsed.data
         try {
-          assertAllowedChat(args.chat_id, config)
+          assertAllowedChat(args.chat_id, config, deps.policy)
         } catch (err) {
           return toolError(name, err instanceof Error ? err.message : String(err))
         }
@@ -477,7 +481,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
         const args = parsed.data
         try {
-          assertAllowedChat(args.chat_id, config)
+          assertAllowedChat(args.chat_id, config, deps.policy)
         } catch (err) {
           return toolError(name, err instanceof Error ? err.message : String(err))
         }
@@ -492,7 +496,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
         const args = parsed.data
         try {
-          assertAllowedChat(args.chat_id, config)
+          assertAllowedChat(args.chat_id, config, deps.policy)
         } catch (err) {
           return toolError(name, err instanceof Error ? err.message : String(err))
         }

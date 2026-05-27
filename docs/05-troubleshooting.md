@@ -218,7 +218,7 @@ Telegram pending updates = 0 (плагин их забирает), tmux пока
 
 `TELEGRAM_ALLOWED_USER_IDS` и/или `TELEGRAM_ALLOWED_CHAT_IDS` в `channel.env` не содержит ваш Telegram user ID. Плагин получает update, проверяет gate — и тихо дропает (это by-design, защита от спама / попадания в чужие чаты).
 
-Default allowlist в коде = `[164795011]` (это user ID разработчика плагина), он применяется только если в env ничего не указано.
+Default allowlist в коде = `[<your-telegram-user-id>]` (зашитый user ID разработчика плагина — должен быть переопределён через env под ваш ID), он применяется только если в env ничего не указано.
 
 ### Фикс
 

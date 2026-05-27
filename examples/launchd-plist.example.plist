@@ -8,6 +8,18 @@
     <you>      → ваш macOS username (echo $USER)
     myagent    → имя вашего агента (lowercase, без пробелов)
 
+  ВАЖНО: этот plist запускает wrapper-скрипт (launchd-wrapper.sh), а НЕ
+  пытается inline-командой через `sh -c "exec tmux ...; sleep; send-keys"`.
+  Прежний inline-подход ломался: `exec` подменял shell, sleep/send-keys
+  никогда не запускались, launchd терял supervised PID после detach tmux.
+
+  Wrapper-скрипт:
+    1. Source-ит channel.env (секреты остаются в env, не в plist)
+    2. Стартует tmux-сессию с claude
+    3. Прокидывает Enter в welcome-промты
+    4. Блокируется на polling has-session — launchd видит живой supervised PID
+    5. На SIGTERM от launchctl делает trap-cleanup и убивает tmux-сессию
+
   Загрузка:
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist
 
@@ -20,22 +32,13 @@
     <string>com.dashi-plugin.channel-myagent</string>
 
     <!--
-      ProgramArguments — массив argv процесса.
-      Используем sh -c потому что:
-      1. Нужно source secrets из channel.env (не хотим класть токены в plist —
-         plist читается любым процессом этого user, env stays in memory)
-      2. Нужно отправить Enter в tmux для прохождения welcome-промтов
-
-      WARNING: путь к tmux зависит от вашей установки:
-        Apple Silicon (M1/M2/M3/M4): /opt/homebrew/bin/tmux
-        Intel Mac:                    /usr/local/bin/tmux
-      Проверьте `which tmux` и подставьте.
+      ProgramArguments — путь к wrapper-скрипту.
+      Скрипт должен быть исполняемым (chmod +x) и owned вашим user.
+      См. examples/launchd-wrapper.sh.example
     -->
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/sh</string>
-        <string>-c</string>
-        <string>set -a; . /Users/&lt;you&gt;/.claude-lab/myagent/secrets/channel.env; set +a; exec /opt/homebrew/bin/tmux new-session -d -s channel-myagent claude --dangerously-load-development-channels server:dashi-channel; sleep 6; /opt/homebrew/bin/tmux send-keys -t channel-myagent Enter; sleep 2; /opt/homebrew/bin/tmux send-keys -t channel-myagent Enter; wait</string>
+        <string>/Users/&lt;you&gt;/.claude-lab/myagent/scripts/launchd-wrapper.sh</string>
     </array>
 
     <!--
@@ -49,7 +52,7 @@
 
     <!--
       EnvironmentVariables — переменные окружения для процесса.
-      Только non-secret здесь. Bot token и т.п. — через source в ProgramArguments.
+      Только non-secret здесь. Bot token и т.п. — wrapper source-ит из channel.env.
     -->
     <key>EnvironmentVariables</key>
     <dict>
@@ -70,21 +73,42 @@
     <true/>
 
     <!--
-      KeepAlive: запускать снова если:
-      - процесс упал с non-zero exit (Crashed)
-      Если установить KeepAlive=true (булево, не dict) — будет рестарт всегда,
-      что приведёт к loop когда welcome-промты не пройдены.
-      Поэтому используем dict с conditional restart.
+      KeepAlive: respawn только если предыдущий exit был НЕ 0.
+
+      SuccessfulExit=false означает: «перезапускай unless prior exit code == 0».
+      Wrapper differentiates:
+        - exit 0 → operator-initiated stop (SIGTERM от launchctl, trap cleanup).
+                   launchd НЕ respawn-ит. `launchctl kill SIGTERM` реально стопает.
+        - exit 1 → tmux session died unexpectedly (claude crash, manual
+                   kill-session, OOM). launchd respawn-ит через ThrottleInterval.
+        - exit 78 (EX_CONFIG) → channel.env отсутствует. Тоже non-zero, тоже
+                   respawn — лечится правкой env, не плагином.
+
+      Почему НЕ `Crashed=true`: ловит только сигналы (SIGSEGV/SIGABRT), но НЕ
+      ловит «процесс штатно завершился с non-zero exit code» (например wrapper
+      детектит мёртвую tmux и сам выходит с exit 1). С Crashed=true такой
+      «штатный exit 1» НЕ перезапускается — agent остаётся мёртвым. SuccessfulExit
+      покрывает оба кейса (signal-death и штатный exit 1) одинаково.
+
+      НЕ ставьте `<key>KeepAlive</key><true/>` (булево) — это infinite respawn
+      при welcome-промтах без persistent approvals и игнор операторского stop.
     -->
     <key>KeepAlive</key>
     <dict>
-        <key>Crashed</key>
-        <true/>
+        <key>SuccessfulExit</key>
+        <false/>
     </dict>
 
-    <!-- Пауза 15 секунд между попытками рестарта (антиloop) -->
+    <!-- Пауза 15 секунд между попытками рестарта (анти-loop при crash) -->
     <key>ThrottleInterval</key>
     <integer>15</integer>
+
+    <!--
+      ExitTimeOut — даём wrapper-у 30 секунд на graceful trap cleanup
+      перед SIGKILL. Этого хватает на tmux kill-session и финальный лог.
+    -->
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
 
     <!-- Логи. Создайте директорию заранее: mkdir -p ~/Library/Logs/dashi-plugin -->
     <key>StandardOutPath</key>
@@ -94,9 +118,9 @@
     <string>/Users/&lt;you&gt;/Library/Logs/dashi-plugin/channel-myagent.err.log</string>
 
     <!--
-      Опционально: ProcessType: Interactive
+      ProcessType: Interactive
       Гарантирует, что launchd не будет агрессивно ограничивать ресурсы
-      (имеет смысл для interactive-приложений типа Claude Code, который читает TTY)
+      (имеет смысл для interactive-приложений типа Claude Code, который читает TTY).
     -->
     <key>ProcessType</key>
     <string>Interactive</string>

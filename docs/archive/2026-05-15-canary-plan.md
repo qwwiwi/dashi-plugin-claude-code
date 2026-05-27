@@ -1,3 +1,6 @@
+> ARCHIVED 2026-05-27 — historical reference only.
+> This was the initial canary port plan (PR #1-3 era). Superseded by the current state of plugin/ and docs/.
+
 # Canary Gateway Channel Port Plan
 
 Task: canary-gateway-full-parity

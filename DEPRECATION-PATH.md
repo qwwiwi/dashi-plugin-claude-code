@@ -10,10 +10,15 @@
 ## Почему
 
 Anthropic 15 июня 2026 разделяет billing:
-- `claude -p` (Agent SDK) → отдельный $200/мес pool
-- Interactive Claude Code сессия → остаётся в Max subscription
+- `claude -p` (Agent SDK) → отдельный SDK-кредит, **зависящий от плана**:
+  - Pro — $20/мес
+  - Max 5× — $100/мес
+  - Max 20× — $200/мес
+- Interactive Claude Code сессия → остаётся в обычной Max-квоте подписки
 
-Старая gateway-архитектура (Python-демон спавнит `claude -p` на каждое сообщение в Telegram) после cutover расходует деньги из SDK pool на каждый turn. Этот плагин держит **одну** живую interactive сессию — расход остаётся в Max.
+Источник: [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+
+Старая gateway-архитектура (Python-демон спавнит `claude -p` на каждое сообщение в Telegram) после cutover расходует деньги из SDK-кредита на каждый turn. Этот плагин держит **одну** живую interactive сессию (или пул per-chat tmux-сессий при `multichat.enabled`) — расход остаётся в обычной Max-квоте.
 
 ## Сроки
 
@@ -55,7 +60,7 @@ Anthropic 15 июня 2026 разделяет billing:
 ## Поддержка миграции
 
 - **Issues по миграции** — [github.com/qwwiwi/dashi-plugin-claude-code/issues](https://github.com/qwwiwi/dashi-plugin-claude-code/issues) с тегом `migration`. Опишите ваш текущий setup максимально подробно.
-- **Telegram чат поддержки** — открывается ближе к 2026-06-01 (ссылка появится здесь и в [README.md](README.md))
+- **Telegram чат поддержки** — community-run; проверьте актуальный invite через [issues репозитория](https://github.com/qwwiwi/dashi-plugin-claude-code/issues), pinned issue содержит текущую ссылку.
 
 ## Не успеваете до 2026-06-15?
 

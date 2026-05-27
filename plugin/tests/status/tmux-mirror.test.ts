@@ -22,6 +22,10 @@ import {
   type TmuxExec,
   type TmuxExecResult,
 } from '../../src/status/tmux-mirror.js'
+import {
+  type ChatPolicy,
+  type MultichatPolicy,
+} from '../../src/chats/policy-loader.js'
 
 interface SentOp {
   method: 'sendMessage' | 'editMessageText' | 'deleteMessage'
@@ -856,6 +860,165 @@ describe('TmuxMirror — status accessor', () => {
     expect(s.messageId).toBeDefined()
     expect(s.lastPollAt).toBe(1000)
     expect(s.lastError).toBeUndefined()
+    await mirror.stop()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Multichat policy gate (Codex review fix 2026-05-27, TASK-2 /
+// HIGH #9). The mirror must consult `shouldMirrorTmuxForChat(policy,
+// chatId)` per public entry point — pre-fix a single boolean was
+// computed at construction time from the warchief's chat id, leaking
+// pane content into chats absent from policy (fail-open) or making
+// the wrong chat the source of truth for the wrong instance.
+// ─────────────────────────────────────────────────────────────────────
+
+function makeChatPolicy(overrides: Partial<ChatPolicy> = {}): ChatPolicy {
+  return {
+    mode: 'private',
+    streaming: 'progress',
+    tmux_mirror: true,
+    edit_message_progress: true,
+    delivery: 'streamed',
+    persona_file: 'persona.md',
+    handoff_file: 'handoff.md',
+    system_reminder: '',
+    idle_ttl_ms: 1_800_000,
+    max_queue_depth: 1,
+    ...overrides,
+  }
+}
+
+function makePolicy(chats: Record<string, ChatPolicy>): MultichatPolicy {
+  return {
+    version: 1,
+    allowlist: { chats: Object.keys(chats), users: [] },
+    mention_allowlist: [],
+    chats,
+  }
+}
+
+describe('TmuxMirror — multichat policy isolation', () => {
+  const WARCHIEF = '164795011'
+  const PUBLIC_GROUP = '-1003784643974'
+  const UNLISTED = '999'
+
+  test('chat with tmux_mirror=true sends the initial pane message', async () => {
+    const stub = makeStubApi()
+    const exec = makeExec([ok('warchief pane')])
+    const policy = makePolicy({
+      [WARCHIEF]: makeChatPolicy({ tmux_mirror: true }),
+    })
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: WARCHIEF,
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+      policy,
+    })
+    await mirror.start()
+    expect(stub.ops.filter((o) => o.method === 'sendMessage').length).toBe(1)
+    expect(mirror.status().enabled).toBe(true)
+    await mirror.stop()
+  })
+
+  test('chat with tmux_mirror=false is a complete no-op (fail-closed for public groups)', async () => {
+    const stub = makeStubApi()
+    const exec = makeExec([ok('public pane should never appear')])
+    const policy = makePolicy({
+      [WARCHIEF]: makeChatPolicy({ tmux_mirror: true }),
+      [PUBLIC_GROUP]: makeChatPolicy({
+        tmux_mirror: false,
+        mode: 'public',
+        streaming: 'off',
+      }),
+    })
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: PUBLIC_GROUP,
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+      policy,
+    })
+
+    await mirror.start()
+    await mirror.onPoll()
+    await mirror.bump()
+    await mirror.stop()
+
+    expect(stub.ops.length).toBe(0)
+    expect(mirror.status().enabled).toBe(false)
+    expect(mirror.status().messageId).toBeUndefined()
+  })
+
+  test('chat absent from policy is fail-CLOSED (no traffic)', async () => {
+    // Regression for HIGH #9: pre-fix `shouldEnableMirror()` returned
+    // `true` for a missing chat entry (fail-OPEN). The new helper is
+    // fail-closed — verify a chat that nobody declared in policy
+    // receives zero pane content.
+    const stub = makeStubApi()
+    const exec = makeExec([ok('leak canary should not appear')])
+    const policy = makePolicy({
+      [WARCHIEF]: makeChatPolicy({ tmux_mirror: true }),
+    })
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: UNLISTED,
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+      policy,
+    })
+    await mirror.start()
+    expect(stub.ops.length).toBe(0)
+    await mirror.stop()
+    expect(stub.ops.length).toBe(0)
+  })
+
+  test('null policy preserves legacy single-DM behaviour (mirror runs)', async () => {
+    const stub = makeStubApi()
+    const exec = makeExec([ok('legacy DM pane')])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: WARCHIEF,
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+      policy: null,
+    })
+    await mirror.start()
+    expect(stub.ops.filter((o) => o.method === 'sendMessage').length).toBe(1)
+    await mirror.stop()
+  })
+
+  test('omitting policy in opts defaults to null (legacy behaviour)', async () => {
+    // Construction without `policy` must NOT silently deny — existing
+    // single-DM deployments rely on the legacy default of "mirror
+    // always runs when enabled".
+    const stub = makeStubApi()
+    const exec = makeExec([ok('legacy default')])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: WARCHIEF,
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+      // `policy` deliberately omitted.
+    })
+    await mirror.start()
+    expect(stub.ops.filter((o) => o.method === 'sendMessage').length).toBe(1)
     await mirror.stop()
   })
 })

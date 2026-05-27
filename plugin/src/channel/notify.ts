@@ -3,12 +3,23 @@
 // Claude Code drops meta keys with hyphens silently (per RESEARCH.md). We
 // enforce identifier-style snake_case keys and stringify all values so the
 // receiver never has to guess how to render a number/boolean.
+//
+// Multichat contract: callers MUST populate `meta.chat_id` with the
+// originating Telegram chat id (already done in handlers.ts:buildMeta).
+// The master Claude session inspects `meta.chat_id` to know which chat
+// the inbound message came from — there is NO implicit fallback to the
+// warchief's DM. This module never injects a default chat_id; an event
+// arriving without one is a wiring bug at the caller, not something we
+// paper over here.
 
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import type { Logger } from '../log.js'
 
 export type ChannelEvent = {
   content: string
+  // Caller-supplied metadata. In multichat mode this MUST include
+  // `chat_id` so the master session can route the event; in the legacy
+  // DM-only mode `chat_id` is still set (handlers.ts always populates it).
   meta: Record<string, string>
 }
 

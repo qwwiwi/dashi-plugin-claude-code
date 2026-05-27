@@ -2,7 +2,7 @@
 
 Этот гайд позволяет за пару кликов включить в своём агенте «rolling activity card» — одно сообщение в Telegram, которое обновляется по мере исполнения tool-calls (`Bash`, `Edit`, `Write`, ...) и в конце сессии превращается в финальное `done -- Ns`.
 
-Это **вариант A** из брейншторма UX 2026-05-20.
+Это **вариант A** из брейншторма UX 2026-05-20. С тех пор зашиплены: ProgressReporter (PR #5/8), TaskMirror (PR #11), фильтр шумных tool-ов и финализация Stop (PR #12), per-chat изоляция в multichat-режиме (PR #13).
 
 ---
 
@@ -15,13 +15,10 @@
 | 3 | `ProgressReporter` редактирует одно Telegram-сообщение per chat по мере событий | визуально в чате с ботом |
 | 4 | `Stop` финализирует сообщение строкой `done -- Ns` | визуально |
 | 5 | Бэкенд игнорирует ошибки и не блокирует агента | хук всегда выходит с `0`, агент продолжает работу даже если webhook упал |
+| 6 | Шумные read-only tools (`Read`, `Grep`, `Glob`, `ToolSearch`) не показываются в карточке, только Bash/Edit/Write/Task* и mutating MCP-вызовы | строка `▸` появляется только для значимых tool-ов |
+| 7 | `TaskMirror` отдельным сообщением показывает progress по TodoWrite-плану (если агент пользуется TodoWrite) | отдельное сообщение, обновляется в реальном времени |
 
-Что **не реализовано** в этой итерации:
-- Фильтр шумных tools (Read/Grep/Glob/ToolSearch). Сейчас все события летят на webhook, рендер ловит самые недавние 5 (`config.progress.recent_buffer`).
-- Per-tool emoji-free статусы (`[ok]`/`[run]`) в самой карточке. Текущий renderer использует typographic маркер `▸` для строки.
-- Mirror в TG для MCP-инструментов (`mcp__dashi-channel__*`, `mcp__dashi-gbrain-*`). Сейчас они идут как обычные `tool_name = mcp__...` — рендерер для них даст generic-summary.
-
-Эти пункты — следующий PR.
+Конфиг ключевых параметров — в `<state_dir>/config.json` блок `"progress": { ... }`: `edit_throttle_ms`, `recent_buffer`, `session_ttl_ms`, `noisy_tools` (override default-листа), `enabled`.
 
 ---
 
@@ -45,8 +42,8 @@ TOKEN=$(grep '^TELEGRAM_WEBHOOK_TOKEN=' ~/.claude-lab/<agent>/secrets/channel.en
 # Какой URL слушает webhook
 URL="http://127.0.0.1:8093/hooks/agent"   # подставь свой port
 
-# Chat ID (твой Telegram user id)
-CHAT_ID="164795011"
+# Chat ID (твой Telegram user id — узнать у @userinfobot)
+CHAT_ID="<your-telegram-user-id>"
 ```
 
 ### 2. Запатчить settings.json

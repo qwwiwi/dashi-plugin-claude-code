@@ -24,6 +24,10 @@ function makeConfig(overrides: Partial<AppConfig['status']> = {}): AppConfig {
       interval_ms: 700,
       ttl_ms: 300_000,
       delete_on_complete: true,
+      // Keep legacy behaviour (eager «Печатает...» bubble) so the existing
+      // suite covers the non-suppressed path. Dedicated tests below opt in
+      // by passing { suppress_typing_bubble: true } via overrides.
+      suppress_typing_bubble: false,
       ...overrides,
     },
     album: { flush_ms: 2000 },
@@ -698,5 +702,119 @@ describe('StatusManager.recordActivityByChatId', () => {
     expect(last.text).not.toContain('cmd-00')
     expect(last.text).not.toContain('cmd-01')
     expect(last.text).not.toContain('cmd-06')
+  })
+})
+
+describe('StatusManager.suppress_typing_bubble', () => {
+  // Warchief request 2026-05-27: the «Печатает...» bubble is visual noise
+  // on top of TmuxMirror. When suppress_typing_bubble=true (production
+  // default), the bubble must NOT exist until state advances past typing.
+  // Native sendChatAction (header animation) and TTL guard still run.
+
+  test('skips initial sendMessage while state is typing', async () => {
+    const { mgr, api } = makeManager({
+      config: makeConfig({ suppress_typing_bubble: true }),
+    })
+    const handle = await mgr.start('164795011', undefined)
+    expect(handle.messageId).toBe(0)
+    // No send for the bubble. sendChatAction still fires immediately so the
+    // Telegram header animation is unchanged.
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(0)
+    expect(api.calls.filter((c) => c.kind === 'chat_action').length).toBe(1)
+    expect(mgr.isActive('164795011')).toBe(true)
+  })
+
+  test('does not edit while state stays in typing across ticks', async () => {
+    const { mgr, api, clock } = makeManager({
+      config: makeConfig({ suppress_typing_bubble: true }),
+    })
+    await mgr.start('164795011', undefined)
+    clock.advance(5000)
+    expect(api.calls.filter((c) => c.kind === 'edit').length).toBe(0)
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(0)
+  })
+
+  test('lazy-creates bubble on first non-typing update', async () => {
+    const { mgr, api } = makeManager({
+      config: makeConfig({ suppress_typing_bubble: true }),
+    })
+    await mgr.start('164795011', 4242)
+    await mgr.updateByChatId('164795011', { kind: 'tool', toolName: 'Bash' })
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(1)
+    expect(sends[0]!.text).toContain('Bash')
+    // Lazy create preserves the original reply target captured at start.
+    const opts = sends[0]!.opts as { reply_to_message_id?: number }
+    expect(opts.reply_to_message_id).toBe(4242)
+  })
+
+  test('lazy-creates bubble on first activity event', async () => {
+    const { mgr, api } = makeManager({
+      config: makeConfig({ suppress_typing_bubble: true }),
+    })
+    await mgr.start('164795011', undefined)
+    await mgr.recordActivityByChatId('164795011', { kind: 'reasoning' })
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(1)
+    // First render is the activity block, not «Печатает...».
+    expect(sends[0]!.text).not.toContain('Печатает')
+  })
+
+  test('cancel on a pure-typing session is a quiet no-op (no edit, no leak)', async () => {
+    const { mgr, api } = makeManager({
+      config: makeConfig({ suppress_typing_bubble: true }),
+    })
+    await mgr.start('164795011', undefined)
+    await mgr.cancel('164795011', 'user stop')
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(0)
+    expect(api.calls.filter((c) => c.kind === 'edit').length).toBe(0)
+    expect(mgr.isActive('164795011')).toBe(false)
+  })
+
+  test('complete on a pure-typing session does not call deleteMessage', async () => {
+    const { mgr, api } = makeManager({
+      config: makeConfig({ suppress_typing_bubble: true }),
+    })
+    await mgr.start('164795011', undefined)
+    await mgr.complete('164795011')
+    expect(api.calls.filter((c) => c.kind === 'delete').length).toBe(0)
+    expect(mgr.isActive('164795011')).toBe(false)
+  })
+
+  test('TTL on a pure-typing session expires silently without «Остановлено» bubble', async () => {
+    const { mgr, api, clock, config } = makeManager({
+      config: makeConfig({ suppress_typing_bubble: true }),
+    })
+    await mgr.start('164795011', undefined)
+    clock.advance(config.status.ttl_ms + 1)
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(0)
+    expect(api.calls.filter((c) => c.kind === 'edit').length).toBe(0)
+    expect(mgr.isActive('164795011')).toBe(false)
+  })
+
+  test('chat_action still pulses on the 4s timer while bubble is suppressed', async () => {
+    const { mgr, api, clock } = makeManager({
+      config: makeConfig({ suppress_typing_bubble: true }),
+    })
+    await mgr.start('164795011', undefined)
+    expect(api.calls.filter((c) => c.kind === 'chat_action').length).toBe(1)
+    clock.advance(4000)
+    expect(api.calls.filter((c) => c.kind === 'chat_action').length).toBe(2)
+    clock.advance(4000)
+    expect(api.calls.filter((c) => c.kind === 'chat_action').length).toBe(3)
+  })
+
+  test('subsequent edits after lazy-create go through editMessageText', async () => {
+    const { mgr, api } = makeManager({
+      config: makeConfig({ suppress_typing_bubble: true }),
+    })
+    await mgr.start('164795011', undefined)
+    await mgr.updateByChatId('164795011', { kind: 'thinking' })
+    await mgr.updateByChatId('164795011', { kind: 'tool', toolName: 'Read' })
+    // First non-typing transition sends; second edits the same message.
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(1)
+    expect(api.calls.filter((c) => c.kind === 'edit').length).toBeGreaterThanOrEqual(1)
+    const lastEdit = api.calls.filter((c) => c.kind === 'edit').pop()!
+    expect(lastEdit.text).toContain('Read')
   })
 })

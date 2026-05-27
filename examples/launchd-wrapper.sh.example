@@ -1,0 +1,131 @@
+#!/bin/sh
+# dashi-plugin-claude-code · launchd wrapper для macOS
+#
+# Назначение:
+#   launchd запускает этот скрипт как foreground-процесс с tracked PID.
+#   Скрипт стартует tmux-сессию с Claude Code, прокидывает Enter в welcome-промты,
+#   и БЛОКИРУЕТСЯ на tmux wait-for пока сессия жива.
+#   Когда tmux-сессия завершится (claude exit, crash, ручной kill-session) — wait-for
+#   разблокируется, скрипт выйдет, launchd зафиксирует exit code и применит KeepAlive.
+#
+# Почему wrapper, а не один `sh -c` в ProgramArguments:
+#   Прежняя версия использовала `exec tmux new-session -d ...; sleep 6; send-keys ...`.
+#   `exec` подменяет shell на tmux client (который сразу завершается с success,
+#   потому что -d детачит сервер). Все команды после `exec` НЕ выполняются.
+#   Дополнительно launchd теряет supervised PID — supervisor процесс ушёл, а tmux
+#   server живёт сам по себе. KeepAlive/Restart не работают корректно.
+#
+# Установка:
+#   cp examples/launchd-wrapper.sh.example ~/.claude-lab/<agent>/scripts/launchd-wrapper.sh
+#   chmod +x ~/.claude-lab/<agent>/scripts/launchd-wrapper.sh
+#   $EDITOR ~/.claude-lab/<agent>/scripts/launchd-wrapper.sh    # подставить пути/имена
+#
+# Замены:
+#   <you>      → ваш macOS username (echo $USER)
+#   <agent>    → имя вашего агента (lowercase)
+#
+# См. docs/03-installation-macos.md для полной инструкции.
+
+set -eu
+
+# --- Параметры (подставьте свои) ---------------------------------------------
+AGENT="<agent>"
+USER_HOME="/Users/<you>"
+ENV_FILE="${USER_HOME}/.claude-lab/${AGENT}/secrets/channel.env"
+TMUX_SESSION="channel-${AGENT}"
+
+# Путь к tmux зависит от вашей установки:
+#   Apple Silicon (M1/M2/M3/M4): /opt/homebrew/bin/tmux
+#   Intel Mac:                    /usr/local/bin/tmux
+# Проверьте `which tmux` и подставьте.
+TMUX_BIN="/opt/homebrew/bin/tmux"
+
+# Команда, которую запускаем внутри tmux. Можно заменить на полный путь к claude
+# если он не в PATH у launchd.
+CLAUDE_CMD="claude --dangerously-load-development-channels server:dashi-channel"
+
+# Сколько секунд ждать первого welcome-промта (если он есть). 6 — эмпирически.
+WELCOME_DELAY_1=6
+WELCOME_DELAY_2=2
+# -----------------------------------------------------------------------------
+
+log() {
+  # stderr → StandardErrorPath в plist
+  printf '[%s] launchd-wrapper: %s\n' "$(date -u +%FT%TZ)" "$*" >&2
+}
+
+# Source secrets (TELEGRAM_BOT_TOKEN и т.п.) без коммита в plist.
+if [ -f "${ENV_FILE}" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "${ENV_FILE}"
+  set +a
+else
+  log "FATAL: env file not found: ${ENV_FILE}"
+  exit 78  # EX_CONFIG
+fi
+
+# Если tmux-сессия с таким именем уже существует — это аномалия (предыдущий запуск
+# не сделал cleanup). Прибиваем её и стартуем заново. Без этого новый
+# new-session -d выдаст «duplicate session: channel-...» и скрипт упадёт в loop.
+if "${TMUX_BIN}" has-session -t "${TMUX_SESSION}" 2>/dev/null; then
+  log "stale tmux session '${TMUX_SESSION}' found, killing before restart"
+  "${TMUX_BIN}" kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+fi
+
+# EXPECTED_SHUTDOWN: ставится в 1 trap-ом при получении SIGTERM/SIGINT от launchd.
+# Используется ниже чтобы различить graceful stop (operator) и unexpected death tmux.
+EXPECTED_SHUTDOWN=0
+
+# Trap для cleanup при SIGTERM/SIGINT от launchd (launchctl kill / kickstart -k).
+cleanup() {
+  EXPECTED_SHUTDOWN=1
+  log "cleanup: killing tmux session '${TMUX_SESSION}' (operator-initiated)"
+  "${TMUX_BIN}" kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+  exit 0
+}
+trap cleanup TERM INT
+
+# Стартуем claude внутри detached tmux-сессии.
+# -d детачит, новый tmux server живёт сам по себе — но мы дальше блокируемся
+# на wait-for, который привязан к жизни сессии, не к жизни tmux client.
+log "starting tmux session '${TMUX_SESSION}'"
+"${TMUX_BIN}" new-session -d -s "${TMUX_SESSION}" "${CLAUDE_CMD}"
+
+# Welcome-промты Claude Code (первый запуск).
+# 1) «Allow external CLAUDE.md file imports?»  → Enter
+# 2) «--dangerously-load-development-channels» → Enter
+# Если промтов нет (persistent approvals уже записаны в ~/.claude/settings.json),
+# Enter-ы безвредны — попадут в input буфер живой Claude Code сессии.
+(
+  sleep "${WELCOME_DELAY_1}"
+  "${TMUX_BIN}" send-keys -t "${TMUX_SESSION}" Enter 2>/dev/null || true
+  sleep "${WELCOME_DELAY_2}"
+  "${TMUX_BIN}" send-keys -t "${TMUX_SESSION}" Enter 2>/dev/null || true
+) &
+WELCOME_PID=$!
+
+# Главный foreground-блок: ждём пока tmux session существует.
+# tmux wait-for -S <chan> разблокируется при tmux signal -S, что не наш кейс,
+# поэтому делаем простой polling-loop. Минимальная нагрузка, max latency 5 сек
+# на детект смерти сессии.
+log "supervising tmux session '${TMUX_SESSION}' (pid wrapper=$$)"
+while "${TMUX_BIN}" has-session -t "${TMUX_SESSION}" 2>/dev/null; do
+  sleep 5
+done
+
+# Сессия умерла. Различаем два сценария:
+#   (a) EXPECTED_SHUTDOWN=1 — мы сюда не попадём (cleanup сделал exit 0 раньше),
+#       но на всякий случай если trap отработал и tmux-сессия уже мертва — exit 0.
+#   (b) EXPECTED_SHUTDOWN=0 — claude crash, claude exit, manual kill-session,
+#       OOM, ranаway sandbox — для launchd это «unexpected death», нужен respawn.
+#       Выходим с exit 1 → launchd KeepAlive.SuccessfulExit=false перезапустит.
+wait "${WELCOME_PID}" 2>/dev/null || true
+
+if [ "${EXPECTED_SHUTDOWN}" = "1" ]; then
+  log "tmux session '${TMUX_SESSION}' ended (expected shutdown), wrapper exiting 0"
+  exit 0
+fi
+
+log "tmux session '${TMUX_SESSION}' died unexpectedly, wrapper exiting 1 (launchd will respawn)"
+exit 1

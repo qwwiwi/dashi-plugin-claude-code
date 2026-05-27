@@ -21,11 +21,18 @@ import type { Logger } from '../log.js'
 // emits `tool_start`; PostToolUse emits `tool_end`. The renderer collapses
 // matching pairs into a single rendered line and uses `tool_use_id` to
 // resolve Agent done-summary updates.
+//
+// Multichat: every variant carries an optional `chatId` so StatusManager
+// can route status updates to the correct Telegram chat. The id is sourced
+// from the hook payload (`ClaudeHookCommonShape.chatId`) by `toActivityEvent`
+// when present; for the legacy single-chat wiring it stays `undefined` and
+// StatusManager falls back to its single-chat behaviour.
 export interface ToolStartEvent {
   readonly kind: 'tool_start'
   readonly toolName: string
   readonly toolInput: Record<string, unknown>
   readonly toolUseId: string
+  readonly chatId?: string
 }
 
 export interface ToolEndEvent {
@@ -37,20 +44,24 @@ export interface ToolEndEvent {
   // gateway.py:1855: dispatch "summary" cap) before display. We carry the
   // raw value so the renderer is the single mask point.
   readonly toolResult?: unknown
+  readonly chatId?: string
 }
 
 // Phase events flip the status to `reasoning…` without recording a tool
 // call. SessionStart also opens a status if none is active; Stop closes it.
 export interface ReasoningEvent {
   readonly kind: 'reasoning'
+  readonly chatId?: string
 }
 
 export interface SessionStartEvent {
   readonly kind: 'session_start'
+  readonly chatId?: string
 }
 
 export interface SessionStopEvent {
   readonly kind: 'session_stop'
+  readonly chatId?: string
 }
 
 export type ActivityStatusEvent =
@@ -71,6 +82,7 @@ export type ActivityStatusEvent =
 export interface TodoWriteEvent {
   readonly kind: 'todo_write'
   readonly todos: ReadonlyArray<TodoItem>
+  readonly chatId?: string
 }
 
 // TaskCreate / TaskUpdate hooks emitted by the newer Claude Code harness.
@@ -88,12 +100,14 @@ export interface TaskCreateEvent {
   // on PreToolUse. Format: usually `Task #<n> created` — TaskMirror runs the
   // same regex extract as the warchief's terminal renderer.
   readonly toolResult?: unknown
+  readonly chatId?: string
 }
 
 export interface TaskUpdateEvent {
   readonly kind: 'task_update'
   readonly toolUseId: string
   readonly input: TaskUpdateInput
+  readonly chatId?: string
 }
 
 // Session-stop signal for TaskMirror specifically. Renamed from the
@@ -101,6 +115,7 @@ export interface TaskUpdateEvent {
 // accidentally consume a non-todo Stop hook.
 export interface TodoSessionStopEvent {
   readonly kind: 'todo_session_stop'
+  readonly chatId?: string
 }
 
 export type TaskMirrorEvent =
@@ -115,8 +130,21 @@ export type TaskMirrorEvent =
  * `UserPromptSubmit` carries the user prompt text — we deliberately drop it
  * here so the prompt never reaches StatusManager (and through it Telegram).
  * The phase change to `reasoning` is the only signal that survives.
+ *
+ * Multichat: `payload.chatId` (required by `ClaudeHookCommonShape`) is
+ * propagated to every emitted event so StatusManager can route updates to
+ * the correct chat. The plugin's webhook handler also surfaces
+ * `process.env.CHAT_ID` upstream when a hook fires inside a tmux session
+ * that the master process spawned — but propagation from the payload is
+ * the source of truth here. `exactOptionalPropertyTypes` requires the
+ * property to be absent rather than `undefined`; the helper below
+ * conditionally spreads it.
  */
 export function toActivityEvent(payload: ClaudeHookPayload): ActivityStatusEvent {
+  const chatIdProp =
+    payload.chatId !== undefined && payload.chatId !== ''
+      ? { chatId: payload.chatId }
+      : {}
   switch (payload.hook_event_name) {
     case 'PreToolUse':
       return {
@@ -124,6 +152,7 @@ export function toActivityEvent(payload: ClaudeHookPayload): ActivityStatusEvent
         toolName: payload.tool_name,
         toolInput: payload.tool_input,
         toolUseId: payload.tool_use_id,
+        ...chatIdProp,
       }
     case 'PostToolUse': {
       const event: ToolEndEvent = {
@@ -131,6 +160,7 @@ export function toActivityEvent(payload: ClaudeHookPayload): ActivityStatusEvent
         toolName: payload.tool_name,
         toolInput: payload.tool_input,
         toolUseId: payload.tool_use_id,
+        ...chatIdProp,
       }
       // exactOptionalPropertyTypes: only attach `toolResult` if defined,
       // otherwise the property must be absent — `undefined` is not allowed.
@@ -139,11 +169,11 @@ export function toActivityEvent(payload: ClaudeHookPayload): ActivityStatusEvent
         : event
     }
     case 'Stop':
-      return { kind: 'session_stop' }
+      return { kind: 'session_stop', ...chatIdProp }
     case 'UserPromptSubmit':
-      return { kind: 'reasoning' }
+      return { kind: 'reasoning', ...chatIdProp }
     case 'SessionStart':
-      return { kind: 'session_start' }
+      return { kind: 'session_start', ...chatIdProp }
   }
 }
 
@@ -166,8 +196,16 @@ export function toTodoWriteEvent(
   payload: ClaudeHookPayload,
   log?: Logger,
 ): TaskMirrorEvent | null {
+  // Same chatId propagation rule as toActivityEvent — the master
+  // session's dispatcher passes the event to the right per-chat
+  // TaskMirror instance.
+  const chatIdProp =
+    payload.chatId !== undefined && payload.chatId !== ''
+      ? { chatId: payload.chatId }
+      : {}
+
   if (payload.hook_event_name === 'Stop') {
-    return { kind: 'todo_session_stop' }
+    return { kind: 'todo_session_stop', ...chatIdProp }
   }
   if (payload.hook_event_name === 'PostToolUse' && payload.tool_name === 'TodoWrite') {
     const parsed = TodoWriteInputSchema.safeParse(payload.tool_input)
@@ -177,7 +215,7 @@ export function toTodoWriteEvent(
       })
       return null
     }
-    return { kind: 'todo_write', todos: parsed.data.todos }
+    return { kind: 'todo_write', todos: parsed.data.todos, ...chatIdProp }
   }
 
   // TaskCreate -- emit on PreToolUse so the milestone shows up the moment the
@@ -198,6 +236,7 @@ export function toTodoWriteEvent(
       kind: 'task_create',
       toolUseId: payload.tool_use_id,
       input: parsed.data,
+      ...chatIdProp,
     }
     return payload.hook_event_name === 'PostToolUse' && payload.tool_result !== undefined
       ? { ...event, toolResult: payload.tool_result }
@@ -219,6 +258,7 @@ export function toTodoWriteEvent(
       kind: 'task_update',
       toolUseId: payload.tool_use_id,
       input: parsed.data,
+      ...chatIdProp,
     }
   }
 
