@@ -1,0 +1,30 @@
+{
+  "_comment_1": "Рекомендуемые permissions для autonomous-агентов под dashi-plugin.",
+  "_comment_2": "Скопируй как ~/.claude-lab/<agent>/.claude/settings.local.json ИЛИ смерджи permissions.deny в свой settings.json.",
+  "_comment_3": "Применяется на старте новой Claude-сессии (рестарт сервиса).",
+  "_comment_4": "Зачем: блокирует interactive tools, которые рисуют меню прямо в tmux и блокируются на stdin — плагин их сейчас не пробрасывает в Telegram, и агент висит молча.",
+  "_comment_5": "См. docs/05-troubleshooting.md → Проблема 11.",
+
+  "permissions": {
+    "deny": [
+      "AskUserQuestion",
+      "ExitPlanMode",
+
+      "Bash(vim:*)",
+      "Bash(vi:*)",
+      "Bash(nano:*)",
+      "Bash(emacs:*)",
+      "Bash(less:*)",
+      "Bash(more:*)",
+      "Bash(top)",
+      "Bash(htop:*)",
+      "Bash(watch:*)",
+
+      "Bash(git rebase -i:*)",
+      "Bash(git add -i:*)",
+      "Bash(git commit -i:*)",
+      "Bash(npm init)",
+      "Bash(yarn init)"
+    ]
+  }
+}
