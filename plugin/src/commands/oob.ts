@@ -107,6 +107,11 @@ export interface TmuxMirrorControl {
   start(): Promise<void>
   stop(): Promise<void>
   bump?(): Promise<void>
+  // MED-A #2: recovery from a permanent Telegram error (403 / parse)
+  // that flipped `disabled=true`. /mirror on calls reset() before
+  // start() so the warchief never has to restart the plugin.
+  // Optional for source-compat with existing test stubs.
+  reset?(): void
   status(): {
     enabled: boolean
     messageId?: number
@@ -350,6 +355,16 @@ export async function handleOobCommand(
       if (action === 'on') {
         ctx.log.info('oob /mirror on', { chat_id: ctx.chatId })
         try {
+          // MED-A #2: a permanent error (403 / parse) flips the
+          // mirror's `disabled` flag and the polling loop becomes a
+          // no-op forever — `/mirror off; /mirror on` alone never
+          // cleared the flag because start() short-circuits on a
+          // disabled mirror. Call reset() first so /mirror on
+          // unconditionally re-arms the mirror after a permanent
+          // error. Idempotent when the mirror is healthy. Optional
+          // on the control interface for source-compat with test
+          // stubs that don't implement it.
+          if (mirror.reset) mirror.reset()
           await mirror.start()
         } catch (err) {
           ctx.log.warn('oob /mirror on start failed', {

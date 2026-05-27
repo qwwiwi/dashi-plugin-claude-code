@@ -10,7 +10,11 @@
 #
 # Failure modes (graceful degradation — do not block the session):
 #   * CHAT_ID empty / unset      -> log to stderr, exit 0 (no injection).
-#   * persona.md missing         -> log to stderr, exit 0.
+#   * persona.md missing         -> log to stderr, emit degraded-mode
+#                                   additionalContext warning so the
+#                                   session sees that pre-tool-use will
+#                                   deny every tool call until persona
+#                                   is provisioned. Exit 0.
 #   * policy.yaml unreadable     -> log to stderr, exit 0.
 #   * python3 unavailable        -> log to stderr, exit 0.
 #
@@ -38,18 +42,48 @@ WORKSPACE="${CLAUDE_WORKSPACE_DIR:-${HOME}/.claude-lab/thrall/.claude}"
 POLICY_PATH="${WORKSPACE}/chats/policy.yaml"
 PERSONA_PATH="${WORKSPACE}/chats/${CHAT_ID}/persona.md"
 
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "session-start: python3 not available, skipping injection" >&2
+  exit 0
+fi
+
+# Persona missing while running inside a multichat session is an
+# operationally degraded state — the session will boot but every
+# subsequent tool call will be denied by pre-tool-use.sh (fail-closed
+# branch when policy lookup fails or persona context is absent). Emit
+# an explicit additionalContext warning so the Claude session sees the
+# degradation on startup and can route the next action (escalate to
+# operator, refuse work, etc.) instead of plowing into a wall of denies.
 if [[ ! -f "$PERSONA_PATH" ]]; then
-  echo "session-start: persona file not found at ${PERSONA_PATH}" >&2
+  echo "session-start: persona file not found at ${PERSONA_PATH} — emitting degraded-mode warning" >&2
+  CHAT_ID="$CHAT_ID" \
+  PERSONA_PATH="$PERSONA_PATH" \
+  python3 - <<'PYEOF'
+import json
+import os
+
+chat_id = os.environ.get('CHAT_ID', '')
+persona_path = os.environ.get('PERSONA_PATH', '')
+
+warning = (
+    f"⚠ Persona file missing for chat {chat_id}: {persona_path}. "
+    "Multichat session running in degraded mode — tool calls will be "
+    "denied by pre-tool-use until persona is provisioned."
+)
+
+payload = {
+    'hookSpecificOutput': {
+        'hookEventName': 'SessionStart',
+        'additionalContext': warning,
+    }
+}
+print(json.dumps(payload, ensure_ascii=False))
+PYEOF
   exit 0
 fi
 
 if [[ ! -f "$POLICY_PATH" ]]; then
   echo "session-start: policy file not found at ${POLICY_PATH}" >&2
-  exit 0
-fi
-
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "session-start: python3 not available, skipping injection" >&2
   exit 0
 fi
 

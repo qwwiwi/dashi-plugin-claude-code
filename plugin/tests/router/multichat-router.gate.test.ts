@@ -436,6 +436,58 @@ describe('dispatch() chat_id validation (TASK-5 bug 4)', () => {
       fx.loggerState.logs.some((l) => l.msg === 'router.dispatch.invalid_chat_id'),
     ).toBe(true)
   })
+
+  // ──────────────────────────────────────────────────────────────────
+  // Opus MED-B #20 (2026-05-27): expanded chat_id edge cases at the
+  // dispatch boundary. Each payload below MUST be dropped without
+  // creating any chats directory and without crashing the dispatch
+  // loop. The primitive (assertValidChatId) carries the rejection;
+  // these tests assert that the router's catch block routes it to a
+  // structured log + early return.
+  // ──────────────────────────────────────────────────────────────────
+
+  const MED_B_INVALID_CHAT_IDS: Array<{ name: string; chatId: string }> = [
+    { name: 'absolute path (/etc/passwd)', chatId: '/etc/passwd' },
+    { name: 'Windows traversal (..\\\\x)', chatId: '..\\x' },
+    { name: 'single space', chatId: ' ' },
+    { name: 'newline', chatId: '\n' },
+    { name: 'float 1.5', chatId: '1.5' },
+    { name: 'empty string', chatId: '' },
+    { name: 'Infinity string', chatId: 'Infinity' },
+    { name: 'negative zero', chatId: '-0' },
+    { name: '4 KB digit smuggle', chatId: '1'.repeat(4096) },
+  ]
+
+  for (const { name, chatId } of MED_B_INVALID_CHAT_IDS) {
+    test(`MED-B #20: chat_id ${name} — drop, no FS, structured log`, async () => {
+      const policy = makePolicy({
+        chats: { '164795011': makeChatPolicy() },
+        allowlist_users: ['164795011'],
+      })
+      const router = makeRouter(fx, policy)
+
+      await router.dispatch({
+        text: 'x',
+        chat_id: chatId,
+        user_id: '164795011',
+        user: 'dashi',
+        timestamp: '2026-05-27T00:00:00Z',
+      })
+
+      // No chats dir created — primitive killed the dispatch.
+      expect(existsSync(join(fx.stateDir, 'chats'))).toBe(false)
+      expect(fx.pool.spawned).toEqual([])
+      const invalidLogs = fx.loggerState.logs.filter(
+        (l) => l.msg === 'router.dispatch.invalid_chat_id',
+      )
+      expect(invalidLogs.length).toBe(1)
+      // Log MUST NOT echo the full smuggle payload (4 KB) verbatim —
+      // the dispatch path truncates at 64 chars.
+      const ctx = invalidLogs[0]?.ctx
+      const echoed = typeof ctx?.chat_id === 'string' ? ctx.chat_id : ''
+      expect(echoed.length).toBeLessThanOrEqual(64)
+    })
+  }
 })
 
 // ──────────────────────────────────────────────────────────────────────
@@ -558,6 +610,25 @@ describe('outbox drain concurrency guard (TASK-5 bug 3)', () => {
   })
 
   test('slow first drain in flight → second tick skips, single sendMessage call', async () => {
+    // Opus MED-B #19 (2026-05-27): the previous version of this test
+    // used real `setTimeout(800)` to wait through multiple 200 ms
+    // poll ticks. On loaded CI the wall clock slipped and the
+    // assertion `skipped >= 1` flaked.
+    //
+    // Fake timers (vi.useFakeTimers) do not work here because
+    // pollOutboxOnce performs real libuv I/O (readdir, rename,
+    // readFile) — those operations only resolve on a real event-loop
+    // tick, not on Promise.resolve / process.nextTick / setImmediate
+    // (the latter is also faked under vi.useFakeTimers). Fake timers
+    // therefore wedge the drain indefinitely.
+    //
+    // The deterministic alternative: spy on global setInterval before
+    // start(), capture the interval callback, and NEVER let it auto-
+    // fire. We drive ticks by calling the captured callback by hand —
+    // each invocation is observable, each one happens after we have
+    // explicitly awaited the previous tick's work to settle (or
+    // confirmed it is still in-flight). Real I/O completes naturally
+    // between awaits; no wall-clock waits are required.
     const ownerChat = '164795011'
     const policy = makePolicy({
       chats: { [ownerChat]: makeChatPolicy() },
@@ -573,14 +644,8 @@ describe('outbox drain concurrency guard (TASK-5 bug 3)', () => {
     await mkdir(join(outboxDir, 'processing'), { recursive: true })
 
     // Drop one claim. After the first drain claims it, subsequent
-    // drains find an empty outbox — BUT without the guard, a second
-    // drain could attempt a duplicate sendMessage if it raced with
-    // the in-flight rename or saw a re-armed entry. We use a SINGLE
-    // file + slow send to make the race visible: under the guard,
-    // exactly one sendMessage; without the guard, the second tick
-    // would also try to fire (but find nothing) — the assertion we
-    // want is that the guard *log line* fires when the tick is
-    // skipped while in-flight.
+    // ticks must see `draining.has(chatId) === true` and skip — that
+    // is the in-flight guard contract under test.
     const file = `${Date.now()}-cccc.json`
     await writeFile(
       join(outboxDir, file),
@@ -591,23 +656,88 @@ describe('outbox drain concurrency guard (TASK-5 bug 3)', () => {
       }),
     )
 
-    await router.start()
-    // Wait long enough for several poll ticks (200ms each).
-    await new Promise((r) => setTimeout(r, 800))
+    // Capture the router's outbox interval callback by replacing
+    // global setInterval with a recorder. We return a no-op handle
+    // (with the unref shape the router calls) so the interval never
+    // auto-fires; the captured callback is the function we hand-
+    // invoke per "tick".
+    const capturedTicks: Array<() => void> = []
+    const originalSetInterval = globalThis.setInterval
+    globalThis.setInterval = ((fn: () => void, _ms?: number): ReturnType<
+      typeof setInterval
+    > => {
+      capturedTicks.push(fn)
+      // Return an object shaped like a NodeJS.Timer so the router's
+      // `.unref?.()` call and the eventual `clearInterval` no-op.
+      return {
+        ref: () => undefined,
+        unref: () => undefined,
+        hasRef: () => false,
+        refresh: () => undefined,
+        [Symbol.toPrimitive]: () => 0,
+        [Symbol.dispose]: () => undefined,
+      } as unknown as ReturnType<typeof setInterval>
+    }) as typeof setInterval
 
-    // Exactly ONE sendMessage in flight.
-    expect(fx.telegram.calls.length).toBe(1)
+    // Yield to the real event loop for `ms` milliseconds so libuv
+    // I/O (readdir, rename, readFile) and the awaited sendMessage
+    // entry callback can settle. We piggy-back on the captured
+    // setInterval reference instead of using bare setTimeout — that
+    // way if some future test swap also wraps setTimeout, this
+    // helper still hits the real timer.
+    const realDelay = (ms: number): Promise<void> =>
+      new Promise<void>((resolve) => {
+        const handle = originalSetInterval(() => {
+          clearInterval(handle)
+          resolve()
+        }, ms)
+      })
 
-    // Confirm at least one tick was skipped while the first drain
-    // was still in-flight.
-    const skipped = fx.loggerState.logs.filter(
-      (l) => l.msg === 'router.outbox.tick_skipped_inflight',
-    )
-    expect(skipped.length).toBeGreaterThanOrEqual(1)
+    try {
+      await router.start()
+      // The router installed its outbox interval — capturedTicks now
+      // holds the tick callback.
+      expect(capturedTicks.length).toBe(1)
+      const tick = capturedTicks[0]
+      if (tick === undefined) throw new Error('tick not captured')
 
-    // Release the slow send so the test can shut down cleanly.
-    fx.telegram.releaseSlow()
-    await new Promise((r) => setTimeout(r, 200))
-    await router.stop()
+      // Tick 1: drainOutbox runs, claims the file, calls sendMessage
+      // (slow spy adds the call to `calls[]` synchronously before
+      // awaiting `release`). The `draining` set holds the chat id
+      // until the send resolves.
+      tick()
+      await realDelay(20) // let readdir/rename/readFile/send-entry settle
+
+      expect(fx.telegram.calls.length).toBe(1)
+
+      // Ticks 2..4: each one observes `draining.has(chatId) === true`
+      // and logs `tick_skipped_inflight` without spawning a new
+      // drain. No extra sendMessage calls.
+      for (let i = 0; i < 3; i++) {
+        tick()
+        await realDelay(5)
+      }
+      expect(fx.telegram.calls.length).toBe(1)
+
+      const skipped = fx.loggerState.logs.filter(
+        (l) => l.msg === 'router.outbox.tick_skipped_inflight',
+      )
+      expect(skipped.length).toBeGreaterThanOrEqual(3)
+
+      // Release the slow send so the drain completes, then let
+      // confirmOutboxClaim run and `draining` clear.
+      fx.telegram.releaseSlow()
+      await realDelay(20)
+
+      // Next tick should NOT be skipped — outbox is empty so
+      // drainOutbox returns early without another send. Total send
+      // count stays at 1.
+      tick()
+      await realDelay(10)
+      expect(fx.telegram.calls.length).toBe(1)
+    } finally {
+      globalThis.setInterval = originalSetInterval
+      await router.stop()
+    }
   }, 5_000)
 })

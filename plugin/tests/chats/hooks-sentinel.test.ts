@@ -189,3 +189,59 @@ describe('session-start.sh — sentinel pass-through', () => {
     expect(r.stdout).toBe('')
   })
 })
+
+describe('session-start.sh — degraded-mode warning (Opus #16)', () => {
+  // session-start was previously fail-open and silent when persona.md
+  // was missing while pre-tool-use was fail-closed for the same state.
+  // Result: Thrall would boot up cleanly and then every tool call would
+  // be denied with no startup signal that the gate was broken. The fix
+  // makes the inconsistency observable via additionalContext so the
+  // session can route around the degradation on its first turn.
+
+  test('MULTICHAT_STATE_DIR + CHAT_ID set + persona missing -> exit 0 + degraded-mode additionalContext', () => {
+    // No persona.md, no chat dir. Policy.yaml is present (created by
+    // beforeEach) but unused on this path.
+    const r = run(SESSION_HOOK, {
+      MULTICHAT_STATE_DIR: workspace,
+      CLAUDE_WORKSPACE_DIR: workspace,
+      CHAT_ID: '164795011',
+    })
+    expect(r.code).toBe(0)
+    expect(r.stdout).not.toBe('')
+
+    const payload = JSON.parse(r.stdout)
+    expect(payload.hookSpecificOutput?.hookEventName).toBe('SessionStart')
+    const ctx = payload.hookSpecificOutput?.additionalContext ?? ''
+    expect(ctx).toContain('Persona file missing')
+    expect(ctx).toContain('164795011')
+    expect(ctx).toContain(
+      join(workspace, 'chats', '164795011', 'persona.md'),
+    )
+    expect(ctx).toContain('degraded mode')
+    // Mirror to stderr for the operator tailing logs.
+    expect(r.stderr).toContain('persona file not found')
+  })
+
+  test('MULTICHAT_STATE_DIR + CHAT_ID set + persona present -> normal injection, no degraded warning', () => {
+    mkdirSync(join(workspace, 'chats', '164795011'), { recursive: true })
+    writeFileSync(
+      join(workspace, 'chats', '164795011', 'persona.md'),
+      'Ты Тралл, архитектор Оргриммара.',
+      'utf8',
+    )
+    const r = run(SESSION_HOOK, {
+      MULTICHAT_STATE_DIR: workspace,
+      CLAUDE_WORKSPACE_DIR: workspace,
+      CHAT_ID: '164795011',
+    })
+    expect(r.code).toBe(0)
+    expect(r.stdout).not.toBe('')
+
+    const payload = JSON.parse(r.stdout)
+    const ctx = payload.hookSpecificOutput?.additionalContext ?? ''
+    // Persona is loaded as-is; degraded marker must not appear.
+    expect(ctx).toContain('Тралл')
+    expect(ctx).not.toContain('degraded mode')
+    expect(ctx).not.toContain('Persona file missing')
+  })
+})

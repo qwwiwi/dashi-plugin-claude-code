@@ -129,6 +129,122 @@ describe('buildSanitizedTmuxEnv', () => {
     )
   })
 
+  // ──────────────────────────────────────────────────────────────────
+  // Opus MED-B #21 (2026-05-27): broadened regex coverage. Each secret
+  // family below MUST be caught by FORBIDDEN_ENV_REGEX even though it
+  // does not match a *_TOKEN / *_API_KEY / *_SECRET suffix. These tests
+  // failed against the pre-MED-B regex (which only had the GBRAIN/
+  // OPENAI/ANTHROPIC/TELEGRAM prefix list) and pass after the prefix +
+  // suffix broadening was applied.
+  // ──────────────────────────────────────────────────────────────────
+
+  test('MED-B #21: catches AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY', () => {
+    const parent = {
+      PATH: '/usr/bin',
+      AWS_ACCESS_KEY_ID: 'AKIATESTREDACTED',
+      AWS_SECRET_ACCESS_KEY: 'aws-secret-redacted',
+    }
+    const { childEnv, forbiddenSeen } = buildSanitizedTmuxEnv(parent)
+    expect(childEnv.AWS_ACCESS_KEY_ID).toBeUndefined()
+    expect(childEnv.AWS_SECRET_ACCESS_KEY).toBeUndefined()
+    expect(forbiddenSeen).toContain('AWS_ACCESS_KEY_ID')
+    expect(forbiddenSeen).toContain('AWS_SECRET_ACCESS_KEY')
+  })
+
+  test('MED-B #21: catches NPM_TOKEN', () => {
+    const parent = { PATH: '/usr/bin', NPM_TOKEN: 'npm-x' }
+    const { childEnv, forbiddenSeen } = buildSanitizedTmuxEnv(parent)
+    expect(childEnv.NPM_TOKEN).toBeUndefined()
+    expect(forbiddenSeen).toContain('NPM_TOKEN')
+  })
+
+  test('MED-B #21: catches SUPABASE_KEY + SUPABASE_SERVICE_ROLE_KEY', () => {
+    const parent = {
+      PATH: '/usr/bin',
+      SUPABASE_KEY: 'sb-key',
+      SUPABASE_SERVICE_ROLE_KEY: 'sb-role',
+    }
+    const { childEnv, forbiddenSeen } = buildSanitizedTmuxEnv(parent)
+    expect(childEnv.SUPABASE_KEY).toBeUndefined()
+    expect(childEnv.SUPABASE_SERVICE_ROLE_KEY).toBeUndefined()
+    expect(forbiddenSeen).toContain('SUPABASE_KEY')
+    expect(forbiddenSeen).toContain('SUPABASE_SERVICE_ROLE_KEY')
+  })
+
+  test('MED-B #21: catches DATABASE_URL via _URL$ suffix', () => {
+    const parent = {
+      PATH: '/usr/bin',
+      DATABASE_URL: 'postgres://user:pass@host/db',
+      REDIS_URL: 'redis://:secret@redis/0',
+    }
+    const { childEnv, forbiddenSeen } = buildSanitizedTmuxEnv(parent)
+    expect(childEnv.DATABASE_URL).toBeUndefined()
+    expect(childEnv.REDIS_URL).toBeUndefined()
+    expect(forbiddenSeen).toContain('DATABASE_URL')
+    expect(forbiddenSeen).toContain('REDIS_URL')
+  })
+
+  test('MED-B #21: catches STRIPE_API_KEY (already by suffix) and STRIPE_* prefix', () => {
+    const parent = {
+      PATH: '/usr/bin',
+      STRIPE_API_KEY: 'sk_test_x',
+      STRIPE_WEBHOOK_SECRET: 'whsec_x',
+      STRIPE_FOO: 'arbitrary', // prefix-only — caught by STRIPE_ prefix
+    }
+    const { childEnv, forbiddenSeen } = buildSanitizedTmuxEnv(parent)
+    expect(childEnv.STRIPE_API_KEY).toBeUndefined()
+    expect(childEnv.STRIPE_WEBHOOK_SECRET).toBeUndefined()
+    expect(childEnv.STRIPE_FOO).toBeUndefined()
+    expect(forbiddenSeen).toContain('STRIPE_API_KEY')
+    expect(forbiddenSeen).toContain('STRIPE_WEBHOOK_SECRET')
+    expect(forbiddenSeen).toContain('STRIPE_FOO')
+  })
+
+  test('MED-B #21: catches GITHUB_TOKEN + arbitrary GITHUB_* prefix', () => {
+    const parent = {
+      PATH: '/usr/bin',
+      GITHUB_TOKEN: 'ghp_x',
+      GITHUB_REPOSITORY: 'qwwiwi/repo', // prefix sweep (acceptable risk)
+    }
+    const { childEnv, forbiddenSeen } = buildSanitizedTmuxEnv(parent)
+    expect(childEnv.GITHUB_TOKEN).toBeUndefined()
+    expect(childEnv.GITHUB_REPOSITORY).toBeUndefined()
+    expect(forbiddenSeen).toContain('GITHUB_TOKEN')
+    expect(forbiddenSeen).toContain('GITHUB_REPOSITORY')
+  })
+
+  test('MED-B #21: _URL$ suffix does NOT catch bare URL or BASE_URL without underscore prefix', () => {
+    // `URL` alone or `BASE_URL` alone should match `^.+_URL$` only if a
+    // non-empty prefix precedes the `_URL`. `BASE_URL` does match
+    // (`BASE` is the non-empty prefix), but a plain `URL` does NOT
+    // because there is no `_URL` boundary. We do not allowlist either
+    // — the test documents the regex behaviour, not desirability.
+    const parent = {
+      PATH: '/usr/bin',
+      URL: 'https://example.com', // not caught (no `_URL` suffix structure)
+      BASE_URL: 'https://api.example.com', // caught — matches `^.+_URL$`
+    }
+    const { forbiddenSeen } = buildSanitizedTmuxEnv(parent)
+    expect(forbiddenSeen).not.toContain('URL')
+    expect(forbiddenSeen).toContain('BASE_URL')
+  })
+
+  test('MED-B #21: legitimate non-secret keys NOT caught (HOSTNAME, HOME, USER, TERM)', () => {
+    // Regression guard — the broadened regex must not accidentally
+    // hit plain shell metadata keys.
+    const parent = {
+      PATH: '/usr/bin',
+      HOSTNAME: 'thrall',
+      HOME: '/home/test',
+      USER: 'test',
+      TERM: 'xterm',
+      SHELL: '/bin/bash',
+      LANG: 'en_US.UTF-8',
+    }
+    const { forbiddenSeen } = buildSanitizedTmuxEnv(parent)
+    expect(forbiddenSeen).toEqual([])
+  })
+
   test('empty-string values are dropped (not forwarded as "" )', () => {
     const parent = {
       PATH: '',

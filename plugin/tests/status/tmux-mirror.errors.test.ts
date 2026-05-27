@@ -535,3 +535,110 @@ describe('TmuxMirror — FIX-C bug #5 (disabled=true disarms the polling timer)'
     }
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// MED-A #2 — TmuxMirror.reset() recovery primitive.
+//
+// Pre-fix: once `disabled=true` (Telegram 403 / parse error) the
+// mirror stayed mute until plugin restart. `/mirror off; /mirror on`
+// alone did not help — start() short-circuits on the `disabled`
+// check, so the polling loop never re-armed.
+//
+// Post-fix: reset() clears `disabled` AND `enabled` so the next
+// start() falls through both early-return guards and re-arms the
+// mirror end-to-end. Wired into the `/mirror on` OOB command (see
+// commands/oob.ts).
+// ─────────────────────────────────────────────────────────────────────
+
+describe('TmuxMirror — MED-A #2 (reset() recovery)', () => {
+  test('reset() after a 403 disable allows start() to re-arm the mirror', async () => {
+    const stub = makeStubApi()
+    const exec = makeExec([ok('first'), ok('second'), ok('third')])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+    })
+    stub.queueSendError(
+      new TelegramError(403, 'Forbidden: bot was blocked by the user'),
+    )
+    await mirror.start()
+    expect(mirror.status().disabled).toBe(true)
+    expect(mirror.status().enabled).toBe(true) // disabled doesn't flip enabled
+
+    // Pre-fix: a second start() here returns early on `disabled` and
+    // the mirror stays mute forever. We MUST call reset() first.
+    const sendsBefore = stub.ops.filter((o) => o.method === 'sendMessage').length
+    await mirror.start() // no-op without reset
+    expect(stub.ops.filter((o) => o.method === 'sendMessage').length).toBe(sendsBefore)
+
+    // reset() then start() — the next poll succeeds and the mirror
+    // is fully re-armed.
+    mirror.reset()
+    expect(mirror.status().disabled).toBeUndefined()
+    expect(mirror.status().enabled).toBe(false) // reset wipes both flags
+
+    await mirror.start()
+    expect(mirror.status().enabled).toBe(true)
+    expect(mirror.status().disabled).toBeUndefined()
+    // Second poll round-trip: the second exec scenario returned
+    // 'second', so sendMessage fired again.
+    expect(stub.ops.filter((o) => o.method === 'sendMessage').length).toBe(sendsBefore + 1)
+    await mirror.stop()
+  })
+
+  test('reset() on a healthy mirror is a no-op', async () => {
+    const stub = makeStubApi()
+    const exec = makeExec([ok('alive')])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+    })
+    await mirror.start()
+    expect(mirror.status().enabled).toBe(true)
+    expect(mirror.status().disabled).toBeUndefined()
+
+    // reset() does NOT take down a healthy mirror.
+    mirror.reset()
+    expect(mirror.status().enabled).toBe(true)
+    expect(mirror.status().disabled).toBeUndefined()
+    await mirror.stop()
+  })
+
+  test('reset() after parse-error disable enables full recovery via start()', async () => {
+    const stub = makeStubApi()
+    const exec = makeExec([ok('first'), ok('second'), ok('third')])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1_000_000,
+      lineCount: 50,
+      exec,
+    })
+    await mirror.start()
+    stub.queueEditError(
+      new TelegramError(400, "Bad Request: can't find end of the entity"),
+    )
+    await mirror.onPoll() // edit fails → disabled
+    expect(mirror.status().disabled).toBe(true)
+
+    mirror.reset()
+    expect(mirror.status().disabled).toBeUndefined()
+    expect(mirror.status().enabled).toBe(false)
+    await mirror.start()
+    expect(mirror.status().enabled).toBe(true)
+    expect(mirror.status().disabled).toBeUndefined()
+    await mirror.stop()
+  })
+})

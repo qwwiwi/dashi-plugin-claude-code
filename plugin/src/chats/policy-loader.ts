@@ -198,6 +198,13 @@ export function getChatPolicy(
 // `policy.chats[…]` index lookup.
 const CHAT_ID_PATTERN = /^-?\d+$/
 
+// Opus MED-B #20 (2026-05-27): hard cap on chat id length. A signed
+// 64-bit integer is at most 20 characters including the optional `-`
+// sign. We cap at 32 to leave headroom for any future Telegram-side
+// schema change (BigInt extension?) while still rejecting the 4 KB
+// "smuggle a payload as a chat id" abuse case the MED-B audit flagged.
+const MAX_CHAT_ID_LENGTH = 32
+
 /**
  * Throw if `chatId` is not a strict signed-integer string.
  *
@@ -209,6 +216,18 @@ const CHAT_ID_PATTERN = /^-?\d+$/
  * (`"../some/path"`, `"1; rm -rf /"`, `"$(whoami)"`). Both deserve a
  * hard fail, not silent coercion.
  *
+ * Opus MED-B #20 (2026-05-27): three additional guards layered on top
+ * of the regex:
+ *   1. Length cap at {@link MAX_CHAT_ID_LENGTH} — a 4 KB digit string
+ *      is syntactically valid for `/^-?\d+$/` but pathologically large
+ *      and indicates a smuggling attempt or runaway concat bug.
+ *   2. Reject the degenerate "-0" — distinct path namespace from "0"
+ *      that Telegram never emits; closing it keeps lookups canonical.
+ *   3. Reject leading-zero values other than literal "0" (e.g. "01",
+ *      "-007") — Telegram chat ids never carry leading zeroes; allowing
+ *      them would split the keyspace and let two valid-looking strings
+ *      collide on disk after normalisation.
+ *
  * @param chatId the value to validate
  * @throws TypeError when chatId is not a string matching `/^-?\d+$/`
  */
@@ -218,12 +237,41 @@ export function assertValidChatId(chatId: string): void {
       `invalid chat id: expected string, got ${typeof chatId}`,
     )
   }
+  if (chatId.length > MAX_CHAT_ID_LENGTH) {
+    // Echo only the length and a short prefix — never the whole
+    // payload, so a malicious 4 KB string cannot blow up the log line.
+    throw new TypeError(
+      `invalid chat id: length ${chatId.length} exceeds cap ${MAX_CHAT_ID_LENGTH} ` +
+        `(prefix=${JSON.stringify(chatId.slice(0, 16))}…)`,
+    )
+  }
   if (!CHAT_ID_PATTERN.test(chatId)) {
     // Truncate echoed value so a malicious payload can't blow up a
     // log line; 64 chars is enough to recognise the shape in audits.
     const sample = chatId.length > 64 ? `${chatId.slice(0, 64)}…` : chatId
     throw new TypeError(
       `invalid chat id ${JSON.stringify(sample)}: must match /^-?\\d+$/`,
+    )
+  }
+  // MED-B #20: reject "-0" specifically — regex accepts it but it is a
+  // distinct path namespace that collides with "0" after FS
+  // normalisation on case-insensitive filesystems or after a
+  // path.normalize pass.
+  if (chatId === '-0') {
+    throw new TypeError(
+      `invalid chat id "-0": negative-zero is not a Telegram chat id`,
+    )
+  }
+  // MED-B #20: reject leading-zero values like "01", "-007". The
+  // regex accepts them but Telegram never emits leading zeroes, and
+  // their existence would mean two distinct strings ("1" and "01") map
+  // to the same logical chat after parseInt normalisation downstream.
+  // Allowed forms: "0", "1", "12345", "-1", "-1003784643974".
+  // Disallowed: "01", "00", "-01", "-0123".
+  const body = chatId.startsWith('-') ? chatId.slice(1) : chatId
+  if (body.length > 1 && body.startsWith('0')) {
+    throw new TypeError(
+      `invalid chat id ${JSON.stringify(chatId)}: leading zeroes not permitted`,
     )
   }
 }

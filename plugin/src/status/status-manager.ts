@@ -98,6 +98,19 @@ const ACTIVITY_MAX_BUFFER = 10
 // throttle in `_TaskBoundaryTracker`.
 const ACTIVITY_EDIT_THROTTLE_MS = 5000
 
+// Per-chat 403/forbidden cache. After Telegram returns 401/403 on a
+// chat surface (bot kicked, chat 403, user blocked), subsequent
+// start() calls within this TTL must short-circuit BEFORE sending —
+// otherwise every inbound update pays a fresh sendMessage 403 round-
+// trip (MED-A #1). After the TTL elapses we allow one probe in case
+// the bot was re-added.
+const BLOCKED_CHAT_TTL_MS = 5 * 60 * 1000 // 5 minutes
+// Prune the entire blockedChats map of entries older than this so a
+// long-running plugin doesn't leak unbounded chatId state. Pruned
+// entries are simply re-probed on the next start() — same as if the
+// entry had been removed by `firstSeen` ageing out below.
+const BLOCKED_CHAT_PRUNE_MS = 60 * 60 * 1000 // 1 hour
+
 export interface StatusHandle {
   readonly chatId: string
   // messageId is `0` while the bubble is suppressed (lazy-create
@@ -231,6 +244,14 @@ interface InternalEntry {
   disabled: boolean
   messageGoneRecoveryDone: boolean
   parseDowngraded: boolean
+  // MED-A #4: 429 backoff. When Telegram's rate-limit wrapper exhausts
+  // its retries and surfaces the `flood` classifier kind, we capture
+  // `now + retryAfterSec*1000` here. Subsequent timer ticks (interval
+  // + chat_action pulse + TTL) check `now() < pausedUntil` and bail
+  // BEFORE issuing any Telegram I/O — without this the next tick
+  // fired immediately and hit 429 again. `0` (or any past value)
+  // means no active pause.
+  pausedUntil: number
 }
 
 function renderState(state: StatusState, tick: number, nowMs: number): string {
@@ -277,6 +298,23 @@ export class StatusManager {
   // (no entry tracks it) and its timer-driven edits chase a stale
   // message_id (HIGH #3, codex review 2026-05-27).
   private readonly lifecycleLocks: Map<string, Promise<void>>
+  // Per-chat 403 cache (MED-A #1). When Telegram returns forbidden
+  // (401/403) on send / edit / chat_action, we record the chatId here
+  // with a wall-clock timestamp. Subsequent start() calls within
+  // BLOCKED_CHAT_TTL_MS short-circuit to a sentinel handle BEFORE the
+  // sendMessage attempt — otherwise every inbound message on a
+  // permanently-blocked chat (bot kicked, user blocked, chat 403)
+  // paid a fresh 403 round-trip.
+  //
+  // After BLOCKED_CHAT_TTL_MS elapses we allow one probe — the bot
+  // may have been re-added or the user unblocked. The cache is
+  // periodically pruned via maybePruneBlockedChats() on entry-points
+  // (cheap call site amortisation; no separate timer needed).
+  private readonly blockedChats: Map<
+    string,
+    { firstSeen: number; lastSeen: number; reason: string }
+  >
+  private lastBlockedPruneAt: number
   // Multichat policy reference (or `null` for legacy single-DM mode).
   // Every public mutation re-evaluates `shouldStreamForChat(policy,
   // chatId)` against the TARGET chat — we never memoise the answer at
@@ -294,7 +332,53 @@ export class StatusManager {
     this.clearTimer = deps.clearTimer ?? ((h) => clearTimeout(h))
     this.entries = new Map()
     this.lifecycleLocks = new Map()
+    this.blockedChats = new Map()
+    this.lastBlockedPruneAt = 0
     this.policy = deps.policy ?? null
+  }
+
+  // Record a 403/forbidden Telegram failure for a chat. Future start()
+  // calls within BLOCKED_CHAT_TTL_MS will short-circuit without trying
+  // sendMessage. Idempotent — repeated calls just refresh `lastSeen`.
+  private markChatBlocked(chatId: string, reason: string): void {
+    const t = this.now()
+    const prev = this.blockedChats.get(chatId)
+    if (prev) {
+      prev.lastSeen = t
+      prev.reason = reason
+    } else {
+      this.blockedChats.set(chatId, { firstSeen: t, lastSeen: t, reason })
+    }
+  }
+
+  // Returns true when the chat is in the blocked cache AND the most
+  // recent 403 happened within BLOCKED_CHAT_TTL_MS. Re-probes after
+  // the window allow recovery if the bot was re-added.
+  private isChatBlocked(chatId: string): boolean {
+    const rec = this.blockedChats.get(chatId)
+    if (!rec) return false
+    const t = this.now()
+    if (t - rec.lastSeen >= BLOCKED_CHAT_TTL_MS) {
+      // TTL elapsed — drop the entry so the next start() probes fresh.
+      // If Telegram still returns 403, mark it again immediately.
+      this.blockedChats.delete(chatId)
+      return false
+    }
+    return true
+  }
+
+  // Periodically drop entries older than BLOCKED_CHAT_PRUNE_MS so a
+  // long-running plugin doesn't accumulate dead chatIds. Runs at most
+  // once per BLOCKED_CHAT_TTL_MS to keep amortised cost negligible.
+  private maybePruneBlockedChats(): void {
+    const t = this.now()
+    if (t - this.lastBlockedPruneAt < BLOCKED_CHAT_TTL_MS) return
+    this.lastBlockedPruneAt = t
+    for (const [id, rec] of this.blockedChats.entries()) {
+      if (t - rec.firstSeen >= BLOCKED_CHAT_PRUNE_MS) {
+        this.blockedChats.delete(id)
+      }
+    }
   }
 
   // Per-chat lifecycle serialization. Caller's `op` runs only after
@@ -361,6 +445,23 @@ export class StatusManager {
         // so a staleness check `handle.generation === entry.generation`
         // against this sentinel can never spuriously match a real
         // entry that landed on the same chatId after a policy change.
+        generation: 0,
+      }
+    }
+    // MED-A #1: short-circuit start() when a recent 403/forbidden was
+    // recorded for this chat. Without this, every inbound message on
+    // a permanently-blocked chat (bot kicked / user blocked / chat
+    // 403) paid a fresh sendMessage round-trip just to learn Telegram
+    // still refuses. Re-probe is allowed after BLOCKED_CHAT_TTL_MS so
+    // the bot can recover if re-added to the chat. Return the same
+    // sentinel shape the policy-gate uses so downstream tools see a
+    // consistent "no active surface" signal.
+    this.maybePruneBlockedChats()
+    if (this.isChatBlocked(chatId)) {
+      return {
+        chatId,
+        messageId: 0,
+        startedAt: this.now(),
         generation: 0,
       }
     }
@@ -441,13 +542,24 @@ export class StatusManager {
       try {
         sent = await this.telegramApi.sendMessage(chatId, text, sendOpts)
       } catch (err) {
-        // If we can't even send the initial status, log and rethrow — caller
-        // can decide whether to proceed without status. (handlers.ts treats
-        // status as best-effort and will catch this.)
-        this.log.warn('status start failed', {
-          chat_id: chatId,
-          error: err instanceof Error ? err.message : String(err),
-        })
+        // MED-A #1: classify the failure. A 403/forbidden on the
+        // initial send means the bot has no access to the chat — mark
+        // it blocked so the next start() short-circuits without
+        // another sendMessage round-trip. Other error kinds rethrow
+        // (handlers.ts treats status as best-effort and catches).
+        const cls = classifyEditError(err)
+        if (cls.kind === 'forbidden') {
+          this.markChatBlocked(chatId, `start ${cls.code}: ${cls.description}`)
+          this.log.warn('status start forbidden, chat marked blocked', {
+            chat_id: chatId,
+            code: cls.code,
+          })
+        } else {
+          this.log.warn('status start failed', {
+            chat_id: chatId,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        }
         throw err
       }
       messageId = sent.message_id
@@ -486,6 +598,7 @@ export class StatusManager {
       disabled: false,
       messageGoneRecoveryDone: false,
       parseDowngraded: false,
+      pausedUntil: 0,
     }
     this.entries.set(chatId, entry)
     const generation = entry.generation
@@ -515,6 +628,19 @@ export class StatusManager {
     const tick = (): void => {
       const live = this.entries.get(chatId)
       if (!live || live.generation !== generation) return
+      // MED-A #4: if Telegram returned 429 and pausedUntil is in the
+      // future, skip ALL work this tick — including the tick counter
+      // and the edit — but keep the interval re-armed so we resume
+      // automatically once the pause window expires. Re-arming with a
+      // smaller delay so the resume isn't gated on a full interval.
+      if (this.now() < live.pausedUntil) {
+        const remaining = Math.max(50, live.pausedUntil - this.now())
+        live.intervalHandle = this.setTimer(
+          tick,
+          Math.min(remaining, this.config.status.interval_ms),
+        )
+        return
+      }
       live.tick += 1
       if (!live.bubbleSuppressed) {
         const next = renderState(live.state, live.tick, this.now())
@@ -611,6 +737,13 @@ export class StatusManager {
       const cls = classifyEditError(err)
       if (cls.kind === 'forbidden') {
         entry.disabled = true
+        // MED-A #1: also mark the chat in the per-chat blocked cache
+        // so the NEXT start() (after this entry is gone via complete
+        // / cancel) short-circuits without another sendMessage 403.
+        this.markChatBlocked(
+          entry.handle.chatId,
+          `lazy-send ${cls.code}: ${cls.description}`,
+        )
         this.log.warn('status lazy-send forbidden, entry disabled', {
           chat_id: entry.handle.chatId,
           code: cls.code,
@@ -623,13 +756,23 @@ export class StatusManager {
           chat_id: entry.handle.chatId,
           description: cls.description,
         })
-        // Re-attempt once without parse_mode. Failures here fall through
-        // to the standard log-and-leave-suppressed path.
+        // MED-A #6 (Codex status #5): retry must preserve
+        // `reply_to_message_id` so the recovered bubble stays in the
+        // same reply thread the warchief expects. Pre-fix retried
+        // with `{}`, dropping the entire sendOpts including the
+        // reply target — the rolling status then appeared at the
+        // bottom of the chat unconnected to the originating message.
+        // We drop only `parse_mode`, keeping every other option
+        // (including reply_to_message_id) intact.
+        const retryOpts: { reply_to_message_id?: number } = {}
+        if (entry.replyToMessageId !== undefined) {
+          retryOpts.reply_to_message_id = entry.replyToMessageId
+        }
         try {
           const sent = await this.telegramApi.sendMessage(
             entry.handle.chatId,
             text,
-            {} as { parse_mode: 'HTML'; reply_to_message_id?: number },
+            retryOpts as { parse_mode: 'HTML'; reply_to_message_id?: number },
           )
           entry.handle.messageId = sent.message_id
           entry.lastText = text
@@ -1020,6 +1163,12 @@ export class StatusManager {
           // still return true so the outer pipeline knows there is a
           // live session, just one that we can't write to.
           entry.disabled = true
+          // MED-A #1: per-chat blocked cache so the next start() also
+          // short-circuits before sendMessage.
+          this.markChatBlocked(
+            entry.handle.chatId,
+            `edit ${cls.code}: ${cls.description}`,
+          )
           this.log.warn('status edit forbidden, entry disabled', {
             chat_id: entry.handle.chatId,
             code: cls.code,
@@ -1085,16 +1234,21 @@ export class StatusManager {
             description: cls.description,
           })
           return
-        case 'flood':
-          // The rate-limit wrapper around TelegramApi handles 429
-          // transparently. We only land here when its retries are
-          // exhausted — drop this attempt; next tick gets a fresh
-          // edit budget.
-          this.log.warn('status edit 429 post-retry, dropping this tick', {
+        case 'flood': {
+          // MED-A #4: pause the chat's tick handlers for retryAfterSec
+          // before any more I/O lands. Without this, the next interval
+          // tick fired immediately and hit 429 again, generating an
+          // edit storm that the rate-limit wrapper had already given
+          // up on. Default to 5s when Telegram omitted retry_after.
+          const pauseSec = cls.retryAfterSec ?? 5
+          entry.pausedUntil = this.now() + pauseSec * 1000
+          this.log.warn('status edit 429 post-retry, pausing chat ticks', {
             chat_id: entry.handle.chatId,
             retry_after_s: cls.retryAfterSec,
+            paused_for_ms: pauseSec * 1000,
           })
           return
+        }
         case 'transient':
           // Network glitch, 5xx, unknown 4xx. Drop and let the next
           // tick retry. lastText is intentionally NOT mutated — the
@@ -1140,6 +1294,12 @@ export class StatusManager {
       const cls = classifyEditError(err)
       if (cls.kind === 'forbidden') {
         entry.disabled = true
+        // MED-A #1: per-chat blocked cache so the next start() also
+        // short-circuits before sendMessage.
+        this.markChatBlocked(
+          entry.handle.chatId,
+          `chat_action ${cls.code}: ${cls.description}`,
+        )
         this.log.warn('sendChatAction forbidden, entry disabled', {
           chat_id: entry.handle.chatId,
           code: cls.code,
@@ -1159,6 +1319,17 @@ export class StatusManager {
     const live = this.entries.get(chatId)
     if (!live || live.generation !== generation) return
     if (live.disabled) return
+    // MED-A #4: respect the 429 pause window — sendChatAction shares
+    // the same per-chat rate-limit bucket as editMessageText, so a
+    // pulse during a 429 hold would just re-trigger the flood.
+    if (this.now() < live.pausedUntil) {
+      const remaining = Math.max(50, live.pausedUntil - this.now())
+      live.chatActionHandle = this.setTimer(
+        () => this.chatActionTick(chatId, generation),
+        Math.min(remaining, CHAT_ACTION_PULSE_MS),
+      )
+      return
+    }
     void this.pulseChatAction(live)
     live.chatActionHandle = this.setTimer(
       () => this.chatActionTick(chatId, generation),

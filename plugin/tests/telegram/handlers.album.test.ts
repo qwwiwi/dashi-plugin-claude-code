@@ -14,7 +14,16 @@
 // live in handlers.test.ts.
 
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync, readdirSync, existsSync, writeFileSync, mkdirSync } from 'fs'
+import {
+  mkdtempSync,
+  rmSync,
+  readdirSync,
+  existsSync,
+  writeFileSync,
+  mkdirSync,
+  readFileSync,
+  truncateSync,
+} from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import type { Context } from 'grammy'
@@ -642,6 +651,257 @@ describe('Album fragment persistence (Bug #2)', () => {
     expect(existsSync(orphan)).toBe(false)
     const dl = readdirSync(join(statePaths.root, 'albums', 'dead-letter'))
     expect(dl.some((n) => n.startsWith('broken-key-'))).toBe(true)
+
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// MED-C (Codex handlers #4) — recovery dead-letters corrupt fragments
+// instead of dispatching a partial album.
+//
+// Pre-MED-C behaviour: `readFragments` swallowed any read/parse error
+// on a fragment file and returned the remaining ones. `recoverPendingAlbums`
+// then dispatched a PARTIAL album and deleted the source dir, losing
+// the corrupt fragment forever and (worse) delivering an incomplete
+// media-group to the user.
+//
+// MED-C contract:
+//   - First unreadable / zero-byte / unparseable fragment short-circuits.
+//   - The whole album dir is moved to `dead-letter/albums/<key>-<ts>/`
+//     with a `.recovery-failure.json` sidecar.
+//   - `flush` is NEVER invoked for that album.
+//   - The source dir under `albums/<key>/` is gone only AFTER the move
+//     destination is populated (atomic rename when possible).
+// ─────────────────────────────────────────────────────────────────────
+
+describe('MED-C — recovery dead-letters corrupt fragments without partial dispatch', () => {
+  test('3 fragments, 1 truncated to 0 bytes → album dead-lettered, no flush', async () => {
+    const statePaths = makeStatePaths()
+    const key = compositeAlbumKey('164795011', 'med-c-zero')
+    await ensureAlbumsDir(statePaths.root)
+
+    const meta: PersistedAlbumMeta = {
+      chatId: '164795011',
+      senderId: '164795011',
+      user: 'warchief',
+      mediaGroupId: 'med-c-zero',
+      kind: 'document',
+      firstAt: Date.now() - 60_000, // aged past graceMs
+    }
+    for (let i = 1; i <= 3; i++) {
+      await persistFragment(statePaths.root, key, meta, {
+        descriptors: [`<media kind="document" file_id="f${i}" />`],
+        mediaPaths: [],
+        caption: `frag ${i}`,
+        messageId: 100 + i,
+        reply: undefined,
+      } as AlbumEntry)
+      // small spacing so filenames sort
+      await new Promise((r) => setTimeout(r, 2))
+    }
+
+    // Pick the middle fragment file and truncate it to 0 bytes.
+    const albumDirPath = join(statePaths.root, 'albums', key)
+    const fragFiles = readdirSync(albumDirPath)
+      .filter((n) => n !== 'meta.json' && n.endsWith('.json'))
+      .sort()
+    expect(fragFiles.length).toBe(3)
+    const corruptName = fragFiles[1]!
+    truncateSync(join(albumDirPath, corruptName), 0)
+
+    let flushCalls = 0
+    const stats = await recoverPendingAlbums<AlbumEntry>({
+      stateDir: statePaths.root,
+      graceMs: 10_000,
+      flush: async () => {
+        flushCalls++
+      },
+    })
+
+    // No partial dispatch — flush MUST NOT be called for a corrupt album.
+    expect(flushCalls).toBe(0)
+    expect(stats.recovered).toBe(0)
+    expect(stats.deadLettered).toBe(1)
+    expect(stats.scheduled).toBe(0)
+
+    // Original album dir is gone (moved, not just deleted).
+    expect(existsSync(albumDirPath)).toBe(false)
+
+    // Dead-letter entry + JSON sidecar exist.
+    const dlRoot = join(statePaths.root, 'albums', 'dead-letter')
+    const dlEntries = readdirSync(dlRoot)
+    const dlDirName = dlEntries.find(
+      (n) => n.startsWith(`${key}-`) && !n.endsWith('.recovery-failure.json'),
+    )
+    expect(dlDirName).toBeDefined()
+    const dlDir = join(dlRoot, dlDirName!)
+    // All 3 original fragment files (including the zero-byte one) plus
+    // meta.json were moved verbatim — dead-letter preserves evidence.
+    const movedFiles = readdirSync(dlDir).sort()
+    expect(movedFiles).toContain('meta.json')
+    for (const f of fragFiles) expect(movedFiles).toContain(f)
+
+    const sidecarPath = `${dlDir}.recovery-failure.json`
+    expect(existsSync(sidecarPath)).toBe(true)
+    const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf8')) as {
+      timestamp: string
+      key: string
+      chatId: string | null
+      mediaGroupId: string | null
+      fragmentCount: number
+      corruptFile: string
+      errorType: string
+      errorMessage: string
+    }
+    expect(sidecar.key).toBe(key)
+    expect(sidecar.chatId).toBe('164795011')
+    expect(sidecar.mediaGroupId).toBe('med-c-zero')
+    expect(sidecar.fragmentCount).toBe(3)
+    expect(sidecar.corruptFile).toBe(corruptName)
+    expect(sidecar.errorType).toBe('empty_file')
+    expect(typeof sidecar.errorMessage).toBe('string')
+    expect(sidecar.errorMessage.length).toBeGreaterThan(0)
+    // ISO timestamp sanity check.
+    expect(Number.isNaN(Date.parse(sidecar.timestamp))).toBe(false)
+
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  test('fragment with invalid JSON → album dead-lettered with errorType=parse', async () => {
+    const statePaths = makeStatePaths()
+    const key = compositeAlbumKey('164795011', 'med-c-parse')
+    await ensureAlbumsDir(statePaths.root)
+
+    const meta: PersistedAlbumMeta = {
+      chatId: '164795011',
+      senderId: '164795011',
+      user: 'warchief',
+      mediaGroupId: 'med-c-parse',
+      kind: 'document',
+      firstAt: Date.now() - 60_000,
+    }
+    for (let i = 1; i <= 3; i++) {
+      await persistFragment(statePaths.root, key, meta, {
+        descriptors: [`<media kind="document" file_id="f${i}" />`],
+        mediaPaths: [],
+        caption: `frag ${i}`,
+        messageId: 100 + i,
+        reply: undefined,
+      } as AlbumEntry)
+      await new Promise((r) => setTimeout(r, 2))
+    }
+
+    // Overwrite the LAST fragment with garbage JSON (simulates a
+    // version-skew rewrite that lost its closing brace mid-write).
+    const albumDirPath = join(statePaths.root, 'albums', key)
+    const fragFiles = readdirSync(albumDirPath)
+      .filter((n) => n !== 'meta.json' && n.endsWith('.json'))
+      .sort()
+    const corruptName = fragFiles[2]!
+    writeFileSync(join(albumDirPath, corruptName), '{"descriptors": [unterminated', {
+      mode: 0o600,
+    })
+
+    const warns: Array<{ msg: string; ctx?: Record<string, unknown> }> = []
+    const log: Logger = {
+      ...silentLog,
+      warn: (msg, ctx) => {
+        warns.push({ msg, ...(ctx ? { ctx } : {}) })
+      },
+    }
+
+    let flushCalls = 0
+    const stats = await recoverPendingAlbums<AlbumEntry>({
+      stateDir: statePaths.root,
+      graceMs: 10_000,
+      flush: async () => {
+        flushCalls++
+      },
+      log,
+    })
+
+    expect(flushCalls).toBe(0)
+    expect(stats.recovered).toBe(0)
+    expect(stats.deadLettered).toBe(1)
+    expect(existsSync(albumDirPath)).toBe(false)
+
+    const dlRoot = join(statePaths.root, 'albums', 'dead-letter')
+    const dlEntries = readdirSync(dlRoot)
+    const dlDirName = dlEntries.find(
+      (n) => n.startsWith(`${key}-`) && !n.endsWith('.recovery-failure.json'),
+    )
+    expect(dlDirName).toBeDefined()
+    const sidecar = JSON.parse(
+      readFileSync(`${join(dlRoot, dlDirName!)}.recovery-failure.json`, 'utf8'),
+    ) as {
+      key: string
+      corruptFile: string
+      errorType: string
+      fragmentCount: number
+    }
+    expect(sidecar.key).toBe(key)
+    expect(sidecar.corruptFile).toBe(corruptName)
+    expect(sidecar.errorType).toBe('parse')
+    expect(sidecar.fragmentCount).toBe(3)
+
+    // Structured log surface — the dead_letter event carries the
+    // canonical fields ops needs to triage.
+    const dlLog = warns.find((w) => w.msg === 'album.recovery.dead_letter')
+    expect(dlLog).toBeDefined()
+    expect(dlLog!.ctx?.chatId).toBe('164795011')
+    expect(dlLog!.ctx?.mgid).toBe('med-c-parse')
+    expect(typeof dlLog!.ctx?.reason).toBe('string')
+    expect(String(dlLog!.ctx?.reason)).toContain('parse')
+
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  test('all 3 fragments intact → recovery dispatches normally (no false-positive)', async () => {
+    // Negative control: the MED-C guard MUST NOT fire on a healthy
+    // album. Same shape as the corrupt cases above but no tampering.
+    const statePaths = makeStatePaths()
+    const key = compositeAlbumKey('164795011', 'med-c-clean')
+    await ensureAlbumsDir(statePaths.root)
+
+    const meta: PersistedAlbumMeta = {
+      chatId: '164795011',
+      senderId: '164795011',
+      user: 'warchief',
+      mediaGroupId: 'med-c-clean',
+      kind: 'document',
+      firstAt: Date.now() - 60_000,
+    }
+    for (let i = 1; i <= 3; i++) {
+      await persistFragment(statePaths.root, key, meta, {
+        descriptors: [`<media kind="document" file_id="f${i}" />`],
+        mediaPaths: [],
+        caption: `frag ${i}`,
+        messageId: 100 + i,
+        reply: undefined,
+      } as AlbumEntry)
+      await new Promise((r) => setTimeout(r, 2))
+    }
+
+    let flushed: AlbumEntry[] = []
+    const stats = await recoverPendingAlbums<AlbumEntry>({
+      stateDir: statePaths.root,
+      graceMs: 10_000,
+      flush: async (album) => {
+        flushed = album.fragments
+      },
+    })
+
+    expect(stats.recovered).toBe(1)
+    expect(stats.deadLettered).toBe(0)
+    expect(flushed.length).toBe(3)
+    expect(flushed.map((f) => f.caption)).toEqual(['frag 1', 'frag 2', 'frag 3'])
+    expect(existsSync(join(statePaths.root, 'albums', key))).toBe(false)
+    // Dead-letter remains empty (the dir might exist from ensureAlbumsDir;
+    // assert no children prefixed with our key).
+    const dlRoot = join(statePaths.root, 'albums', 'dead-letter')
+    const dlEntries = existsSync(dlRoot) ? readdirSync(dlRoot) : []
+    expect(dlEntries.some((n) => n.startsWith(`${key}-`))).toBe(false)
 
     rmSync(statePaths.root, { recursive: true, force: true })
   })

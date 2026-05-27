@@ -34,11 +34,13 @@
 import { randomBytes } from 'node:crypto'
 import {
   chmod,
+  copyFile,
   mkdir,
   readdir,
   readFile,
   rename,
   rm,
+  stat,
   unlink,
   writeFile,
 } from 'node:fs/promises'
@@ -234,6 +236,11 @@ export async function persistFragment(
  * `meta.json` and any in-progress `.tmp` files. Returns the parsed
  * payloads. Missing dir / unreadable files → empty array (caller
  * decides whether to treat as "no album" or "recovery noop").
+ *
+ * NOTE: lenient — silently skips unreadable / corrupt fragments. The
+ * recovery path uses {@link readFragmentsStrict} instead so a corrupt
+ * fragment is never silently dropped. This lenient version is retained
+ * for callers that want best-effort reads (ops tools, diagnostics).
  */
 export async function readFragments<TFragment>(
   stateDir: string,
@@ -268,6 +275,112 @@ export async function readFragments<TFragment>(
   return out
 }
 
+/** Classified failure surface for {@link readFragmentsStrict}. The
+ *  recovery path treats every kind as a hard stop — no partial dispatch
+ *  — and dead-letters the whole album dir with this payload in the
+ *  `.recovery-failure.json` sidecar. */
+export type FragmentReadFailure =
+  | { kind: 'stat'; file: string; error: string }
+  | { kind: 'read'; file: string; error: string }
+  | { kind: 'parse'; file: string; error: string }
+  | { kind: 'empty_file'; file: string; error: string }
+
+export type FragmentReadResult<TFragment> =
+  | { ok: true; fragments: TFragment[]; files: string[] }
+  | { ok: false; failure: FragmentReadFailure; filesSeen: string[] }
+
+/**
+ * Strict variant of {@link readFragments} used by the recovery path.
+ *
+ * Unlike `readFragments`, the FIRST unreadable, zero-byte, or unparseable
+ * fragment short-circuits the read and returns a classified failure.
+ * The recovery caller is responsible for moving the album dir to
+ * dead-letter — this function performs zero FS mutations.
+ *
+ * Classification:
+ *   - `stat`        — fragment file `stat` failed (ENOENT race, EACCES)
+ *   - `empty_file`  — zero-byte fragment (partial-write detected)
+ *   - `read`        — `readFile` failed for any other reason
+ *   - `parse`       — JSON.parse threw on the file contents
+ *
+ * The `meta.json` file is NOT checked here — readMeta in the caller
+ * handles that. Only fragment payload files matter for this function.
+ */
+export async function readFragmentsStrict<TFragment>(
+  stateDir: string,
+  key: string,
+): Promise<FragmentReadResult<TFragment>> {
+  const dir = albumDir(stateDir, key)
+  let entries: string[]
+  try {
+    entries = await readdir(dir)
+  } catch (err) {
+    // No fragments at all — caller (recoverPendingAlbums) already
+    // handles the "meta present, zero fragments" case as dead-letter.
+    // Return success with empty list; the caller's zero-length check
+    // catches it without conflating "empty" with "corrupt".
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { ok: true, fragments: [], files: [] }
+    }
+    return {
+      ok: false,
+      failure: { kind: 'read', file: '<dir>', error: String(err) },
+      filesSeen: [],
+    }
+  }
+  const files = entries
+    .filter((name) => name !== META_FILENAME)
+    .filter((name) => name.endsWith('.json'))
+    .filter((name) => !name.endsWith('.tmp'))
+    .sort() // lexicographic = chronological at ms resolution
+
+  const out: TFragment[] = []
+  for (const f of files) {
+    const full = join(dir, f)
+    let size: number
+    try {
+      const st = await stat(full)
+      size = st.size
+    } catch (err) {
+      return {
+        ok: false,
+        failure: { kind: 'stat', file: f, error: String(err) },
+        filesSeen: files,
+      }
+    }
+    if (size === 0) {
+      // Zero-byte file is the canonical partial-write signature on
+      // Linux ext4 when a crash hits between create() and the rename
+      // of the .tmp suffix. Treat as corrupt — never silently skip.
+      return {
+        ok: false,
+        failure: { kind: 'empty_file', file: f, error: 'fragment size is 0 bytes' },
+        filesSeen: files,
+      }
+    }
+    let raw: string
+    try {
+      raw = await readFile(full, 'utf8')
+    } catch (err) {
+      return {
+        ok: false,
+        failure: { kind: 'read', file: f, error: String(err) },
+        filesSeen: files,
+      }
+    }
+    try {
+      out.push(JSON.parse(raw) as TFragment)
+    } catch (err) {
+      return {
+        ok: false,
+        failure: { kind: 'parse', file: f, error: String(err) },
+        filesSeen: files,
+      }
+    }
+  }
+  return { ok: true, fragments: out, files }
+}
+
 /**
  * Remove an album's directory and every file inside it. Called on
  * successful flush. Idempotent — a missing dir is treated as success.
@@ -278,11 +391,59 @@ export async function dropAlbumDir(stateDir: string, key: string): Promise<void>
   await rm(dir, { recursive: true, force: true })
 }
 
+/** Move a directory atomically when possible, falling back to
+ *  copy+delete when `rename` returns `EXDEV` (cross-FS move).
+ *
+ *  Used by the dead-letter routines so the album dir is not deleted
+ *  from `albums/` until the destination is fully populated. On
+ *  copy+delete the destination is built up first; only after every file
+ *  is copied is the source removed. If the copy phase throws midway,
+ *  the source stays put so the next startup will retry.
+ */
+async function moveDirSafely(src: string, dest: string): Promise<void> {
+  try {
+    await rename(src, dest)
+    return
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code !== 'EXDEV') throw err
+    // Cross-FS move — copy+delete. We do NOT delete the source until
+    // every file is copied so a mid-copy crash leaves the album dir
+    // intact for the next recovery pass.
+    await copyDirRecursive(src, dest)
+    await rm(src, { recursive: true, force: true })
+  }
+}
+
+/** Minimal recursive directory copy used by {@link moveDirSafely}'s
+ *  EXDEV fallback. Preserves the tightened modes used elsewhere in this
+ *  module. Not exported — the only caller is `moveDirSafely`. */
+async function copyDirRecursive(src: string, dest: string): Promise<void> {
+  await mkdir(dest, { recursive: true, mode: STATE_DIR_MODE })
+  const entries = await readdir(src, { withFileTypes: true })
+  for (const e of entries) {
+    const s = join(src, e.name)
+    const d = join(dest, e.name)
+    if (e.isDirectory()) {
+      await copyDirRecursive(s, d)
+    } else if (e.isFile()) {
+      await copyFile(s, d)
+      await chmod(d, STATE_FILE_MODE).catch(() => {})
+    }
+    // Symlinks / other types are not expected inside album dirs; skip.
+  }
+  await chmod(dest, STATE_DIR_MODE).catch(() => {})
+}
+
 /**
  * Move a failed album's directory into `albums/dead-letter/{key}-{ts}/`.
  * Called when the flush callback errors. The operator can inspect or
  * manually replay; this module never auto-retries to avoid duplicate
  * delivery.
+ *
+ * Move strategy: atomic `rename` on the same filesystem; on `EXDEV`
+ * falls back to copy+delete via {@link moveDirSafely} so the source dir
+ * is never removed until the destination is fully populated.
  */
 export async function moveToAlbumDeadLetter(
   stateDir: string,
@@ -296,7 +457,7 @@ export async function moveToAlbumDeadLetter(
     mode: STATE_DIR_MODE,
   })
   try {
-    await rename(src, dest)
+    await moveDirSafely(src, dest)
     // Drop a `.reason` sidecar so operators can grep failure causes.
     const reasonPath = `${dest}.reason`
     await writeFile(reasonPath, reason, {
@@ -309,6 +470,72 @@ export async function moveToAlbumDeadLetter(
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null
     throw err
   }
+}
+
+/** Structured payload written alongside the dead-lettered album dir as
+ *  `<dest>.recovery-failure.json`. Used for the corrupt-fragment case
+ *  (MED-C) so operators can triage without grepping plain-text reasons.
+ */
+export interface RecoveryFailureSidecar {
+  /** ISO-8601 timestamp of the recovery attempt. */
+  timestamp: string
+  /** Composite album key (`<chatId>:<mgid>`). */
+  key: string
+  /** Captured `chatId` / `mediaGroupId` if meta.json was readable;
+   *  null when the album dir lacked usable meta. */
+  chatId: string | null
+  mediaGroupId: string | null
+  /** Total fragment-shaped files seen on disk (parseable or not). */
+  fragmentCount: number
+  /** The file that triggered the dead-letter. Empty when failure is
+   *  not file-scoped (e.g. dir-level read error). */
+  corruptFile: string
+  /** Classification of the failure — see {@link FragmentReadFailure}. */
+  errorType: FragmentReadFailure['kind']
+  /** Raw error message captured from the underlying FS / JSON op. */
+  errorMessage: string
+}
+
+/**
+ * Move an album dir to dead-letter AND drop a structured
+ * `.recovery-failure.json` sidecar describing the failure.
+ *
+ * Used exclusively by the recovery path when a fragment is unreadable
+ * or unparseable. The plain `.reason` text sidecar produced by
+ * {@link moveToAlbumDeadLetter} is intentionally NOT written here so
+ * operators can distinguish "flush failure" (text sidecar) from
+ * "recovery corruption" (JSON sidecar) by file extension alone.
+ *
+ * The dir move uses the same atomic-then-EXDEV-fallback strategy as
+ * {@link moveToAlbumDeadLetter}. Source is removed only after the
+ * destination is fully populated.
+ */
+export async function moveToAlbumDeadLetterWithSidecar(
+  stateDir: string,
+  key: string,
+  sidecar: RecoveryFailureSidecar,
+): Promise<string | null> {
+  const src = albumDir(stateDir, key)
+  const dest = join(deadLetterDir(stateDir), `${basename(src)}-${Date.now()}`)
+  await mkdir(deadLetterDir(stateDir), {
+    recursive: true,
+    mode: STATE_DIR_MODE,
+  })
+  try {
+    await moveDirSafely(src, dest)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw err
+  }
+  // Sidecar is written AFTER the move is confirmed. Failure to write
+  // the sidecar is logged-and-swallowed — the album bytes are already
+  // safely in dead-letter, the sidecar is purely diagnostic.
+  const sidecarPath = `${dest}.recovery-failure.json`
+  await writeFile(sidecarPath, JSON.stringify(sidecar, null, 2), {
+    encoding: 'utf8',
+    mode: STATE_FILE_MODE,
+  }).catch(() => {})
+  return dest
 }
 
 /**
@@ -420,7 +647,40 @@ export async function recoverPendingAlbums<TFragment>(opts: {
       skipped++
       continue
     }
-    const fragments = await readFragments<TFragment>(stateDir, entry.key)
+    const readResult = await readFragmentsStrict<TFragment>(stateDir, entry.key)
+    if (!readResult.ok) {
+      // MED-C (Codex handlers #4): any unreadable / unparseable fragment
+      // is a hard stop. NEVER dispatch a partial album. Move the whole
+      // dir to dead-letter with a structured JSON sidecar so operators
+      // can triage. The dir is removed from `albums/` only AFTER the
+      // dead-letter destination is fully populated (rename when
+      // possible; copy+delete on EXDEV).
+      const sidecar: RecoveryFailureSidecar = {
+        timestamp: new Date().toISOString(),
+        key: entry.key,
+        chatId: entry.meta.chatId,
+        mediaGroupId: entry.meta.mediaGroupId,
+        fragmentCount: readResult.filesSeen.length,
+        corruptFile: readResult.failure.file,
+        errorType: readResult.failure.kind,
+        errorMessage: readResult.failure.error,
+      }
+      await moveToAlbumDeadLetterWithSidecar(
+        stateDir,
+        entry.key,
+        sidecar,
+      ).catch(() => {})
+      deadLettered++
+      opts.log?.warn?.('album.recovery.dead_letter', {
+        chatId: entry.meta.chatId,
+        mgid: entry.meta.mediaGroupId,
+        reason: `corrupt_fragment:${readResult.failure.kind}`,
+        corrupt_file: readResult.failure.file,
+        fragment_count: readResult.filesSeen.length,
+      })
+      continue
+    }
+    const fragments = readResult.fragments
     if (fragments.length === 0) {
       // Meta present but no fragments (race: persistFragment crashed
       // between meta write and first fragment). Move to dead-letter to

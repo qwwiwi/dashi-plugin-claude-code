@@ -468,12 +468,47 @@ export class TmuxMirror {
     // for any concurrent interval poll to finish so our send goes
     // through. Bounded by BUMP_WAIT_MAX_MS to avoid hanging on a stuck
     // poll (e.g. tmux exec hanging for the full 5s timeout).
-    const waitStart = this.now()
-    while (this.inFlight && this.now() - waitStart < BUMP_WAIT_MAX_MS) {
+    //
+    // MED-A #3: this wait-bound uses Date.now() rather than this.now()
+    // — it is a REAL-TIME backstop against a stuck poll, not part of
+    // the mirror's logical clock. With a fake `now()` injected for
+    // tests, the loop with this.now() never advanced (the clock
+    // doesn't tick on its own) and the test process could hang for
+    // BUMP_WAIT_MAX_MS of wall-clock real-setTimeout sleeps anyway —
+    // worse, if the test pinned `now` to a single value the loop
+    // could spin in a way the fake setTimeout never released. Wall-
+    // clock Date.now() makes the bound deterministic and unrelated
+    // to the test clock.
+    const waitStart = Date.now()
+    while (this.inFlight && Date.now() - waitStart < BUMP_WAIT_MAX_MS) {
       await new Promise<void>((r) => setTimeout(r, BUMP_WAIT_TICK_MS))
       if (!this.enabled) return
     }
     await this.onPoll()
+  }
+
+  // Re-arm a mirror that flipped `disabled=true` due to a permanent
+  // Telegram error (forbidden / parse). Clears the disabled flag,
+  // resets lastError, AND flips `enabled` back to false so the
+  // caller's subsequent start() can re-arm the polling loop.
+  // Idempotent on a healthy mirror (no-op when not disabled). Wire
+  // `/mirror on` to call this before start() so the warchief doesn't
+  // have to restart the plugin to recover from a 403/parse error
+  // (MED-A #2).
+  //
+  // Sequence: reset() -> start(). reset() clears the permanent-
+  // disable latch and the enabled flag so start()'s early-return
+  // guards both fall through; start() then runs the initial poll
+  // and (if it succeeds) arms the interval. If the underlying
+  // condition that caused the original disable is still present,
+  // the next send/edit will re-flip `disabled=true` via
+  // handleSendError / handleEditError exactly as before — reset()
+  // is a recovery primitive, not a force-override.
+  reset(): void {
+    if (!this.disabled) return
+    this.disabled = false
+    this.enabled = false
+    this.lastError = undefined
   }
 
   async stop(): Promise<void> {

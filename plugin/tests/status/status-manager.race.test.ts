@@ -359,6 +359,59 @@ describe('StatusManager — concurrent lazy-bubble (HIGH #4)', () => {
     expect(mgr.isActive(CHAT)).toBe(true)
   })
 
+  test('lazy-send parse downgrade preserves reply_to_message_id (MED-A #6)', async () => {
+    // Codex status #5 / MED-A #6: when the initial lazy-send hits a
+    // parse error, the retry without parse_mode must STILL carry the
+    // original reply_to_message_id captured at start(). Pre-fix the
+    // retry sent `{}`, dropping the reply target entirely — the
+    // recovered status appeared unanchored at the bottom of the
+    // chat.
+    const { mgr, api } = makeManager({
+      config: makeConfig({ suppress_typing_bubble: true }),
+    })
+    // start() captures reply_to=4242. Lazy-bubble path will use it.
+    await mgr.start(CHAT, 4242)
+
+    // First sendMessage on the non-typing transition fails with
+    // parse error. Second attempt (the parse-downgrade retry) must
+    // succeed and MUST carry reply_to_message_id=4242.
+    api.sendErrors = [
+      new TelegramError(400, "Bad Request: can't parse entities: oh no"),
+    ]
+    await mgr.updateByChatId(CHAT, { kind: 'tool', toolName: 'Bash' })
+
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(2)
+    // The retry has no parse_mode (downgrade) but keeps reply_to.
+    const retry = sends[1]!
+    const retryOpts = retry.opts as { parse_mode?: string; reply_to_message_id?: number }
+    expect(retryOpts.parse_mode).toBeUndefined()
+    expect(retryOpts.reply_to_message_id).toBe(4242)
+    // First attempt had parse_mode=HTML + reply_to too.
+    const first = sends[0]!
+    const firstOpts = first.opts as { parse_mode?: string; reply_to_message_id?: number }
+    expect(firstOpts.parse_mode).toBe('HTML')
+    expect(firstOpts.reply_to_message_id).toBe(4242)
+  })
+
+  test('lazy-send parse downgrade with no reply target omits reply_to_message_id cleanly', async () => {
+    // start() with replyTo=undefined → parseDowngrade retry must NOT
+    // synthesise a reply_to_message_id. Sanity check: undefined in →
+    // undefined out (no zero-value or stray field appears).
+    const { mgr, api } = makeManager({
+      config: makeConfig({ suppress_typing_bubble: true }),
+    })
+    await mgr.start(CHAT, undefined)
+    api.sendErrors = [
+      new TelegramError(400, "Bad Request: can't parse entities"),
+    ]
+    await mgr.updateByChatId(CHAT, { kind: 'tool', toolName: 'Bash' })
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(2)
+    const retryOpts = sends[1]!.opts as { reply_to_message_id?: number }
+    expect(retryOpts.reply_to_message_id).toBeUndefined()
+  })
+
   test('failed bubble creation can retry on the next event', async () => {
     // ensureBubble caches the in-flight promise but clears it on
     // success OR failure so a future event can retry. Pre-fix this
@@ -473,7 +526,7 @@ describe('StatusManager — edit-error classification (HIGH #5)', () => {
     expect(retry.parse_mode).toBeUndefined()
   })
 
-  test('429 Too Many Requests after retry exhaustion drops this tick (no state mutation)', async () => {
+  test('429 Too Many Requests pauses chat ticks for retry_after seconds then resumes (MED-A #4)', async () => {
     const { mgr, api, clock } = makeManager()
     const h = await mgr.start(CHAT, undefined)
     const editsBefore = api.calls.filter((c) => c.kind === 'edit').length
@@ -482,20 +535,36 @@ describe('StatusManager — edit-error classification (HIGH #5)', () => {
       new TelegramError(429, 'Too Many Requests', { retry_after: 5 }),
     ]
     await mgr.update(h, { kind: 'thinking' })
-    // One attempt fired; no retry inside StatusManager (the rate-limit
-    // wrapper handles 429 transparently when present, and the
-    // status-manager classifier just drops this tick).
+    // One attempt fired; classifier sets entry.pausedUntil = now + 5s.
     const editsAfter = api.calls.filter((c) => c.kind === 'edit').length
     expect(editsAfter - editsBefore).toBe(1)
-    // Entry not disabled — 429 is transient.
+    // Entry not disabled — 429 is transient, just paused.
     expect(mgr.isActive(CHAT)).toBe(true)
-    // Next interval tick fires a fresh edit (lastText was NOT synced
-    // because the edit didn't succeed).
+
+    // MED-A #4 — within the pause window the tick MUST NOT fire a
+    // fresh edit (pre-fix this re-issued the edit immediately,
+    // hitting 429 again and again).
     clock.advance(700)
     await Promise.resolve()
     await Promise.resolve()
-    const editsAfterTick = api.calls.filter((c) => c.kind === 'edit').length
-    expect(editsAfterTick).toBeGreaterThan(editsAfter)
+    const editsAfterFirstTick = api.calls.filter((c) => c.kind === 'edit').length
+    expect(editsAfterFirstTick).toBe(editsAfter)
+
+    // Stay inside the pause window for a couple more ticks — still
+    // no fresh I/O.
+    clock.advance(3000) // ~3.7s in total — well below the 5s pause
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(api.calls.filter((c) => c.kind === 'edit').length).toBe(editsAfter)
+
+    // Once we cross the pause boundary (5s after the 429), the next
+    // tick may resume. Advance past the boundary + an interval to
+    // guarantee a tick fires.
+    clock.advance(3000) // total ~6.7s — past the 5s pause
+    await Promise.resolve()
+    await Promise.resolve()
+    const editsAfterResume = api.calls.filter((c) => c.kind === 'edit').length
+    expect(editsAfterResume).toBeGreaterThan(editsAfter)
   })
 
   test('benign "message is not modified" syncs lastText cache', async () => {
@@ -820,5 +889,132 @@ describe('StatusManager — FIX-C bug #4 (shouldStream legacy export is fail-CLO
     })
     expect(() => shouldStream('abc', policy)).toThrow(TypeError)
     expect(() => shouldStream('../etc/passwd', policy)).toThrow(TypeError)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// MED-A #1 — per-chat blockedChats cache.
+//
+// Pre-fix: `entry.disabled = true` lived on the entry. After
+// complete()/cancel() removed the entry, the next start() created a
+// fresh entry with `disabled: false`, so every inbound message on a
+// permanently-blocked chat paid a full sendMessage 403 round-trip.
+//
+// Post-fix: a per-chat cache `blockedChats` records 401/403 events
+// keyed by chatId with timestamps. start() short-circuits to a
+// sentinel handle (messageId=0, generation=0) when the cache holds a
+// recent entry. After 5 minutes the entry is dropped so the bot can
+// recover if re-added to the chat.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('StatusManager — MED-A #1 (per-chat 403 cache)', () => {
+  test('403 on initial send caches the chat; next start() within 5 min skips sendMessage', async () => {
+    const { mgr, api } = makeManager()
+    // First start: the initial sendMessage fails with 403. start()
+    // rethrows so the handlers.ts caller can decide; but the
+    // blockedChats cache is updated as a side-effect.
+    api.sendErrors = [new TelegramError(403, 'Forbidden: bot was blocked by the user')]
+    let threw = false
+    try {
+      await mgr.start(CHAT, undefined)
+    } catch {
+      threw = true
+    }
+    expect(threw).toBe(true)
+    // Exactly one sendMessage attempt landed (the failed one).
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(1)
+
+    // Second start within the TTL — must short-circuit BEFORE
+    // sendMessage. Sentinel handle returned (messageId=0, gen=0).
+    const h2 = await mgr.start(CHAT, undefined)
+    expect(h2.messageId).toBe(0)
+    expect(h2.generation).toBe(0)
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(1)
+    // No entry was created — isActive stays false.
+    expect(mgr.isActive(CHAT)).toBe(false)
+  })
+
+  test('403 on edit caches the chat; next start() after complete() also skips sendMessage', async () => {
+    // The realistic permanent-block scenario: status starts fine,
+    // first edit returns 403 (bot just got kicked). complete()
+    // wipes the entry. Next inbound message would pre-fix retry the
+    // sendMessage and get another 403.
+    const { mgr, api } = makeManager()
+    const h = await mgr.start(CHAT, undefined)
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(1)
+
+    api.editErrors = [new TelegramError(403, 'Forbidden: bot was kicked from the group chat')]
+    await mgr.update(h, { kind: 'thinking' })
+    // Entry was disabled (still tracked) and chat marked blocked.
+    await mgr.complete(CHAT)
+    expect(mgr.isActive(CHAT)).toBe(false)
+
+    // Second start — must short-circuit because the chat is now in
+    // blockedChats. Pre-fix: a fresh entry would be created with
+    // disabled=false and another sendMessage 403 round-trip would
+    // fire. The chat MUST stay marked because the test clock didn't
+    // advance past the TTL.
+    const h2 = await mgr.start(CHAT, undefined)
+    expect(h2.messageId).toBe(0)
+    expect(h2.generation).toBe(0)
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(1)
+  })
+
+  test('after BLOCKED_CHAT_TTL_MS (~5 min) elapses, start() re-probes Telegram', async () => {
+    const { mgr, api, clock } = makeManager()
+    api.sendErrors = [new TelegramError(403, 'Forbidden: bot was blocked by the user')]
+    try {
+      await mgr.start(CHAT, undefined)
+    } catch {
+      // expected
+    }
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(1)
+
+    // Advance past the 5-minute TTL.
+    clock.advance(5 * 60 * 1000 + 1)
+
+    // Re-probe — sendMessage attempts again. (Will fail again if the
+    // 403 persists, but we don't queue another error: the second
+    // start() should succeed and create a normal entry.)
+    const h2 = await mgr.start(CHAT, undefined)
+    expect(h2.messageId).not.toBe(0)
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(2)
+    expect(mgr.isActive(CHAT)).toBe(true)
+    await mgr.complete(CHAT)
+  })
+
+  test('chat_action 403 also marks the chat blocked', async () => {
+    // chat_action shares the same per-chat permission as edit/send,
+    // so a 403 there should populate the cache identically.
+    const { mgr, api } = makeManager()
+    await mgr.start(CHAT, undefined)
+    // The first start completed normally (sendMessage succeeded).
+    // Now force the chat_action pulse to fail with 403; the entry
+    // will be disabled AND the chat marked blocked.
+    api.api.sendChatAction = async (_chatId: string, _action: string) => {
+      throw new TelegramError(403, 'Forbidden: chat_write_forbidden')
+    }
+    // Trigger another chat_action pulse via pulseChatAction (drives
+    // by advancing the clock past CHAT_ACTION_PULSE_MS).
+    // Actually simpler: trigger update which doesn't pulse, so let
+    // us call complete then start again — the immediate pulse in
+    // startInternal will fire and fail.
+    await mgr.complete(CHAT)
+    // Second start — note we haven't recorded a 403 in blockedChats
+    // YET, so this start() will not short-circuit. It WILL fire
+    // sendMessage (succeed), then pulse chat_action (fail with
+    // 403). After this the cache must hold the chat.
+    await mgr.start(CHAT, undefined)
+    // Microtask flush for the fire-and-forget pulseChatAction.
+    await Promise.resolve()
+    await Promise.resolve()
+    await mgr.complete(CHAT)
+
+    // Now the THIRD start must short-circuit.
+    const sendsBefore = api.calls.filter((c) => c.kind === 'send').length
+    const h3 = await mgr.start(CHAT, undefined)
+    expect(h3.messageId).toBe(0)
+    expect(h3.generation).toBe(0)
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(sendsBefore)
   })
 })

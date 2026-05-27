@@ -390,6 +390,15 @@ export async function confirmOutboxClaim(claim: OutboxClaim): Promise<void> {
  * Falls back to `unlink` if the dead-letter sibling lookup fails so
  * the file does not stick in `processing/` and block the poll loop.
  *
+ * Opus MED-B #15 (2026-05-27): chatIdFromProcessingPath gives us a
+ * defence-in-depth sanity check that the claim's processingPath
+ * carries a valid integer chat id at the expected layout slot. If it
+ * does not, the path was constructed outside our canonical layout
+ * (programmer error, tampering, or callable injected with a path from
+ * a future feature) and we MUST NOT touch the filesystem under that
+ * path — fall back to unlink (best-effort) so the file is removed
+ * from processing/ and the poll loop is not wedged.
+ *
  * @param claim the claim returned by {@link pollOutboxOnce}
  * @param mismatch metadata describing the chat id discrepancy
  */
@@ -397,6 +406,23 @@ export async function quarantineMismatchedClaim(
   claim: OutboxClaim,
   mismatch: { expectedChatId: string; actualChatId: string },
 ): Promise<void> {
+  // MED-B #15: assert the embedded chatId looks legitimate before we
+  // build sibling paths off it. A failure here means the processing
+  // path was constructed outside our layout — unlink and bail.
+  const claimChatId = chatIdFromProcessingPath(claim.processingPath)
+  if (claimChatId === null) {
+    await unlink(claim.processingPath).catch(() => {})
+    return
+  }
+  try {
+    assertValidChatId(claimChatId)
+  } catch {
+    // The path embeds a non-numeric chat id — refuse to operate under
+    // it; the file is removed so the poll loop can move on.
+    await unlink(claim.processingPath).catch(() => {})
+    return
+  }
+
   // Compute the chat-local outbox root via the well-known relative
   // layout: processing/ and mismatched/ are siblings under outbox/.
   const mismatchedDir = join(
@@ -455,6 +481,19 @@ export async function rejectOutboxClaim(
     // Defensive — should never happen because pollOutboxOnce hands
     // back a path it just built. Fall back to unlink so the file
     // does not stick in processing/.
+    await unlink(claim.processingPath).catch(() => {})
+    return
+  }
+  // Opus MED-B #15 (2026-05-27): defence-in-depth — the helper
+  // confirmed the layout shape; assertValidChatId confirms the
+  // embedded id is a strict signed-integer string. A failure means
+  // the processing path was assembled around a tampered or
+  // hand-crafted chat id; refuse to build sibling dead-letter paths
+  // off it and fall back to unlink so the file does not block the
+  // poll loop.
+  try {
+    assertValidChatId(claimChatId)
+  } catch {
     await unlink(claim.processingPath).catch(() => {})
     return
   }

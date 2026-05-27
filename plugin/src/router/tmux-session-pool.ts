@@ -114,14 +114,32 @@ const TMUX_CHILD_ENV_ALLOWLIST = [
 
 // Regex catching credential-shaped env keys. Applied even to allow-
 // listed keys as a defence-in-depth — if someone accidentally adds
-// `PATH_API_KEY` to the allowlist it still gets dropped. Matches:
-//   *_TOKEN, *_API_KEY, *_SECRET, *_PASSWORD, *_PRIVATE_KEY
-//   plus literal TOKEN / API_KEY / SECRET / PASSWORD / PRIVATE_KEY.
-// Also drops every key starting with GBRAIN_, OPENAI_, ANTHROPIC_,
-// TELEGRAM_ — the four namespaces we know contain orchestrator
-// credentials that must never reach user-visible claude sessions.
+// `PATH_API_KEY` to the allowlist it still gets dropped.
+//
+// Prefix list (Opus MED-B #21, 2026-05-27): namespaces known to carry
+// orchestrator credentials that must never reach user-visible claude
+// sessions. Expanded from the original GBRAIN/OPENAI/ANTHROPIC/TELEGRAM
+// set to cover the secondary providers we hit in EdgeLab + DCA + Edge
+// Lab infra (AWS, Supabase, Stripe, GitHub, NPM).
+//
+// Suffix list: literal credential-shaped tail tokens.
+//   * TOKEN / API_KEY / SECRET / PASSWORD / PRIVATE_KEY — original set.
+//   * URL — added for `_URL$` matches only (DATABASE_URL, REDIS_URL,
+//     MONGODB_URL, etc. typically embed credentials in the connection
+//     string). We anchor the URL match on `_URL$` so plain `URL` /
+//     `BASE_URL` strings (often non-credential) are not caught — the
+//     trailing-segment requirement keeps the regex narrow.
+//
+// NOTE on prefix breadth: AWS_, SUPABASE_, STRIPE_, GITHUB_, NPM_ may
+// catch a few non-secret keys (e.g. AWS_REGION, AWS_DEFAULT_REGION,
+// SUPABASE_URL, GITHUB_REPOSITORY). That is intentional and acceptable:
+// (1) those vars belong to orchestrator config, not the user-facing
+// claude session; (2) the chat-side hook can re-export them from a
+// dedicated allowlist if a workflow genuinely needs them; (3) leaking
+// region/repo metadata is harmless compared to leaking the matching
+// secret. Risk analysis is logged in the MED-B report.
 const FORBIDDEN_ENV_REGEX =
-  /^(?:GBRAIN_|OPENAI_|ANTHROPIC_|TELEGRAM_).*$|^.*(?:^|_)(?:TOKEN|API_KEY|SECRET|PASSWORD|PRIVATE_KEY)$/
+  /^(?:GBRAIN_|OPENAI_|ANTHROPIC_|TELEGRAM_|AWS_|SUPABASE_|STRIPE_|GITHUB_|NPM_).*$|^.*(?:^|_)(?:TOKEN|API_KEY|SECRET|PASSWORD|PRIVATE_KEY)$|^.+_URL$/
 
 /**
  * Build the sanitized env passed to a tmux child session.
@@ -161,7 +179,11 @@ export function buildSanitizedTmuxEnv(parentEnv: NodeJS.ProcessEnv): {
   // Audit pass: enumerate every key in the parent env and record
   // any forbidden hits (without values). Caller logs these so an
   // operator can spot a misconfigured systemd unit or sourced .env.
-  for (const key of Object.keys(parentEnv)) {
+  //
+  // Opus MED-B #22 (2026-05-27): iterate the parent env keys in
+  // sorted order so `forbiddenSeen` is deterministic without the
+  // caller having to re-sort for stable audit log assertions.
+  for (const key of Object.keys(parentEnv).sort()) {
     if (FORBIDDEN_ENV_REGEX.test(key) && parentEnv[key] !== undefined && parentEnv[key] !== '') {
       forbiddenSeen.push(key)
     }
@@ -712,7 +734,16 @@ export class TmuxSessionPool {
       '-e',
       `CLAUDE_WORKSPACE_DIR=${this.workspaceDir}`,
     ]
-    for (const [key, val] of Object.entries(childEnv)) {
+    // Opus MED-B #22 (2026-05-27): sort childEnv entries by key before
+    // emitting `-e KEY=VAL` pairs. `Object.entries` order is
+    // implementation-defined (V8 honours insertion order for string
+    // keys, but spec compliance should not be load-bearing). Stable
+    // alphabetical ordering makes the argv log + the audit warn
+    // (`pool.forbidden_env_dropped`) deterministic across runs and
+    // platforms — tests assert exact argv subsequences without flake.
+    for (const [key, val] of Object.entries(childEnv).sort(([a], [b]) =>
+      a.localeCompare(b),
+    )) {
       args.push('-e', `${key}=${val}`)
     }
     // PATH baseline if the parent didn't have one (extremely unlikely
