@@ -1,8 +1,16 @@
 # dashi-plugin-claude-code
 
-**Telegram → Claude Code channel plugin.** Превращает обычную, живую Claude Code сессию в Telegram-агента: бот слушает один или несколько чатов, отвечает в той же сессии, и оставляет всю работу внутри обычной Anthropic Max-подписки — без отдельного SDK-биллинга.
+> **Read in your language:** English (this page) · [**Русская версия →**](README.ru.md)
 
-Это замена устаревшему `claude -p` gateway-паттерну (Python-демон, который спавнил новую headless-сессию на каждое сообщение). Cutover deadline — **2026-06-15** (Anthropic разделяет billing, подробности в разделе [13](#13-зачем-переезд--дедлайн-2026-06-15)).
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Runtime: Bun](https://img.shields.io/badge/runtime-Bun_1.3+-f9f1e1.svg)](https://bun.sh)
+[![Language: TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)](https://www.typescriptlang.org/)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-v2.1.80+-d97757.svg)](https://code.claude.com/docs/en/channels-reference)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#license-and-author)
+
+**A Telegram → Claude Code channel plugin.** It turns an ordinary, live Claude Code session into a Telegram agent: the bot listens to one or more chats, replies inside the same session, and keeps all the work within your regular Anthropic Max subscription — with no separate SDK billing.
+
+It replaces the deprecated `claude -p` gateway pattern (a Python daemon that spawned a fresh headless session for every message). Cutover deadline — **2026-06-15** (Anthropic is splitting billing; details in section [13](#13-why-migrate--the-2026-06-15-deadline)).
 
 ```
 [ Telegram ]
@@ -14,100 +22,100 @@
      └──────────────────────────────────────────────────────────────┘
 ```
 
-Один процесс плагина = один Telegram-бот = один агент. По умолчанию обслуживается **один DM-чат** (legacy single-session режим). При включённом `multichat.enabled` тот же бот раскладывает входящие по нескольким per-chat tmux-сессиям одной identity — см. раздел [3](#3-multichat--как-работает-и-зачем).
+One plugin process = one Telegram bot = one agent. By default it serves **a single DM chat** (legacy single-session mode). With `multichat.enabled` turned on, the same bot fans incoming messages out across several per-chat tmux sessions of one identity — see section [3](#3-multichat--how-it-works-and-why).
 
-> **Статус:** под активной разработкой. Актуальный смерженный PR — **#34** (Stop-хук пишет ответ multichat в outbox). Авто-реконнект поллера — **#30**. Полный список: `gh pr list --state merged --limit 15`. CI: `bun test` + `bun run typecheck` обязаны проходить чисто перед merge.
-
----
-
-## Содержание
-
-1. [Как работает плагин и зачем он нужен](#1-как-работает-плагин-и-зачем-он-нужен)
-2. [Личная сессия + channel tmux, и как добавить свой user_id](#2-личная-сессия--channel-tmux-и-как-добавить-свой-user_id)
-3. [Multichat — как работает и зачем](#3-multichat--как-работает-и-зачем)
-4. [Hooks плагина](#4-hooks-плагина)
-5. [Интерактивные команды: permission-prompt (sudo) и AskUserQuestion](#5-интерактивные-команды-permission-prompt-sudo-и-askuserquestion)
-6. [Terminal mirror — как работает и зачем](#6-terminal-mirror--как-работает-и-зачем)
-7. [Передача медиа, аудио и транскрибация голосовых](#7-передача-медиа-аудио-и-транскрибация-голосовых)
-8. [Авторестарт сессии — чтобы связь не прерывалась](#8-авторестарт-сессии--чтобы-связь-не-прерывалась)
-9. [HTML-фильтрация из терминала в Telegram](#9-html-фильтрация-из-терминала-в-telegram)
-10. [Безопасность — чтобы данные не утекали](#10-безопасность--чтобы-данные-не-утекали)
-11. [Rate limits Telegram API](#11-rate-limits-telegram-api)
-12. [Быстрый старт и документация](#12-быстрый-старт-и-документация)
-13. [Зачем переезд — дедлайн 2026-06-15](#13-зачем-переезд--дедлайн-2026-06-15)
+> **Status:** under active development. Latest merged PR — **#34** (the Stop hook writes the multichat reply to the outbox). Poller auto-reconnect — **#30**. Full list: `gh pr list --state merged --limit 15`. CI: `bun test` + `bun run typecheck` must pass clean before merge.
 
 ---
 
-## 1. Как работает плагин и зачем он нужен
+## Table of contents
 
-### Зачем
+1. [How the plugin works and why you need it](#1-how-the-plugin-works-and-why-you-need-it)
+2. [Personal session + channel tmux, and how to add your user_id](#2-personal-session--channel-tmux-and-how-to-add-your-user_id)
+3. [Multichat — how it works and why](#3-multichat--how-it-works-and-why)
+4. [Plugin hooks](#4-plugin-hooks)
+5. [Interactive commands: permission prompts (sudo) and AskUserQuestion](#5-interactive-commands-permission-prompts-sudo-and-askuserquestion)
+6. [Terminal mirror — how it works and why](#6-terminal-mirror--how-it-works-and-why)
+7. [Media, audio, and voice-message transcription](#7-media-audio-and-voice-message-transcription)
+8. [Session auto-restart — so the link never drops](#8-session-auto-restart--so-the-link-never-drops)
+9. [HTML filtering from terminal to Telegram](#9-html-filtering-from-terminal-to-telegram)
+10. [Security — so data never leaks](#10-security--so-data-never-leaks)
+11. [Telegram API rate limits](#11-telegram-api-rate-limits)
+12. [Quick start and documentation](#12-quick-start-and-documentation)
+13. [Why migrate — the 2026-06-15 deadline](#13-why-migrate--the-2026-06-15-deadline)
 
-Старая архитектура (`jarvis-telegram-gateway`) — это Python-демон, который на каждое сообщение из Telegram запускал `claude -p` (headless Agent SDK). Каждый turn = новый процесс, новая загрузка контекста, и — после 15 июня 2026 — **отдельный SDK-кредит мимо Max-подписки** (см. раздел 13).
+---
 
-Этот плагин держит **одну живую interactive Claude Code сессию** и просто пушит в неё channel-сообщения. Сессия классифицируется как interactive → расход остаётся в обычной Max-квоте и не растёт от количества сообщений в Telegram. Бонусом — сессия помнит контекст между сообщениями, а не стартует с нуля каждый раз.
+## 1. How the plugin works and why you need it
 
-### Как
+### Why
 
-Это Claude Code **channel plugin** (Bun + TypeScript, grammY для Telegram, Zod для валидации). Поток сообщения:
+The old architecture (`jarvis-telegram-gateway`) is a Python daemon that ran `claude -p` (a headless Agent SDK session) for every Telegram message. Each turn = a new process, a fresh context load, and — after June 15, 2026 — **a separate SDK credit billed outside your Max subscription** (see section 13).
 
-1. `TelegramPoller` (`src/telegram/poller.ts`) тянет `getUpdates` (long polling) с per-instance lock на `state_dir`, чтобы два процесса не подняли одного бота.
-2. Входящее проходит **allowlist-gate** (`src/telegram/gate.ts`) — кто не разрешён, отбивается ДО любой обработки.
-3. Хендлеры (`src/telegram/handlers.ts`) собирают текст + медиа в channel-сообщение (`src/prompt/build.ts`) и пушат его в Claude Code сессию.
-4. Claude думает, вызывает tools/MCP, формирует ответ.
-5. Ответ уходит в Telegram через `safe-telegram-api` (`src/safety/safe-telegram-api.ts`): redact секретов → HTML-валидация → 4000-char chunking → token-bucket rate limiter.
+This plugin keeps **one live, interactive Claude Code session** and simply pushes channel messages into it. The session is classified as interactive → usage stays within your normal Max quota and does not grow with the number of Telegram messages. As a bonus, the session remembers context between messages instead of starting from scratch every time.
 
-Параллельно работают три «поверхности прогресса» (питаются от hooks, см. раздел 4):
+### How
 
-| Подсистема | Что делает |
+It is a Claude Code **channel plugin** (Bun + TypeScript, grammY for Telegram, Zod for validation). The message flow:
+
+1. `TelegramPoller` (`src/telegram/poller.ts`) pulls `getUpdates` (long polling) with a per-instance lock on `state_dir`, so two processes can't bring up the same bot.
+2. Each incoming message passes the **allowlist gate** (`src/telegram/gate.ts`) — anyone not allowed is rejected *before* any processing.
+3. Handlers (`src/telegram/handlers.ts`) assemble text + media into a channel message (`src/prompt/build.ts`) and push it into the Claude Code session.
+4. Claude thinks, calls tools/MCP, and forms a reply.
+5. The reply goes out to Telegram through `safe-telegram-api` (`src/safety/safe-telegram-api.ts`): secret redaction → HTML validation → 4000-char chunking → token-bucket rate limiter.
+
+In parallel, three "progress surfaces" run (fed by hooks, see section 4):
+
+| Subsystem | What it does |
 |---|---|
-| `StatusManager` | transient bubble: typing → thinking → имя текущего tool |
-| `ProgressReporter` | отдельное rolling-сообщение со строками активности (PreToolUse/PostToolUse/Stop) через `editMessageText` |
-| `TaskMirror` | третье rolling-сообщение — milestones из `TodoWrite` / `TaskCreate` / `TaskUpdate` |
+| `StatusManager` | transient bubble: typing → thinking → name of the current tool |
+| `ProgressReporter` | a separate rolling message with activity lines (PreToolUse/PostToolUse/Stop) via `editMessageText` |
+| `TaskMirror` | a third rolling message — milestones from `TodoWrite` / `TaskCreate` / `TaskUpdate` |
 
-Запуск — два варианта: standalone Bun-процесс (`bun start`, быстрая проверка токена) или production через `claude --dangerously-load-development-channels server:dashi-channel` (Claude Code сам держит runtime плагина). См. раздел 12.
+Two ways to launch: a standalone Bun process (`bun start`, a quick token check) or production via `claude --dangerously-load-development-channels server:dashi-channel` (Claude Code itself hosts the plugin runtime). See section 12.
 
 ---
 
-## 2. Личная сессия + channel tmux, и как добавить свой user_id
+## 2. Personal session + channel tmux, and how to add your user_id
 
-### Модель процесса
+### Process model
 
-В legacy-режиме плагин живёт внутри одной Claude Code сессии, которую удобно запускать в именованной **tmux-сессии** (например `channel-thrall`) — так её можно держать постоянно резидентной, переподключаться по SSH без потери состояния и мирорить pane в Telegram (раздел 6). Один workspace, один `CLAUDE.md`, один бот, один DM-чат.
+In legacy mode the plugin lives inside a single Claude Code session, which is convenient to run inside a named **tmux session** (e.g. `channel-thrall`) — that way you can keep it permanently resident, reconnect over SSH without losing state, and mirror the pane to Telegram (section 6). One workspace, one `CLAUDE.md`, one bot, one DM chat.
 
-### Как добавить свой user_id (legacy single-DM)
+### How to add your user_id (legacy single-DM)
 
-Доступ — единственный gate, и он **обязателен**. Разрешённые пользователи задаются переменной `TELEGRAM_ALLOWED_USER_IDS`:
+Access is the single gate, and it is **mandatory**. Allowed users are set via the `TELEGRAM_ALLOWED_USER_IDS` variable:
 
 ```bash
-# в channel.env (CSV, без пробелов после запятых, только положительные целые)
+# in channel.env (CSV, no spaces after commas, positive integers only)
 TELEGRAM_ALLOWED_USER_IDS=164795011,123456789
 ```
 
-Эквивалент в `config.json`:
+The `config.json` equivalent:
 
 ```json
 { "allowed_user_ids": [164795011, 123456789] }
 ```
 
-Парсер (`src/config.ts`) валидирует каждое значение как положительное целое и падает с понятной ошибкой на мусоре. Env перекрывает `config.json`. В DM Telegram ставит `chat.id == user.id`, поэтому gate проверяет и sender_id, и chat_id (defence-in-depth, `src/telegram/gate.ts`).
+The parser (`src/config.ts`) validates every value as a positive integer and fails with a clear error on garbage. Env overrides `config.json`. In a DM, Telegram sets `chat.id == user.id`, so the gate checks both sender_id and chat_id (defence-in-depth, `src/telegram/gate.ts`).
 
-**Как узнать свой user_id:** напишите [@userinfobot](https://t.me/userinfobot) — он ответит числовым id. Для групп id начинается с `-100…`.
+**How to find your user_id:** message [@userinfobot](https://t.me/userinfobot) — it replies with your numeric id. For groups the id starts with `-100…`.
 
-> Anti-spoof: reply-to сообщение валидируется как принадлежащее вашему боту (`is_bot` + username), поэтому подставными reply-метаданными gate не обойти (`src/telegram/addressing.ts`). См. раздел 10.
+> Anti-spoof: a reply-to message is validated as belonging to your bot (`is_bot` + username), so forged reply metadata can't bypass the gate (`src/telegram/addressing.ts`). See section 10.
 
 ---
 
-## 3. Multichat — как работает и зачем
+## 3. Multichat — how it works and why
 
-### Зачем
+### Why
 
-Иногда нужно вести параллельно несколько чатов одной и той же identity: личный DM вождя + рабочая группа + sandbox. Один бот, одна личность, разные «комнаты» с разными правами и разной приватностью.
+Sometimes you need to run several chats in parallel under the same identity: the operator's personal DM + a work group + a sandbox. One bot, one personality, different "rooms" with different rights and different privacy levels.
 
-### Как
+### How
 
-`MultichatRouter` (`src/router/multichat-router.ts`, default **OFF**) разводит входящие по нескольким **per-chat tmux-сессиям** `claude` через `TmuxSessionPool`. Связь плагин ↔ сессия — JSON-pipe через файловый inbox/outbox (`inbox-bridge.ts`). Гибридный роутинг (PR #33): личка вождя идёт в host-сессию (`channel-thrall`), группы — в свои per-chat сессии. Stop-хук per-chat сессии пишет финальный ответ в outbox (PR #34), откуда плагин его забирает и шлёт в Telegram.
+`MultichatRouter` (`src/router/multichat-router.ts`, default **OFF**) routes incoming messages across several **per-chat tmux sessions** of `claude` via `TmuxSessionPool`. The plugin ↔ session link is a JSON pipe over a file-based inbox/outbox (`inbox-bridge.ts`). Hybrid routing (PR #33): the operator's DM goes to the host session (`channel-thrall`), groups go to their own per-chat sessions. The per-chat session's Stop hook writes the final reply to the outbox (PR #34), from which the plugin picks it up and sends it to Telegram.
 
-Включение — флаг в `config.json` (или `TELEGRAM_MULTICHAT_ENABLED=1`):
+Enable it with a flag in `config.json` (or `TELEGRAM_MULTICHAT_ENABLED=1`):
 
 ```json
 {
@@ -120,26 +128,26 @@ TELEGRAM_ALLOWED_USER_IDS=164795011,123456789
 }
 ```
 
-Чаты описываются в `policy.yaml` (strict Zod-схема, `src/chats/policy-loader.ts` — опечатка в ключе валит загрузку громко, не молча):
+Chats are described in `policy.yaml` (strict Zod schema, `src/chats/policy-loader.ts` — a typo in a key fails the load loudly, not silently):
 
 ```yaml
 version: 1
 allowlist:
-  chats: ["164795011", "-1003784643974"]   # chat_id строкой; отрицательные group id ОБЯЗАНЫ быть в кавычках
-  users: ["164795011"]                       # кто вообще может писать
-mention_allowlist: ["164795011"]             # кто может звать бота через @mention в группах
+  chats: ["164795011", "-1003784643974"]   # chat_id as a string; negative group ids MUST be quoted
+  users: ["164795011"]                       # who is allowed to write at all
+mention_allowlist: ["164795011"]             # who may summon the bot via @mention in groups
 chats:
   "164795011":
-    mode: private                            # private | public — выбирает доступные поверхности
+    mode: private                            # private | public — selects the available surfaces
     streaming: progress                      # progress | off
-    tmux_mirror: true                        # TmuxMirror только в этом чате
-    edit_message_progress: true              # rolling editMessageText для ProgressReporter
+    tmux_mirror: true                        # TmuxMirror only in this chat
+    edit_message_progress: true              # rolling editMessageText for ProgressReporter
     delivery: streamed                       # streamed | final_only
-    persona_file: chats/personas/warchief.md # per-chat persona overlay (относительно workspace_dir)
+    persona_file: chats/personas/warchief.md # per-chat persona overlay (relative to workspace_dir)
     handoff_file: core/hot/handoff.md
-    system_reminder: "Это личный DM вождя. Полный доступ."
-    idle_ttl_ms: 1800000                     # 30 мин до выгрузки tmux-сессии (default)
-    max_queue_depth: 1                        # сколько inbound можно поставить в очередь (default 1)
+    system_reminder: "This is the operator's personal DM. Full access."
+    idle_ttl_ms: 1800000                     # 30 min before the tmux session is unloaded (default)
+    max_queue_depth: 1                        # how many inbound messages may be queued (default 1)
   "-1003784643974":
     mode: public
     streaming: off
@@ -147,114 +155,114 @@ chats:
     edit_message_progress: false
     delivery: final_only
     persona_file: chats/personas/intensive-agent-os.md
-    system_reminder: "Публичная группа. Никаких внутренних логов и mirror'ов."
+    system_reminder: "Public group. No internal logs or mirrors."
 ```
 
-`PersonaManager` накладывает per-chat persona-файл поверх единой identity — никаких отдельных `CLAUDE.md` per chat не нужно. Логи: `{state_dir}/chats/<chat_id>/{inbox,outbox,processing,dead-letter}/*.json`.
+`PersonaManager` overlays a per-chat persona file on top of the single identity — no separate `CLAUDE.md` per chat is needed. Logs: `{state_dir}/chats/<chat_id>/{inbox,outbox,processing,dead-letter}/*.json`.
 
-**Failure mode:** невалидная `policy.yaml` → плагин логирует ошибку и деградирует в multichat-OFF (legacy single-DM). Лучше работать с одним чатом, чем упасть целиком.
+**Failure mode:** an invalid `policy.yaml` → the plugin logs the error and degrades to multichat-OFF (legacy single-DM). Better to work with one chat than to crash entirely.
 
-**Изоляция приватности:** `private` чаты получают все поверхности (TmuxMirror, progress-edit). `public` — только финальный ответ (`delivery: final_only`), никаких внутренних логов и mirror'ов. См. раздел 10.
+**Privacy isolation:** `private` chats get all surfaces (TmuxMirror, progress-edit). `public` chats get only the final reply (`delivery: final_only`), no internal logs or mirrors. See section 10.
 
 ---
 
-## 4. Hooks плагина
+## 4. Plugin hooks
 
-Прогресс в Telegram (`ProgressReporter`, `TaskMirror`, `StatusManager`) питается от Claude Code hooks. Без установки хуков эти поверхности молчат — приходит только финальный ответ.
+Progress in Telegram (`ProgressReporter`, `TaskMirror`, `StatusManager`) is fed by Claude Code hooks. Without installing the hooks these surfaces stay silent — you only get the final reply.
 
-### Установка
+### Installation
 
 ```bash
 bash plugin/scripts/install-hooks.sh \
   --settings ~/.claude/settings.json \
-  --chat-id <ваш-Telegram-chat-id> \
+  --chat-id <your-Telegram-chat-id> \
   --webhook-url http://127.0.0.1:8089/hooks/agent \
   --agent-id dashi-channel
 ```
 
-Идемпотентно: marker-based replacement (`"dashi-channel-hook"`) — повторный запуск не дублирует записи и чистит legacy markerless entries. Скрипт ставит **пять** событий: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` (для Pre/PostToolUse — matcher `.*`, на все tool-вызовы).
+Idempotent: marker-based replacement (`"dashi-channel-hook"`) — re-running doesn't duplicate entries and cleans up legacy markerless ones. The script installs **five** events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` (for Pre/PostToolUse the matcher is `.*`, i.e. all tool calls).
 
-### Как работает
+### How it works
 
-1. Claude Code на каждом событии запускает `scripts/post-hook.ts` (читает JSON хука из stdin).
-2. `post-hook.ts` POST'ит payload на `TELEGRAM_WEBHOOK_URL` с заголовком `Authorization: Bearer $TELEGRAM_WEBHOOK_TOKEN`. **Stdout всегда пустой, exit всегда 0** — хук никогда не блокирует Claude и ничего не подмешивает в контекст модели.
-3. Webhook-сервер плагина (`src/webhook/server.ts`, `POST /hooks/agent`) проверяет bearer-токен (timing-safe), 256 KB cap на тело, chatId allowlist, и Zod-валидацию.
-4. `src/hooks/claude-events.ts` маппит payload в внутренние события и роутит на три независимых, best-effort поверхности: MemoryWriter, StatusManager/ProgressReporter, TaskMirror.
+1. On every event, Claude Code runs `scripts/post-hook.ts` (reads the hook JSON from stdin).
+2. `post-hook.ts` POSTs the payload to `TELEGRAM_WEBHOOK_URL` with an `Authorization: Bearer $TELEGRAM_WEBHOOK_TOKEN` header. **Stdout is always empty, exit is always 0** — the hook never blocks Claude and injects nothing into the model's context.
+3. The plugin's webhook server (`src/webhook/server.ts`, `POST /hooks/agent`) verifies the bearer token (timing-safe), caps the body at 256 KB, checks the chatId allowlist, and runs Zod validation.
+4. `src/hooks/claude-events.ts` maps the payload into internal events and routes them to three independent, best-effort surfaces: MemoryWriter, StatusManager/ProgressReporter, TaskMirror.
 
-Маппинг событий:
+Event mapping:
 
 | Hook event | Activity | TaskMirror |
 |---|---|---|
-| `PreToolUse` | `tool_start` | `task_create` (если TaskCreate) |
+| `PreToolUse` | `tool_start` | `task_create` (if TaskCreate) |
 | `PostToolUse` | `tool_end` | `task_create` / `task_update` / `todo_write` |
 | `UserPromptSubmit` | `reasoning` | — |
 | `Stop` | `session_stop` | `todo_session_stop` |
 | `SessionStart` | `session_start` | — |
 
-> Bearer-токен **никогда не пишется в settings.json** — берётся из env `TELEGRAM_WEBHOOK_TOKEN` в момент запуска хука. Webhook bind — `TELEGRAM_WEBHOOK_HOST` / `TELEGRAM_WEBHOOK_PORT` (default loopback). Подробнее — [`docs/progress-reporter-setup.md`](plugin/docs/progress-reporter-setup.md).
+> The bearer token is **never written to settings.json** — it's read from the `TELEGRAM_WEBHOOK_TOKEN` env var at the moment the hook runs. Webhook bind — `TELEGRAM_WEBHOOK_HOST` / `TELEGRAM_WEBHOOK_PORT` (default loopback). More in [`docs/progress-reporter-setup.md`](plugin/docs/progress-reporter-setup.md).
 
 ---
 
-## 5. Интерактивные команды: permission-prompt (sudo) и AskUserQuestion
+## 5. Interactive commands: permission prompts (sudo) and AskUserQuestion
 
-Когда Claude в сессии упирается в интерактивный вопрос, плагин выносит его в Telegram и возвращает ответ обратно — оператор управляет агентом из чата, без SSH.
+When Claude hits an interactive prompt inside the session, the plugin surfaces it in Telegram and feeds the answer back — the operator drives the agent from the chat, no SSH needed.
 
-### Permission relay (sudo и прочие чувствительные tools)
+### Permission relay (sudo and other sensitive tools)
 
-`src/channel/permissions.ts` слушает `notifications/claude/channel/permission_request`. Поток:
+`src/channel/permissions.ts` listens for `notifications/claude/channel/permission_request`. The flow:
 
-1. Claude хочет выполнить чувствительный tool (например `sudo …`) → шлёт request с `tool_name`, `description`, `input_preview`.
-2. Плагин кладёт request в `pending` (ключ — 5-буквенный short-id) и шлёт в Telegram сообщение с инлайн-клавиатурой `[See more] [✅ Allow] [❌ Deny]`.
-3. Оператор жмёт кнопку (или отвечает текстом `yes abcde` / `no abcde`). Ответчик проверяется по `permission_relay.allowed_user_ids`.
-4. Вердикт уходит обратно в сессию через `notifications/claude/channel/permission` → Claude разрешает или блокирует tool.
+1. Claude wants to run a sensitive tool (e.g. `sudo …`) → sends a request with `tool_name`, `description`, `input_preview`.
+2. The plugin puts the request into `pending` (keyed by a 5-letter short-id) and sends a Telegram message with an inline keyboard `[See more] [✅ Allow] [❌ Deny]`.
+3. The operator taps a button (or replies with the text `yes abcde` / `no abcde`). The responder is checked against `permission_relay.allowed_user_ids`.
+4. The verdict goes back into the session via `notifications/claude/channel/permission` → Claude allows or blocks the tool.
 
-Каждое решение пишется в audit-JSONL (`statePaths.logs.permissions`). Short-id-алфавит исключает букву `l` (чтобы не путать с `1`/`i`).
+Every decision is written to an audit JSONL (`statePaths.logs.permissions`). The short-id alphabet excludes the letter `l` (to avoid confusion with `1`/`i`).
 
 ### AskUserQuestion relay (PR #28)
 
-Tool `AskUserQuestion` рендерится в Telegram как инлайн-клавиатура (`src/channel/ask-user-question.ts` + `src/telegram/ask-user-question.ts`):
+The `AskUserQuestion` tool renders in Telegram as an inline keyboard (`src/channel/ask-user-question.ts` + `src/telegram/ask-user-question.ts`):
 
-- Хук-обёртка POST'ит вопрос на `POST /hooks/ask-user-question/request` и ждёт ответа.
-- Один вопрос = одно сообщение с кнопками. Callback'и: `ask:choose` (single), `ask:toggle` + `ask:done` (multi-select), `ask:other` (свободный текст).
-- Ответ приходит на `POST /hooks/ask-user-question/answer`, привязка по `chat_id` (защита от cross-chat инъекции) и по allowlist ответчика.
-- Timeout (default 5 мин) → relay отдаёт `{ status: 'timeout' }`, хук падает обратно на нативный CC UI.
+- A hook wrapper POSTs the question to `POST /hooks/ask-user-question/request` and waits for the answer.
+- One question = one message with buttons. Callbacks: `ask:choose` (single), `ask:toggle` + `ask:done` (multi-select), `ask:other` (free text).
+- The answer arrives at `POST /hooks/ask-user-question/answer`, bound by `chat_id` (protection against cross-chat injection) and by the responder allowlist.
+- Timeout (default 5 min) → the relay returns `{ status: 'timeout' }`, and the hook falls back to the native CC UI.
 
-Оба эндпоинта `/hooks/ask-user-question/*` принимают **только loopback** (127.0.0.1 / localhost / ::1) + bearer-токен — чтобы вопрос и токен не утекли на внешний хост.
+Both `/hooks/ask-user-question/*` endpoints accept **loopback only** (127.0.0.1 / localhost / ::1) + a bearer token — so the question and the token never leak to an external host.
 
-### OOB-команды (slash-команды в Telegram)
+### OOB commands (slash commands in Telegram)
 
-Это «out-of-band» команды управления плагином и сессией — они перехватываются плагином и не доходят до Claude как обычный промпт (кроме тех, что специально транслируют сигнал в сессию). Регистрируются через `setMyCommands`, поэтому видны в меню «/» Telegram и локализованы на русский (PR #18):
+These are "out-of-band" commands for managing the plugin and the session — the plugin intercepts them and they don't reach Claude as a normal prompt (except those that deliberately relay a signal into the session). They're registered via `setMyCommands`, so they show up in Telegram's "/" menu and are localized to Russian (PR #18):
 
-| Команда | Что делает | Как пользоваться |
+| Command | What it does | How to use |
 |---|---|---|
-| `/help` | Справка — список всех команд | `/help` |
-| `/status` | Снимок состояния: bot_id, state_dir, poller offset, статус webhook, состояние mirror (message_id, last_poll, ошибки) | `/status` |
-| `/stop` | Просит Claude остановить текущую задачу. Отменяет активный status-bubble и шлёт сигнал `/stop` в сессию | `/stop` |
-| `/reset force` | Сбрасывает состояние сессии — следующее сообщение начнёт с чистого листа | `/reset` без флага только переспросит; подтверждение — `/reset force` |
-| `/new force` | Начинает новую сессию | Аналогично: `/new` переспросит, `/new force` выполнит |
-| `/mirror on\|off\|status` | Включает/выключает terminal mirror без рестарта плагина (раздел 6) | `/mirror on` · `/mirror off` · `/mirror status` |
+| `/help` | Help — list of all commands | `/help` |
+| `/status` | State snapshot: bot_id, state_dir, poller offset, webhook status, mirror state (message_id, last_poll, errors) | `/status` |
+| `/stop` | Asks Claude to stop the current task. Cancels the active status bubble and sends a `/stop` signal into the session | `/stop` |
+| `/reset force` | Resets the session state — the next message starts from a clean slate | `/reset` without the flag only re-asks; confirm with `/reset force` |
+| `/new force` | Starts a new session | Same idea: `/new` re-asks, `/new force` does it |
+| `/mirror on\|off\|status` | Turns the terminal mirror on/off without restarting the plugin (section 6) | `/mirror on` · `/mirror off` · `/mirror status` |
 
-Поведение, которое важно знать:
+Behavior worth knowing:
 
-- **`/stop` — best-effort.** Плагин передаёт сигнал остановки в сессию, но не «убивает» процесс — Claude останавливается на ближайшей безопасной точке, а не мгновенно.
-- **`/reset` и `/new` требуют `force`.** Без флага команда возвращает подсказку («для подтверждения добавь `force`») — защита от случайного сброса контекста.
-- **Суффикс `@botname` снимается** — `/status@trallvibecoderbot` в группе работает так же, как `/status`.
-- **Доступ.** Команды слушаются только из разрешённых чатов/от разрешённых user_id (тот же allowlist, раздел 10) — в публичной группе посторонний не сбросит вашу сессию.
-- В multichat доступность `/mirror` управляется флагом `tmux_mirror` в `policy.yaml` per chat.
+- **`/stop` is best-effort.** The plugin passes a stop signal into the session, but it doesn't "kill" the process — Claude stops at the nearest safe point, not instantly.
+- **`/reset` and `/new` require `force`.** Without the flag the command returns a hint ("add `force` to confirm") — protection against an accidental context reset.
+- **The `@botname` suffix is stripped** — `/status@trallvibecoderbot` in a group works the same as `/status`.
+- **Access.** Commands are only honored from allowed chats / allowed user_ids (the same allowlist, section 10) — an outsider in a public group can't reset your session.
+- In multichat, `/mirror` availability is controlled by the `tmux_mirror` flag in `policy.yaml` per chat.
 
-> Тестирование: автоматический парсинг и роутинг команд покрыт `tests/commands/oob.test.ts` (23 assertions). Живой прогон против реального бота — операторская smoke-матрица [`plugin/docs/canary-smoke.md`](plugin/docs/canary-smoke.md) (строки `/status`, `/help`, `/stop`, `/reset`, `/new`, `/mirror`).
+> Testing: automatic command parsing and routing is covered by `tests/commands/oob.test.ts` (23 assertions). A live run against a real bot — the operator smoke matrix [`plugin/docs/canary-smoke.md`](plugin/docs/canary-smoke.md) (rows `/status`, `/help`, `/stop`, `/reset`, `/new`, `/mirror`).
 
 ---
 
-## 6. Terminal mirror — как работает и зачем
+## 6. Terminal mirror — how it works and why
 
-### Зачем
+### Why
 
-Оператор хочет видеть «сырой» вывод терминала (bash, логи) того, что агент делает прямо сейчас — без SSH-доступа к машине. `TmuxMirror` (PR #15) мирорит pane tmux-сессии в **одно rolling Telegram-сообщение** через `editMessageText`.
+The operator wants to see the "raw" terminal output (bash, logs) of what the agent is doing right now — without SSH access to the machine. `TmuxMirror` (PR #15) mirrors the pane of a tmux session into **one rolling Telegram message** via `editMessageText`.
 
-### Как
+### How
 
-Default-**OFF**, opt-in через config (в multichat — через флаг `tmux_mirror` в policy, per chat):
+Default **OFF**, opt-in via config (in multichat — via the `tmux_mirror` flag in policy, per chat):
 
 ```json
 {
@@ -270,226 +278,228 @@ Default-**OFF**, opt-in через config (в multichat — через флаг 
 }
 ```
 
-Поведение:
+Behavior:
 
-- Polls `tmux capture-pane -p -t <pane_target> -S -<line_count>` каждые `poll_interval_ms`.
-- ANSI/CSI/OSC/DCS sequences стрипаются, control-chars (кроме `\n`, `\t`) удаляются.
-- Текст проходит `redactSecrets` (раздел 10) → HTML-escape → оборачивается в `<pre>`.
-- Hash-based dedup: одинаковый poll → нет API-вызова.
-- `mode: latest_inbound_only` (default с PR #21) обрезает всё до последнего `← <channel>:` preview — видно только что агент делает после последнего сообщения вождя.
-- `max_lines` cap (default 14, диапазон 4..100, 0=off) — верх обрезается маркером `… +N lines`.
-- Edit «message to edit not found» → re-send; прочие 4xx **не** триггерят resend (защита от storm).
+- Polls `tmux capture-pane -p -t <pane_target> -S -<line_count>` every `poll_interval_ms`.
+- ANSI/CSI/OSC/DCS sequences are stripped, control chars (except `\n`, `\t`) removed.
+- The text passes through `redactSecrets` (section 10) → HTML-escape → wrapped in `<pre>`.
+- Hash-based dedup: an identical poll → no API call.
+- `mode: latest_inbound_only` (default since PR #21) trims everything up to the last `← <channel>:` preview — you only see what the agent is doing after the operator's last message.
+- `max_lines` cap (default 14, range 4..100, 0=off) — the top is trimmed with a `… +N lines` marker.
+- An edit `"message to edit not found"` → re-send; other 4xx do **not** trigger a resend (storm protection).
 - SIGINT/SIGTERM → best-effort `deleteMessage`.
 
-Runtime-управление: `/mirror on|off|status` без рестарта плагина.
+Runtime control: `/mirror on|off|status` without restarting the plugin.
 
-> Mirror — **только для приватного DM** (`mode: private`). В публичных группах он выключен, чтобы внутренняя «кухня» не светилась.
+> The mirror is **for the private DM only** (`mode: private`). In public groups it's turned off, so the internal "kitchen" doesn't leak.
 
 ---
 
-## 7. Передача медиа, аудио и транскрибация голосовых
+## 7. Media, audio, and voice-message transcription
 
-### Фото
+### Photos
 
-`handleInboundPhoto` после allowlist-gate **авто-скачивает** крупнейшее разрешение в `{state_dir}/inbox/` (права `0600`, имя из `file_unique_id`, hard-cap 20 MB) и инжектит в промпт как:
+After the allowlist gate, `handleInboundPhoto` **auto-downloads** the largest resolution into `{state_dir}/inbox/` (perms `0600`, name from `file_unique_id`, hard cap 20 MB) and injects it into the prompt as:
 
 ```
 <media kind="photo" local_path="/abs/inbox/123-abc.jpg" width="…" height="…" />
 ```
 
-Агент читает файл обычным `Read` по `local_path`. Альбомы (несколько фото за раз) буферизуются по `media_group_id` с flush по тишине (`album-buffer.ts`); каждый фрагмент атомарно пишется на диск до in-memory обновления, есть recovery при рестарте и dead-letter для битых.
+The agent reads the file with a normal `Read` on the `local_path`. Albums (several photos at once) are buffered by `media_group_id` with a flush on silence (`album-buffer.ts`); each fragment is atomically written to disk before the in-memory update, with recovery on restart and a dead-letter for broken ones.
 
-### Документы
+### Documents
 
-Документ **не** скачивается сразу — приходит метаданными:
+A document is **not** downloaded immediately — it arrives as metadata:
 
 ```
 <media kind="document" file_id="…" name="foo.pdf" mime="application/pdf" size="12345" />
 ```
 
-Когда агенту нужны байты, он вызывает tool `download_attachment(file_id, chat_id)` → плагин качает в inbox и возвращает абсолютный путь (с проверкой chat_id по allowlist, защита от cross-chat утечки).
+When the agent needs the bytes, it calls the `download_attachment(file_id, chat_id)` tool → the plugin downloads it into the inbox and returns the absolute path (with the chat_id checked against the allowlist, protection against cross-chat leakage).
 
-### Голосовые → транскрибация
+### Voice → transcription
 
-`maybeTranscribeVoice` (`src/telegram/media.ts`) транскрибирует через **Groq Whisper** (OpenAI-совместимый endpoint):
+`maybeTranscribeVoice` (`src/telegram/media.ts`) transcribes via **Groq Whisper** (an OpenAI-compatible endpoint):
 
-- **Что использовать:** переменная `GROQ_API_KEY`. Модель — `config.voice.model` (рабочий выбор: `whisper-large-v3-turbo`), язык — `config.voice.language` (например `ru`).
+- **What to use:** the `GROQ_API_KEY` variable. The model is `config.voice.model` (a working pick: `whisper-large-v3-turbo`), the language is `config.voice.language` (e.g. `ru`).
 - Endpoint: `POST https://api.groq.com/openai/v1/audio/transcriptions`, `response_format=text`.
-- Hard-cap 25 MB (лимит Groq), проверяется по Telegram-метаданным **до** скачивания.
-- Telegram отдаёт голос как `.oga` (Ogg/Opus) — Groq отвергает это расширение, поэтому файл переименовывается в `.ogg` перед загрузкой.
-- Ключ редактится из любых сообщений об ошибках. Исключения не пробрасываются — дескриптор всегда несёт статус.
+- Hard cap 25 MB (Groq's limit), checked against Telegram metadata **before** downloading.
+- Telegram serves voice as `.oga` (Ogg/Opus) — Groq rejects that extension, so the file is renamed to `.ogg` before upload.
+- The key is redacted from any error messages. Exceptions are not propagated — the descriptor always carries a status.
 
-Результат в промпте:
+The result in the prompt:
 
 ```
-<media kind="voice" mime="audio/ogg" duration_sec="5" transcript="привет мой вождь" transcription_status="ok" />
+<media kind="voice" mime="audio/ogg" duration_sec="5" transcript="hi operator" transcription_status="ok" />
 ```
 
-Без `GROQ_API_KEY` → `transcription_status="missing_key"` (без ошибки — Claude сам решает, попросить ли включить).
+Without `GROQ_API_KEY` → `transcription_status="missing_key"` (no error — Claude decides whether to ask you to enable it).
 
 ---
 
-## 8. Авторестарт сессии — чтобы связь не прерывалась
+## 8. Session auto-restart — so the link never drops
 
-Связь держится на трёх уровнях, от самого мелкого сбоя к падению процесса:
+The link holds at three levels, from the smallest glitch to a process crash:
 
-**1. In-process auto-reconnect поллера (PR #30).** При сетевых сбоях / 5xx / разрывах `TelegramPoller` сам переподключается с экспоненциальным backoff `1с → 2с → 4с → … → cap 60с` + jitter, счётчик сбрасывается на первом успешном `getUpdates`. На `429` honor'ится `retry_after`; на `409 Conflict` (другой consumer держит токен) — backoff до 8 попыток; на `401` — до 3. Процесс при этом не умирает.
+**1. In-process poller auto-reconnect (PR #30).** On network failures / 5xx / disconnects, `TelegramPoller` reconnects itself with exponential backoff `1s → 2s → 4s → … → cap 60s` + jitter, and the counter resets on the first successful `getUpdates`. On `429` it honors `retry_after`; on `409 Conflict` (another consumer holds the token) it backs off for up to 8 attempts; on `401` up to 3. The process doesn't die in the meantime.
 
-**2. Single-instance lock.** Lock-файл `{state_dir}/bot.pid` создаётся атомарно (`O_EXCL`). Второй процесс читает PID, проверяет `process.kill(pid, 0)` и отказывается стартовать, если владелец жив — нет «409-шторма» от двух поллеров на одном боте. Мёртвый PID чистится и lock переберётся (до 3 попыток).
+**2. Single-instance lock.** The lock file `{state_dir}/bot.pid` is created atomically (`O_EXCL`). A second process reads the PID, checks `process.kill(pid, 0)`, and refuses to start if the owner is alive — no "409 storm" from two pollers on one bot. A dead PID is cleaned up and the lock is reclaimed (up to 3 attempts).
 
-**3. Process supervisor (рестарт всего процесса).**
+**3. Process supervisor (restart of the whole process).**
 
-- **Linux / systemd** (`examples/systemd-unit.service.example`): `Restart=on-failure`, `RestartSec=15s` — рестарт только на ненулевом exit (не зацикливается на welcome-промтах).
-- **macOS / launchd** (`examples/launchd-plist.example.plist`): `KeepAlive.SuccessfulExit=false`, `ThrottleInterval=15`. Wrapper-скрипт `trap cleanup TERM INT` отдаёт exit 0 при штатном стопе оператором и exit 1 при падении — launchd респавнит только падения.
+- **Linux / systemd** (`examples/systemd-unit.service.example`): `Restart=on-failure`, `RestartSec=15s` — restart only on a non-zero exit (it won't loop on welcome prompts).
+- **macOS / launchd** (`examples/launchd-plist.example.plist`): `KeepAlive.SuccessfulExit=false`, `ThrottleInterval=15`. The wrapper script `trap cleanup TERM INT` returns exit 0 on a clean operator stop and exit 1 on a crash — launchd respawns only crashes.
 
-**4. Idle-respawn tmux-сессий (multichat).** `TmuxSessionPool` watchdog (раз в 60с) гасит сессии, висящие дольше `idle_ttl_ms` (default 30 мин), и поднимает заново на следующем сообщении. `sessions.json` хранит маппинг chat→tmux и переподключается к живым сессиям при рестарте плагина, не оставляя сирот.
-
----
-
-## 9. HTML-фильтрация из терминала в Telegram
-
-Чтобы в Telegram приходил красивый форматированный текст, а не сырой markdown или поломанная разметка, исходящий путь (`src/format/html.ts` + `src/safety/html-validator.ts` + `src/format/chunk.ts`) делает:
-
-**1. Markdown → Telegram HTML.** Telegram принимает узкий набор тегов: `b, strong, i, em, u, ins, s, strike, del, code, pre, a, br, blockquote, tg-spoiler`. Конвертер аккуратно «прячет» code-блоки, таблицы, инлайн-код, ссылки `[text](url)` и уже валидный HTML в плейсхолдеры **до** экранирования, экранирует остальной текст (`&`, `<`, `>`), применяет markdown-трансформы (заголовки → `<b>`, `**bold**`, `~~strike~~`, `*italic*` с word-boundary проверками чтобы не ломать `foo_bar`) и восстанавливает плейсхолдеры.
-
-**2. Pre-send валидация.** `validateTelegramHtml()` токенизирует результат, ловит несбалансированные скобки, неизвестные/неразрешённые теги, неправильные атрибуты (`<a href>` только `http/https/tg/mailto`). При любой ошибке — **downgrade в plain text** (escape сырого ввода без `parse_mode`), сообщение всё равно уходит. В лог пишется только причина, не тело.
-
-**3. ANSI-стрип (для mirror).** Pane перед отправкой чистится от ANSI/CSI/OSC/DCS sequences и control-chars.
-
-**4. Chunking на 4000 символов.** `splitForTelegram` режет по границам: абзац (`\n\n`) > строка (`\n`) > жёсткий cut. Если split попадает внутрь `<pre>`/`<code>` — тег закрывается на текущем чанке и переоткрывается на следующем (баланс тегов отслеживается), `language-` класс сохраняется на первом чанке.
-
-Дефолт `reply` — `format='html'` (PR #22): markdown авто-конвертится, авто-чанкится, а голые `<`/`>`/`&` в обычном тексте безопасно экранируются.
+**4. Idle-respawn of tmux sessions (multichat).** The `TmuxSessionPool` watchdog (every 60s) kills sessions that have been idle longer than `idle_ttl_ms` (default 30 min) and brings them back on the next message. `sessions.json` stores the chat→tmux mapping and reconnects to live sessions when the plugin restarts, leaving no orphans.
 
 ---
 
-## 10. Безопасность — чтобы данные не утекали
+## 9. HTML filtering from terminal to Telegram
 
-Защита эшелонирована — несколько независимых барьеров:
+So that Telegram receives nicely formatted text — not raw markdown or broken markup — the outbound path (`src/format/html.ts` + `src/safety/html-validator.ts` + `src/format/chunk.ts`) does the following:
 
-**Allowlist-gate (первый барьер).** Любое входящее проверяется ДО обработки (`src/telegram/gate.ts`): в DM — sender_id ∈ `allowed_user_ids` (+ defensive chat_id); в группах (multichat) — chat ∈ `policy.allowlist.chats` И sender ∈ `policy.allowlist.users`. Не прошёл — drop без обработки.
+**1. Markdown → Telegram HTML.** Telegram accepts a narrow set of tags: `b, strong, i, em, u, ins, s, strike, del, code, pre, a, br, blockquote, tg-spoiler`. The converter carefully "hides" code blocks, tables, inline code, `[text](url)` links, and already-valid HTML into placeholders **before** escaping, escapes the rest of the text (`&`, `<`, `>`), applies markdown transforms (headings → `<b>`, `**bold**`, `~~strike~~`, `*italic*` with word-boundary checks so it doesn't break `foo_bar`), and restores the placeholders.
 
-**Anti-spoof addressing** (`src/telegram/addressing.ts`). В группах бот реагирует только на явный @mention или reply-to на собственное сообщение (валидируется `is_bot` + username). `mention_allowlist` дополнительно ограничивает, кто вообще может звать бота. Пустой allowlist = никто. Подставные reply-метаданные не обходят проверку.
+**2. Pre-send validation.** `validateTelegramHtml()` tokenizes the result, catches unbalanced brackets, unknown/disallowed tags, invalid attributes (`<a href>` only `http/https/tg/mailto`). On any error — **downgrade to plain text** (escape the raw input without `parse_mode`), and the message still goes out. Only the reason is logged, not the body.
 
-**Redact секретов** (`src/safety/redact.ts`). Перед отправкой и в mirror маскируются: Telegram bot-token, ключи Groq/OpenAI/GitHub PAT/Resend/Slack, Firebase private_key/client_email, `Bearer …`, query-string токены (`?token=`, `&api_key=`), IPv4 (средние октеты), secret-пути (`secrets/***`), Supabase host, и любой длинный токен (≥24 символов). Маскирование идемпотентно.
+**3. ANSI strip (for the mirror).** Before sending, the pane is cleaned of ANSI/CSI/OSC/DCS sequences and control chars.
 
-**Path traversal** (`src/security/paths.ts`). `resolveInsideWorkspace()` канонизирует путь через `realpathSync` (резолвит симлинки) и требует, чтобы файл лежал внутри workspace — иначе user-facing ошибка без стека. Cap 50 MB на вложение.
+**4. Chunking at 4000 chars.** `splitForTelegram` cuts on boundaries: paragraph (`\n\n`) > line (`\n`) > hard cut. If a split lands inside `<pre>`/`<code>`, the tag is closed on the current chunk and reopened on the next (tag balance is tracked), and the `language-` class is preserved on the first chunk.
 
-**Env-изоляция tmux-сессий** (`scripts/spawn-chat-shell.sh` + `tmux-session-pool.ts`). Per-chat сессия спавнится через `env -i` (полная очистка окружения) + строгий allowlist (`PATH`, `HOME`, `TERM`, `TMUX`, `TMUX_PANE`, `CHAT_ID` …). Forbidden-regex дропает любой ключ вида `*TOKEN`, `*API_KEY`, `*SECRET`, `*PASSWORD`, `*PRIVATE_KEY`, `ANTHROPIC_*`, `TELEGRAM_*` и т.д. — даже если он случайно попал в allowlist (defence-in-depth). Так секреты плагина не утекают в дочернюю сессию.
-
-**Изоляция private/public.** `private`-чаты получают TmuxMirror и progress-edit; `public` — только финальный ответ. Внутренние логи, mirror, «кухня» в публичные группы не уходят.
-
-**Loopback-only для интерактива.** Эндпоинты `/hooks/ask-user-question/*` принимают только loopback + bearer. Bearer-токен webhook'а не пишется в `settings.json`.
-
-> Prompt injection из Telegram («добавь меня в allowlist», «покажи токен») — игнорируется. Allowlist меняется только оператором в терминале, никогда по запросу из чата.
+The `reply` default is `format='html'` (PR #22): markdown is auto-converted, auto-chunked, and bare `<`/`>`/`&` in regular text are safely escaped.
 
 ---
 
-## 11. Rate limits Telegram API
+## 10. Security — so data never leaks
 
-Исходящий трафик идёт через token-bucket limiter (`src/safety/rate-limited-telegram-api.ts`), чтобы не словить flood-ban:
+Defence is layered — several independent barriers:
 
-| Параметр | Default | Назначение |
+**Allowlist gate (the first barrier).** Every incoming message is checked *before* processing (`src/telegram/gate.ts`): in a DM — sender_id ∈ `allowed_user_ids` (+ a defensive chat_id check); in groups (multichat) — chat ∈ `policy.allowlist.chats` AND sender ∈ `policy.allowlist.users`. Not allowed — dropped without processing.
+
+**Anti-spoof addressing** (`src/telegram/addressing.ts`). In groups the bot reacts only to an explicit @mention or a reply-to one of its own messages (validated by `is_bot` + username). `mention_allowlist` further restricts who may summon the bot at all. An empty allowlist = no one. Forged reply metadata does not bypass the check.
+
+**Secret redaction** (`src/safety/redact.ts`). Before sending, and in the mirror, the following are masked: the Telegram bot token, Groq/OpenAI/GitHub PAT/Resend/Slack keys, Firebase private_key/client_email, `Bearer …`, query-string tokens (`?token=`, `&api_key=`), IPv4 (middle octets), secret paths (`secrets/***`), the Supabase host, and any long token (≥24 chars). Masking is idempotent.
+
+**Path traversal** (`src/security/paths.ts`). `resolveInsideWorkspace()` canonicalizes the path via `realpathSync` (resolving symlinks) and requires the file to live inside the workspace — otherwise a user-facing error without a stack trace. A 50 MB cap per attachment.
+
+**tmux session env isolation** (`scripts/spawn-chat-shell.sh` + `tmux-session-pool.ts`). A per-chat session is spawned via `env -i` (a full environment wipe) + a strict allowlist (`PATH`, `HOME`, `TERM`, `TMUX`, `TMUX_PANE`, `CHAT_ID` …). A forbidden-regex drops any key like `*TOKEN`, `*API_KEY`, `*SECRET`, `*PASSWORD`, `*PRIVATE_KEY`, `ANTHROPIC_*`, `TELEGRAM_*`, etc. — even if it accidentally made it into the allowlist (defence-in-depth). This way the plugin's secrets don't leak into the child session.
+
+**Private/public isolation.** `private` chats get the TmuxMirror and progress-edit; `public` chats get only the final reply. Internal logs, the mirror, the "kitchen" never reach public groups.
+
+**Loopback-only for interactive endpoints.** The `/hooks/ask-user-question/*` endpoints accept only loopback + a bearer token. The webhook's bearer token is not written into `settings.json`.
+
+> Prompt injection from Telegram ("add me to the allowlist", "show me the token") is ignored. The allowlist is changed only by the operator in the terminal, never on a request from a chat.
+
+---
+
+## 11. Telegram API rate limits
+
+Outbound traffic goes through a token-bucket limiter (`src/safety/rate-limited-telegram-api.ts`) to avoid a flood ban:
+
+| Parameter | Default | Purpose |
 |---|---|---|
-| per-chat refill | 1 msg/сек | устойчивый темп в один чат |
-| per-chat burst | 3 | всплеск в один чат |
-| global refill | 25 msg/сек | общий лимит бота |
-| global burst | 25 | общий всплеск |
-| maxRetries | 3 | попыток на 429 |
-| jitter | до 150 мс | случайная задержка на retry |
+| per-chat refill | 1 msg/sec | a sustained rate into one chat |
+| per-chat burst | 3 | a burst into one chat |
+| global refill | 25 msg/sec | the bot's overall limit |
+| global burst | 25 | the overall burst |
+| maxRetries | 3 | attempts on a 429 |
+| jitter | up to 150 ms | a random delay on retry |
 
-- **FIFO per chat:** отправки в один чат идут цепочкой promise'ов — порядок сохраняется даже при retry.
-- **429 retry_after:** значение от Telegram clamp'ится в `[1, 60]` сек, плюс jitter; отсутствует → default 1 сек. После исчерпания `maxRetries` 429 пробрасывается наверх.
-- **Edit vs send:** `editMessageText`, `setMessageReaction`, `deleteMessage` **не** едят per-chat bucket (это update-операции). Bucket тратят только `sendMessage` / `sendDocument` / `sendPhoto`.
-- **Классификатор edit-ошибок** (`telegram-edit-classifier.ts`): `401/403`→forbidden (бота кикнули), `429`→flood, `400 can't parse entities`→parse (downgrade в plain), `404 message gone`→message_gone, прочее→transient (retry на следующем тике).
+- **FIFO per chat:** sends into one chat go as a chain of promises — order is preserved even on retry.
+- **429 retry_after:** the value from Telegram is clamped to `[1, 60]` sec, plus jitter; if absent → default 1 sec. After `maxRetries` is exhausted, the 429 is propagated up.
+- **Edit vs send:** `editMessageText`, `setMessageReaction`, `deleteMessage` do **not** consume the per-chat bucket (they're update operations). Only `sendMessage` / `sendDocument` / `sendPhoto` spend the bucket.
+- **Edit-error classifier** (`telegram-edit-classifier.ts`): `401/403`→forbidden (the bot was kicked), `429`→flood, `400 can't parse entities`→parse (downgrade to plain), `404 message gone`→message_gone, everything else→transient (retry on the next tick).
 
-Отдельно — поллер на **входящем** пути honor'ит `retry_after` на `getUpdates` (раздел 8).
+Separately, the poller on the **inbound** path honors `retry_after` on `getUpdates` (section 8).
 
-> Практический смысл лимитов: три ответа подряд в один чат могут упереться в per-chat 429 с большим `retry_after`. Для многочастных отчётов — либо темпить, либо склеивать в одно сообщение.
+> The practical meaning of the limits: three replies in a row into one chat may hit the per-chat 429 with a large `retry_after`. For multi-part reports — either pace them out or merge into a single message.
 
 ---
 
-## 12. Быстрый старт и документация
+## 12. Quick start and documentation
 
 ```bash
 # 1. Bun runtime
 curl -fsSL https://bun.sh/install | bash
 
-# 2. Workspace агента
+# 2. Agent workspace
 mkdir -p ~/.claude-lab/myagent/.claude ~/.claude-lab/myagent/secrets
 cd ~/.claude-lab/myagent/.claude
 
-# 3. Клонировать плагин ВНУТРЬ workspace (расположение критично — см. docs/02)
+# 3. Clone the plugin INSIDE the workspace (location is critical — see docs/02)
 git clone https://github.com/qwwiwi/dashi-plugin-claude-code.git
 cd dashi-plugin-claude-code/plugin && bun install
 
-# 4. config + токен
+# 4. config + token
 cp ../examples/channel.env.example ~/.claude-lab/myagent/secrets/channel.env
 chmod 600 ~/.claude-lab/myagent/secrets/channel.env
 $EDITOR ~/.claude-lab/myagent/secrets/channel.env   # TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS, GROQ_API_KEY
 
-# 5. Запуск (production-вариант — Claude Code держит runtime)
+# 5. Launch (production variant — Claude Code hosts the runtime)
 set -a; . ~/.claude-lab/myagent/secrets/channel.env; set +a
 claude --dangerously-load-development-channels server:dashi-channel
 
-# 6. ОБЯЗАТЕЛЬНО — установить hooks (иначе нет прогресса в Telegram)
+# 6. MANDATORY — install the hooks (otherwise there's no progress in Telegram)
 bash scripts/install-hooks.sh --settings ~/.claude/settings.json \
-  --chat-id <ваш-chat-id> --webhook-url http://127.0.0.1:8089/hooks/agent --agent-id dashi-channel
+  --chat-id <your-chat-id> --webhook-url http://127.0.0.1:8089/hooks/agent --agent-id dashi-channel
 ```
 
-При первом запуске Claude Code задаст 2 интерактивных вопроса (allow external imports + dev channels) — **разово**, ответьте `1` на оба.
+On the first launch, Claude Code asks 2 interactive questions (allow external imports + dev channels) — **once**; answer `1` to both.
 
-**Stack:** Bun 1.3+ / TypeScript strict, Claude Code v2.1.80+ ([Channels reference](https://code.claude.com/docs/en/channels-reference)), grammY 1.21+, Zod 3.23+, supervisor systemd/launchd.
+**Stack:** Bun 1.3+ / TypeScript strict, Claude Code v2.1.80+ ([Channels reference](https://code.claude.com/docs/en/channels-reference)), grammY 1.21+, Zod 3.23+, systemd/launchd supervisor.
 
-| Док | Что внутри |
+| Doc | What's inside |
 |---|---|
-| [docs/01-what-is-this.md](docs/01-what-is-this.md) | Plugin vs Gateway — архитектура и преимущества |
-| [docs/02-where-to-place-plugin.md](docs/02-where-to-place-plugin.md) | **Главное.** Где разместить каталог, чтобы сессия грузилась правильно (90% проблем) |
-| [docs/03-installation.md](docs/03-installation.md) | systemd / launchd, EnvironmentFile, фикс welcome-промтов, smoke test |
+| [docs/01-what-is-this.md](docs/01-what-is-this.md) | Plugin vs Gateway — architecture and advantages |
+| [docs/02-where-to-place-plugin.md](docs/02-where-to-place-plugin.md) | **The big one.** Where to place the directory so the session loads correctly (90% of problems) |
+| [docs/03-installation.md](docs/03-installation.md) | systemd / launchd, EnvironmentFile, the welcome-prompt fix, smoke test |
 | [docs/03-installation-linux.md](docs/03-installation-linux.md) · [macos](docs/03-installation-macos.md) | OS-specific unit/plist |
-| [docs/04-migration-from-gateway.md](docs/04-migration-from-gateway.md) | Пошаговая миграция с `jarvis-telegram-gateway`, откат на каждом шаге |
-| [docs/05-troubleshooting.md](docs/05-troubleshooting.md) | Типовые ошибки: симптом → корень → фикс |
-| [docs/06-how-claude-loads-session.md](docs/06-how-claude-loads-session.md) | Как Claude Code находит `CLAUDE.md`, CWD upward search, `@-include` |
-| [plugin/docs/progress-reporter-setup.md](plugin/docs/progress-reporter-setup.md) | Установка hooks в 3 шага + troubleshooting |
-| [plugin/docs/canary-smoke.md](plugin/docs/canary-smoke.md) | Live smoke-матрица против тест-бота |
+| [docs/04-migration-from-gateway.md](docs/04-migration-from-gateway.md) | Step-by-step migration from `jarvis-telegram-gateway`, with a rollback at each step |
+| [docs/05-troubleshooting.md](docs/05-troubleshooting.md) | Common errors: symptom → root cause → fix |
+| [docs/06-how-claude-loads-session.md](docs/06-how-claude-loads-session.md) | How Claude Code finds `CLAUDE.md`, CWD upward search, `@-include` |
+| [plugin/docs/progress-reporter-setup.md](plugin/docs/progress-reporter-setup.md) | Installing the hooks in 3 steps + troubleshooting |
+| [plugin/docs/canary-smoke.md](plugin/docs/canary-smoke.md) | A live smoke matrix against a test bot |
+
+> Documentation is currently being translated to English. Sections still in Russian live alongside their English counterparts — contributions welcome (see [License and author](#license-and-author)).
 
 ---
 
-## 13. Зачем переезд — дедлайн 2026-06-15
+## 13. Why migrate — the 2026-06-15 deadline
 
-С 15 июня 2026 Anthropic разделяет billing. `claude -p` (Agent SDK) уходит в **отдельный SDK-кредит, зависящий от плана**:
+From June 15, 2026, Anthropic is splitting billing. `claude -p` (the Agent SDK) moves to a **separate, plan-dependent SDK credit**:
 
-- Pro — $20/мес · Max 5× — $100/мес · Max 20× — $200/мес
+- Pro — $20/mo · Max 5× — $100/mo · Max 20× — $200/mo
 
-Источник: [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+Source: [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
 
-Старая gateway-архитектура (Python-демон спавнит `claude -p` на каждый Telegram-turn) после cutover жжёт SDK-кредит на каждое сообщение. Этот плагин держит **одну живую interactive сессию** (или пул per-chat tmux-сессий при multichat) — расход остаётся в обычной Max-квоте и не растёт от числа сообщений. Полный план — [DEPRECATION-PATH.md](DEPRECATION-PATH.md).
+The old gateway architecture (a Python daemon spawning `claude -p` on every Telegram turn) will burn SDK credit on every message after the cutover. This plugin keeps **one live, interactive session** (or a pool of per-chat tmux sessions in multichat) — usage stays within your normal Max quota and does not grow with the number of messages. The full plan — [DEPRECATION-PATH.md](DEPRECATION-PATH.md).
 
-**Trade-offs:** один процесс = один бот (нужно 5 ботов → 5 процессов); рестарт сессии = потеря текущего контекста (но `core/hot/recent.md` хранит хвост); multichat = больше памяти и обязательная аккуратная `policy.yaml`; нужен Bun + Claude Code v2.1.80+ (не Python-only хост).
-
----
-
-## Что прочитать обязательно (и не забыть)
-
-Если времени мало — три дока решают 90% проблем, в этом порядке:
-
-1. **[docs/02-where-to-place-plugin.md](docs/02-where-to-place-plugin.md) — читать ПЕРВЫМ.** Где физически разместить каталог плагина, чтобы Claude Code загрузил правильную сессию и `CLAUDE.md`. 90% сбоев первого запуска — отсюда. Не пропускать.
-2. **[docs/03-installation.md](docs/03-installation.md)** (+ [linux](docs/03-installation-linux.md) / [macos](docs/03-installation-macos.md)) — production-setup: systemd/launchd, EnvironmentFile, как погасить welcome-промты, чтобы сервис не зацикливался. Без этого агент не переживёт reboot.
-3. **[plugin/docs/progress-reporter-setup.md](plugin/docs/progress-reporter-setup.md)** — установка hooks в 3 шага. Без хуков нет прогресса в Telegram (разделы 4–5). Самая частая жалоба «бот молчит во время работы» лечится здесь.
-
-Дальше — по ситуации:
-
-- **Мигрируете со старого gateway?** → [docs/04-migration-from-gateway.md](docs/04-migration-from-gateway.md) (пошагово, с откатом на каждом шаге) + [DEPRECATION-PATH.md](DEPRECATION-PATH.md) (сроки и why).
-- **Сломалось?** → [docs/05-troubleshooting.md](docs/05-troubleshooting.md) — таблица «симптом → корень → фикс».
-- **Не понимаете, почему агент не видит свой `CLAUDE.md`?** → [docs/06-how-claude-loads-session.md](docs/06-how-claude-loads-session.md) — CWD upward search, `@-include`, global vs project.
-- **Перед первым live-прогоном** → [plugin/docs/canary-smoke.md](plugin/docs/canary-smoke.md) — smoke-матрица против тест-бота (text, media, OOB, permission relay, webhook).
-- **Параметры конфигурации** — единственный источник правды: `plugin/src/config.ts` (`RuntimeEnvSchema`) и `examples/config.example.json` + `examples/channel.env.example`.
-
-Внутренние dev-доки (история PR, review-спеки) — в [docs/dev/](docs/dev/), читать необязательно.
+**Trade-offs:** one process = one bot (need 5 bots → 5 processes); a session restart = loss of the current context (but `core/hot/recent.md` keeps the tail); multichat = more memory and a mandatory, carefully written `policy.yaml`; you need Bun + Claude Code v2.1.80+ (not a Python-only host).
 
 ---
 
-## Лицензия и автор
+## Must-read (and don't skip)
 
-Apache 2.0 (см. [LICENSE](LICENSE)). Fork идеи Anthropic Telegram plugin с полной Jarvis Gateway parity.
+If you're short on time — three docs solve 90% of the problems, in this order:
 
-[@qwwiwi](https://github.com/qwwiwi) (Dashi Eshiev) · EdgeLab AI. Issues / PRs приветствуются; для миграции — issue с тегом `migration` и описанием setup.
+1. **[docs/02-where-to-place-plugin.md](docs/02-where-to-place-plugin.md) — read this FIRST.** Where to physically place the plugin directory so Claude Code loads the right session and `CLAUDE.md`. 90% of first-launch failures come from here. Don't skip it.
+2. **[docs/03-installation.md](docs/03-installation.md)** (+ [linux](docs/03-installation-linux.md) / [macos](docs/03-installation-macos.md)) — production setup: systemd/launchd, EnvironmentFile, how to silence welcome prompts so the service doesn't loop. Without this the agent won't survive a reboot.
+3. **[plugin/docs/progress-reporter-setup.md](plugin/docs/progress-reporter-setup.md)** — install the hooks in 3 steps. Without hooks there's no progress in Telegram (sections 4–5). The most common complaint, "the bot is silent while working," is cured here.
+
+After that — as needed:
+
+- **Migrating from the old gateway?** → [docs/04-migration-from-gateway.md](docs/04-migration-from-gateway.md) (step-by-step, with a rollback at each step) + [DEPRECATION-PATH.md](DEPRECATION-PATH.md) (timelines and why).
+- **Something broke?** → [docs/05-troubleshooting.md](docs/05-troubleshooting.md) — a "symptom → root cause → fix" table.
+- **Don't understand why the agent can't see its `CLAUDE.md`?** → [docs/06-how-claude-loads-session.md](docs/06-how-claude-loads-session.md) — CWD upward search, `@-include`, global vs project.
+- **Before the first live run** → [plugin/docs/canary-smoke.md](plugin/docs/canary-smoke.md) — a smoke matrix against a test bot (text, media, OOB, permission relay, webhook).
+- **Configuration parameters** — the single source of truth: `plugin/src/config.ts` (`RuntimeEnvSchema`) and `examples/config.example.json` + `examples/channel.env.example`.
+
+Internal dev docs (PR history, review specs) are in [docs/dev/](docs/dev/) — optional reading.
+
+---
+
+## License and author
+
+Apache 2.0 (see [LICENSE](LICENSE)). A fork of the idea behind Anthropic's Telegram plugin, with full Jarvis Gateway parity.
+
+[@qwwiwi](https://github.com/qwwiwi) (Dashi Eshiev) · EdgeLab AI. Issues / PRs welcome; for migration — open an issue tagged `migration` with a description of your setup.
