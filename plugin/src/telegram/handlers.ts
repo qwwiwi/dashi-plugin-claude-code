@@ -440,12 +440,16 @@ async function gateAndNotify(
   const descriptors = buildMedia ? await buildMedia() : []
   const renderedMedia = descriptors.map(renderMediaDescriptor)
 
-  // Router path: when wired, dispatch to the per-chat tmux session via
-  // file-based inbox instead of MCP-notifying the master session. The
-  // router takes full ownership — no fallback to sendChannelNotification
-  // so the master Claude session never sees traffic that belongs to a
-  // different chat (defence in depth, persona isolation).
-  if (deps.router && deps.policy) {
+  // Router path: route GROUP/supergroup chats to their per-chat tmux
+  // session via the file-based inbox. Private DMs deliberately fall
+  // through to the legacy sendChannelNotification path below so they
+  // land in the master (channel-thrall) session — the warchief's main
+  // Telegram channel lives there, not in a spawned per-chat session
+  // (explicit requirement 2026-05-28; matches the long-standing comments
+  // that "DMs use the legacy notify path even in multichat builds").
+  // For groups the router still takes full ownership — no fallback — so
+  // the master session never sees traffic belonging to a different chat.
+  if (deps.router && deps.policy && isGroup) {
     // Open a status before dispatch — symmetric with the legacy path so
     // the user sees "Печатает..." within a tick. Streaming is per-chat
     // gated inside StatusManager.start via shouldStreamForChat(policy,
@@ -905,11 +909,16 @@ export async function sendAlbumNotification(
   // user replied with the first photo of the album we forward that context.
   const reply = album.messages.find((m) => m.reply !== undefined)?.reply
 
-  // Router path: synthesise one InboundMessage that carries the merged
-  // caption + every downloaded media path. Symmetric with the single-
-  // message router branch in gateAndNotify so the tmux side sees a
-  // consistent DTO shape regardless of album vs solo arrival.
-  if (deps.router && deps.policy) {
+  // Router path: GROUP albums go to the per-chat session (merged caption
+  // + every downloaded media path). Private-DM albums fall through to the
+  // legacy notify path below, landing in the master (channel-thrall)
+  // session — symmetric with the single-message branch in gateAndNotify.
+  // Reuse the `isGroup` local set above (isGroupChatId(ids.chatId)) — it
+  // is the only group signal here since the original Context/chatType is
+  // gone by album flush time. Channel-type posts never reach this path
+  // (gate.ts drops chatType==='channel' before buffering), so the
+  // negative-id check cannot misclassify a channel as a group here.
+  if (deps.router && deps.policy && isGroup) {
     const combinedMediaPaths: string[] = []
     for (const m of album.messages) {
       for (const p of m.mediaPaths) combinedMediaPaths.push(p)

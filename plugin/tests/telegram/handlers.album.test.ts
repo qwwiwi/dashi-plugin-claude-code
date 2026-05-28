@@ -1024,6 +1024,60 @@ describe('FIX-D B1 — group album aggregate addressing', () => {
     rmSync(statePaths.root, { recursive: true, force: true })
   })
 
+  test('DM album + router wired → legacy notify to master, NO router dispatch', async () => {
+    // Hybrid routing (2026-05-28): even with the router wired, a private
+    // DM album must land in the master (channel-thrall) session via legacy
+    // notify, NOT a per-chat session. Mirrors the single-message DM test
+    // in handlers.addressing.test.ts, for the album flush path.
+    const clock = makeClock()
+    const buffer = makeBuffer(50, clock)
+    const serverSpy = makeServerSpy()
+    const policy = makeAlbumPolicy()
+    const routerCalls: InboundMessage[] = []
+    const router: MultichatRouter = {
+      dispatch: async (msg: InboundMessage) => {
+        routerCalls.push(msg)
+      },
+    } as unknown as MultichatRouter
+    const { deps, statePaths } = makeDeps({
+      albumBuffer: buffer,
+      server: serverSpy.server,
+      policy,
+      router,
+    })
+
+    // DM album (positive chat id = private). No @mention needed — DMs are
+    // addressed unconditionally.
+    const ctx1 = makeAlbumCtx({
+      chatId: ADDR_WARCHIEF,
+      fromId: ADDR_WARCHIEF,
+      messageId: 1,
+      mediaGroupId: 'dm-mgid',
+      fileId: 'dm-doc-1',
+      caption: 'личный альбом',
+    })
+    const ctx2 = makeAlbumCtx({
+      chatId: ADDR_WARCHIEF,
+      fromId: ADDR_WARCHIEF,
+      messageId: 2,
+      mediaGroupId: 'dm-mgid',
+      fileId: 'dm-doc-2',
+    })
+
+    await handleInboundDocument(ctx1, deps)
+    await handleInboundDocument(ctx2, deps)
+
+    await clock.tick(60)
+    for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 5))
+
+    // DM album stays on the master session — router NOT used.
+    expect(routerCalls.length).toBe(0)
+    expect(serverSpy.calls.length).toBe(1)
+    expect(JSON.stringify(serverSpy.calls[0]!.params)).toContain('личный альбом')
+
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
   test('3 fragments NONE addressed in group → silent drop, no dispatch, dir cleaned', async () => {
     const clock = makeClock()
     const buffer = makeBuffer(50, clock)

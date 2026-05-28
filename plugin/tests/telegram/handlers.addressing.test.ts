@@ -36,6 +36,8 @@ import { createLogger } from '../../src/log.js'
 import type { TelegramApi } from '../../src/channel/tools.js'
 import type { BotIdentity } from '../../src/prompt/build.js'
 import type { TmuxMirrorControl } from '../../src/commands/oob.js'
+import type { MultichatRouter } from '../../src/router/multichat-router.js'
+import type { InboundMessage } from '../../src/router/inbox-bridge.js'
 
 const silentLog = createLogger('test', {
   stream: { write: () => true } as unknown as NodeJS.WritableStream,
@@ -592,6 +594,92 @@ describe('FIX-D M1 — text handler policy/router XOR check', () => {
 
     // DM notify fires through legacy path.
     expect(notifyCalls.length).toBe(1)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Hybrid routing (2026-05-28): even with router AND policy wired, a
+// private DM lands in the master (channel-thrall) session via legacy
+// notify — NOT a per-chat tmux session. Only group/supergroup chats are
+// dispatched to the router. This is the warchief's explicit topology:
+// "main Telegram → channel-thrall, group chats → multichat".
+// ─────────────────────────────────────────────────────────────────────
+
+describe('hybrid routing — DM to master, groups to per-chat (router wired)', () => {
+  function makeRouterSpy(): { router: MultichatRouter; calls: InboundMessage[] } {
+    const calls: InboundMessage[] = []
+    const router = {
+      dispatch: async (msg: InboundMessage) => {
+        calls.push(msg)
+      },
+    } as unknown as MultichatRouter
+    return { router, calls }
+  }
+
+  function makeDepsWithRouter(
+    router: MultichatRouter,
+    policy: MultichatPolicy,
+    notifyCalls: Array<{ method: string; params: unknown }>,
+  ): { deps: HandlerDeps; statePaths: StatePaths } {
+    const statePaths = makeStatePaths()
+    const bot: BotIdentity = { id: 8507713167, username: 'canarybot' }
+    const deps: HandlerDeps = {
+      server: {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        notification: async (msg: any) => {
+          notifyCalls.push({ method: msg.method, params: msg.params })
+        },
+      } as any,
+      config: makeConfig(),
+      statePaths,
+      telegramApi: makeTelegramApi().api,
+      log: silentLog,
+      bot,
+      botApi: { api: {} } as unknown as HandlerDeps['botApi'],
+      botToken: 'fake-token',
+      env: {},
+      policy,
+      router,
+    }
+    return { deps, statePaths }
+  }
+
+  test('DM + policy + router PRESENT → legacy notify, NO router dispatch', async () => {
+    const { router, calls } = makeRouterSpy()
+    const notifyCalls: Array<{ method: string; params: unknown }> = []
+    const { deps, statePaths } = makeDepsWithRouter(router, makePolicy(), notifyCalls)
+
+    const ctx = makeDmCtx({
+      text: 'привет',
+      chatId: WARCHIEF_USER_ID,
+      fromId: WARCHIEF_USER_ID,
+    })
+    await handleInboundText(ctx, deps)
+
+    // DM stays on the master session — router is NOT used.
+    expect(calls.length).toBe(0)
+    expect(notifyCalls.length).toBe(1)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  test('group + policy + router PRESENT → router dispatch, NO legacy notify', async () => {
+    const { router, calls } = makeRouterSpy()
+    const notifyCalls: Array<{ method: string; params: unknown }> = []
+    const { deps, statePaths } = makeDepsWithRouter(router, makePolicy(), notifyCalls)
+
+    const ctx = makeGroupCtx({
+      text: 'эй',
+      chatId: ALLOWED_GROUP_CHAT_ID,
+      fromId: WARCHIEF_USER_ID,
+      mentionBot: true,
+    })
+    await handleInboundText(ctx, deps)
+
+    // Group goes to its per-chat session via the router, not the master.
+    expect(calls.length).toBe(1)
+    expect(calls[0]?.chat_id).toBe(String(ALLOWED_GROUP_CHAT_ID))
+    expect(notifyCalls.length).toBe(0)
     rmSync(statePaths.root, { recursive: true, force: true })
   })
 })
