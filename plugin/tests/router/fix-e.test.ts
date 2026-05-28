@@ -530,6 +530,7 @@ describe('FIX-E M3 — dispatch concurrent + max_queue_depth', () => {
         ({ ok: true, result: { message_id: 1 } }) as unknown as Awaited<
           ReturnType<MultichatTelegramApi['sendMessage']>
         >,
+      sendChatAction: async () => {},
     }
   }
 

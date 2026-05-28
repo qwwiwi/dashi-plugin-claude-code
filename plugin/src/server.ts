@@ -775,10 +775,13 @@ if (
       workspaceDir: multichatWorkspaceDir,
       telegramApi: {
         // Adapt the safe-wrapped API surface to the narrow contract the
-        // router asks for. `sendMessage` is the only method touched on
-        // the outbox path; the router never edits or deletes messages.
+        // router asks for. `sendMessage` carries outbox replies;
+        // `sendChatAction` drives the group typing indicator (M7). The
+        // router never edits or deletes messages.
         sendMessage: (chatId, text, opts) =>
           telegramApi.sendMessage(chatId, text, opts),
+        sendChatAction: (chatId, action) =>
+          telegramApi.sendChatAction(chatId, action),
       },
       logger: log,
     })

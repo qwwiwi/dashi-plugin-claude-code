@@ -167,6 +167,7 @@ function spyTelegramApi(): {
         ReturnType<MultichatTelegramApi['sendMessage']>
       >
     },
+    sendChatAction: async () => {},
   }
   return {
     api,

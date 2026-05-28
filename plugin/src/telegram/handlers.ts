@@ -502,6 +502,9 @@ async function gateAndNotify(
       timestamp: new Date().toISOString(),
       ...(replyContext !== undefined ? { reply_context: replyContext } : {}),
       ...(mediaPaths.length > 0 ? { media_paths: mediaPaths } : {}),
+      ...(ctx.message?.message_id !== undefined
+        ? { message_id: String(ctx.message.message_id) }
+        : {}),
     }
 
     deps.log.info('inbound dispatched to router', { kind, chat_id: decision.chatId })
@@ -926,6 +929,11 @@ export async function sendAlbumNotification(
     const replyContext = reply
       ? buildChannelContent({ text: '', bot: deps.bot, reply })
       : undefined
+    // First available message_id in the album — Telegram attaches the
+    // @mention to one fragment; any fragment's id anchors the quote-reply.
+    const albumMessageId = album.messages.find(
+      (m) => m.messageId !== undefined,
+    )?.messageId
     const inboundMsg: InboundMessage = {
       text: mergedText,
       chat_id: ids.chatId,
@@ -934,6 +942,7 @@ export async function sendAlbumNotification(
       timestamp: new Date().toISOString(),
       ...(replyContext !== undefined ? { reply_context: replyContext } : {}),
       ...(combinedMediaPaths.length > 0 ? { media_paths: combinedMediaPaths } : {}),
+      ...(albumMessageId !== undefined ? { message_id: String(albumMessageId) } : {}),
     }
     deps.log.info('album dispatched to router', {
       kind: ids.kind,

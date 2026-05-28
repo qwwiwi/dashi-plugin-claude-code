@@ -66,6 +66,12 @@ export type InboundMessage = {
   reply_context?: string
   media_paths?: string[]
   timestamp: string
+  // Telegram message_id (stringified) of the triggering message — the one
+  // that summoned the bot (an @mention or reply-to-bot in a group). The
+  // router stores it per chat and, for public chats, threads the outbound
+  // reply as a quote-reply to it (reply_to_message_id). Omitted for legacy
+  // writers / messages where no id was available.
+  message_id?: string
 }
 
 // Outbound DTO — what the tmux session emits back to the plugin.

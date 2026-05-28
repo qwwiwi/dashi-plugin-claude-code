@@ -47,11 +47,13 @@ import {
 } from './inbox-bridge.js'
 import type { TmuxSessionPool } from './tmux-session-pool.js'
 
-// Telegram surface the router actually touches. We only need sendMessage —
-// editMessageText is owned by StatusManager / TmuxMirror, not the outbox
-// path. Keep the type narrow so unit tests can stub a minimal surface.
+// Telegram surface the router actually touches: sendMessage for outbox
+// replies and sendChatAction for the group typing indicator (M7).
+// editMessageText is owned by StatusManager / TmuxMirror, not this path.
+// Keep the type narrow so unit tests can stub a minimal surface.
 export interface MultichatTelegramApi {
   sendMessage: TelegramApi['sendMessage']
+  sendChatAction: TelegramApi['sendChatAction']
 }
 
 export interface RouterDeps {
@@ -73,6 +75,25 @@ export interface RouterDeps {
 // for replies without hammering the disk (one readdir per chat).
 // Matches PLAN.md section 2 ("setInterval(200ms)").
 const DEFAULT_OUTBOX_POLL_INTERVAL_MS = 200
+// M7 typing indicator. Telegram clears a chat action ~5s after it is sent, so
+// re-send every 4s to keep the "typing…" status alive while the per-chat
+// session works. TYPING_MAX_TICKS caps the loop (~2 min) so a session that
+// never produces an outbox reply cannot leave the indicator spinning forever.
+const TYPING_INTERVAL_MS = 4000
+const TYPING_MAX_TICKS = 30
+
+/**
+ * Parse a Telegram message_id string into a positive, safe-integer number.
+ * Stricter than parseInt (Codex review 2026-05-28 [low]): requires all
+ * digits so partial garbage like "123abc" is rejected, and rejects values
+ * outside the JS safe-integer range. Returns undefined when invalid.
+ */
+function parseMessageId(raw: string): number | undefined {
+  if (!/^\d+$/.test(raw)) return undefined
+  const n = Number(raw)
+  if (!Number.isSafeInteger(n) || n <= 0) return undefined
+  return n
+}
 
 // Per-chat outbox loop bookkeeping. fs.watch is intentionally NOT used
 // today — Node's watcher behaviour differs across platforms (linux
@@ -126,6 +147,20 @@ export class MultichatRouter {
   // to wait on inbound writes for the same chat — unnecessary
   // latency.
   private readonly dispatchLocks = new Map<string, Promise<void>>()
+  // M7 (2026-05-28): per-chat quote-reply target. On dispatch we record the
+  // triggering message_id (the @mention / reply-to-bot that summoned us in a
+  // public group); deliverClaim consumes it ONCE to thread the first outbound
+  // reply as reply_to_message_id, then deletes it so a later un-prompted
+  // outbox message is not mis-threaded.
+  private readonly pendingReplyTo = new Map<string, string>()
+  // M7: per-chat typing-indicator loop. Presence means "typing is being shown
+  // for this chat". sendChatAction('typing') is re-sent every ~4s (Telegram
+  // clears the status after 5s); stopped when the reply is delivered or after
+  // an idle cap so a session that never replies cannot leave it spinning.
+  private readonly typingTimers = new Map<
+    string,
+    ReturnType<typeof setInterval>
+  >()
   private started = false
 
   constructor(deps: RouterDeps) {
@@ -174,6 +209,12 @@ export class MultichatRouter {
     for (const chatId of Array.from(this.outboxLoops.keys())) {
       this.stopOutboxLoop(chatId)
     }
+    // M7: tear down any live typing-indicator loops so timers don't leak
+    // across stop()/start() cycles (and the process can exit cleanly).
+    for (const chatId of Array.from(this.typingTimers.keys())) {
+      this.stopTypingLoop(chatId)
+    }
+    this.pendingReplyTo.clear()
     this.pool.stopWatchdog()
     // FIX-E M3: clear any lingering dispatch chain heads. The values
     // are promise chains — Node will GC them once their owning
@@ -401,6 +442,18 @@ export class MultichatRouter {
     // 7. Arm outbox poll if missing. Idempotent.
     this.startOutboxLoop(input.chat_id)
 
+    // 8. M7 — group liveness. Only public (group) chats: in a DM the
+    //    in-process StatusManager already drives the typing bubble, and
+    //    reply-to-mention is meaningless. A message only reaches dispatch
+    //    for a public chat if it was addressed (mention / reply-to-bot per
+    //    handlers' gate), so threading the reply to it == reply-on-mention.
+    if (chatPolicy.mode === 'public') {
+      if (input.message_id !== undefined) {
+        this.pendingReplyTo.set(input.chat_id, input.message_id)
+      }
+      this.startTypingLoop(input.chat_id)
+    }
+
     this.logger.debug?.('router.dispatch.ok', {
       chat_id: input.chat_id,
       user_id: input.user_id,
@@ -485,6 +538,54 @@ export class MultichatRouter {
    * id is logged and silently skipped (the chat was already denied at
    * dispatch, so a poll loop here is a programmer error in start()).
    */
+  /**
+   * M7: start (or no-op if already running) the group typing indicator for a
+   * chat. Sends `sendChatAction('typing')` immediately, then every
+   * `TYPING_INTERVAL_MS` until {@link stopTypingLoop} is called (reply
+   * delivered) or `TYPING_MAX_TICKS` is reached (session never replied).
+   * Send errors are swallowed — a failed chat action must never affect
+   * delivery or crash the interval. The timer is `unref`'d so it never keeps
+   * the process alive on its own.
+   */
+  private startTypingLoop(chatId: string): void {
+    if (this.typingTimers.has(chatId)) return
+    const send = (): void => {
+      void Promise.resolve(this.telegramApi.sendChatAction(chatId, 'typing')).catch(
+        (err: unknown) => {
+          this.logger.debug?.('router.typing.send_failed', {
+            chat_id: chatId,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        },
+      )
+    }
+    send()
+    let ticks = 0
+    const timer = setInterval(() => {
+      ticks += 1
+      if (ticks >= TYPING_MAX_TICKS) {
+        this.logger.debug?.('router.typing.capped', { chat_id: chatId })
+        this.stopTypingLoop(chatId)
+        // Codex review [medium]: the session never produced a reply this
+        // turn — drop the stale pending reply target too, so it cannot
+        // mis-thread a much-later un-prompted outbox message.
+        this.pendingReplyTo.delete(chatId)
+        return
+      }
+      send()
+    }, TYPING_INTERVAL_MS)
+    timer.unref?.()
+    this.typingTimers.set(chatId, timer)
+  }
+
+  /** M7: stop the typing indicator for a chat. No-op when none is running. */
+  private stopTypingLoop(chatId: string): void {
+    const timer = this.typingTimers.get(chatId)
+    if (timer === undefined) return
+    clearInterval(timer)
+    this.typingTimers.delete(chatId)
+  }
+
   private startOutboxLoop(chatId: string): void {
     // TASK-5 bug 4 (2026-05-27): assertValidChatId at the outbox-loop
     // entry point. start() iterates `policy.allowlist.chats`, which
@@ -650,7 +751,32 @@ export class MultichatRouter {
           reply_to: message.reply_to,
         })
       }
+    } else {
+      // M7: the session did not set an explicit reply_to. Thread the FIRST
+      // outbound reply to the mention that summoned us (only ever populated
+      // for public chats — see dispatch step 8). Consume it so a follow-up
+      // un-prompted outbox message is not mis-threaded.
+      //
+      // Semantics are per-chat "latest mention" (Codex review 2026-05-28
+      // [high]): if a second addressed message arrives before the first
+      // reply drains, its id overwrites the pending one, so the reply
+      // threads to the most recent question. Precise per-turn threading
+      // would require piping message_id through the tmux session/outbox;
+      // for a quote-reply UX nicety the latest-mention behaviour is the
+      // accepted trade-off. max_queue_depth=1 keeps one turn in flight in
+      // the common case.
+      const pending = this.pendingReplyTo.get(chatId)
+      if (pending !== undefined) {
+        this.pendingReplyTo.delete(chatId)
+        const id = parseMessageId(pending)
+        if (id !== undefined) {
+          opts.reply_to_message_id = id
+        }
+      }
     }
+
+    // M7: a reply is leaving for this chat — the agent is no longer "typing".
+    this.stopTypingLoop(chatId)
     // FIX-F (2026-05-27, Opus router #14): map OutboxMessage.format to
     // the Telegram parse_mode. The Zod schema in inbox-bridge.ts
     // populates `format` with the default 'html' when the writer omits
