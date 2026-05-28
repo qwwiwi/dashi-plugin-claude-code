@@ -54,6 +54,9 @@ function makeConfig(overrides: Partial<AppConfig['watcher']> = {}): AppConfig {
       busy_threshold_ms: 30_000,
       ...overrides,
     },
+    tmux_mirror: { enabled: false, pane_target: '', poll_interval_ms: 5000, line_count: 50, hide_segments: ['boot_banner', 'inbound_warning', 'footer_hints', 'input_box'], mode: 'latest_inbound_only', max_lines: 14 },
+    multichat: { enabled: false },
+    ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
   }
 }
 

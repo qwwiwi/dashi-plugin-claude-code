@@ -112,6 +112,7 @@ function makeStatePaths(): StatePaths {
       telegram: join(root, 'logs', 'telegram.log'),
       permissions: join(root, 'logs', 'permissions.jsonl'),
       webhook: join(root, 'logs', 'webhook.log'),
+      ask_user_question: join(root, 'logs', 'ask-user-question.jsonl'),
     },
   }
 }

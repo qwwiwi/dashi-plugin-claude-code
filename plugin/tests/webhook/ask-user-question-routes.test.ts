@@ -62,10 +62,10 @@ beforeEach(() => {
     TELEGRAM_BOT_TOKEN: FAKE_TOKEN,
     TELEGRAM_STATE_DIR: stateDir,
   })
-  // ensureStateDirs is a stub today (state/store.ts); the audit writer
-  // creates its parent dir on demand via mkdirSync(recursive: true), so
-  // we don't need a pre-pass.
-  ensureStateDirs()
+  // ensureStateDirs now creates the state directory tree (state/store.ts).
+  // The audit writer also creates its parent dir on demand via
+  // mkdirSync(recursive: true), so either path is safe.
+  ensureStateDirs(paths)
   handle = null
 })
 

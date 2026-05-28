@@ -424,7 +424,7 @@ describe('loadConfig', () => {
     const cfg = loadConfig(env())
     expect(cfg.ask_user_question.allowed_user_ids).toBeUndefined()
 
-    const calls: Array<{ msg: string; fields?: Record<string, unknown> }> = []
+    const calls: Array<{ msg: string; fields: Record<string, unknown> | undefined }> = []
     const logger = { info: (msg: string, fields?: Record<string, unknown>) => calls.push({ msg, fields }) }
     const resolved = resolveAskUserQuestionAllowedUserIds(cfg, logger)
     expect(resolved).toEqual(cfg.permission_relay.allowed_user_ids)
@@ -440,7 +440,7 @@ describe('loadConfig', () => {
     const cfg = loadConfig(env())
     expect(cfg.ask_user_question.allowed_user_ids).toEqual([555, 666])
 
-    const calls: Array<{ msg: string; fields?: Record<string, unknown> }> = []
+    const calls: Array<{ msg: string; fields: Record<string, unknown> | undefined }> = []
     const logger = { info: (msg: string, fields?: Record<string, unknown>) => calls.push({ msg, fields }) }
     const resolved = resolveAskUserQuestionAllowedUserIds(cfg, logger)
     expect(resolved).toEqual([555, 666])
