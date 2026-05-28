@@ -144,12 +144,87 @@ describe('stop-to-outbox.py — extraction', () => {
     expect(readOutboxPayload(files[0]!).text).toBe('line one\nline two')
   })
 
-  test('tool-only MOST-RECENT assistant turn -> no delivery (no stale resend)', () => {
-    // The latest assistant message is tool-use-only. We must NOT resurface
-    // the older "the real answer" text — that would re-deliver a stale reply
-    // after a tool-only turn / resume / clear.
+  test('delivers current-turn text even when the turn ENDS on a tool_use', () => {
+    // Production bug (2026-05-28): the agent answered with text, then ran a
+    // tool (Write/gbrain/Bash) as the LAST action of the same turn. The old
+    // "most-recent message is tool-only -> None" rule dropped the answer the
+    // turn already produced, so the group chat never received the reply.
+    // The reply text belongs to the current turn (after the last real user
+    // prompt) so it MUST be delivered regardless of a trailing tool_use.
     const transcript = writeTranscript([
-      assistantLine([{ type: 'text', text: 'the real answer' }]),
+      userLine('упакуй задачу в md'),
+      assistantLine([{ type: 'text', text: 'Файл готов, держи.' }]),
+      assistantLine([
+        { type: 'tool_use', id: 'tu1', name: 'Write', input: { file_path: '/tmp/x.md' } },
+      ]),
+      JSON.stringify({
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }],
+        },
+      }),
+      assistantLine([
+        { type: 'tool_use', id: 'tu2', name: 'Bash', input: { command: 'ls' } },
+      ]),
+    ])
+    const r = run(
+      { CHAT_ID, MULTICHAT_STATE_DIR: stateDir },
+      { transcript_path: transcript, session_id: 's1' },
+    )
+    expect(r.code).toBe(0)
+    const files = listOutboxJson()
+    expect(files.length).toBe(1)
+    expect(readOutboxPayload(files[0]!).text).toBe('Файл готов, держи.')
+  })
+
+  test('does NOT resurface text from BEFORE the current user prompt', () => {
+    // Stale-resend guard (the original concern): text answered in a previous
+    // turn must not leak into the current turn's delivery. The current turn
+    // (after "новый вопрос") is tool-only, so nothing is delivered.
+    const transcript = writeTranscript([
+      userLine('старый вопрос'),
+      assistantLine([{ type: 'text', text: 'старый ответ' }]),
+      userLine('новый вопрос'),
+      assistantLine([
+        { type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls' } },
+      ]),
+    ])
+    const r = run(
+      { CHAT_ID, MULTICHAT_STATE_DIR: stateDir },
+      { transcript_path: transcript, session_id: 's1' },
+    )
+    expect(r.code).toBe(0)
+    expect(listOutboxJson().length).toBe(0)
+  })
+
+  test('a media-only user prompt is a turn boundary (no stale resend)', () => {
+    // Codex review [medium]: a prompt whose content is media-only (no text
+    // block) must still stop the backward walk, so a previous turn's answer is
+    // never resurfaced when the current (media-prompt) turn is tool-only.
+    const transcript = writeTranscript([
+      userLine('старый вопрос'),
+      assistantLine([{ type: 'text', text: 'старый ответ' }]),
+      JSON.stringify({
+        message: {
+          role: 'user',
+          content: [{ type: 'image', source: { type: 'base64', data: 'AAAA' } }],
+        },
+      }),
+      assistantLine([
+        { type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls' } },
+      ]),
+    ])
+    const r = run(
+      { CHAT_ID, MULTICHAT_STATE_DIR: stateDir },
+      { transcript_path: transcript, session_id: 's1' },
+    )
+    expect(r.code).toBe(0)
+    expect(listOutboxJson().length).toBe(0)
+  })
+
+  test('pure tool-only turn with no text -> no delivery', () => {
+    const transcript = writeTranscript([
+      userLine('запусти ls'),
       assistantLine([
         { type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls' } },
       ]),
@@ -187,11 +262,12 @@ describe('stop-to-outbox.py — extraction', () => {
     expect(readOutboxPayload(files[0]!).text).toBe('final answer')
   })
 
-  test('tail-reads past 256KB: drops truncated leading line, still extracts', () => {
-    // A >256KB leading assistant line forces the tail read to start mid-file
-    // (start > 0), so its first in-window line is a truncated JSON fragment
-    // that must be dropped without aborting extraction of the final line.
-    const huge = 'x'.repeat(300 * 1024)
+  test('tail-reads past the window: drops truncated leading line, still extracts', () => {
+    // A leading assistant line larger than TAIL_BYTES (1 MiB) forces the tail
+    // read to start mid-file (start > 0), so its first in-window line is a
+    // truncated JSON fragment that must be dropped without aborting extraction
+    // of the final line.
+    const huge = 'x'.repeat(1200 * 1024)
     const transcript = writeTranscript([
       assistantLine([{ type: 'text', text: huge }]),
       assistantLine([{ type: 'text', text: 'tail answer' }]),
@@ -255,6 +331,57 @@ describe('stop-to-outbox.py — extraction', () => {
     expect(all.every((f) => f.endsWith('.json'))).toBe(true)
     expect(all.some((f) => f.endsWith('.tmp'))).toBe(false)
     expect(all.filter((f) => f.endsWith('.json')).length).toBe(1)
+  })
+})
+
+describe('stop-to-outbox.py — diagnostic log (STOP_OUTBOX_DEBUG)', () => {
+  function debugLogPath(): string {
+    return join(stateDir, 'chats', CHAT_ID, '.hook-state', 'stop-outbox-debug.log')
+  }
+
+  test('off by default: no debug log written', () => {
+    const transcript = writeTranscript([
+      userLine('вопрос'),
+      assistantLine([{ type: 'text', text: 'ответ' }]),
+    ])
+    run(
+      { CHAT_ID, MULTICHAT_STATE_DIR: stateDir },
+      { transcript_path: transcript, session_id: 's1' },
+    )
+    expect(() => readFileSync(debugLogPath(), 'utf8')).toThrow()
+  })
+
+  test('on: records fired + written for a delivered turn', () => {
+    const transcript = writeTranscript([
+      userLine('вопрос'),
+      assistantLine([{ type: 'text', text: 'ответ' }]),
+    ])
+    run(
+      { CHAT_ID, MULTICHAT_STATE_DIR: stateDir, STOP_OUTBOX_DEBUG: '1' },
+      { transcript_path: transcript, session_id: 's1' },
+    )
+    const lines = readFileSync(debugLogPath(), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    const decisions = lines.map((l) => l.decision)
+    expect(decisions).toContain('fired')
+    expect(decisions).toContain('written')
+  })
+
+  test('on: records no_text for a tool-only turn', () => {
+    const transcript = writeTranscript([
+      userLine('запусти ls'),
+      assistantLine([
+        { type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls' } },
+      ]),
+    ])
+    run(
+      { CHAT_ID, MULTICHAT_STATE_DIR: stateDir, STOP_OUTBOX_DEBUG: '1' },
+      { transcript_path: transcript, session_id: 's1' },
+    )
+    const decisions = readFileSync(debugLogPath(), 'utf8')
+      .trim().split('\n').map((l) => JSON.parse(l).decision)
+    expect(decisions).toContain('fired')
+    expect(decisions).toContain('no_text')
+    expect(listOutboxJson().length).toBe(0)
   })
 })
 
