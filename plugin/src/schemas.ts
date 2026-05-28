@@ -34,6 +34,20 @@ export const ReactArgsSchema = z.object({
 })
 export type ReactArgs = z.infer<typeof ReactArgsSchema>
 
+// Webhook route body - POST /hooks/react (read-receipt hook → plugin).
+// The read-receipt Stop hook posts here once per inbound message it has
+// actually read in a turn, so `👀` deterministically means "the agent read
+// this through the plugin" rather than "the bot received it". message_id is
+// coerced from a numeric string because hook payloads carry it as text.
+// emoji defaults to 👀 so the common read-receipt call body is just
+// {chat_id, message_id}.
+export const ReactRouteRequestSchema = z.object({
+  chat_id: z.string().min(1),
+  message_id: z.coerce.number().int().positive(),
+  emoji: z.string().min(1).default('👀'),
+})
+export type ReactRouteRequest = z.infer<typeof ReactRouteRequestSchema>
+
 // Tool args - download_attachment. chat_id is required so the tool can
 // gate the download through the chat allowlist — without it, Claude could
 // be tricked into fetching an arbitrary file_id (e.g. one leaked into a

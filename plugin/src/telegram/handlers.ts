@@ -1003,31 +1003,15 @@ export async function sendAlbumNotification(
 export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promise<void> {
   const text = ctx.message?.text ?? ''
 
-  // Auto-react 👀 on inbound — prince visibility signal, replaces typing indicator.
-  // ONLY for messages that pass BOTH the allowlist gate AND the addressing
-  // check (DM, @mention from a mention_allowlist sender, or reply to bot).
-  //
-  // Bug #4 (TASK-4): historically reaction ran before the allowlist gate,
-  // so an unallowed DM sender, or a group sender whose mention WAS allowed
-  // by mention_allowlist but whose chat/user was NOT in the gate
-  // allowlist, could force visible bot activity (and burn 429 budget on
-  // setMessageReaction). Gating on `gateTelegramMessage` + addressing
-  // pulls reactions back behind the same fence reply/notify already sit
-  // behind.
-  const reactionInput = gateInputFromContext(ctx)
-  const reactionDecision = gateTelegramMessage(reactionInput, deps.config, deps.policy)
-  if (
-    reactionDecision.kind === 'allow'
-    && isAddressedToBot(ctx, deps.policy?.mention_allowlist)
-  ) {
-    try {
-      const _chatId = ctx.chat?.id
-      const _msgId = ctx.message?.message_id
-      if (_chatId !== undefined && _msgId !== undefined) {
-        await deps.telegramApi.setMessageReaction(String(_chatId), _msgId, '👀')
-      }
-    } catch (_e) { /* react best-effort */ }
-  }
+  // fix/eyes-on-read (2026-05-28): the 👀 read receipt is NO LONGER set
+  // here. Setting it at bot-receive time made 👀 mean "the bot saw the
+  // update", not "Thrall read it" — if a turn was busy, the message queued
+  // while the eyes already showed, so the signal lied. The reaction now
+  // fires deterministically from the Stop hook (scripts/read-receipt-hook.ts
+  // → POST /hooks/react) once the message has actually entered and been read
+  // in a session turn. This covers every message type (text, voice, photo,
+  // document) and both the DM and per-chat multichat sessions uniformly,
+  // because all of them run the same Stop hook against their transcript.
 
   // FIX-T1 F3 (PRX-1 Phase 5, 2026-05-27): permission verdicts ALWAYS take
   // priority over the AskUserQuestion «Other» text consumer. Previously the
