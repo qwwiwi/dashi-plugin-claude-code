@@ -542,8 +542,11 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
         )
       }
     }
-    // Sanity: there should be no `TMUX_PANE=` either (we deliberately
-    // do not forward it; tmux populates it inside each pane).
+    // Sanity: the POOL must not forward TMUX_PANE via a tmux `-e` flag —
+    // it has no valid pane id at spawn time. The pane id is recovered
+    // inside the pane by spawn-chat-shell.sh, which reads $TMUX_PANE
+    // (set by tmux on the new-session command) and forwards it across
+    // its `env -i` wipe. See the standalone wrapper test below.
     expect(readFileSync(fixture.argvLog, 'utf8')).not.toContain('TMUX_PANE=')
   })
 
@@ -663,6 +666,39 @@ describe('spawn-chat-shell.sh standalone leak closure (FIX-A B2)', () => {
     expect(childEnv).toMatch(/^CHAT_ID=12345$/m)
     expect(childEnv).toMatch(/^MULTICHAT_STATE_DIR=\/tmp\/state$/m)
     expect(childEnv).toMatch(/^CLAUDE_WORKSPACE_DIR=\/tmp\/ws$/m)
+  })
+
+  test('TMUX and TMUX_PANE ARE forwarded across `env -i` (watcher routing fix, 2026-05-28)', () => {
+    // Regression guard: multichat-entrypoint.sh's inbox-watcher reads
+    // $TMUX_PANE to target its pane with `tmux send-keys`. tmux sets
+    // TMUX_PANE on the new-session command; the wrapper's `env -i` must
+    // forward it (and TMUX) or the watcher self-disables and the
+    // chat_id→session routing silently dies. Neither value is a
+    // credential, so forwarding them does not weaken FIX-A B2 isolation.
+    const result = spawnSync(SPAWN_WRAPPER, ['/usr/bin/env'], {
+      env: {
+        PATH: '/usr/local/bin:/usr/bin:/bin',
+        HOME: '/home/test',
+        CHAT_ID: '12345',
+        MULTICHAT_STATE_DIR: '/tmp/state',
+        CLAUDE_WORKSPACE_DIR: '/tmp/ws',
+        // Values tmux would have set on the pane process.
+        TMUX: '/tmp/tmux-1000/default,4242,7',
+        TMUX_PANE: '%7',
+        // A leaked credential in the same env must STILL be dropped —
+        // forwarding the pane locators must not widen the allowlist.
+        TELEGRAM_BOT_TOKEN: 'leaked-token-DO-NOT-PROPAGATE',
+      },
+      encoding: 'utf8',
+    })
+
+    expect(result.status).toBe(0)
+    const childEnv = result.stdout
+    expect(childEnv).toMatch(/^TMUX_PANE=%7$/m)
+    expect(childEnv).toMatch(/^TMUX=\/tmp\/tmux-1000\/default,4242,7$/m)
+    // Isolation guarantee unchanged: the credential is still gone.
+    expect(childEnv).not.toContain('leaked-token-DO-NOT-PROPAGATE')
+    expect(childEnv).not.toMatch(/^TELEGRAM_BOT_TOKEN=/m)
   })
 
   test('wrapper exits non-zero if no CLAUDE_BIN argument given', () => {

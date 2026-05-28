@@ -49,11 +49,36 @@ shift
 # Optional (hook bookkeeping, set when policy-loader / persona pipeline
 # wants them; absent in MVP):
 #   POLICY_PATH, PERSONA_PATH
+#
+# FIX (2026-05-28): forward TMUX and TMUX_PANE through the env -i wipe.
+# tmux sets these on the new-session command's environment (verified:
+# this wrapper, run as that command, sees TMUX_PANE=%N before we exec).
+# The consumer is the deployed per-chat entrypoint hook (in the agent
+# workspace at chats/hooks/multichat-entrypoint.sh — NOT shipped in this
+# repo; wired via TmuxSessionPool.entrypointScript). Its background
+# inbox-watcher reads $TMUX_PANE to know which pane to `tmux send-keys`
+# inbound messages into. Without it the watcher self-disables
+# ("TMUX_PANE not set, watcher disabled") and the per-chat session never
+# consumes its inbox — the whole chat_id->session routing silently dies.
+# This regressed on 2026-05-27 when FIX-A B2 (env -i) and FIX-A B3
+# (removal of the bare `-e TMUX_PANE` arg) landed together: B3's premise
+# that "tmux populates TMUX_PANE regardless" is false once B2 wipes it.
+#
+# Why BOTH, not just TMUX_PANE: send-keys by pane id alone works only
+# when the server is on tmux's DEFAULT socket; forwarding TMUX keeps the
+# watcher correct under a custom socket (`tmux -L`) too. Forwarding TMUX
+# does not widen the trust boundary — a same-UID process already reaches
+# the default socket, and TMUX_PANE alone is enough to target any pane
+# on it. (Cross-pane isolation between chats is a separate concern, not
+# something this env wipe ever provided.) Neither value is a credential:
+# TMUX is a socket path, TMUX_PANE a pane id — token isolation intact.
 
 exec env -i \
   CHAT_ID="${CHAT_ID:-}" \
   MULTICHAT_STATE_DIR="${MULTICHAT_STATE_DIR:-}" \
   CLAUDE_WORKSPACE_DIR="${CLAUDE_WORKSPACE_DIR:-}" \
+  TMUX="${TMUX:-}" \
+  TMUX_PANE="${TMUX_PANE:-}" \
   PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}" \
   HOME="${HOME:-}" \
   USER="${USER:-}" \
