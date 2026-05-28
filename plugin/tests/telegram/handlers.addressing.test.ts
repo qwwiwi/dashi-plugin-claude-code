@@ -3,11 +3,12 @@
 // Covers:
 //   * watcher does not fire for a group message without @mention / reply
 //   * tmux-mirror bump does not fire for a non-addressed group message
-//   * setMessageReaction does NOT run when the allowlist gate would
-//     drop the sender (unallowed sender, or allowed sender in a chat
-//     not in the gate's allowlist)
-//   * setMessageReaction DOES fire for an allowed DM sender and for
-//     an allowed group sender that @mentions the bot
+//   * setMessageReaction never runs at bot-receive time at all
+//     (fix/eyes-on-read 2026-05-28): the 👀 read receipt moved to the
+//     Stop hook so it means "Thrall read it", not "the bot saw it".
+//     These tests now assert NO receive-time reaction for any sender —
+//     allowed or dropped. The receipt path is covered by
+//     tests/hooks/read-receipt-hook.test.ts + tests/webhook/react-route.test.ts.
 //
 // Permitted-side effects in legacy mode (no policy) are exercised in
 // handlers.test.ts; this file focuses on the multichat-aware paths
@@ -418,7 +419,7 @@ describe('handleInboundText — addressing gate on side effects (Bug #3)', () =>
 // Bug #4 — reaction must require gate.allow before firing
 // ─────────────────────────────────────────────────────────────────────
 
-describe('handleInboundText — reaction guard (Bug #4)', () => {
+describe('handleInboundText — no receive-time reaction (fix/eyes-on-read)', () => {
   test('unallowed DM sender does NOT receive reaction', async () => {
     const tg = makeTelegramApi()
     const { deps, statePaths } = makeDeps({ telegramApi: tg.api })
@@ -434,7 +435,11 @@ describe('handleInboundText — reaction guard (Bug #4)', () => {
     rmSync(statePaths.root, { recursive: true, force: true })
   })
 
-  test('allowed DM sender DOES receive reaction', async () => {
+  // fix/eyes-on-read (2026-05-28): the 👀 receipt no longer fires at
+  // bot-receive time — it moved to the Stop hook so it means "Thrall read
+  // it", not "the bot saw it". An allowed DM message must therefore produce
+  // NO reaction inside handleInboundText.
+  test('allowed DM sender gets NO receive-time reaction (moved to Stop hook)', async () => {
     const tg = makeTelegramApi()
     const { deps, statePaths } = makeDeps({ telegramApi: tg.api })
     const ctx = makeDmCtx({
@@ -443,12 +448,11 @@ describe('handleInboundText — reaction guard (Bug #4)', () => {
       fromId: WARCHIEF_USER_ID,
     })
     await handleInboundText(ctx, deps)
-    expect(tg.reactions.length).toBe(1)
-    expect(tg.reactions[0]!.emoji).toBe('👀')
+    expect(tg.reactions.length).toBe(0)
     rmSync(statePaths.root, { recursive: true, force: true })
   })
 
-  test('allowed sender in group + mention → reaction fires after gate', async () => {
+  test('allowed group + mention gets NO receive-time reaction (moved to Stop hook)', async () => {
     const policy = makePolicy()
     const tg = makeTelegramApi()
     const { deps, statePaths } = makeDeps({ policy, telegramApi: tg.api })
@@ -459,8 +463,7 @@ describe('handleInboundText — reaction guard (Bug #4)', () => {
       mentionBot: true,
     })
     await handleInboundText(ctx, deps)
-    expect(tg.reactions.length).toBe(1)
-    expect(tg.reactions[0]!.chatId).toBe(String(ALLOWED_GROUP_CHAT_ID))
+    expect(tg.reactions.length).toBe(0)
     rmSync(statePaths.root, { recursive: true, force: true })
   })
 

@@ -982,6 +982,11 @@ try {
     // at runtime via env without a restart.
     askRelay: askUserQuestionRelay,
     askUi: askUserQuestionUi,
+    // fix/eyes-on-read (2026-05-28): read-receipt route capability. Uses
+    // the same safe-wrapped, rate-limited telegramApi every other outbound
+    // call goes through, so 👀 reactions share the per-chat rate budget.
+    reactToMessage: (chatId, messageId, emoji) =>
+      telegramApi.setMessageReaction(chatId, messageId, emoji),
   })
 } catch (err) {
   log.error('webhook server failed to start', {

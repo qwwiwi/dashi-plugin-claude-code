@@ -42,6 +42,42 @@ bash plugin/scripts/install-hooks.sh \
 
 Идемпотентно. Marker-based replacement — повторный запуск не дублирует записи. Чистит legacy markerless entries указывающие на наш `post-hook.ts`.
 
+## Read receipts (реакция 👀)
+
+**Зачем.** Реакция `👀` на входящем сообщении — это сигнал «агент это **прочитал**». Главная её ценность в том, что вождь видит, какие сообщения уже дошли до агента и обработаны, а какие ещё нет — особенно для голосовых, файлов и фото, где иначе непонятно, «увидел» ли их агент вообще. Поэтому момент постановки реакции критичен: `👀` должна означать «прочитано агентом», а не «бот принял апдейт».
+
+**Как это работает (детерминистски).** Реакция ставится НЕ в момент приёма апдейта ботом. Если так делать, при занятой сессии сообщение стоит в очереди, а глаза уже горят — сигнал врёт. Вместо этого:
+
+1. Сообщение доходит до сессии Claude (через MCP-нотификацию в личке вождя или через per-chat сессию в мультичате) и попадает в её ход как блок `<channel source="telegram" ... chat_id="X" message_id="Y">`.
+2. По событию `Stop` (конец хода) хук `scripts/read-receipt-hook.ts` читает транскрипт сессии, находит telegram-блоки, которые ход реально прочитал, и POST'ит их в роут плагина `POST /hooks/react`.
+3. Роут (loopback + bearer + chat-allowlist) ставит `👀` единственным ботом.
+
+Так `👀` = «прочитано агентом» одинаково для текста, голоса, фото — и в личке, и в мультичате (каждая per-chat сессия гоняет тот же Stop-хук против своего транскрипта). Хук берёт сообщения именно текущего хода (идёт по транскрипту с конца, пропуская хвост из ответа+тулов — длинный ход с кучей tool-вызовов не «теряет» входящее). Пер-сессионный дедуп-лог (`<state>/read-receipts/<session_id>.log`) гарантирует ровно одну реакцию на сообщение и исключает гонку между параллельными сессиями.
+
+**Почему через env-файл (важно для мультичата).** Per-chat сессии стартуют под `env -i` со строгим allowlist (`src/router/tmux-session-pool.ts`), который вырезает ВСЕ `TELEGRAM_*`. Поэтому хук НЕ читает webhook-конфиг из `process.env` — он берёт `TELEGRAM_WEBHOOK_PORT/HOST/TOKEN` и `TELEGRAM_STATE_DIR` (для дедуп-лога) из env-файла, путь до которого вписан прямо в команду хука (shell-присваивание перед `bun` переживает `env -i`). Токен в `settings.json` НЕ пишется — только путь до файла. В per-chat сессии дедуп дополнительно умеет падать на `MULTICHAT_STATE_DIR` (он в allowlist).
+
+**Регистрация хука** (в дополнение к `install-hooks.sh` выше) — добавь в `Stop` своего `settings.json` команду с путём до env-файла плагина:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "marker": "dashi-channel-read-receipt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TELEGRAM_CHANNEL_ENV_FILE='/abs/path/to/channel.env' bun '/abs/path/to/plugin/scripts/read-receipt-hook.ts'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Хук всегда exit 0 и не пишет в stdout — read receipt никогда не блокирует и не загрязняет контекст модели. Если роут недоступен (или реакция не вписана в деплой) — хук тихо ничего не делает.
+
 ## Environment variables
 
 Полный список — `plugin/src/config.ts` (`RuntimeEnvSchema`). Минимум:
@@ -55,6 +91,9 @@ bash plugin/scripts/install-hooks.sh \
 | `TELEGRAM_ALLOWED_USER_IDS` | CSV — кто имеет право писать боту (legacy DM-режим). |
 | `TELEGRAM_WORKSPACE_ROOT` | Корень agent workspace (где CLAUDE.md). |
 | `TELEGRAM_WEBHOOK_HOST` / `TELEGRAM_WEBHOOK_PORT` / `TELEGRAM_WEBHOOK_TOKEN` | Bind для webhook-сервера хуков. |
+| `TELEGRAM_CHANNEL_ENV_FILE` | Путь до env-файла плагина — read-receipt хук (`Stop`) берёт из него `WEBHOOK_PORT/HOST/TOKEN`, чтобы ставить `👀` даже из per-chat сессии с очищенным env. См. секцию «Read receipts». |
+| `TELEGRAM_READ_RECEIPT_URL` | Явный URL роута `/hooks/react` (альтернатива выводу из `HOST`+`PORT`). |
+| `TELEGRAM_READ_RECEIPT_STATE` | Явный путь до дедуп-лога (single-writer). По умолчанию — пер-сессионный `<state>/read-receipts/<session_id>.log` в `TELEGRAM_STATE_DIR` (или `MULTICHAT_STATE_DIR`). |
 | `TELEGRAM_MEMORY_*` | Memory hook config (см. секцию ниже). |
 | `TELEGRAM_MULTICHAT_*` | Multichat router config (см. секцию ниже). |
 | `GROQ_API_KEY` | Whisper transcription для голосовых (опционально). |

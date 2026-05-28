@@ -26,6 +26,7 @@ import { writeDeadLetter } from '../state/store.js'
 import {
   AskUserQuestionAnswerSchema,
   AskUserQuestionRequestSchema,
+  ReactRouteRequestSchema,
   WebhookPayloadSchema,
   type AskUserQuestionAnswer,
   type AskUserQuestionRequest,
@@ -50,6 +51,9 @@ const BODY_LIMIT_BYTES = 256 * 1024
 // 4 questions × 4 options × ~1 KB preview ≈ 16 KB worst case, leaving
 // headroom for header/description text + question prose.
 const ASK_BODY_LIMIT_BYTES = 64 * 1024
+// Read-receipt bodies are tiny ({chat_id, message_id, emoji}); 4 KB is
+// generous and keeps the route cheap to abuse-proof.
+const REACT_BODY_LIMIT_BYTES = 4 * 1024
 const DEFAULT_AGENT_ID = 'dashi-channel'
 
 // Margin added on top of the configured AskUserQuestion timeout to set
@@ -158,6 +162,14 @@ export interface WebhookDeps {
   // "wired but disabled" from "wrong route".)
   askRelay?: AskUserQuestionRelay
   askUi?: AskUserQuestionUi
+  // fix/eyes-on-read (2026-05-28): read-receipt route. The Stop hook posts
+  // {chat_id, message_id} here once it has confirmed the agent actually read
+  // an inbound message in a turn (parsed from the session transcript). We set
+  // the 👀 reaction at THAT point — not when the bot first received the update
+  // — so the reaction deterministically means "Thrall read it through the
+  // plugin". Optional so tests/legacy paths can omit; when absent the route
+  // answers 503 and the hook degrades to a no-op (no read receipt, no crash).
+  reactToMessage?: (chatId: string, messageId: number, emoji: string) => Promise<void>
 }
 
 export interface WebhookServerHandle {
@@ -313,6 +325,14 @@ async function handleRequest(
   }
   if (method === 'POST' && path === '/hooks/ask-user-question/answer') {
     await handleAskAnswer(req, res, deps, webhookToken)
+    return
+  }
+
+  // fix/eyes-on-read (2026-05-28): read-receipt route. Wired before
+  // /hooks/agent so the more-specific path takes priority. Loopback +
+  // bearer + chat allowlist, then sets 👀 via deps.reactToMessage.
+  if (method === 'POST' && path === '/hooks/react') {
+    await handleReact(req, res, deps, webhookToken)
     return
   }
 
@@ -713,6 +733,66 @@ function authGate(
     return false
   }
   return true
+}
+
+// fix/eyes-on-read (2026-05-28): POST /hooks/react — set the 👀 read
+// receipt on an inbound message the agent has actually read in a turn.
+// Auth: loopback origin + bearer (same fence as the AskUserQuestion
+// routes). Defence in depth: chatId must be in the allowlist, so a leaked
+// token still can't make the bot react in an arbitrary chat.
+async function handleReact(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: WebhookDeps,
+  webhookToken: string | undefined,
+): Promise<void> {
+  const { config, log, reactToMessage } = deps
+
+  if (!authGate(req, res, webhookToken)) return
+
+  // Feature wiring gate: when no reaction capability was injected we answer
+  // 503 (not 404) so an operator can tell "wired but disabled" from "wrong
+  // route", and the hook degrades to a no-op without retry storms.
+  if (!reactToMessage) {
+    reply(res, 503, { status: 'reactions_unavailable' })
+    return
+  }
+
+  const parsed = await readJsonBody(
+    req,
+    res,
+    log,
+    REACT_BODY_LIMIT_BYTES,
+    ReactRouteRequestSchema,
+    'react',
+  )
+  if (!parsed.ok) return
+  const payload = parsed.value
+  const emoji = payload.emoji ?? '👀'
+
+  if (!chatIdAllowed(config, payload.chat_id)) {
+    log.warn('react chatId not in allowlist', { chat_id: payload.chat_id })
+    reply(res, 403, { error: 'chatId not in allowlist' })
+    return
+  }
+
+  try {
+    await reactToMessage(payload.chat_id, payload.message_id, emoji)
+  } catch (err) {
+    // A failed reaction must never wedge the hook. Telegram returns 400 for
+    // reactions on messages too old to react to (and 429 under burst); we
+    // log and answer 200 so the hook records the message as handled and
+    // moves on rather than retrying forever.
+    log.warn('react setMessageReaction failed', {
+      chat_id: payload.chat_id,
+      message_id: payload.message_id,
+      error: err instanceof Error ? redactToken(err.message) : String(err),
+    })
+    reply(res, 200, { status: 'react_failed' })
+    return
+  }
+
+  reply(res, 200, { status: 'reacted' })
 }
 
 async function handleAskRequest(
