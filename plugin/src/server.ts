@@ -25,10 +25,11 @@ import {
   getStatePaths,
   loadConfig,
   redactToken,
+  resolveFileSink,
   type AppConfig,
   type StatePaths,
 } from './config.js'
-import { createLogger } from './log.js'
+import { createFileSink, createLogger, type LineSink } from './log.js'
 import { ensureStateDirs, migrateLegacyAllowlist } from './state/store.js'
 import {
   callTool,
@@ -273,7 +274,25 @@ if (env.GROQ_API_KEY) {
   logSecrets.push(env.GROQ_API_KEY)
   crashSecrets.push(env.GROQ_API_KEY)
 }
-const log = createLogger('dashi-channel', { secrets: logSecrets })
+// Persistent log file sink (task #17 P2). Tees every redacted log line to
+// disk so silent-degrade events (failed policy load, reconnect storms)
+// survive even though bun routes stderr to the invisible MCP stdio socket.
+// Default ON; path defaults to StatePaths.logs.server (dir already created
+// by ensureStateDirs). Disable via config.logging.file_sink.enabled=false
+// or TELEGRAM_LOG_FILE_SINK=0.
+const fileSinkCfg = resolveFileSink(config)
+let logFileSink: LineSink | undefined
+if (fileSinkCfg.enabled) {
+  logFileSink = createFileSink(fileSinkCfg.path ?? statePaths.logs.server, {
+    maxBytes: fileSinkCfg.maxBytes,
+    maxFiles: fileSinkCfg.maxFiles,
+  })
+}
+// Build opts conditionally — exactOptionalPropertyTypes forbids passing
+// `fileSink: undefined` explicitly.
+const log = logFileSink
+  ? createLogger('dashi-channel', { secrets: logSecrets, fileSink: logFileSink })
+  : createLogger('dashi-channel', { secrets: logSecrets })
 
 // Lock down the env file to owner-only after we've read it.
 try {

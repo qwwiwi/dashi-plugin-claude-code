@@ -33,6 +33,13 @@ export const MultichatConfigSchema = z.object({
 })
 export type MultichatConfig = z.infer<typeof MultichatConfigSchema>
 
+// Log file-sink defaults — referenced by BOTH the Zod schema (when an
+// operator supplies a partial `logging` block) and resolveFileSink (when
+// the block is omitted entirely). Single source of truth so the two paths
+// can never drift.
+export const DEFAULT_LOG_MAX_BYTES = 5 * 1024 * 1024
+export const DEFAULT_LOG_MAX_FILES = 5
+
 export const AppConfigSchema = z.object({
   bot_id: z.number().int().positive().default(8507713167),
   // `dm_only` predates the multichat router. With `multichat.enabled=false`
@@ -262,6 +269,31 @@ export const AppConfigSchema = z.object({
     allowed_user_ids: z.array(z.number().int().positive()).optional(),
     max_preview_chars: z.number().int().positive().default(1000),
   }).default({}),
+  // Persistent file sink for the structured logger (task #17 P2, 2026-05-28).
+  // bun routes the logger's stderr to the MCP stdio socket, which never
+  // reaches journald or the tmux pane — a degraded policy load or a
+  // reconnect storm leaves no durable trace. Default ON: tee every redacted
+  // log line to `path` (defaults to StatePaths.logs.server) with size-based
+  // rotation. The line is redacted before it hits the file, same as stderr.
+  //
+  // `path` undefined means «use StatePaths.logs.server» — resolved in
+  // server.ts where the state paths are known. We do NOT hardcode an
+  // agent-specific directory here: the plugin ships generically.
+  //
+  // `.optional()` (not `.default({})`): the block is absent from every
+  // hand-built AppConfig test fixture, and a top-level required field would
+  // force an unrelated edit to all of them. Runtime defaults live in
+  // resolveFileSink() below — a single source keyed off the same constants
+  // the inner schema defaults use, so omitting the block and passing `{}`
+  // converge on identical behaviour.
+  logging: z.object({
+    file_sink: z.object({
+      enabled: z.boolean().default(true),
+      path: z.string().optional(),
+      max_bytes: z.number().int().positive().default(DEFAULT_LOG_MAX_BYTES),
+      max_files: z.number().int().nonnegative().default(DEFAULT_LOG_MAX_FILES),
+    }).default({}),
+  }).optional(),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
 
@@ -333,6 +365,14 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_ASK_USER_QUESTION_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
   TELEGRAM_ASK_USER_QUESTION_ALLOWED_USER_IDS: z.string().optional(), // CSV
   TELEGRAM_ASK_USER_QUESTION_MAX_PREVIEW_CHARS: z.coerce.number().int().positive().optional(),
+  // Log file sink (task #17 P2, 2026-05-28). ENABLED follows the same truthy
+  // convention as the other flags. PATH overrides the default
+  // StatePaths.logs.server location.
+  TELEGRAM_LOG_FILE_SINK: z
+    .string()
+    .transform((v) => /^(1|true|yes|on)$/i.test(v))
+    .optional(),
+  TELEGRAM_LOG_FILE_PATH: z.string().optional(),
 })
 export type RuntimeEnv = z.infer<typeof RuntimeEnvSchema>
 
@@ -506,6 +546,20 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   }
   if (Object.keys(askUserQuestion).length > 0) merged.ask_user_question = askUserQuestion
 
+  // Log file sink env overrides (task #17 P2, 2026-05-28). Same layering
+  // pattern: lift the existing config.json sub-object, layer env on top,
+  // emit only when something is set so Zod defaults apply cleanly.
+  const logging = (merged.logging && typeof merged.logging === 'object'
+    ? merged.logging
+    : {}) as Record<string, unknown>
+  const fileSink = (logging.file_sink && typeof logging.file_sink === 'object'
+    ? logging.file_sink
+    : {}) as Record<string, unknown>
+  if (parsedEnv.TELEGRAM_LOG_FILE_SINK !== undefined) fileSink.enabled = parsedEnv.TELEGRAM_LOG_FILE_SINK
+  if (parsedEnv.TELEGRAM_LOG_FILE_PATH !== undefined) fileSink.path = parsedEnv.TELEGRAM_LOG_FILE_PATH
+  if (Object.keys(fileSink).length > 0) logging.file_sink = fileSink
+  if (Object.keys(logging).length > 0) merged.logging = logging
+
   try {
     return AppConfigSchema.parse(merged)
   } catch (err) {
@@ -574,6 +628,32 @@ export function getStatePaths(_config: AppConfig, env: RuntimeEnv): StatePaths {
       ask_user_question: join(root, 'logs', 'ask-user-question.jsonl'),
     },
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveFileSink — concrete log file-sink settings. Bridges the optional
+// `config.logging.file_sink` block to the values server.ts needs, applying
+// the shared defaults when the block (or any field) is omitted. Keeping the
+// defaulting here means the schema's `logging` field can stay `.optional()`
+// without server.ts sprinkling `?? DEFAULT_*` at the call site.
+// ─────────────────────────────────────────────────────────────────────
+
+export interface ResolvedFileSink {
+  enabled: boolean
+  path?: string
+  maxBytes: number
+  maxFiles: number
+}
+
+export function resolveFileSink(config: AppConfig): ResolvedFileSink {
+  const fs = config.logging?.file_sink
+  const resolved: ResolvedFileSink = {
+    enabled: fs?.enabled ?? true,
+    maxBytes: fs?.max_bytes ?? DEFAULT_LOG_MAX_BYTES,
+    maxFiles: fs?.max_files ?? DEFAULT_LOG_MAX_FILES,
+  }
+  if (fs?.path !== undefined) resolved.path = fs.path
+  return resolved
 }
 
 // ─────────────────────────────────────────────────────────────────────
