@@ -23,7 +23,7 @@ The official plugin is a self-contained Bun MCP server using `@modelcontextproto
 | Process-level rejection/exception loggers | `server.ts:71-78` | Logs unhandled async failures so polling does not go silent. | Keep, route to structured logger too. |
 | `PERMISSION_REPLY_RE` | `server.ts:80-84` | Parses `yes <id>` / `no <id>` permission decisions using the Claude Code 5-letter id alphabet. | Keep. |
 | `PendingEntry`, `GroupPolicy`, `Access` | `server.ts:89-117` | Models pairing, groups, allowlists, and delivery settings. | Replace with strict Zod-derived types; Scope A is DM-only. |
-| `defaultAccess()` | `server.ts:119-126` | Default policy is pairing with empty allowlists. | Rewrite default to static allowlist for user id `164795011`; no pairing this iteration. |
+| `defaultAccess()` | `server.ts:119-126` | Default policy is pairing with empty allowlists. | Rewrite default to static allowlist for user id `123456789`; no pairing this iteration. |
 | `MAX_CHUNK_LIMIT`, `MAX_ATTACHMENT_BYTES` | `server.ts:128-129` | Telegram text/file hard limits. | Keep. |
 | `assertSendable(f)` | `server.ts:131-145` | Blocks sending files from channel state dir except inbox. | Needs rewrite: hard requirement is workspace-relative allowlist from `gateway.py:2987-3016`. |
 | `readAccessFile()` | `server.ts:147-170` | Reads `access.json`, fills defaults, renames corrupt file aside. | Rewrite with Zod validation and no pairing mutations by default. |
@@ -77,7 +77,7 @@ Statuses:
 | Process model and long-poll consumer | `gateway.py:3237-3400` | `server.ts:994-1038` | Have with Grammy long-poll and pid guard. No Python threads. |
 | One bot token, one consumer | `gateway.py:3237-3400` | `server.ts:53-69`, `994-1038` | Have, plus test-bot id guard. |
 | File offset persistence | `gateway.py:20`, `3237-3281` | none explicit | Missing: write `update-offset` checkpoint for diagnostics; do not replace Grammy polling in Scope A. |
-| User allowlist by sender id | `gateway.py:47-59`, `3318-3325` | `server.ts:227-285` | Rewrite: static DM-only allowlist for user `164795011`, gate by `from.id`. |
+| User allowlist by sender id | `gateway.py:47-59`, `3318-3325` | `server.ts:227-285` | Rewrite: static DM-only allowlist for user `123456789`, gate by `from.id`. |
 | Group allowlist/topics | `gateway.py:51-58`, `3327-3336` | `server.ts:269-281`, `300-324` | Defer. No groups in Scope A. |
 | Mention/reply detection in groups | `gateway.py:753-793` | `server.ts:300-324` | Defer; current official reply check by username is not acceptable for anti-spoof. |
 | Markdown to Telegram HTML | `gateway.py:261-410` | none; official supports MarkdownV2 only in tools | Missing: port gateway HTML converter to strict TS and tests. |
@@ -220,7 +220,7 @@ Permission flow:
 ```text
 Claude Code permission_request notification
   -> permissions.handlePermissionRequest()
-  -> Telegram DM to owner user_id 164795011
+  -> Telegram DM to owner user_id 123456789
   -> owner replies "yes abcde" or presses allow/deny button
   -> permissions.handleDecision()
   -> MCP notification: notifications/claude/channel/permission
@@ -245,7 +245,7 @@ Default for canary:
 ```text
 TELEGRAM_STATE_DIR/
   .env                         # optional local secret file, chmod 600, never committed
-  allowlist.json               # static DM allowlist; starts with user id 164795011
+  allowlist.json               # static DM allowlist; starts with user id 123456789
   config.json                  # optional non-secret runtime config overrides
   bot.pid                      # single-consumer guard
   update-offset                # last observed Telegram update id checkpoint
@@ -266,9 +266,9 @@ TELEGRAM_STATE_DIR/
 ```json
 {
   "mode": "allowlist",
-  "allow_user_ids": ["164795011"],
-  "allow_chat_ids": ["164795011"],
-  "permission_owner_user_ids": ["164795011"],
+  "allow_user_ids": ["123456789"],
+  "allow_chat_ids": ["123456789"],
+  "permission_owner_user_ids": ["123456789"],
   "groups": {}
 }
 ```
@@ -286,7 +286,7 @@ Environment variables:
 | `DASHI_CHANNEL_CONFIG` | no | Path to optional JSON config. |
 | `DASHI_AGENT_ID` | no | Canary agent id for logs/meta. Default `dashi-canary`. |
 | `DASHI_WORKSPACE_ROOT` | yes for file replies | Absolute workspace root used by sendDocument security check. |
-| `TELEGRAM_ALLOWED_USER_IDS` | no | Comma-separated override; default `164795011`. |
+| `TELEGRAM_ALLOWED_USER_IDS` | no | Comma-separated override; default `123456789`. |
 | `TELEGRAM_STATUS_INTERVAL_MS` | no | Default `700`. |
 | `TELEGRAM_ALBUM_WINDOW_MS` | no | Default `2000`. |
 | `TELEGRAM_TEXT_CHUNK_LIMIT` | no | Default `4000`, max `4096`. |
@@ -304,9 +304,9 @@ Optional `config.json` keys, all Zod validated:
   "agent_id": "dashi-canary",
   "workspace_root": "/Users/jasonqwwen/qwwiwi-channel-telegram-Claude-code",
   "expected_bot_id": 8507713167,
-  "allowed_user_ids": [164795011],
-  "allowed_chat_ids": [164795011],
-  "permission_owner_user_ids": [164795011],
+  "allowed_user_ids": [123456789],
+  "allowed_chat_ids": [123456789],
+  "permission_owner_user_ids": [123456789],
   "dm_only": true,
   "album_window_ms": 2000,
   "status_interval_ms": 700,
@@ -726,7 +726,7 @@ export class PermissionRelay {
 
 - [ ] **Acceptance criteria**
   - MCP capability declares `claude/channel/permission`, matching research lines `RESEARCH.md:46-52`.
-  - Only `permission_owner_user_ids` can decide requests; default is `164795011`.
+  - Only `permission_owner_user_ids` can decide requests; default is `123456789`.
   - Text decisions match `yes <id>` / `no <id>` and callback decisions match the same request id.
   - TTL expiry rejects stale decisions and writes audit JSONL.
   - Smoke proof includes a single Bash approval flow; no `--dangerously-skip-permissions` flag is introduced.
@@ -804,7 +804,7 @@ export async function deliverChannelEvent(event: ChannelEvent, deps: ChannelDeps
 
 - [ ] **Acceptance criteria**
   - Start in tmux with `claude --dangerously-load-development-channels server:dashi-channel`.
-  - Send a DM from user `164795011` to @testmyfirsttmuxbot and receive a reply through the `reply` tool.
+  - Send a DM from user `123456789` to @testmyfirsttmuxbot and receive a reply through the `reply` tool.
   - Send a denied DM from a non-allowlisted user if available, or replay fixture through offline handler.
   - Send a photo/document/voice sample and verify channel content contains `<media>` descriptors.
   - Send two photos as an album and verify one channel event after the 2s buffer.
@@ -987,9 +987,9 @@ chmod 700 "$HOME/.claude/channels/dashi-telegram-canary"
 cat > "$HOME/.claude/channels/dashi-telegram-canary/allowlist.json" <<'JSON'
 {
   "mode": "allowlist",
-  "allow_user_ids": ["164795011"],
-  "allow_chat_ids": ["164795011"],
-  "permission_owner_user_ids": ["164795011"],
+  "allow_user_ids": ["123456789"],
+  "allow_chat_ids": ["123456789"],
+  "permission_owner_user_ids": ["123456789"],
   "groups": {}
 }
 JSON
@@ -1005,13 +1005,13 @@ tmux send-keys -t dashi-channel-canary \
 
 Smoke against @testmyfirsttmuxbot:
 
-1. DM from Telegram user `164795011`: `ping from channel canary`.
+1. DM from Telegram user `123456789`: `ping from channel canary`.
 2. Verify `logs/server-YYYY-MM-DD.jsonl` records accepted update and channel notification.
 3. Verify Claude replies through the `reply` tool and Telegram receives the answer.
 4. Send `/status`; verify direct status response names bot id `8507713167` and no secrets.
 5. Send a two-photo album; verify one channel event after about 2 seconds.
 6. Send a voice message without `GROQ_API_KEY`; verify descriptor path, not failure.
-7. Trigger one Bash permission request from Claude Code and approve with `yes <request_id>` from user `164795011`.
+7. Trigger one Bash permission request from Claude Code and approve with `yes <request_id>` from user `123456789`.
 8. Run `ps -axo command | rg 'claude -p|dashi-channel|telegram'` and verify the channel path does not contain `claude -p`.
 
 ### Rollback

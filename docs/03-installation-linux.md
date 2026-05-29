@@ -128,7 +128,7 @@ sudo $EDITOR /etc/dashi-plugin/myagent/channel.env
 ```bash
 TELEGRAM_BOT_TOKEN=123456789:AAH...
 TELEGRAM_EXPECTED_BOT_ID=123456789
-TELEGRAM_ALLOWED_USER_IDS=164795011    # ваш Telegram user ID
+TELEGRAM_ALLOWED_USER_IDS=123456789    # ваш Telegram user ID
 TELEGRAM_STATE_DIR=/home/agentctl/.claude-lab/shared/state/myagent/telegram
 TELEGRAM_WORKSPACE_ROOT=/home/agentctl/.claude-lab/myagent/.claude
 TELEGRAM_WEBHOOK_HOST=127.0.0.1

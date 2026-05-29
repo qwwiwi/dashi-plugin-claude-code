@@ -39,7 +39,7 @@
 - Bun + TypeScript MCP server (`jarvis-channel/src/index.ts`)
 - Capability `claude/channel`
 - Telegram Bot API long-poll внутри плагина
-- Allowlist `user_id 164795011`
+- Allowlist `user_id 123456789`
 - Plain text reply через `sendMessage` (без HTML, без media)
 
 ### Phase 2: Parity port (1.5–3 дня)
