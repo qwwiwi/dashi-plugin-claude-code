@@ -104,6 +104,14 @@ External imports:
 
 `install-hooks.sh` плагина модифицирует `~/.claude/settings.json` (а не project) — это делает hooks доступными для **любой** Claude Code сессии этого пользователя, не только для плагина. Если у вас несколько агентов под одним service-user — будьте в курсе, что hooks shared.
 
+> **Ловушка (важно): хуки плагина ОБЯЗАНЫ жить в глобальном `~/.claude/settings.json`, а не в project settings.**
+>
+> Project settings (`<project>/.claude/settings.json`) определяются от **cwd сессии** (точнее — от git-root этого cwd), а не от вашего workspace-каталога агента. Сервис плагина обычно стартует с `WorkingDirectory=<...>/jarvis-channel/plugin`, поэтому «project» для сессии — это репозиторий плагина, а **не** `~/.claude-lab/<agent>/`. Если вы зарегистрируете хук в `~/.claude-lab/<agent>/.claude/settings.json`, рассчитывая что это «project settings», — живая сессия его **не прочитает**, и хук молча не сработает.
+>
+> Реальный инцидент (2026-05-29): read-receipt хук (детерминированная 👀-реакция «агент прочитал сообщение») положили в `~/.claude-lab/<agent>/.claude/settings.json`. Сессия канала стартует из `jarvis-channel/plugin` → читает глобальный `~/.claude/settings.json` → хук не подхватился → реакции 👀 пропали полностью. Диагностический признак: **ни один** Stop-хук из workspace-settings не отрабатывал (heartbeat пустой, `handoff.md`/`recent.md` не обновлялись). Лечение — перенести хук в глобальный `~/.claude/settings.json` + рестарт сервиса.
+>
+> Правило: **все** хуки плагина (`PreToolUse`/`PostToolUse`/`Stop`/`UserPromptSubmit`) регистрируются только в глобальном `~/.claude/settings.json`. Workspace-level settings подходят лишь для `permissions`/`env`, которые мёрджатся независимо от cwd.
+
 ## MCP servers
 
 `<workspace>/.mcp.json` (и `~/.claude/mcp.json`) — список MCP-серверов которые Claude Code подключит при старте.

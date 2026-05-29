@@ -1,6 +1,6 @@
 # Troubleshooting
 
-11 типовых проблем — все взяты из реальных инцидентов. Каждая: **симптом** → **корень** → **фикс** → **как не повторить**.
+12 типовых проблем — все взяты из реальных инцидентов. Каждая: **симптом** → **корень** → **фикс** → **как не повторить**.
 
 > **Прочтите перед использованием.** Документ разделён на две секции:
 > - **Section A — Current (Bun plugin) — problems** — актуальные проблемы текущей версии плагина на Bun + TypeScript. Применимо ко всем установкам.
@@ -20,6 +20,7 @@
 - [Проблема 9. Tmux death loop](#проблема-9-tmux-death-loop-claude-exits--service-в-crash-loop) [current]
 - [Проблема 10. Sudo deny rules: что должно блокироваться ВСЕГДА](#проблема-10-sudo-deny-rules-что-должно-блокироваться-всегда) [current]
 - [Проблема 11. Agent silently stuck in interactive prompt](#проблема-11-agent-silently-stuck-in-interactive-prompt-askuserquestion-vim-less-etc) [current]
+- [Проблема 12. Хук работал, потом «пропал» — зарегистрирован не в том settings.json](#проблема-12-хук-работал-потом-пропал--зарегистрирован-не-в-том-settingsjson) [current]
 
 ### Section B — Pre-cutover migration only (Python gateway.py) — applicable until 2026-06-15
 - [Проблема 3. `getUpdates conflict` — две сессии слушают одного бота](#проблема-3-getupdates-conflict--две-сессии-слушают-одного-бота) [pre-cutover]
@@ -729,6 +730,48 @@ sudo systemctl start channel-<agent>
 ```
 
 **Урок:** state-каталог — отдельная сущность от плагин-кода. При планировании переноса учитывайте оба пути. Архивируйте старый workspace (`tar czf` + `mv .old`) перед любыми деструктивными операциями — см. [04-migration-from-gateway.md → Шаг 7](04-migration-from-gateway.md#шаг-7-архивация-gateway-через-7-14-дней) для безопасного workflow.
+
+---
+
+## Проблема 12. Хук работал, потом «пропал» — зарегистрирован не в том settings.json
+
+`[current]`
+
+### Симптом
+
+Хук, который раньше работал (например, детерминированная 👀-реакция «агент прочитал сообщение» через Stop-хук), внезапно перестаёт срабатывать после коммита, который перенёс логику из кода плагина в Claude Code hook. Бот живой, отвечает, но побочный эффект хука (реакция, запись памяти, heartbeat) молча исчезает. В логах ошибок нет.
+
+### Корень
+
+Claude Code читает **project settings** (`<project>/.claude/settings.json`) относительно **cwd сессии**, а не относительно workspace-каталога агента. Сервис плагина обычно стартует с `WorkingDirectory=<...>/jarvis-channel/plugin` — значит «project» для живой сессии это **репозиторий плагина**, а не `~/.claude-lab/<agent>/`.
+
+Если хук зарегистрировать в `~/.claude-lab/<agent>/.claude/settings.json`, ошибочно считая это «project settings» сессии, — живая сессия этот файл **не читает**, и хук не выполняется. Диагностический признак: **ни один** Stop-хук из этого settings не отрабатывает — `core/hot/handoff.md` и `recent.md` не обновляются, heartbeat-файл пустой/старый.
+
+Реальный инцидент (2026-05-29): read-receipt хук положили в workspace-settings; сессия стартует из `jarvis-channel/plugin` → читает только глобальный `~/.claude/settings.json` → 👀 пропали полностью.
+
+### Фикс
+
+```bash
+# 1. Проверить, какой settings реально читает сессия:
+#    cwd сервиса → его git-root → там ищется .claude/settings.json
+systemctl show channel-<agent> -p WorkingDirectory
+cd <WorkingDirectory> && git rev-parse --show-toplevel   # это и есть "project" для сессии
+
+# 2. Убедиться что workspace-хуки НЕ срабатывают (косвенный признак):
+stat -c '%y' ~/.claude-lab/<agent>/.claude/core/hot/handoff.md   # не обновляется = settings не читается
+
+# 3. Перенести хук в ГЛОБАЛЬНЫЙ ~/.claude/settings.json (бэкап обязателен)
+cp ~/.claude/settings.json ~/.claude/settings.json.bak.$(date +%Y%m%d-%H%M%S)
+#    добавить группу в hooks.Stop (или нужное событие), валидировать JSON:
+python3 -c "import json; json.load(open('$HOME/.claude/settings.json')); print('OK')"
+
+# 4. Рестарт сервиса — settings читается только на старте новой сессии
+sudo systemctl restart channel-<agent>
+```
+
+### Как не повторить
+
+**Все хуки плагина** (`PreToolUse`/`PostToolUse`/`Stop`/`UserPromptSubmit`) регистрируются **только** в глобальном `~/.claude/settings.json` — именно его читает любая сессия пользователя независимо от cwd. Workspace-level `settings.json` годится лишь для `permissions`/`env` (они мёрджатся независимо от cwd). Подробнее — [06-how-claude-loads-session.md → Settings.json hierarchy](06-how-claude-loads-session.md#settingsjson-hierarchy).
 
 ---
 
