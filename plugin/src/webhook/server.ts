@@ -56,9 +56,11 @@ const ASK_BODY_LIMIT_BYTES = 64 * 1024
 // generous and keeps the route cheap to abuse-proof.
 const REACT_BODY_LIMIT_BYTES = 4 * 1024
 // Fallback-reply bodies carry one text up to Telegram's 4096-char cap plus a
-// short chat_id; 16 KB covers a worst-case multibyte (UTF-8) 4096-char text
-// with JSON overhead while still cheap to abuse-proof. 2026-06-03.
-const FALLBACK_REPLY_BODY_LIMIT_BYTES = 16 * 1024
+// short chat_id. FIX 5 (2026-06-03): 4096 chars × up to 4 UTF-8 bytes + JSON
+// overhead can exceed 16 KB, which would 413 BEFORE the schema validates the
+// 4096-char text. 32 KB covers the worst-case multibyte body with headroom
+// while still cheap to abuse-proof.
+const FALLBACK_REPLY_BODY_LIMIT_BYTES = 32 * 1024
 const DEFAULT_AGENT_ID = 'dashi-channel'
 
 // Margin added on top of the configured AskUserQuestion timeout to set

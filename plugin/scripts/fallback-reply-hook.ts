@@ -84,6 +84,22 @@ const REPLY_TOOL_NAMES = new Set<string>([
 const FETCH_TIMEOUT_MS = 5000
 const STATE_CAP_BYTES = 256 * 1024
 
+// Telegram's sendMessage hard caps a single message at 4096 chars; the route
+// schema rejects anything longer with 400. The bare sendMessage does NOT chunk
+// (chunking lives only in the MCP reply tool), so a >4096-char final answer
+// would 400-drop forever. FIX 5 (minimum viable): truncate to TELEGRAM_TEXT_MAX
+// with a short marker so a long answer always delivers SOMETHING. Marker stays
+// within the 4096 budget: body ≤ 4096 − marker length.
+const TELEGRAM_TEXT_MAX = 4096
+const TRUNCATION_MARKER = '\n…[обрезано]'
+
+/** Truncate a final text to Telegram's 4096-char cap, appending a marker. */
+export function truncateForTelegram(text: string): string {
+  if (text.length <= TELEGRAM_TEXT_MAX) return text
+  const room = TELEGRAM_TEXT_MAX - TRUNCATION_MARKER.length
+  return text.slice(0, room) + TRUNCATION_MARKER
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Transcript turn-walk. Ported from stop-to-outbox.py's
 // read_last_assistant_text + _is_user_prompt: walk the CURRENT TURN backward,
@@ -105,27 +121,38 @@ export interface TurnResult {
   // The inbound Telegram chat_id parsed from the turn's user prompt, or
   // undefined when the turn was not answering a Telegram message.
   readonly chatId?: string | undefined
+  // The boundary user-prompt's text content (FIX 6 dedup discriminator). Used
+  // to distinguish two different turns that have no `uuid` but identical
+  // assistant text. Undefined when no boundary prompt text was found.
+  readonly promptText?: string | undefined
 }
 
-const CHANNEL_TAG_RE = /<channel\b([^>]*)>/g
-
 /**
- * Extract the FIRST telegram chat_id from one chunk of text. Tolerant of both
- * the JSON-escaped transcript form (`chat_id=\"164795011\"`) and the raw form.
- * Only telegram blocks match (orgrimmar-inbox events carry no telegram source).
- * Returns undefined when no telegram chat_id is present.
+ * Extract the genuine inbound Telegram chat_id from the LEADING `<channel ...>`
+ * envelope of a user-prompt's TEXT. The real inbound envelope ALWAYS leads the
+ * user prompt; a `<channel ...>` tag appearing later in the body is untrusted
+ * (it could be injected by a message author or echoed transcript content), so
+ * we read ONLY the leading tag.
+ *
+ * Tolerant of both the JSON-escaped transcript form (`chat_id=\"164795011\"`)
+ * and the raw form. Only telegram envelopes match (orgrimmar-inbox events carry
+ * no telegram source). Returns undefined when the trimmed text does NOT start
+ * with a telegram channel envelope → no trusted destination → no forward.
+ *
+ * FIX 7: the regex is constructed locally (no shared module-level `/g` regex
+ * with a mutable `lastIndex` that could carry state across calls).
  */
-export function parseTelegramChatId(text: string): string | undefined {
-  CHANNEL_TAG_RE.lastIndex = 0
-  let match: RegExpExecArray | null
-  while ((match = CHANNEL_TAG_RE.exec(text)) !== null) {
-    const attrs = match[1] ?? ''
-    if (!/source\s*=\s*\\?"telegram\\?"/.test(attrs)) continue
-    // chat_id is negative for groups/supergroups, so allow a leading `-`.
-    const chat = attrs.match(/chat_id\s*=\s*\\?"(-?\d+)\\?"/)
-    if (chat) return chat[1] as string
-  }
-  return undefined
+export function extractLeadingTelegramChatId(promptText: string): string | undefined {
+  const trimmed = promptText.trimStart()
+  // Anchored at the start: only the LEADING channel tag is considered. The
+  // attrs group is non-greedy up to the first `>` so it captures one tag.
+  const leadingTag = /^<channel\b([^>]*)>/.exec(trimmed)
+  if (!leadingTag) return undefined
+  const attrs = leadingTag[1] ?? ''
+  if (!/source\s*=\s*\\?"telegram\\?"/.test(attrs)) return undefined
+  // chat_id is negative for groups/supergroups, so allow a leading `-`.
+  const chat = /chat_id\s*=\s*\\?"(-?\d+)\\?"/.exec(attrs)
+  return chat ? (chat[1] as string) : undefined
 }
 
 interface TranscriptMessage {
@@ -160,6 +187,28 @@ function assistantText(content: unknown): string {
     if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text)
   }
   return parts.join('\n')
+}
+
+/**
+ * Extract the TEXT content of a user-prompt message. For a string content the
+ * string itself is the text; for an array content we join the `{type:'text'}`
+ * blocks ONLY. We deliberately do NOT serialize the whole array (FIX 2): the
+ * raw JSON line can carry channel-looking substrings inside tool metadata, and
+ * the leading-envelope rule must see the genuine prompt text, not that noise.
+ * Returns undefined when there is no usable text content.
+ */
+function userPromptText(content: unknown): string | undefined {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    const parts: string[] = []
+    for (const block of content) {
+      if (block === null || typeof block !== 'object') continue
+      const b = block as Record<string, unknown>
+      if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text)
+    }
+    return parts.length > 0 ? parts.join('\n') : undefined
+  }
+  return undefined
 }
 
 /**
@@ -215,13 +264,15 @@ export function analyzeCurrentTurn(transcript: string): TurnResult {
 
     if (role === 'user') {
       // tool_result echo → part of this turn, keep walking. Genuine prompt →
-      // turn boundary: extract the inbound telegram chat_id and stop.
+      // turn boundary: extract the inbound telegram chat_id from the LEADING
+      // envelope of the prompt's TEXT (FIX 2) and stop. We use only the
+      // prompt's text blocks — never the raw JSON line — so injected
+      // `<channel ...>` substrings in tool metadata cannot redirect the send.
       if (isUserPrompt(content)) {
+        const promptText = userPromptText(content)
         const chatId =
-          typeof content === 'string'
-            ? parseTelegramChatId(content)
-            : parseTelegramChatId(lines[i] as string)
-        return { text, uuid, replied, chatId }
+          promptText !== undefined ? extractLeadingTelegramChatId(promptText) : undefined
+        return { text, uuid, replied, chatId, promptText }
       }
       continue
     }
@@ -239,8 +290,8 @@ export function analyzeCurrentTurn(transcript: string): TurnResult {
   }
   // Reached the top without a genuine user prompt: no turn boundary found, so
   // we cannot confirm a Telegram chat_id → no fallback. Still report replied
-  // (harmless) but leave chatId undefined.
-  return { text, uuid, replied, chatId: undefined }
+  // (harmless) but leave chatId/promptText undefined.
+  return { text, uuid, replied, chatId: undefined, promptText: undefined }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -348,9 +399,23 @@ export function resolveStatePath(
   return join(base, 'fallback-reply', file)
 }
 
-export function dedupeToken(uuid: string | undefined, text: string): string {
+/**
+ * Per-turn dedup token. When the transcript line carries a `uuid` it uniquely
+ * identifies the turn → use it alone. Without a uuid (legacy transcripts) the
+ * assistant text alone is NOT a turn discriminator: two DIFFERENT turns in the
+ * same session with identical assistant text would collide and the second
+ * would be suppressed, losing the warchief an answer (FIX 6). So we fold the
+ * boundary user-prompt's text into the hash — different prompts → different
+ * tokens even when the assistant text matches.
+ */
+export function dedupeToken(
+  uuid: string | undefined,
+  text: string,
+  promptText?: string | undefined,
+): string {
   if (uuid) return uuid
-  return createHash('sha256').update(text, 'utf8').digest('hex')
+  const material = promptText !== undefined ? `${promptText} ${text}` : text
+  return createHash('sha256').update(material, 'utf8').digest('hex')
 }
 
 export function loadDedupState(
@@ -453,7 +518,18 @@ function warn(reason: string): void {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-/** POST one fallback reply. Returns true when the route handled it (200 family). */
+/**
+ * POST one fallback reply. Returns true ONLY when the route confirms the send
+ * actually reached Telegram ({status:'sent'}).
+ *
+ * FIX 1: the route returns HTTP 200 for BOTH a real send AND a fail-soft send
+ * failure ({status:'send_failed'}). Treating any 200 as success would persist
+ * dedup on a transient send failure → a repeat Stop fire for the same turn is
+ * suppressed → the warchief never gets the answer. So we parse the body and
+ * succeed only on `{status:'sent'}`. For `{status:'send_failed'}`, an
+ * unparseable body, or any non-200 → return false (dedup NOT written → a repeat
+ * Stop fire retries the send).
+ */
 async function postFallback(config: FallbackConfig, chatId: string, text: string): Promise<boolean> {
   try {
     const response = await fetch(config.url, {
@@ -468,12 +544,16 @@ async function postFallback(config: FallbackConfig, chatId: string, text: string
       // not linger and delay session teardown.
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     })
-    // The route returns 200 for both a successful send AND a terminal send
-    // failure ({status:'send_failed'}): both are recorded as handled so we
-    // don't retry-storm. A 4xx/5xx (auth, allowlist, route down) or a
-    // network/timeout error returns false → left unrecorded so the next turn
-    // retries.
-    return response.ok
+    if (!response.ok) return false
+    let body: unknown
+    try {
+      body = await response.json()
+    } catch {
+      // Unparseable body on a 200 — cannot confirm the send → do NOT dedup.
+      return false
+    }
+    if (body === null || typeof body !== 'object') return false
+    return (body as Record<string, unknown>).status === 'sent'
   } catch {
     return false
   }
@@ -518,19 +598,35 @@ async function main(): Promise<void> {
   const delayMs = envInt(env, 'FALLBACK_REPLY_RETRY_DELAY_MS', 120, 0, 2000)
 
   let turn: TurnResult = { replied: false }
+  // FIX 3: cap the CUMULATIVE sleep at a hard 3s ceiling regardless of the
+  // attempts×delay knob product (up to 50×2000 = 100s otherwise). Once the
+  // budget is exhausted we stop sleeping but still run the remaining read
+  // attempts back-to-back, so a transcript that lands late is still picked up
+  // without hanging the synchronous Stop hook.
+  const SLEEP_BUDGET_MS = 3000
+  let sleptMs = 0
   for (let attempt = 0; attempt < attempts; attempt++) {
     let transcript = ''
     try {
       transcript = tailReadTranscript(transcriptPath)
     } catch {
-      // No transcript yet — nothing to forward.
-      return
+      // FIX 4: a transient read/write race must NOT abort the whole retry
+      // loop. Skip to the next attempt; only give up after all attempts are
+      // exhausted with no text (bounded by the FIX 3 sleep budget).
+      if (attempt < attempts - 1 && delayMs > 0 && sleptMs < SLEEP_BUDGET_MS) {
+        await sleep(delayMs)
+        sleptMs += delayMs
+      }
+      continue
     }
     turn = analyzeCurrentTurn(transcript)
     // A reply already reached the warchief this turn → never fall back.
     if (turn.replied) return
     if (turn.text !== undefined && turn.text.trim().length > 0) break
-    if (attempt < attempts - 1 && delayMs > 0) await sleep(delayMs)
+    if (attempt < attempts - 1 && delayMs > 0 && sleptMs < SLEEP_BUDGET_MS) {
+      await sleep(delayMs)
+      sleptMs += delayMs
+    }
   }
 
   if (turn.replied) return
@@ -547,7 +643,9 @@ async function main(): Promise<void> {
     return
   }
 
-  const token = dedupeToken(turn.uuid, text)
+  // FIX 6: fold the boundary prompt text into the dedup token so two different
+  // turns with identical assistant text but no uuid don't collide.
+  const token = dedupeToken(turn.uuid, text, turn.promptText)
   const next: DedupState = {
     session_id: sessionId,
     transcript_path: transcriptPath,
@@ -559,7 +657,10 @@ async function main(): Promise<void> {
     if (alreadyForwarded(prior, next)) return
   }
 
-  const ok = await postFallback(config as FallbackConfig, chatId, text)
+  // FIX 5: truncate-with-marker so a >4096-char answer delivers SOMETHING
+  // rather than 400-dropping at the route's schema cap.
+  const outText = truncateForTelegram(text)
+  const ok = await postFallback(config as FallbackConfig, chatId, outText)
   if (ok && statePath) persistDedupState(statePath, next)
 }
 

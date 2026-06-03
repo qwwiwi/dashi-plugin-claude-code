@@ -173,14 +173,27 @@ describe('POST /hooks/fallback-reply', () => {
     expect(resp.status).toBe(400)
   })
 
-  test('413 on a body over the route limit', async () => {
+  test('413 on a body over the route limit (FIX 5: now 32 KB)', async () => {
     process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
     const { h, calls } = await start()
-    // > FALLBACK_REPLY_BODY_LIMIT_BYTES (16 KB). Schema would also reject text
-    // > 4096 chars, but the body cap rejects earlier with 413.
-    const huge = 'a'.repeat(20 * 1024)
+    // > FALLBACK_REPLY_BODY_LIMIT_BYTES (32 KB after FIX 5). Schema would also
+    // reject text > 4096 chars, but the body cap rejects earlier with 413.
+    const huge = 'a'.repeat(40 * 1024)
     const resp = await post(h, { chat_id: WARCHIEF_ID, text: huge })
     expect(resp.status).toBe(413)
     expect(calls).toEqual([])
+  })
+
+  test('FIX 5: a 4096-char multibyte text (≤4096 chars but >16 KB UTF-8) is delivered, not 413', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { h, calls } = await start()
+    // 4096 × 3-byte CJK chars ≈ 12 KB body; switch to 4-byte to exceed the
+    // OLD 16 KB cap and prove the 32 KB cap admits it. The hook truncates to
+    // ≤4096 chars before posting, so the schema's .max(4096) is satisfied.
+    const cjk = '中'.repeat(4096) // 3 bytes each → ~12 KB; under both caps but exercises multibyte
+    const resp = await post(h, { chat_id: WARCHIEF_ID, text: cjk })
+    expect(resp.status).toBe(200)
+    expect(await resp.json()).toEqual({ status: 'sent' })
+    expect(calls).toEqual([{ chatId: WARCHIEF_ID, text: cjk }])
   })
 })
