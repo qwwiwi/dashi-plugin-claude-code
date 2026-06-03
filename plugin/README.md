@@ -78,6 +78,41 @@ bash plugin/scripts/install-hooks.sh \
 
 Хук всегда exit 0 и не пишет в stdout — read receipt никогда не блокирует и не загрязняет контекст модели. Если роут недоступен (или реакция не вписана в деплой) — хук тихо ничего не делает.
 
+## DM fallback reply (Stop hook → `/hooks/fallback-reply`)
+
+**Зачем (2026-06-03).** Личка вождя (главная/launcher-сессия) отвечает ему через MCP-тул `mcp__dashi-channel__reply` — именно этот вызов доходит до Telegram, транскрипт сессии — нет. Если ход завершился БЕЗ вызова `reply()`/`edit_message()`, вождь получает тишину, хотя финальный ответ хода есть. Этот fallback закрывает разрыв.
+
+**Как работает.** По событию `Stop` хук `scripts/fallback-reply-hook.ts` читает транскрипт текущего хода (идёт с конца до последнего настоящего user-промпта — та же логика, что в `src/chats/hooks/stop-to-outbox.py`) и:
+
+1. Если ход вызвал `mcp__dashi-channel__reply` ИЛИ `mcp__dashi-channel__edit_message` — ответ уже дошёл до вождя → молчит (без дубля).
+2. Если у хода нет финального assistant-текста (чистый tool/thinking-ход) → молчит.
+3. Если ход не отвечал на Telegram-сообщение (в его user-промпте нет `<channel source="telegram" ... chat_id="...">`) → молчит. Этот же блок даёт `chat_id` назначения — не доверяя никакому chat_id из env.
+4. Иначе POST'ит `{chat_id, text}` в `POST /hooks/fallback-reply`. Роут (loopback + bearer + chat-allowlist) шлёт текст единственным ботом через `sendMessage`.
+
+Пер-сессионный дедуп (`<state>/fallback-reply/<session_id>.json`, по `session_id`+`transcript_path`+`dedupe_token`) гарантирует не более одного fallback на ход. Хук всегда exit 0 и не пишет в stdout. Это **DM-only**: per-chat мультичат-сессии уже автодоставляют ответ через `stop-to-outbox.py` + outbox — этот хук туда НЕ регистрируется.
+
+**Регистрация хука** (в дополнение к `install-hooks.sh` и read-receipt выше) — добавь в `Stop` своего DM `settings.json` ещё одну команду с путём до env-файла плагина:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "marker": "dashi-channel-fallback-reply",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TELEGRAM_CHANNEL_ENV_FILE='/abs/path/to/channel.env' bun '/abs/path/to/plugin/scripts/fallback-reply-hook.ts'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Если роут недоступен (или `sendMessage` не вписан в деплой — отвечает 503) — хук тихо ничего не делает.
+
 ## Environment variables
 
 Полный список — `plugin/src/config.ts` (`RuntimeEnvSchema`). Минимум:
@@ -94,6 +129,9 @@ bash plugin/scripts/install-hooks.sh \
 | `TELEGRAM_CHANNEL_ENV_FILE` | Путь до env-файла плагина — read-receipt хук (`Stop`) берёт из него `WEBHOOK_PORT/HOST/TOKEN`, чтобы ставить `👀` даже из per-chat сессии с очищенным env. См. секцию «Read receipts». |
 | `TELEGRAM_READ_RECEIPT_URL` | Явный URL роута `/hooks/react` (альтернатива выводу из `HOST`+`PORT`). |
 | `TELEGRAM_READ_RECEIPT_STATE` | Явный путь до дедуп-лога (single-writer). По умолчанию — пер-сессионный `<state>/read-receipts/<session_id>.log` в `TELEGRAM_STATE_DIR` (или `MULTICHAT_STATE_DIR`). |
+| `TELEGRAM_FALLBACK_REPLY_URL` | Явный URL роута `/hooks/fallback-reply` (альтернатива выводу из `HOST`+`PORT`). См. секцию «DM fallback reply». |
+| `TELEGRAM_FALLBACK_REPLY_STATE` | Явный путь до дедуп-стейта fallback-хука. По умолчанию — пер-сессионный `<state>/fallback-reply/<session_id>.json`. |
+| `FALLBACK_REPLY_RETRY_ATTEMPTS` / `FALLBACK_REPLY_RETRY_DELAY_MS` | Ограниченный retry на пустую экстракцию (гонка extended-thinking: [thinking] и [text] в двух строках). Defaults 4 / 120ms, оба клампятся сверху. |
 | `TELEGRAM_MEMORY_*` | Memory hook config (см. секцию ниже). |
 | `TELEGRAM_MULTICHAT_*` | Multichat router config (см. секцию ниже). |
 | `GROQ_API_KEY` | Whisper transcription для голосовых (опционально). |

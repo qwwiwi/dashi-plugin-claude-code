@@ -987,6 +987,13 @@ try {
     // call goes through, so 👀 reactions share the per-chat rate budget.
     reactToMessage: (chatId, messageId, emoji) =>
       telegramApi.setMessageReaction(chatId, messageId, emoji),
+    // 2026-06-03 (feature/dm-fallback-reply-hook): DM fallback-reply route
+    // capability. Fire-and-forget plain-text send through the same
+    // safe-wrapped, rate-limited telegramApi so the fallback shares the
+    // per-chat rate budget. Drops the returned message_id (the route only
+    // needs Promise<void>).
+    sendMessage: (chatId, text) =>
+      telegramApi.sendMessage(chatId, text, {}).then(() => undefined),
   })
 } catch (err) {
   log.error('webhook server failed to start', {

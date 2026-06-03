@@ -48,6 +48,19 @@ export const ReactRouteRequestSchema = z.object({
 })
 export type ReactRouteRequest = z.infer<typeof ReactRouteRequestSchema>
 
+// Webhook route body - POST /hooks/fallback-reply (DM fallback Stop hook →
+// plugin). 2026-06-03. The warchief's DM session normally replies through the
+// `mcp__dashi-channel__reply` MCP tool. When a turn ends WITHOUT having sent
+// such a reply, the fallback-reply Stop hook posts the turn's final assistant
+// text here so it still reaches his Telegram. chat_id is a numeric string
+// (matching the inbound `<channel ... chat_id="...">`), groups are negative.
+// text is bounded at Telegram's 4096-char sendMessage cap.
+export const FallbackReplyRouteRequestSchema = z.object({
+  chat_id: z.string().regex(/^-?\d+$/),
+  text: z.string().min(1).max(4096),
+})
+export type FallbackReplyRouteRequest = z.infer<typeof FallbackReplyRouteRequestSchema>
+
 // Tool args - download_attachment. chat_id is required so the tool can
 // gate the download through the chat allowlist — without it, Claude could
 // be tricked into fetching an arbitrary file_id (e.g. one leaked into a
