@@ -49,6 +49,9 @@ function installStubTmux(): void {
   const stub = `#!/usr/bin/env bash
 DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
 echo "$@" >> "$DIR/tmux.log"
+if [[ "$1" == "load-buffer" && -n "\${TMUX_STUB_FAIL_LOAD:-}" ]]; then
+  exit 1
+fi
 if [[ "$1" == "capture-pane" ]]; then
   n=$(cat "$DIR/capture-count" 2>/dev/null || echo 0)
   n=$((n + 1))
@@ -69,7 +72,10 @@ exit 0
 
 // Run a bash snippet with the script's helpers sourced, the stub tmux
 // first on PATH, and fast test timings.
-function runHelpers(snippet: string): {
+function runHelpers(
+  snippet: string,
+  extraEnv: Record<string, string> = {},
+): {
   code: number
   stdout: string
   stderr: string
@@ -94,6 +100,7 @@ ${snippet}`,
         MULTICHAT_SUBMIT_RETRY_DELAY: '0.01',
         MULTICHAT_SUBMIT_RETRY_FACTOR: '1.0',
         MULTICHAT_SUBMIT_RETRY_MAX: '3',
+        ...extraEnv,
       },
       encoding: 'utf8',
       timeout: 15_000,
@@ -206,6 +213,73 @@ describe('submit_prompt', () => {
     writeFileSync(join(dir, 'pane-3.txt'), `❯ \nanswer rendered above\n`)
 
     const res = runHelpers(`submit_prompt 'fast turn message goes here ok'`)
+
+    expect(res.code).toBe(0)
+    expect(
+      tmuxLog().filter((l) => l === 'send-keys -t %1 Enter').length,
+    ).toBe(1)
+  })
+
+  test('load-buffer failure: exit 1, no paste, no Enter', () => {
+    installStubTmux()
+    writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
+
+    const res = runHelpers(`submit_prompt 'a message that will not load'`, {
+      TMUX_STUB_FAIL_LOAD: '1',
+    })
+
+    expect(res.code).toBe(1)
+    expect(res.stderr).toContain('load-buffer failed')
+    const log = tmuxLog()
+    expect(log.filter((l) => l.startsWith('paste-buffer')).length).toBe(0)
+    expect(log.filter((l) => l === 'send-keys -t %1 Enter').length).toBe(0)
+  })
+
+  test('pre-existing generation: interrupt footer is NOT trusted as success', () => {
+    installStubTmux()
+    // Generating already before the paste (previous turn in flight) and
+    // the fingerprint stays visible after Enter — must retry, not
+    // false-succeed off the old turn's footer.
+    const stuckWhileGenerating = `✻ Reticulating…\n❯ queued message sitting in composer\nesc to interrupt\n`
+    writeFileSync(join(dir, 'pane-1.txt'), READY_PANE.replace('\n', '\nesc to interrupt\n'))
+    writeFileSync(join(dir, 'pane-3.txt'), stuckWhileGenerating)
+    // Eventually the composer clears (queued submit accepted).
+    writeFileSync(join(dir, 'pane-5.txt'), `✻ Reticulating…\n❯ \nesc to interrupt\n`)
+
+    const res = runHelpers(
+      `submit_prompt 'queued message sitting in composer'`,
+    )
+
+    expect(res.code).toBe(0)
+    expect(
+      tmuxLog().filter((l) => l === 'send-keys -t %1 Enter').length,
+    ).toBeGreaterThanOrEqual(2)
+  })
+
+  test('cyrillic fingerprint survives 60-char truncation (UTF-8 safe)', () => {
+    installStubTmux()
+    const ru =
+      '[from @dashieshiev] Проверь пожалуйста последние коммиты плагина и скажи решили ли мы все фиксы по репорту ученика'
+    writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
+    // Fingerprint (first 60 chars) still visible → not submitted → retry;
+    // a byte-split fingerprint would never match and false-succeed on the
+    // first Enter instead.
+    writeFileSync(join(dir, 'pane-3.txt'), `❯ ${ru}\n`)
+    writeFileSync(join(dir, 'pane-5.txt'), GENERATING_PANE)
+
+    const res = runHelpers(`submit_prompt '${ru}'`)
+
+    expect(res.code).toBe(0)
+    expect(
+      tmuxLog().filter((l) => l === 'send-keys -t %1 Enter').length,
+    ).toBeGreaterThanOrEqual(2)
+  })
+
+  test('short body without fingerprint: single Enter, assume success', () => {
+    installStubTmux()
+    writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
+
+    const res = runHelpers(`submit_prompt 'да'`)
 
     expect(res.code).toBe(0)
     expect(

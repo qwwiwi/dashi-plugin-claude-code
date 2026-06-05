@@ -69,11 +69,14 @@ SUBMIT_RETRY_MAX="${MULTICHAT_SUBMIT_RETRY_MAX:-5}"
 # this file (MULTICHAT_ENTRYPOINT_TEST_ONLY=1) and exercise them with a
 # stub `tmux` on PATH.
 
-# Plain-text snapshot of the pane. -p strips attributes, -J rejoins
-# wrapped lines (so fingerprints survive narrow panes), -S -200 reaches
-# back far enough that a long prompt's head is still visible.
+# Plain-text snapshot of the VISIBLE pane only. -p strips attributes,
+# -J rejoins wrapped lines (so fingerprints survive narrow panes). We
+# deliberately do NOT pass -S: Claude Code's TUI scrolls (no alternate
+# screen), so pane history contains stale frames — an old generating
+# footer ("esc to interrupt") in scrollback would read as a false
+# submit-success. The composer always sits in the visible region.
 pane_text() {
-  tmux capture-pane -t "$PANE" -p -J -S -200 2>/dev/null || true
+  tmux capture-pane -t "$PANE" -p -J 2>/dev/null || true
 }
 
 # Block until the Claude Code composer is accepting input. The composer
@@ -97,42 +100,79 @@ wait_claude_ready() {
 
 # A distinctive substring of the prompt used to judge "still sitting in
 # the composer". Heuristic only: a false "still there" costs one extra
-# Enter on an idle composer, which is harmless.
+# Enter on an idle composer, which is harmless. python3 (already a hard
+# dependency via build_prompt) keeps the 60-char truncation UTF-8-safe —
+# byte-oriented `cut -c` would split multibyte Russian text and produce
+# a pattern that can never match the pane.
 prompt_fingerprint() {
-  printf '%s' "$1" | grep -m1 -E '.{8,}' | cut -c1-60 || true
+  printf '%s' "$1" | python3 -c '
+import sys
+for line in sys.stdin.read().splitlines():
+    line = line.strip()
+    if len(line) >= 4:
+        sys.stdout.write(line[:60])
+        break
+' || true
 }
 
 # Paste the body, then press Enter until the turn provably started.
-# Success signals (either suffices):
-#   * footer shows "esc to interrupt" — generation is running;
+# Success signals:
+#   * footer shows "esc to interrupt" AND generation was NOT already
+#     running before our paste — a pre-existing turn would read as a
+#     false success, so when one is in flight we fall back to the
+#     fingerprint signal only (Claude Code queues submits made during
+#     generation, so pasting immediately is still correct);
 #   * the fingerprint vanished from the pane — composer cleared (covers
-#     turns that finish faster than our poll).
-# The body is pasted exactly once; only Enter is ever retried.
+#     turns that finish faster than our poll, and queued submits).
+# The body is pasted exactly once; only Enter is ever retried, so a
+# false "not submitted" reading can never duplicate the message.
 submit_prompt() {
   local msg_text="$1"
-  local fp attempt delay buf
+  local fp attempt delay buf out pre_generating
   fp="$(prompt_fingerprint "$msg_text")"
 
   wait_claude_ready
 
+  pre_generating=0
+  if pane_text | grep -qiE 'esc to interrupt'; then
+    pre_generating=1
+  fi
+
   # Bracketed paste: the TUI receives one atomic paste event, so embedded
   # newlines stay soft newlines and the later Enter can never be grouped
   # into the paste. printf (not heredoc/<<<) avoids a trailing newline.
+  # Explicit `|| return 1` on each tmux op: these run with errexit
+  # suppressed (callers invoke us in `if` context), and a silently failed
+  # paste would otherwise read as "fingerprint vanished" = false success
+  # — losing the message entirely.
   buf="multichat-${CHAT_ID}-$$"
-  printf '%s' "$msg_text" | tmux load-buffer -b "$buf" -
-  tmux paste-buffer -d -t "$PANE" -b "$buf" -p
+  printf '%s' "$msg_text" | tmux load-buffer -b "$buf" - || {
+    echo "multichat-entrypoint(watcher): load-buffer failed" >&2
+    return 1
+  }
+  tmux paste-buffer -d -t "$PANE" -b "$buf" -p || {
+    echo "multichat-entrypoint(watcher): paste-buffer failed" >&2
+    return 1
+  }
 
   sleep "$PASTE_SETTLE"
 
   delay="$SUBMIT_RETRY_DELAY"
   for ((attempt = 1; attempt <= SUBMIT_RETRY_MAX; attempt++)); do
-    tmux send-keys -t "$PANE" Enter
+    tmux send-keys -t "$PANE" Enter || true
     sleep "$delay"
 
-    if pane_text | grep -qiE 'esc to interrupt'; then
+    out="$(pane_text)"
+    if [[ "$pre_generating" == "0" ]] \
+        && grep -qiE 'esc to interrupt' <<<"$out"; then
       return 0
     fi
-    if [[ -z "$fp" ]] || ! pane_text | grep -qF -- "$fp"; then
+    if [[ -n "$fp" ]] && ! grep -qF -- "$fp" <<<"$out"; then
+      return 0
+    fi
+    if [[ -z "$fp" ]]; then
+      # Nothing to verify against (empty/whitespace-only body) — assume
+      # the Enter landed. Degraded path, equals the pre-fix behaviour.
       return 0
     fi
 
@@ -250,17 +290,29 @@ mkdir -p "$INBOX" "$PROCESSED"
   # submit_prompt's readiness gate handles the boot race (no fixed sleep).
   process_inbox
 
+  # Watcher-leak guard (2026-06-05): `exec claude` below replaces the
+  # entrypoint shell, so the EXIT trap never fires when claude exits and
+  # this subshell would outlive the session — a leaked watcher targeting
+  # a dead pane still MOVES inbox files, eating messages meant for the
+  # chat's next spawn. $$ inside the subshell is the original entrypoint
+  # PID (= claude after the exec); when it dies, we exit too.
+  parent_alive() {
+    kill -0 "$$" 2>/dev/null
+  }
+
   # Prefer inotifywait when available; fall back to polling.
   if command -v inotifywait >/dev/null 2>&1; then
     # --include filters to *.json so we ignore .tmp writes mid-rename.
-    while inotifywait -q -e create,moved_to --include '\.json$' "$INBOX" \
+    while parent_alive \
+        && inotifywait -q -e create,moved_to --include '\.json$' "$INBOX" \
         >/dev/null 2>&1; do
       sleep 0.1  # debounce — rename() is atomic but bursts can stack
+      parent_alive || exit 0
       process_inbox
     done
   else
     # 500ms cadence matches the outbox poller's order of magnitude.
-    while true; do
+    while parent_alive; do
       sleep 0.5
       process_inbox
     done
