@@ -12,6 +12,8 @@
 
 It replaces the deprecated `claude -p` gateway pattern (a Python daemon that spawned a fresh headless session for every message). Cutover deadline — **2026-06-15** (Anthropic is splitting billing; details in section [13](#13-why-migrate--the-2026-06-15-deadline)).
 
+> **Migrating from the old gateway? There is now a doctor.** The read-only [`doctor-dashi-plugin`](skills/doctor-dashi-plugin/SKILL.md) skill diagnoses the whole cutover — workspace placement, hooks, MCP comms config, allowlist, and live-session health — and encodes every mistake we already paid for so you don't repeat them. Run `bun skills/doctor-dashi-plugin/scripts/doctor.ts --help`.
+
 ![Architecture — Telegram ↔ plugin ↔ Claude Code session](docs/assets/architecture-hero.svg)
 
 One plugin process = one Telegram bot = one agent. By default it serves **a single DM chat** (legacy single-session mode). With `multichat.enabled` turned on, the same bot fans incoming messages out across several per-chat tmux sessions of one identity — see section [3](#3-multichat--how-it-works-and-why).
