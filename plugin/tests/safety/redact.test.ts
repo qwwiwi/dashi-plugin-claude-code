@@ -163,6 +163,152 @@ describe('redactSecrets — generic long token + extras', () => {
   })
 })
 
+describe('redactSecrets — URL exemption for the generic long-token rule', () => {
+  // 2026-06-05: the generic rule masked repo slugs inside GitHub links
+  // (`dashi-plugin-claude-code` → `dash***code`), producing dead URLs the
+  // warchief could not open. Long path segments inside http(s) URLs are
+  // exempt from the GENERIC rule only — every specific rule still fires.
+
+  test('GitHub PR link with a long repo slug survives intact', () => {
+    const url = 'https://github.com/qwwiwi/dashi-plugin-claude-code/pull/49'
+    expect(redactSecrets(`PR готов: ${url}`)).toBe(`PR готов: ${url}`)
+  })
+
+  test('commit-SHA URL survives intact', () => {
+    const url =
+      'https://github.com/qwwiwi/dashi-plugin-claude-code/commit/' +
+      'a'.repeat(40)
+    expect(redactSecrets(url)).toBe(url)
+  })
+
+  test('the same long token OUTSIDE a URL is still masked', () => {
+    const out = redactSecrets(
+      'slug dashi-plugin-claude-code and https://github.com/qwwiwi/dashi-plugin-claude-code',
+    )
+    // Plain-text occurrence masked…
+    expect(out).toContain('dash***code and')
+    // …URL occurrence intact.
+    expect(out).toContain(
+      'https://github.com/qwwiwi/dashi-plugin-claude-code',
+    )
+  })
+
+  test('?token= query param inside a URL is STILL redacted', () => {
+    const out = redactSecrets(
+      'https://example.com/hook?token=supersecretvalue123456',
+    )
+    expect(out).not.toContain('supersecretvalue123456')
+    expect(out).toContain('?token=')
+  })
+
+  test('Telegram bot token inside a URL is STILL redacted', () => {
+    const out = redactSecrets(
+      'https://api.telegram.org/bot8507713167:AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRR/sendMessage',
+    )
+    expect(out).not.toContain('AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRR')
+  })
+
+  test('GitHub PAT inside a URL is STILL redacted', () => {
+    const out = redactSecrets(
+      `https://ghp_${'Z'.repeat(36)}@github.com/qwwiwi/repo.git`,
+    )
+    expect(out).not.toContain('Z'.repeat(36))
+  })
+
+  test('extras (exact-substring secrets) inside a URL are STILL redacted', () => {
+    const secret = 'wh_exact_secret_value_42'
+    const out = redactSecrets(`https://example.com/hook/${secret}`, [secret])
+    expect(out).not.toContain(secret)
+  })
+
+  test('URL exemption is idempotent', () => {
+    const input =
+      'see https://github.com/qwwiwi/dashi-plugin-claude-code/pull/49 and token abcd1234567890efghij5678WXYZ'
+    const once = redactSecrets(input)
+    const twice = redactSecrets(once)
+    expect(twice).toBe(once)
+  })
+
+  // ── Codex security review (2026-06-05): URL-borne secret shapes the
+  //    exemption must NOT leak ─────────────────────────────────────────
+
+  test('basic-auth password in URL userinfo is redacted, user kept', () => {
+    const out = redactSecrets(
+      'https://deploy:hunter2secret@registry.example.com/v2/',
+    )
+    expect(out).not.toContain('hunter2secret')
+    expect(out).toContain('https://deploy:')
+    expect(out).toContain('@registry.example.com')
+  })
+
+  test('JWT inside a URL path/fragment is redacted', () => {
+    const jwt = `eyJ${'a'.repeat(12)}.eyJ${'b'.repeat(12)}.${'c'.repeat(12)}`
+    const out = redactSecrets(
+      `https://app.example.com/callback#access_token=${jwt} and bare ${jwt}`,
+    )
+    expect(out).not.toContain(jwt)
+  })
+
+  test('signed-URL params (sig / X-Amz-Signature) are redacted', () => {
+    const out = redactSecrets(
+      'https://bucket.s3.amazonaws.com/file?X-Amz-Signature=deadbeefcafe123456&sig=abc123def456',
+    )
+    expect(out).not.toContain('deadbeefcafe123456')
+    expect(out).not.toContain('abc123def456')
+  })
+
+  test('fragment access_token is redacted', () => {
+    const out = redactSecrets(
+      'https://app.example.com/cb#access_token=secrettokenvalue&state=xyz',
+    )
+    expect(out).not.toContain('secrettokenvalue')
+  })
+
+  test('Discord and Slack webhook path tokens are redacted', () => {
+    const out = redactSecrets(
+      [
+        'https://discord.com/api/webhooks/123456789/AbCdEf-Gh_IjKlMnOpQrStUvWxYz123',
+        'https://hooks.slack.com/services/T0001/B0001/XXXXXXXXXXXXXXXXXXXXXXXX',
+      ].join(' '),
+    )
+    expect(out).not.toContain('AbCdEf-Gh_IjKlMnOpQrStUvWxYz123')
+    expect(out).not.toContain('XXXXXXXXXXXXXXXXXXXXXXXX')
+    // Host + route stay visible for debugging.
+    expect(out).toContain('discord.com/api/webhooks/123456789/')
+    expect(out).toContain('hooks.slack.com/services/')
+  })
+
+  test('comma cannot glue a secret into the exempt URL range', () => {
+    const secret = 'SECRET_0123456789012345678901234567'
+    const out = redactSecrets(`https://github.com/org/repo,${secret}`)
+    expect(out).not.toContain(secret)
+    expect(out).toContain('https://github.com/org/repo')
+  })
+
+  test('trailing punctuation does not extend the exemption', () => {
+    // URL ends with "." — the next long token after whitespace is NOT
+    // part of the link and must still be masked.
+    const out = redactSecrets(
+      'https://github.com/qwwiwi/dashi-plugin-claude-code/pull/49. Token abcd1234567890efghij5678WXYZ',
+    )
+    expect(out).toContain('dashi-plugin-claude-code/pull/49.')
+    expect(out).toContain('abcd***WXYZ')
+  })
+
+  test('URL-borne secret redaction is idempotent', () => {
+    const jwt = `eyJ${'a'.repeat(12)}.eyJ${'b'.repeat(12)}.${'c'.repeat(12)}`
+    const input = [
+      'https://deploy:hunter2secret@host.example.com/x',
+      `https://app.example.com/cb#access_token=${jwt}`,
+      'https://discord.com/api/webhooks/42/tok_enva_lue123456789',
+      'https://github.com/qwwiwi/dashi-plugin-claude-code/pull/49,SECRET_0123456789012345678901234567',
+    ].join(' ')
+    const once = redactSecrets(input)
+    const twice = redactSecrets(once)
+    expect(twice).toBe(once)
+  })
+})
+
 describe('redactSecrets — no false positives', () => {
   test('does not mangle a normal English sentence', () => {
     const s = 'The quick brown fox jumps over the lazy dog.'

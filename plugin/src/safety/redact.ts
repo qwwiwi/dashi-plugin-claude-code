@@ -58,9 +58,33 @@ const FIREBASE_REs: RedactionRule[] = FIREBASE_FIELDS.map((field) => ({
 // Match the casing flexibly but not the "Bearer" word itself.
 const BEARER_RE = /(Bearer\s+)[A-Za-z0-9._\-+/=]{8,}/gi
 
-// Query-string tokens: ?token=, ?access_token=, ?api_key=, &key=.
-// Anchored by `[?&]` and the param name so we don't match `&keyword=` etc.
-const QUERY_TOKEN_RE = /([?&](?:access_token|api_key|token)=)[^&\s"']+/gi
+// Query-string / fragment tokens. Anchored by `[?&#]` and the param name
+// so we don't match `&keyword=` etc. The name list deliberately covers
+// signed-URL shapes (AWS/GCS/CloudFront) and OAuth params — with the URL
+// exemption on the generic rule (below), these named params are the main
+// line of defense for secrets riding in URLs. `#` anchor: OAuth implicit
+// flow puts access_token in the FRAGMENT, which is easy to forget is
+// sensitive (Codex review 2026-06-05).
+const QUERY_TOKEN_RE =
+  /([?&#](?:access_token|refresh_token|id_token|api_key|apikey|token|key|secret|auth|password|passwd|pwd|sig|signature|code|policy|key-pair-id|x-amz-signature|x-amz-credential|x-goog-signature)=)[^&#\s"']+/gi
+
+// URL userinfo password: `https://user:secret@host/...`. Keep the user
+// visible (debugging), mask the password. Without this the URL exemption
+// would carry basic-auth credentials verbatim.
+const URL_USERINFO_RE = /(https?:\/\/[^/\s:@]+:)[^@/\s]+(@)/gi
+
+// JWT anywhere (path, query, fragment, prose): three dot-separated
+// base64url segments, the first two starting with `eyJ` (= `{"`). The
+// generic rule never caught these reliably (dots break the char class),
+// and the URL exemption would otherwise let them ride inside URLs.
+const JWT_RE =
+  /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g
+
+// Webhook URLs whose PATH SEGMENT is the secret — no prefix and no param
+// name to anchor on, so the URL exemption would leak them verbatim.
+const DISCORD_WEBHOOK_RE =
+  /(discord(?:app)?\.com\/api\/webhooks\/\d+\/)[A-Za-z0-9_-]+/gi
+const SLACK_WEBHOOK_RE = /(hooks\.slack\.com\/services\/)[A-Za-z0-9/]+/gi
 
 // IPv4 — keep first and last octet (helps debugging) and mask the middle
 // two. Loopback (127.*) and 0.* placeholders are pure debug noise; the
@@ -111,7 +135,50 @@ const TELEGRAM_TOKEN_PARTIAL_RE = /\b(\d{3})\d{7,}:(AA\w{2})\w+/g
 
 // Generic long token rule (≥24 chars of [A-Za-z0-9_-]). LAST — keeps head
 // and tail visible so a partial mask is still useful for debugging.
+//
+// URL exemption (2026-06-05): this rule does NOT fire inside http(s) URLs.
+// Long hyphenated path segments are overwhelmingly public identifiers —
+// repo slugs (`dashi-plugin-claude-code`), commit SHAs, PR paths — and
+// masking them produced dead links the warchief could not open. Secrets
+// embedded in URLs are still covered by every SPECIFIC rule above (bot
+// tokens, ghp_/sk- prefixes, ?token= query params, Supabase hosts, IPs),
+// all of which run regardless of URL context.
 const GENERIC_LONG_TOKEN_RE = /\b([A-Za-z0-9_-]{4})[A-Za-z0-9_-]{16,}([A-Za-z0-9_-]{4})\b/g
+
+// URL detector for the exemption above. Tighter than a linkifier needs to
+// be — when in doubt the range SHRINKS, which merely re-enables generic
+// masking for the tail (fail-closed). `,;` excluded entirely: rare in
+// real links, but a comma can glue a secret onto a URL and smuggle it
+// into the exempt range (Codex review 2026-06-05).
+const URL_RE = /https?:\/\/[^\s<>"'),;\]]+/g
+
+// Trailing prose punctuation that linkifiers drop but our char class
+// admits — trimmed off the detected range so `…/pull/49.` doesn't extend
+// the exemption past the real link.
+const URL_TRAILING_PUNCT_RE = /[.:!?]+$/
+
+// Replace GENERIC_LONG_TOKEN_RE matches everywhere EXCEPT inside http(s)
+// URLs. Ranges are recomputed per call from the current text (earlier
+// rules may have shifted offsets). Idempotent: skipped matches are left
+// byte-identical, masked ones no longer match the pattern.
+function maskLongTokensOutsideUrls(text: string): string {
+  const urlRanges: Array<[number, number]> = []
+  for (const m of text.matchAll(URL_RE)) {
+    if (m.index !== undefined) {
+      const trimmed = m[0].replace(URL_TRAILING_PUNCT_RE, '')
+      urlRanges.push([m.index, m.index + trimmed.length])
+    }
+  }
+  return text.replace(
+    GENERIC_LONG_TOKEN_RE,
+    (match: string, head: string, tail: string, offset: number) => {
+      const inUrl = urlRanges.some(
+        ([start, end]) => offset >= start && offset < end,
+      )
+      return inUrl ? match : `${head}***${tail}`
+    },
+  )
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Public API
@@ -128,9 +195,15 @@ const RULES: ReadonlyArray<RedactionRule> = [
   { pattern: SLACK_BOT_RE, replacement: '[REDACTED]' },
   // 2. Firebase JSON fields — value replaced, key preserved.
   ...FIREBASE_REs,
-  // 3. Auth header + query params — preserve prefix.
+  // 3. Auth header + query/fragment params + URL-borne secrets. These
+  //    MUST stay ahead of the generic rule's URL exemption: they are what
+  //    keeps a secret from riding inside an exempt URL.
   { pattern: BEARER_RE, replacement: '$1[REDACTED]' },
   { pattern: QUERY_TOKEN_RE, replacement: '$1[REDACTED]' },
+  { pattern: URL_USERINFO_RE, replacement: '$1[REDACTED]$2' },
+  { pattern: JWT_RE, replacement: '[REDACTED]' },
+  { pattern: DISCORD_WEBHOOK_RE, replacement: '$1[REDACTED]' },
+  { pattern: SLACK_WEBHOOK_RE, replacement: '$1[REDACTED]' },
   // 4. IPv4 — middle-octet mask.
   { pattern: IPV4_RE, replacement: ipv4Replacer },
   // 5. Secret paths.
@@ -140,8 +213,8 @@ const RULES: ReadonlyArray<RedactionRule> = [
   { pattern: SUPABASE_HOST_RE, replacement: supabaseReplacer },
   // 7. Telegram partial-mask shape (renderer-style).
   { pattern: TELEGRAM_TOKEN_PARTIAL_RE, replacement: '$1***:$2***' },
-  // 8. Generic long-token rule — LAST.
-  { pattern: GENERIC_LONG_TOKEN_RE, replacement: '$1***$2' },
+  // 8. Generic long-token rule — LAST, applied via the URL-aware wrapper
+  //    in redactSecrets() (NOT listed here; see maskLongTokensOutsideUrls).
 ]
 
 /**
@@ -183,5 +256,9 @@ export function redactSecrets(
       out = out.replace(rule.pattern, rule.replacement as (sub: string, ...args: unknown[]) => string)
     }
   }
+  // Generic long-token rule runs LAST and outside RULES: it needs the
+  // final post-specific-rules text to compute URL ranges (offsets shift
+  // as earlier rules rewrite the string).
+  out = maskLongTokensOutsideUrls(out)
   return out
 }
