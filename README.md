@@ -440,9 +440,15 @@ claude --dangerously-load-development-channels server:dashi-channel
 # 6. MANDATORY — install the hooks (otherwise there's no progress in Telegram)
 bash scripts/install-hooks.sh --settings ~/.claude/settings.json \
   --chat-id <your-chat-id> --webhook-url http://127.0.0.1:8089/hooks/agent --agent-id dashi-channel
+
+# 7. Migrating from the old gateway? Run the doctor before AND after cutover
+bun skills/doctor-dashi-plugin/scripts/doctor.ts \
+  --plugin-dir "$PWD" --settings ~/.claude/settings.json --session channel-myagent
 ```
 
 On the first launch, Claude Code asks 2 interactive questions (allow external imports + dev channels) — **once**; answer `1` to both.
+
+> **Migration doctor.** If you are moving an agent off the legacy gateway, the [`doctor-dashi-plugin`](skills/doctor-dashi-plugin/SKILL.md) skill diagnoses the whole cutover — toolchain floors, workspace placement (identity drift), settings/hook registration, MCP comms consistency, the Telegram allowlist, and live-session signals (welcome hang, expired auth, 409 conflict, crash loop). It is read-only — it never restarts a service or prints a secret — and it encodes every mistake we already paid for so you don't repeat them. Run `bun skills/doctor-dashi-plugin/scripts/doctor.ts --help`.
 
 **Stack:** Bun 1.3+ / TypeScript strict, Claude Code v2.1.80+ ([Channels reference](https://code.claude.com/docs/en/channels-reference)), grammY 1.21+, Zod 3.23+, systemd/launchd supervisor.
 
@@ -453,6 +459,7 @@ On the first launch, Claude Code asks 2 interactive questions (allow external im
 | [docs/03-installation.md](docs/03-installation.md) | systemd / launchd, EnvironmentFile, the welcome-prompt fix, smoke test |
 | [docs/03-installation-linux.md](docs/03-installation-linux.md) · [macos](docs/03-installation-macos.md) | OS-specific unit/plist |
 | [docs/04-migration-from-gateway.md](docs/04-migration-from-gateway.md) | Step-by-step migration from `jarvis-telegram-gateway`, with a rollback at each step |
+| [skills/doctor-dashi-plugin/SKILL.md](skills/doctor-dashi-plugin/SKILL.md) | **Migration doctor** — read-only diagnostic skill that checks placement, hooks, comms config, allowlist, and live-session health before/after cutover |
 | [docs/05-troubleshooting.md](docs/05-troubleshooting.md) | Common errors: symptom → root cause → fix |
 | [docs/06-how-claude-loads-session.md](docs/06-how-claude-loads-session.md) | How Claude Code finds `CLAUDE.md`, CWD upward search, `@-include` |
 | [plugin/docs/progress-reporter-setup.md](plugin/docs/progress-reporter-setup.md) | Installing the hooks in 3 steps + troubleshooting |
