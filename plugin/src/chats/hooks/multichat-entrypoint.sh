@@ -332,4 +332,14 @@ trap cleanup EXIT INT TERM
 # Hand the pane over to claude. tmux runs us in the foreground process
 # of the session; exec keeps claude as the leaf process so tmux's
 # remain-on-exit semantics work as expected.
-exec claude
+#
+# Permission mode (2026-06-06): a multichat session has NO human at the
+# terminal — the warchief drives it over Telegram and cannot answer Claude
+# Code's interactive permission prompts, so a default-mode session STALLS on
+# the first gated tool call (every Bash/edit/MCP/network use). We run in
+# bypassPermissions so the session is autonomous; the SECURITY GATE is the
+# PreToolUse hook (chats/hooks/pre-tool-use.sh enforcing policy.yaml deny),
+# which still blocks regardless of permission mode. The hook holds the iron
+# limit (secrets / .env / keys / server creds / private profiles).
+# Override with MULTICHAT_PERMISSION_MODE if a deployment needs a stricter mode.
+exec claude --permission-mode "${MULTICHAT_PERMISSION_MODE:-bypassPermissions}"
