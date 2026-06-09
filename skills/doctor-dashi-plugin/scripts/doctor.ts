@@ -1180,7 +1180,18 @@ function gatherChecks(opts: Options): Check[] {
 
   // live session state (crash loop / auth / welcome hang / listening)
   if (opts.tmuxSession) {
-    const cap = probe('tmux', ['capture-pane', '-t', opts.tmuxSession, '-p', '-S', '-200'])
+    // Fleet convention since the Arthas migration: channel units run their
+    // tmux session on a DEDICATED socket named after the session
+    // (`tmux -L channel-<agent>`), so two Type=forking/launchd units never
+    // race on the default socket and env never bleeds between agents. The
+    // default-socket probe misses those sessions entirely (false
+    // «session not found» across the whole Mac fleet, 2026-06-09) — when it
+    // fails, retry on the convention socket before declaring the session dead.
+    let cap = probe('tmux', ['capture-pane', '-t', opts.tmuxSession, '-p', '-S', '-200'])
+    if (cap.code !== 0) {
+      const socketCap = probe('tmux', ['-L', opts.tmuxSession, 'capture-pane', '-t', opts.tmuxSession, '-p', '-S', '-200'])
+      if (socketCap.code === 0) cap = socketCap
+    }
     const text = `${cap.stdout}\n${cap.stderr}`
     if (cap.code !== 0 || detectCrashLoop(text)) {
       checks.push({ id: 'live-session', title: `Channel session ${opts.tmuxSession} alive`, status: 'fail', detail: detectCrashLoop(text) ? 'tmux server gone — crash loop (claude exits, supervisor relaunches)' : 'tmux session not found', fix: 'stop the service, run claude by hand with a TTY to read the real error, fix it, then start' })
