@@ -21,7 +21,6 @@ import {
   detectListening,
   detectOS,
   detectWelcomeHang,
-  findEnclosingClaudeMd,
   MIN_BUN,
   MIN_CLAUDE,
   parseEnvList,
@@ -32,6 +31,23 @@ import {
   sameTree,
   worstStatus,
   type Check,
+  // 2026-06-09 deep checks (multi-agent / multichat / gate / bind / hygiene)
+  selectHookProfile,
+  resolveSettingsPath,
+  findMatchingRuntime,
+  extractEnvAssignment,
+  parseListeners,
+  checkWebhookBind,
+  checkEnvFileMode,
+  checkSharedSettingsClean,
+  extractConfirmOverrides,
+  extractTopLevelScalar,
+  checkPermissionPolicy,
+  extractChatPolicies,
+  checkMultichatMirror,
+  checkMultichatDirs,
+  checkSpawnChatShell,
+  matchAgentForPlugin,
 } from './doctor.ts'
 
 /** A settings hook entry with a runnable command (what install-hooks writes). */
@@ -640,5 +656,414 @@ describe('findEnclosingClaudeMd — relative plugin dir', () => {
     const fe = (p: string) => found.has(p)
     // grandparent of cwd holds CLAUDE.md: cwd/plugin -> cwd -> parent -> grandparent
     expect(findEnclosingClaudeMd('plugin', fe)).not.toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 2026-06-09 deep checks — multi-agent, hook profiles, gate, bind, multichat
+// ---------------------------------------------------------------------------
+
+describe('selectHookProfile', () => {
+  test('status or progress reporter enabled → hook-feeders', () => {
+    expect(selectHookProfile({ status: { enabled: true } })).toBe('hook-feeders')
+    expect(selectHookProfile({ progress: { enabled: true }, tmux_mirror: { enabled: true } })).toBe('hook-feeders')
+  })
+  test('mirror only → mirror', () => {
+    expect(selectHookProfile({ tmux_mirror: { enabled: true } })).toBe('mirror')
+  })
+  test('config present, nothing enabled → none', () => {
+    expect(selectHookProfile({})).toBe('none')
+  })
+  test('missing config → unknown (conservative)', () => {
+    expect(selectHookProfile(null)).toBe('unknown')
+    expect(selectHookProfile('garbage')).toBe('unknown')
+  })
+})
+
+describe('checkSettingsHooks — profile aware', () => {
+  const stopOnly = {
+    hooks: { Stop: [hookEntry('dashi-channel-hook')] },
+  }
+  test('mirror profile: Stop-only settings produce ZERO feeder warns', () => {
+    const checks = checkSettingsHooks(stopOnly, 'mirror')
+    const feederWarns = checks.filter((c) => c.id.startsWith('hook-') && c.status === 'warn' && c.id !== 'hook-Stop')
+    expect(feederWarns).toHaveLength(0)
+    expect(checks.find((c) => c.id === 'hook-profile')?.status).toBe('pass')
+    expect(checks.find((c) => c.id === 'hook-Stop')?.status).toBe('pass')
+  })
+  test('mirror profile: missing Stop hook still warns', () => {
+    const checks = checkSettingsHooks({ hooks: {} }, 'mirror')
+    expect(checks.find((c) => c.id === 'hook-Stop')?.status).toBe('warn')
+  })
+  test('hook-feeders profile keeps demanding all five events', () => {
+    const checks = checkSettingsHooks(stopOnly, 'hook-feeders')
+    const warns = checks.filter((c) => c.status === 'warn' && /^hook-/.test(c.id))
+    expect(warns.length).toBeGreaterThanOrEqual(4) // 4 missing feeder events
+  })
+  test('unknown profile behaves conservatively (like hook-feeders) and hints at --env', () => {
+    const checks = checkSettingsHooks(stopOnly, 'unknown')
+    const warn = checks.find((c) => c.id === 'hook-SessionStart')
+    expect(warn?.status).toBe('warn')
+    expect(warn?.detail).toContain('profile unknown')
+  })
+  test('default profile is unknown (backward compatible)', () => {
+    const checks = checkSettingsHooks(stopOnly)
+    expect(checks.some((c) => c.id === 'hook-SessionStart')).toBe(true)
+  })
+})
+
+describe('resolveSettingsPath — session cwd layout first', () => {
+  test('prefers <plugin-dir>/.claude/settings.json when present', () => {
+    const r = resolveSettingsPath('/srv/agent/.claude/jc/plugin', '/home/u/.claude/settings.json', (p) => p === '/srv/agent/.claude/jc/plugin/.claude/settings.json')
+    expect(r.source).toBe('plugin-dir')
+    expect(r.path).toBe('/srv/agent/.claude/jc/plugin/.claude/settings.json')
+  })
+  test('falls back to the user-level file', () => {
+    const r = resolveSettingsPath('/srv/agent/plugin', '/home/u/.claude/settings.json', () => false)
+    expect(r.source).toBe('home')
+    expect(r.path).toBe('/home/u/.claude/settings.json')
+  })
+})
+
+describe('findMatchingRuntime — fleet host, match by CWD not by first PID', () => {
+  test('first candidate foreign, second matches → pass with others counted', () => {
+    const r = findMatchingRuntime(
+      [
+        { pid: '100', cwd: '/srv/arthas/.claude/jc/plugin' },
+        { pid: '200', cwd: '/srv/thrall/.claude/jc/plugin' },
+      ],
+      '/srv/thrall/.claude/jc/plugin',
+    )
+    expect(r.match?.pid).toBe('200')
+    expect(r.others).toBe(1)
+  })
+  test('no candidate matches → null match', () => {
+    const r = findMatchingRuntime([{ pid: '100', cwd: '/srv/other/plugin' }], '/srv/thrall/plugin')
+    expect(r.match).toBeNull()
+    expect(r.others).toBe(1)
+  })
+  test('empty cwd (unreadable /proc) never matches', () => {
+    const r = findMatchingRuntime([{ pid: '100', cwd: '' }], '/srv/thrall/plugin')
+    expect(r.match).toBeNull()
+  })
+})
+
+describe('extractEnvAssignment', () => {
+  test('single-quoted, double-quoted and bare values', () => {
+    expect(extractEnvAssignment("FOO='/a b/c.yaml' bun x.ts", 'FOO')).toBe('/a b/c.yaml')
+    expect(extractEnvAssignment('FOO="/a/c.yaml" bun x.ts', 'FOO')).toBe('/a/c.yaml')
+    expect(extractEnvAssignment('FOO=/a/c.yaml bun x.ts', 'FOO')).toBe('/a/c.yaml')
+  })
+  test('missing key → null', () => {
+    expect(extractEnvAssignment('BAR=1 bun x.ts', 'FOO')).toBeNull()
+  })
+})
+
+describe('checkPermissionGate — ask relay, policy path, unit bypass', () => {
+  const gateCmd = "TELEGRAM_PERMISSION_POLICY_PATH='/ws/chats/permission-policy.yaml' bun '/p/scripts/permission-gate-hook.ts'"
+  const gate = { marker: 'dashi-permission-gate-hook', hooks: [{ type: 'command', command: gateCmd }] }
+  const ask = { marker: 'dashi-ask-user-question-hook', hooks: [{ type: 'command', command: "bun '/p/scripts/ask-user-question-hook.ts'" }] }
+  test('gate + ask + existing policy + unit bypass → all pass', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [gate, ask] } }, (p) => p === '/ws/chats/permission-policy.yaml', true)
+    expect(checks.find((c) => c.id === 'permission-gate')?.status).toBe('pass')
+    expect(checks.find((c) => c.id === 'permission-gate-ask-hook')?.status).toBe('pass')
+    expect(checks.find((c) => c.id === 'gate-policy-path')?.status).toBe('pass')
+    expect(checks.find((c) => c.id === 'permission-gate-mode')?.status).toBe('pass')
+  })
+  test('gate without the ask relay → warn (question wedges the session)', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [gate] } }, () => true, true)
+    expect(checks.find((c) => c.id === 'permission-gate-ask-hook')?.status).toBe('warn')
+  })
+  test('policy path missing on disk → warn (fallback policy in force)', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [gate, ask] } }, () => false, true)
+    expect(checks.find((c) => c.id === 'gate-policy-path')?.status).toBe('warn')
+  })
+  test('mode unset and no unit knowledge → warn stays (old behavior)', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [gate, ask] } }, () => true, null)
+    expect(checks.find((c) => c.id === 'permission-gate-mode')?.status).toBe('warn')
+  })
+})
+
+describe('parseListeners / checkWebhookBind — loopback or nothing', () => {
+  const ss = [
+    'State  Recv-Q Send-Q Local Address:Port Peer Address:Port',
+    'LISTEN 0      512        127.0.0.1:8093      0.0.0.0:*',
+    'LISTEN 0      2048         0.0.0.0:8091      0.0.0.0:*',
+    'LISTEN 0      512            [::1]:8103         [::]:*',
+    'LISTEN 0      128                *:9000            *:*',
+  ].join('\n')
+  test('parses IPv4, bracketed IPv6 and wildcard listeners', () => {
+    const l = parseListeners(ss)
+    expect(l).toContainEqual({ addr: '127.0.0.1', port: '8093' })
+    expect(l).toContainEqual({ addr: '0.0.0.0', port: '8091' })
+    expect(l).toContainEqual({ addr: '[::1]', port: '8103' })
+    expect(l).toContainEqual({ addr: '*', port: '9000' })
+  })
+  test('loopback bind passes', () => {
+    expect(checkWebhookBind('8093', parseListeners(ss)).status).toBe('pass')
+  })
+  test('0.0.0.0 bind FAILS (network-reachable hook surface)', () => {
+    const c = checkWebhookBind('8091', parseListeners(ss))
+    expect(c.status).toBe('fail')
+    expect(c.detail).toContain('0.0.0.0')
+  })
+  test('IPv6 loopback passes, wildcard fails', () => {
+    expect(checkWebhookBind('8103', parseListeners(ss)).status).toBe('pass')
+    expect(checkWebhookBind('9000', parseListeners(ss)).status).toBe('fail')
+  })
+  test('port not listening → warn; unknown port → skip; no probe → skip', () => {
+    expect(checkWebhookBind('1234', parseListeners(ss)).status).toBe('warn')
+    expect(checkWebhookBind(null, parseListeners(ss)).status).toBe('skip')
+    expect(checkWebhookBind('8093', null).status).toBe('skip')
+  })
+})
+
+describe('checkEnvFileMode — the token file must be private', () => {
+  test('600 passes, 640 warns, 644 fails, unreadable skips', () => {
+    expect(checkEnvFileMode(0o100600, '/e').status).toBe('pass')
+    expect(checkEnvFileMode(0o100640, '/e').status).toBe('warn')
+    expect(checkEnvFileMode(0o100644, '/e').status).toBe('fail')
+    expect(checkEnvFileMode(null, '/e').status).toBe('skip')
+  })
+})
+
+describe('checkSharedSettingsClean — invariant a outside --fleet', () => {
+  test('channel markers in the user-level file → FAIL', () => {
+    const c = checkSharedSettingsClean('{"hooks":{"Stop":[{"marker":"dashi-channel-hook"}]}}', false)
+    expect(c.status).toBe('fail')
+  })
+  test('clean user-level file → pass; missing file → pass', () => {
+    expect(checkSharedSettingsClean('{"theme":"dark"}', false).status).toBe('pass')
+    expect(checkSharedSettingsClean(null, false).status).toBe('pass')
+  })
+  test('user-level file IS the inspected file → skip (legacy layout)', () => {
+    expect(checkSharedSettingsClean('{"hooks":{"Stop":[{"marker":"dashi-channel-hook"}]}}', true).status).toBe('skip')
+  })
+})
+
+describe('permission policy lint', () => {
+  test('block-form confirm_overrides extracted', () => {
+    const y = ['version: 1', 'confirm_overrides:', '  builtin_rules:', '    - "git push"', '    - sudo ', 'scopes: {}'].join('\n')
+    expect(extractConfirmOverrides(y)).toEqual({ rules: ['git push', 'sudo'], opaque: false })
+  })
+  test('inline-form confirm_overrides extracted', () => {
+    const y = 'confirm_overrides:\n  builtin_rules: ["git push", "rm -rf "]\n'
+    expect(extractConfirmOverrides(y)).toEqual({ rules: ['git push', 'rm -rf '], opaque: false })
+  })
+  test('list items at the SAME indent as builtin_rules are read (review H1)', () => {
+    const y = 'confirm_overrides:\n  builtin_rules:\n  - "sudo "\n'
+    expect(extractConfirmOverrides(y).rules).toEqual(['sudo '])
+  })
+  test('trailing comment after an item does not corrupt the value (review H2)', () => {
+    const y = 'confirm_overrides:\n  builtin_rules:\n    - "sudo " # owner-approved?\n    - git push # narrow\n'
+    expect(extractConfirmOverrides(y).rules).toEqual(['sudo ', 'git push'])
+  })
+  test('inline list with a trailing comment still parses (review M1)', () => {
+    const y = 'confirm_overrides:\n  builtin_rules: ["sudo "] # note\n'
+    expect(extractConfirmOverrides(y).rules).toEqual(['sudo '])
+  })
+  test('flow-form confirm_overrides is OPAQUE → lint warns instead of passing (review M1)', () => {
+    const y = 'confirm_overrides: { builtin_rules: ["sudo "] }\n'
+    expect(extractConfirmOverrides(y).opaque).toBe(true)
+    const c = checkPermissionPolicy(y, '/p').find((x) => x.id === 'permission-policy-risky-override')
+    expect(c?.status).toBe('warn')
+  })
+  test('lifting sudo / rm -rf → FAIL; lifting only git push → pass', () => {
+    const bad = 'confirm_overrides:\n  builtin_rules:\n    - "sudo "\n'
+    expect(checkPermissionPolicy(bad, '/p').find((c) => c.id === 'permission-policy-risky-override')?.status).toBe('fail')
+    const ok = 'confirm_overrides:\n  builtin_rules:\n    - "git push"\n'
+    expect(checkPermissionPolicy(ok, '/p').find((c) => c.id === 'permission-policy-risky-override')?.status).toBe('pass')
+  })
+  test('default_tier allow → warn; confirm → pass; unset → pass', () => {
+    expect(checkPermissionPolicy('default_tier: allow\n', '/p').find((c) => c.id === 'permission-policy-default-tier')?.status).toBe('warn')
+    expect(checkPermissionPolicy('default_tier: confirm\n', '/p').find((c) => c.id === 'permission-policy-default-tier')?.status).toBe('pass')
+    expect(checkPermissionPolicy('version: 1\n', '/p').find((c) => c.id === 'permission-policy-default-tier')?.status).toBe('pass')
+  })
+  test('empty policy file → warn; unreadable → skip', () => {
+    expect(checkPermissionPolicy('  \n', '/p')[0]?.status).toBe('warn')
+    expect(checkPermissionPolicy(null, '/p')[0]?.status).toBe('skip')
+  })
+  test('extractTopLevelScalar ignores indented and commented keys', () => {
+    expect(extractTopLevelScalar('  default_tier: allow\n', 'default_tier')).toBeNull()
+    expect(extractTopLevelScalar('default_tier: confirm # note\n', 'default_tier')).toBe('confirm')
+  })
+})
+
+describe('multichat lint', () => {
+  const policy = [
+    'version: 1',
+    'allowlist:',
+    '  chats:',
+    '    - "164795011"',
+    'chats:',
+    '  "164795011":',
+    '    mode: private',
+    '    tmux_mirror: true',
+    '  "-1003784643974":',
+    '    mode: public',
+    '    tmux_mirror: false',
+  ].join('\n')
+  test('extractChatPolicies reads mode and tmux_mirror per chat', () => {
+    const p = extractChatPolicies(policy)
+    expect(p).toHaveLength(2)
+    expect(p[0]).toEqual({ id: '164795011', mode: 'private', tmuxMirror: true })
+    expect(p[1]).toEqual({ id: '-1003784643974', mode: 'public', tmuxMirror: false })
+  })
+  test('DM mirror + public no-mirror → pass', () => {
+    expect(checkMultichatMirror(extractChatPolicies(policy)).status).toBe('pass')
+  })
+  test('public chat with tmux_mirror=true → FAIL (kitchen leaks into a group)', () => {
+    const bad = policy.replace('    mode: public\n    tmux_mirror: false', '    mode: public\n    tmux_mirror: true')
+    const c = checkMultichatMirror(extractChatPolicies(bad))
+    expect(c.status).toBe('fail')
+    expect(c.detail).toContain('-1003784643974')
+  })
+  test('chat dir without a policy entry → warn', () => {
+    const c = checkMultichatDirs(['164795011'], ['164795011', '-2000'])
+    expect(c.status).toBe('warn')
+    expect(c.detail).toContain('-2000')
+  })
+  test('all dirs covered → pass', () => {
+    expect(checkMultichatDirs(['164795011', '-2000'], ['164795011']).status).toBe('pass')
+  })
+  test('spawn-chat-shell: TMUX_PANE forwarded → pass, absent → FAIL, missing file → skip', () => {
+    expect(checkSpawnChatShell('env -i TMUX_PANE="${TMUX_PANE:-}" bash').status).toBe('pass')
+    expect(checkSpawnChatShell('env -i bash').status).toBe('fail')
+    expect(checkSpawnChatShell(null).status).toBe('skip')
+  })
+})
+
+describe('parseUnitFile — autodetect fields', () => {
+  const unit = [
+    '[Service]',
+    'EnvironmentFile=/srv/thrall/private/channel.env',
+    'WorkingDirectory=/srv/thrall/.claude/jc/plugin',
+    `ExecStart=/usr/bin/tmux -L channel-thrall new-session -d -s channel-thrall 'claude --model fable --permission-mode bypassPermissions server:dashi-channel'`,
+    `ExecStop=/usr/bin/tmux -L channel-thrall kill-session -t channel-thrall`,
+  ].join('\n')
+  test('reads WorkingDirectory, session name and bypassPermissions', () => {
+    const p = parseUnitFile(unit)
+    expect(p.workingDirectory).toBe('/srv/thrall/.claude/jc/plugin')
+    expect(p.sessionName).toBe('channel-thrall')
+    expect(p.bypassPermissions).toBe(true)
+    expect(p.sockets).toEqual(['channel-thrall'])
+  })
+  test('no bypass flag → false; no -s → null session', () => {
+    const p = parseUnitFile("ExecStart=/usr/bin/tmux new-session -d 'claude server:x'")
+    expect(p.bypassPermissions).toBe(false)
+    expect(p.sessionName).toBeNull()
+  })
+  test('session name is read from tmux argv, not from the quoted payload', () => {
+    const p = parseUnitFile(`ExecStart=/usr/bin/tmux new-session -d -s real 'claude -s fake server:x'`)
+    expect(p.sessionName).toBe('real')
+  })
+})
+
+describe('matchAgentForPlugin', () => {
+  const agent = (name: string, wd: string | null, ws: string | null): FleetAgent => ({
+    name,
+    unitPath: `/etc/systemd/system/channel-${name}.service`,
+    sockets: [`channel-${name}`],
+    envPath: null,
+    envReadable: false,
+    port: null,
+    tokenDigest: null,
+    stateDir: null,
+    workspaceRoot: ws,
+    webhookEnabled: null,
+    hookPorts: [],
+    settingsPath: null,
+    workingDirectory: wd,
+    sessionName: `channel-${name}`,
+    bypassPermissions: false,
+  })
+  test('matches by WorkingDirectory first', () => {
+    const a = matchAgentForPlugin([agent('arthas', '/srv/a/plugin', null), agent('thrall', '/srv/t/plugin', null)], '/srv/t/plugin')
+    expect(a?.name).toBe('thrall')
+  })
+  test('falls back to workspace root containment', () => {
+    const a = matchAgentForPlugin([agent('thrall', null, '/srv/t/.claude')], '/srv/t/.claude/jc/plugin')
+    expect(a?.name).toBe('thrall')
+  })
+  test('no match → null (no cross-agent false positive)', () => {
+    expect(matchAgentForPlugin([agent('arthas', '/srv/a/plugin', '/srv/a/.claude')], '/srv/t/plugin')).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review-round fixes (Codex + Fable double review, 2026-06-09)
+// ---------------------------------------------------------------------------
+
+describe('review fixes — bind, env mode, mirror, stop hook, envValue, redact', () => {
+  test('[::ffff:127.0.0.1] v4-mapped loopback PASSES webhook-bind (review M4)', () => {
+    expect(checkWebhookBind('8093', [{ addr: '[::ffff:127.0.0.1]', port: '8093' }]).status).toBe('pass')
+  })
+  test('env mode: other-write/other-exec FAIL, group-write FAIL (Codex High)', () => {
+    expect(checkEnvFileMode(0o100602, '/e').status).toBe('fail') // other-write
+    expect(checkEnvFileMode(0o100601, '/e').status).toBe('fail') // other-exec
+    expect(checkEnvFileMode(0o100620, '/e').status).toBe('fail') // group-write
+    expect(checkEnvFileMode(0o100640, '/e').status).toBe('warn') // group-read only
+    expect(checkEnvFileMode(0o100600, '/e').status).toBe('pass')
+  })
+  test('group chat (negative id) with mirror and NO explicit private mode → FAIL (Codex M)', () => {
+    expect(checkMultichatMirror([{ id: '-100123', mode: null, tmuxMirror: true }]).status).toBe('fail')
+    expect(checkMultichatMirror([{ id: '-100123', mode: 'privte', tmuxMirror: true }]).status).toBe('fail') // typo ≠ private
+    expect(checkMultichatMirror([{ id: '164795011', mode: null, tmuxMirror: true }]).status).toBe('pass') // positive id = DM
+  })
+  test('mirror profile: fallback-only Stop does NOT satisfy the primary Stop hook (Codex M)', () => {
+    const fallbackOnly = { hooks: { Stop: [hookEntry('dashi-channel-fallback-reply')] } }
+    const c = checkSettingsHooks(fallbackOnly, 'mirror').find((x) => x.id === 'hook-Stop')
+    expect(c?.status).toBe('warn')
+    expect(c?.detail).toContain('fallback')
+  })
+  test('envValue strips quotes, export and trailing comments (review M3)', () => {
+    expect(envValue('TELEGRAM_WEBHOOK_PORT="8093"', 'TELEGRAM_WEBHOOK_PORT')).toBe('8093')
+    expect(envValue("export TELEGRAM_STATE_DIR='/srv/state' # note", 'TELEGRAM_STATE_DIR')).toBe('/srv/state')
+  })
+  test('redact keeps 0.0.0.0 and 127.0.0.1 visible (interface literals, review L3)', () => {
+    expect(redact('port 8091 bound to 0.0.0.0')).toContain('0.0.0.0')
+    expect(redact('bound to 127.0.0.1')).toContain('127.0.0.1')
+    expect(redact('server at 100.104.191.127')).toContain('<ip>')
+  })
+  test('shared-settings markers: generic post-hook.ts alone no longer FAILS (review L2)', () => {
+    expect(checkSharedSettingsClean('{"hooks":{"Stop":[{"command":"bun my-post-hook.ts"}]}}', false).status).toBe('pass')
+    expect(checkSharedSettingsClean('{"hooks":{"Stop":[{"marker":"dashi-channel-fallback-reply"}]}}', false).status).toBe('fail')
+  })
+  test('spawn-chat-shell: TMUX_PANE only in a comment does NOT pass (Codex M)', () => {
+    expect(checkSpawnChatShell('# we forward TMUX_PANE here\nenv -i bash').status).toBe('fail')
+    expect(checkSpawnChatShell('env -i TMUX_PANE="${TMUX_PANE:-}" bash').status).toBe('pass')
+  })
+})
+
+describe('extractChatPolicies — bleed hardening (review M2)', () => {
+  test('block scalar content cannot rewrite the chat policy', () => {
+    const y = [
+      'chats:',
+      '  "-100200":',
+      '    mode: public',
+      '    tmux_mirror: false',
+      '    system_reminder: |',
+      '      mode: private',
+      '      tmux_mirror: true',
+    ].join('\n')
+    expect(extractChatPolicies(y)).toEqual([{ id: '-100200', mode: 'public', tmuxMirror: false }])
+  })
+  test('non-numeric sibling key (default template) closes the chat — no attribution bleed', () => {
+    const y = [
+      'chats:',
+      '  "-100200":',
+      '    mode: public',
+      '    tmux_mirror: false',
+      '  default:',
+      '    mode: private',
+      '    tmux_mirror: true',
+    ].join('\n')
+    expect(extractChatPolicies(y)).toEqual([{ id: '-100200', mode: 'public', tmuxMirror: false }])
+  })
+  test('deeper-nested mode under a sub-map is ignored (exact property indent only)', () => {
+    const y = ['chats:', '  "-100200":', '    delivery: final_only', '    sub:', '      mode: private', '    tmux_mirror: false'].join('\n')
+    const p = extractChatPolicies(y)
+    expect(p[0]?.mode).toBeNull()
+    expect(p[0]?.tmuxMirror).toBe(false)
   })
 })

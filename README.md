@@ -12,7 +12,9 @@
 
 It replaces the deprecated `claude -p` gateway pattern (a Python daemon that spawned a fresh headless session for every message). Cutover deadline — **2026-06-15** (Anthropic is splitting billing; details in section [13](#13-why-migrate--the-2026-06-15-deadline)).
 
-> **Migrating from the old gateway? There is now a doctor.** The read-only [`doctor-dashi-plugin`](skills/doctor-dashi-plugin/SKILL.md) skill diagnoses the whole cutover — workspace placement, hooks, MCP comms config, allowlist, and live-session health — and encodes every mistake we already paid for so you don't repeat them. Run `bun skills/doctor-dashi-plugin/scripts/doctor.ts --help`.
+> **Migrating from the old gateway? There is now a doctor — use it.** The read-only [`doctor-dashi-plugin`](skills/doctor-dashi-plugin/SKILL.md) skill diagnoses the whole cutover — workspace placement, hooks (profile-aware), the permission gate and its policy, multichat invariants, webhook bind + token-file hygiene, MCP comms config, allowlist, fleet isolation, and live-session health — and encodes every mistake we already paid for so you don't repeat them. Run it during EVERY migration and whenever the bridge misbehaves: `bun skills/doctor-dashi-plugin/scripts/doctor.ts` (on a systemd host it autodetects the rest).
+>
+> **And one hard rule: migrate from a Claude Code terminal session, not through Telegram.** The migration changes the very bridge that carries your Telegram messages — if it breaks mid-change, the agent you were instructing through Telegram goes silent and can no longer fix itself. Work in a terminal (`tmux attach`, or a plain `claude` session on the host); let Telegram be the thing you test, not the thing you work through.
 
 ![Architecture — Telegram ↔ plugin ↔ Claude Code session](docs/assets/architecture-hero.svg)
 
@@ -445,13 +447,16 @@ bash scripts/install-hooks.sh --settings ~/.claude/settings.json \
   --chat-id <your-chat-id> --webhook-url http://127.0.0.1:8089/hooks/agent --agent-id dashi-channel
 
 # 7. Migrating from the old gateway? Run the doctor before AND after cutover
-bun skills/doctor-dashi-plugin/scripts/doctor.ts \
-  --plugin-dir "$PWD" --settings ~/.claude/settings.json --session channel-myagent
+#    (flag-less on a systemd host — it autodetects the unit/env/session; add
+#    flags only for unusual layouts, see --help)
+bun skills/doctor-dashi-plugin/scripts/doctor.ts --plugin-dir "$PWD"
 ```
 
 On the first launch, Claude Code asks 2 interactive questions (allow external imports + dev channels) — **once**; answer `1` to both.
 
-> **Migration doctor.** If you are moving an agent off the legacy gateway, the [`doctor-dashi-plugin`](skills/doctor-dashi-plugin/SKILL.md) skill diagnoses the whole cutover — toolchain floors, workspace placement (identity drift), settings/hook registration, MCP comms consistency, the Telegram allowlist, and live-session signals (welcome hang, expired auth, 409 conflict, crash loop). It is read-only — it never restarts a service or prints a secret — and it encodes every mistake we already paid for so you don't repeat them. Run `bun skills/doctor-dashi-plugin/scripts/doctor.ts --help`.
+> **Migration doctor.** If you are moving an agent off the legacy gateway — or fixing a bot that misbehaves — start with the [`doctor-dashi-plugin`](skills/doctor-dashi-plugin/SKILL.md) skill. It diagnoses the whole bridge: toolchain floors, workspace placement (identity drift), dev-vs-runtime copy (multi-agent aware), settings/hook registration with hook-profile awareness (a tmux-mirror-only setup is not punished for feeder hooks it deliberately lacks), the permission gate (ask-relay, policy file, `confirm_overrides` must never lift `sudo`/`rm -rf`), multichat (terminal mirror is DM-only, per-chat policy coverage), security hygiene (webhook must bind loopback only; the env file holding the bot token must not be world-readable), MCP comms consistency, the Telegram allowlist, fleet isolation (`--fleet`), and live-session signals (welcome hang, expired auth, 409 conflict, crash loop). It is read-only — it never restarts a service or prints a secret. On a systemd host `bun skills/doctor-dashi-plugin/scripts/doctor.ts` with no flags autodetects the unit, env, session and state config. Exit codes: `0` no FAIL, `1` at least one FAIL, `2` usage.
+>
+> **Do migrations and bridge surgery from a terminal, not through Telegram.** This work modifies the bridge that delivers your Telegram messages. If it breaks halfway, Telegram goes dark and you lose the channel you were issuing instructions through. Open a terminal session on the host (`tmux attach -t channel-<agent>` for inspection, a separate `claude` session for the work), make the change, run the doctor, send a test message — and only then walk away. Fix bugs and errors the same way: doctor first, then the reference for the failing check.
 
 **Stack:** Bun 1.3+ / TypeScript strict, Claude Code v2.1.80+ ([Channels reference](https://code.claude.com/docs/en/channels-reference)), grammY 1.21+, Zod 3.23+, systemd/launchd supervisor.
 

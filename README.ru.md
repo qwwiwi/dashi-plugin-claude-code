@@ -435,9 +435,17 @@ claude --dangerously-load-development-channels server:dashi-channel
 # 6. ОБЯЗАТЕЛЬНО — установить hooks (иначе нет прогресса в Telegram)
 bash scripts/install-hooks.sh --settings ~/.claude/settings.json \
   --chat-id <ваш-chat-id> --webhook-url http://127.0.0.1:8089/hooks/agent --agent-id dashi-channel
+
+# 7. Переезжаете со старого gateway? Прогоните доктора ДО и ПОСЛЕ переключения
+#    (на systemd-хосте — без флагов: юнит/env/сессию он найдёт сам)
+bun skills/doctor-dashi-plugin/scripts/doctor.ts --plugin-dir "$PWD"
 ```
 
 При первом запуске Claude Code задаст 2 интерактивных вопроса (allow external imports + dev channels) — **разово**, ответьте `1` на оба.
+
+> **Доктор — обязательный инструмент переезда и дебага.** Read-only скилл [`doctor-dashi-plugin`](skills/doctor-dashi-plugin/SKILL.md) диагностирует весь мост: toolchain, размещение workspace (дрейф идентичности), dev-vs-runtime копию (учитывает несколько агентов на хосте), hooks с учётом профиля (mirror-конфигурация без feeder-хуков — корректна, доктор её не ругает), permission gate (ask-relay, policy-файл, `confirm_overrides` не может снимать `sudo`/`rm -rf`), мультичат (terminal mirror только в DM, покрытие per-chat policy), гигиену безопасности (webhook слушает ТОЛЬКО loopback — `0.0.0.0` это FAIL; env-файл с токеном не world-readable), консистентность MCP, allowlist, флот (`--fleet`) и живую сессию (welcome-hang, auth, 409, crash loop). Ничего не перезапускает, секретов не печатает. Коды выхода: `0` — нет FAIL, `1` — есть FAIL, `2` — usage.
+>
+> **Железное правило: миграцию и любую хирургию моста делайте из терминала Claude Code, НЕ через Telegram.** Эта работа меняет тот самый мост, который доставляет ваши Telegram-сообщения. Сломается на середине — Telegram замолчит, и канал, через который вы давали команды, исчезнет вместе с возможностью починить. Откройте терминальную сессию на хосте (`tmux attach -t channel-<agent>` для осмотра, отдельная `claude`-сессия для работы), внесите изменение, прогоните доктора, отправьте тестовое сообщение — и только потом уходите. Баги и ошибки чините так же: сначала доктор, потом reference по упавшему чеку.
 
 **Stack:** Bun 1.3+ / TypeScript strict, Claude Code v2.1.80+ ([Channels reference](https://code.claude.com/docs/en/channels-reference)), grammY 1.21+, Zod 3.23+, supervisor systemd/launchd.
 
@@ -448,6 +456,7 @@ bash scripts/install-hooks.sh --settings ~/.claude/settings.json \
 | [docs/03-installation.md](docs/03-installation.md) | systemd / launchd, EnvironmentFile, фикс welcome-промтов, smoke test |
 | [docs/03-installation-linux.md](docs/03-installation-linux.md) · [macos](docs/03-installation-macos.md) | OS-specific unit/plist |
 | [docs/04-migration-from-gateway.md](docs/04-migration-from-gateway.md) | Пошаговая миграция с `jarvis-telegram-gateway`, откат на каждом шаге |
+| [skills/doctor-dashi-plugin/SKILL.md](skills/doctor-dashi-plugin/SKILL.md) | **Доктор миграции** — read-only диагностика: размещение, hooks (профили), permission gate + policy, мультичат, webhook bind, гигиена токена, MCP, allowlist, флот, живая сессия |
 | [docs/05-troubleshooting.md](docs/05-troubleshooting.md) | Типовые ошибки: симптом → корень → фикс |
 | [docs/06-how-claude-loads-session.md](docs/06-how-claude-loads-session.md) | Как Claude Code находит `CLAUDE.md`, CWD upward search, `@-include` |
 | [plugin/docs/progress-reporter-setup.md](plugin/docs/progress-reporter-setup.md) | Установка hooks в 3 шага + troubleshooting |
@@ -721,10 +730,9 @@ sudo systemctl enable --now channel-arthas.service
 
 ```bash
 cd "$WORKSPACE/.claude/dashi-plugin-claude-code"
-bun skills/doctor-dashi-plugin/scripts/doctor.ts \
-  --plugin-dir "$PWD/plugin" \
-  --settings "$WORKSPACE/.claude/settings.json" \
-  --env /etc/dashi-plugin/$AGENT/channel.env \
+# на systemd-хосте доктор сам найдёт юнит, env и сессию; --fleet проверит
+# изоляцию между агентами (порты, токены, сокеты, hooks)
+bun skills/doctor-dashi-plugin/scripts/doctor.ts --plugin-dir "$PWD/plugin" --fleet \
   --user <ваш числовой id>
 ```
 
