@@ -133,17 +133,22 @@ function supabaseReplacer(host: string): string {
 // idempotency.
 const TELEGRAM_TOKEN_PARTIAL_RE = /\b(\d{3})\d{7,}:(AA\w{2})\w+/g
 
-// Generic long token rule (≥24 chars of [A-Za-z0-9_-]). LAST — keeps head
-// and tail visible so a partial mask is still useful for debugging.
+// Generic long token rule (≥24 chars). LAST — keeps head and tail visible
+// so a partial mask is still useful for debugging.
 //
-// URL exemption (2026-06-05): this rule does NOT fire inside http(s) URLs.
-// Long hyphenated path segments are overwhelmingly public identifiers —
-// repo slugs (`dashi-plugin-claude-code`), commit SHAs, PR paths — and
-// masking them produced dead links the warchief could not open. Secrets
-// embedded in URLs are still covered by every SPECIFIC rule above (bot
-// tokens, ghp_/sk- prefixes, ?token= query params, Supabase hosts, IPs),
-// all of which run regardless of URL context.
-const GENERIC_LONG_TOKEN_RE = /\b([A-Za-z0-9_-]{4})[A-Za-z0-9_-]{16,}([A-Za-z0-9_-]{4})\b/g
+// HYPHEN EXEMPTION (2026-06-09): the character class is [A-Za-z0-9_] — a
+// HYPHEN now BREAKS the run instead of extending it. Every false positive
+// the warchief hit was a kebab-case identifier: repo slugs
+// (`dashi-plugin-claude-code`), feature-branch names, multichat link slugs.
+// These are public, not secrets, and masking them ("validate only secrets")
+// produced dead links and noise. Opaque secrets that matter are caught by
+// the SPECIFIC prefix/shape rules above (bot tokens, gsk_/sk-/ghp_ prefixes,
+// Bearer, JWT, ?token= params, Supabase hosts, IPs) plus caller `extras`;
+// a hyphen-free high-entropy run is still masked by this rule as a backstop.
+//
+// URL exemption (2026-06-05): this rule also does NOT fire inside http(s)
+// URLs — long path segments there are overwhelmingly public identifiers.
+const GENERIC_LONG_TOKEN_RE = /\b([A-Za-z0-9_]{4})[A-Za-z0-9_]{16,}([A-Za-z0-9_]{4})\b/g
 
 // URL detector for the exemption above. Tighter than a linkifier needs to
 // be — when in doubt the range SHRINKS, which merely re-enables generic

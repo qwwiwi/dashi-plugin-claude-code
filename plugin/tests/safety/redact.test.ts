@@ -181,16 +181,22 @@ describe('redactSecrets — URL exemption for the generic long-token rule', () =
     expect(redactSecrets(url)).toBe(url)
   })
 
-  test('the same long token OUTSIDE a URL is still masked', () => {
+  test('a kebab-case slug OUTSIDE a URL is now left intact (hyphen exemption)', () => {
+    // 2026-06-09: hyphenated identifiers are public, not secrets. The generic
+    // rule no longer masks them anywhere (plain text or URL).
     const out = redactSecrets(
       'slug dashi-plugin-claude-code and https://github.com/qwwiwi/dashi-plugin-claude-code',
     )
-    // Plain-text occurrence masked…
-    expect(out).toContain('dash***code and')
-    // …URL occurrence intact.
+    expect(out).toContain('slug dashi-plugin-claude-code and')
     expect(out).toContain(
       'https://github.com/qwwiwi/dashi-plugin-claude-code',
     )
+  })
+
+  test('a hyphen-free opaque long token is STILL masked (secret backstop)', () => {
+    const out = redactSecrets('opaque abcd1234567890efghij5678WXYZ token')
+    expect(out).not.toContain('abcd1234567890efghij5678WXYZ')
+    expect(out).toMatch(/abcd\*\*\*WXYZ/)
   })
 
   test('?token= query param inside a URL is STILL redacted', () => {
