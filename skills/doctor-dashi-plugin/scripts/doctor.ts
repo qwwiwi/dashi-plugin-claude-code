@@ -16,7 +16,7 @@
  */
 import { spawnSync } from 'child_process'
 import { createHash } from 'crypto'
-import { existsSync, readFileSync, readdirSync } from 'fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 import { homedir, platform } from 'os'
 
@@ -55,7 +55,22 @@ export const FALLBACK_MARKER = 'dashi-channel-fallback-reply'
 // Permission-gate PreToolUse hook marker (2026-06-09). Written by
 // patch-claude-settings.ts when --permission-gate-helper is given.
 export const GATE_MARKER = 'dashi-permission-gate-hook'
+// AskUserQuestion relay hook — pairs with the gate so questions reach Telegram.
+export const ASK_MARKER = 'dashi-ask-user-question-hook'
 export const LIVE_MARKER = 'Listening for channel messages from: server:dashi-channel'
+
+/**
+ * Hook profile (2026-06-09). The 5-event feeder set is only REQUIRED when a
+ * hook-driven progress surface (status / progress reporter) is enabled in the
+ * state config. The modern minimal profile is "mirror": the tmux terminal
+ * mirror carries progress, and only the Stop delivery hook (plus the optional
+ * permission gate pair) is needed. Demanding all 5 events on a mirror-profile
+ * host produced 3 false WARNs on every correctly configured agent.
+ */
+export type HookProfile = 'hook-feeders' | 'mirror' | 'none' | 'unknown'
+
+/** Feeder events — required only in the hook-feeders profile. */
+export const FEEDER_HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse'] as const
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested)
@@ -260,11 +275,27 @@ function hasWorkingHook(entries: SettingsHookEntry[], marker: string): boolean {
 }
 
 /**
- * Verify the five channel hook events are registered with a runnable command,
- * and that no secret ever leaked into settings.json (the patcher refuses to
- * write the webhook token; anything secret-shaped here is about to be committed).
+ * Map the channel state config to the hook profile in force.
+ *   - status/progress reporter enabled → 'hook-feeders' (all 5 events needed);
+ *   - tmux_mirror enabled (and no hook reporter) → 'mirror' (Stop only);
+ *   - config present, nothing enabled → 'none' (Stop only — final replies still ship);
+ *   - config missing/unreadable → 'unknown' (conservative: demand all 5).
  */
-export function checkSettingsHooks(settings: unknown): Check[] {
+export function selectHookProfile(stateConfig: unknown): HookProfile {
+  if (stateConfig === null || typeof stateConfig !== 'object') return 'unknown'
+  const cfg = stateConfig as Record<string, { enabled?: boolean } | undefined>
+  if (cfg['status']?.enabled === true || cfg['progress']?.enabled === true) return 'hook-feeders'
+  if (cfg['tmux_mirror']?.enabled === true) return 'mirror'
+  return 'none'
+}
+
+/**
+ * Verify the channel hook events required by the active profile are registered
+ * with a runnable command, and that no secret ever leaked into settings.json
+ * (the patcher refuses to write the webhook token; anything secret-shaped here
+ * is about to be committed).
+ */
+export function checkSettingsHooks(settings: unknown, profile: HookProfile = 'unknown'): Check[] {
   const out: Check[] = []
   const raw = JSON.stringify(settings ?? {})
   // Shape-based leak detection: if SECRET-class redaction changes the
@@ -291,26 +322,51 @@ export function checkSettingsHooks(settings: unknown): Check[] {
   )
 
   const hooks = (settings as SettingsShape)?.hooks ?? {}
-  for (const ev of REQUIRED_HOOK_EVENTS) {
-    const entries = Array.isArray(hooks[ev]) ? hooks[ev] : []
-    const working = hasWorkingHook(entries, HOOK_MARKER)
-    const markerOnly = !working && JSON.stringify(entries).includes(HOOK_MARKER)
+  const stopEntries = Array.isArray(hooks['Stop']) ? hooks['Stop'] : []
+  const feederRequired = profile === 'hook-feeders' || profile === 'unknown'
+
+  if (feederRequired) {
+    for (const ev of REQUIRED_HOOK_EVENTS) {
+      const entries = Array.isArray(hooks[ev]) ? hooks[ev] : []
+      const working = hasWorkingHook(entries, HOOK_MARKER)
+      const markerOnly = !working && JSON.stringify(entries).includes(HOOK_MARKER)
+      out.push(
+        working
+          ? { id: `hook-${ev}`, title: `Hook registered: ${ev}`, status: 'pass', detail: `marker ${HOOK_MARKER} with a runnable command` }
+          : {
+              id: `hook-${ev}`,
+              title: `Hook registered: ${ev}`,
+              status: 'warn',
+              detail: markerOnly ? `${ev} has a ${HOOK_MARKER} entry but no runnable command` : `no ${HOOK_MARKER} entry for ${ev}${profile === 'unknown' ? ' (profile unknown — pass --env so the doctor can read the state config)' : ''}`,
+              fix: 'run plugin/scripts/install-hooks.sh to register status + memory hooks',
+            },
+      )
+    }
+  } else {
+    // mirror / none profile: feeder hooks are NOT required — the tmux mirror
+    // (or nothing) carries progress. Only the Stop delivery hook matters.
+    const stopWorking = hasWorkingHook(stopEntries, HOOK_MARKER) || hasWorkingHook(stopEntries, FALLBACK_MARKER)
+    out.push({
+      id: 'hook-profile',
+      title: `Hook profile: ${profile} (feeder hooks not required)`,
+      status: 'pass',
+      detail: `state config enables no hook-driven progress surface — SessionStart/UserPromptSubmit/PostToolUse feeders are optional`,
+    })
     out.push(
-      working
-        ? { id: `hook-${ev}`, title: `Hook registered: ${ev}`, status: 'pass', detail: `marker ${HOOK_MARKER} with a runnable command` }
+      stopWorking
+        ? { id: 'hook-Stop', title: 'Hook registered: Stop (final-reply delivery)', status: 'pass', detail: 'a runnable Stop hook is registered' }
         : {
-            id: `hook-${ev}`,
-            title: `Hook registered: ${ev}`,
+            id: 'hook-Stop',
+            title: 'Hook registered: Stop (final-reply delivery)',
             status: 'warn',
-            detail: markerOnly ? `${ev} has a ${HOOK_MARKER} entry but no runnable command` : `no ${HOOK_MARKER} entry for ${ev}`,
-            fix: 'run plugin/scripts/install-hooks.sh to register status + memory hooks',
+            detail: 'no Stop hook — read receipts and the silent-turn fallback never fire',
+            fix: 'run plugin/scripts/install-hooks.sh to register the Stop hook',
           },
     )
   }
 
   // DM fallback-reply (PR #47) — optional but recommended: guarantees the chief
   // gets an answer even when the agent forgets to call the reply tool.
-  const stopEntries = Array.isArray(hooks['Stop']) ? hooks['Stop'] : []
   out.push(
     hasWorkingHook(stopEntries, FALLBACK_MARKER)
       ? { id: 'fallback-reply-hook', title: 'DM fallback-reply Stop-hook (PR #47)', status: 'pass', detail: 'silent-turn fallback is registered' }
@@ -340,7 +396,12 @@ interface SettingsPermShape {
  *   - the session is (or claims to be) in bypassPermissions — the gate is the
  *     SOLE authority only in that mode; otherwise native prompts still wedge.
  */
-export function checkPermissionGate(settings: unknown): Check[] {
+export function checkPermissionGate(
+  settings: unknown,
+  fileExists: (p: string) => boolean = existsSync,
+  /** True when the supervising unit's ExecStart carries --permission-mode bypassPermissions. */
+  unitBypass: boolean | null = null,
+): Check[] {
   const s = (settings as SettingsPermShape) ?? {}
   const pre = Array.isArray(s.hooks?.PreToolUse) ? s.hooks!.PreToolUse! : []
   const gate = pre.find((e) => e.marker === GATE_MARKER)
@@ -382,18 +443,69 @@ export function checkPermissionGate(settings: unknown): Check[] {
   // explicit settings.permissions.defaultMode but the flag is usually on the
   // CLI/systemd ExecStart, so a non-match is unverified, not a hard fail.
   const mode = s.permissions?.defaultMode
+  if (mode === 'bypassPermissions') {
+    out.push({ id: 'permission-gate-mode', title: 'Permission gate: session in bypassPermissions', status: 'pass', detail: 'permissions.defaultMode=bypassPermissions' })
+  } else if (mode === undefined && unitBypass === true) {
+    // The flag usually rides on the unit's ExecStart, not in settings — when
+    // the supervising unit carries it, an unset defaultMode is the normal
+    // layout, not a gap.
+    out.push({ id: 'permission-gate-mode', title: 'Permission gate: session in bypassPermissions', status: 'pass', detail: '--permission-mode bypassPermissions on the unit ExecStart' })
+  } else {
+    out.push({
+      id: 'permission-gate-mode',
+      title: 'Permission gate: session in bypassPermissions',
+      status: 'warn',
+      detail: mode ? `permissions.defaultMode=${mode} (not bypassPermissions)` : 'permissions.defaultMode unset in settings — verify the session runs with --permission-mode bypassPermissions',
+      fix: 'the gate only suppresses native prompts under bypassPermissions; otherwise interactive prompts still wedge the headless session',
+    })
+  }
+
+  // AskUserQuestion relay must ride along with the gate: under
+  // bypassPermissions a bare AskUserQuestion renders in a pane nobody watches,
+  // so without the relay the session silently hangs on the first question.
+  const ask = pre.find((e) => e.marker === ASK_MARKER)
+  const askWorking = ask !== undefined && entryCommands(ask).some((c) => c.includes('ask-user-question-hook.ts'))
   out.push(
-    mode === 'bypassPermissions'
-      ? { id: 'permission-gate-mode', title: 'Permission gate: session in bypassPermissions', status: 'pass', detail: 'permissions.defaultMode=bypassPermissions' }
+    askWorking
+      ? { id: 'permission-gate-ask-hook', title: 'AskUserQuestion relay next to the gate', status: 'pass', detail: `${ASK_MARKER} registered on PreToolUse` }
       : {
-          id: 'permission-gate-mode',
-          title: 'Permission gate: session in bypassPermissions',
+          id: 'permission-gate-ask-hook',
+          title: 'AskUserQuestion relay next to the gate',
           status: 'warn',
-          detail: mode ? `permissions.defaultMode=${mode} (not bypassPermissions)` : 'permissions.defaultMode unset in settings — verify the session runs with --permission-mode bypassPermissions',
-          fix: 'the gate only suppresses native prompts under bypassPermissions; otherwise interactive prompts still wedge the headless session',
+          detail: 'gate is on but no ask-user-question relay — a question in the pane wedges the session',
+          fix: 'register the ask-user-question PreToolUse hook alongside the gate',
         },
   )
+
+  // The policy file the gate command points at must exist. A missing file is
+  // not fatal at runtime (the hook falls back to confirm-everything) but it
+  // means the operator's policy — including confirm_overrides — is silently
+  // not in force.
+  const policyPath = extractEnvAssignment(cmds.join('\n'), 'TELEGRAM_PERMISSION_POLICY_PATH')
+  if (policyPath) {
+    out.push(
+      fileExists(policyPath)
+        ? { id: 'gate-policy-path', title: 'Permission gate: policy file exists', status: 'pass', detail: `policy at ${policyPath}` }
+        : {
+            id: 'gate-policy-path',
+            title: 'Permission gate: policy file exists',
+            status: 'warn',
+            detail: `gate command points at ${policyPath} but the file does not exist — fallback confirm-everything policy is in force`,
+            fix: 'create the policy file or fix TELEGRAM_PERMISSION_POLICY_PATH in the gate hook command',
+          },
+    )
+  }
   return out
+}
+
+/**
+ * Extract a KEY='value' / KEY="value" / KEY=value assignment from a shell
+ * command string (the install scripts prefix hook commands with env vars).
+ */
+export function extractEnvAssignment(command: string, key: string): string | null {
+  const m = command.match(new RegExp(`${key}=('([^']*)'|"([^"]*)"|(\\S+))`))
+  if (!m) return null
+  return m[2] ?? m[3] ?? m[4] ?? null
 }
 
 interface McpShape {
@@ -535,6 +647,318 @@ export function checkProgressSurfaces(stateConfig: unknown): Check {
   }
   const detail = enabled.length === 1 ? `exactly one surface enabled (${enabled[0]})` : 'no surface explicitly enabled (defaults are all-off)'
   return { id, title, status: 'pass', detail }
+}
+
+/**
+ * Pick the settings.json the doctor should inspect. Claude Code loads project
+ * hooks ONLY from the session cwd's .claude/ — for a channel session that is
+ * <plugin-dir>/.claude/settings.json. Defaulting to ~/.claude/settings.json
+ * produced 5 false hook WARNs + a false gate SKIP on every correct setup.
+ */
+export function resolveSettingsPath(
+  pluginDir: string,
+  homeSettingsPath: string,
+  fileExists: (p: string) => boolean = existsSync,
+): { path: string; source: 'plugin-dir' | 'home' } {
+  const pluginSettings = join(resolve(pluginDir), '.claude', 'settings.json')
+  if (fileExists(pluginSettings)) return { path: pluginSettings, source: 'plugin-dir' }
+  return { path: homeSettingsPath, source: 'home' }
+}
+
+export interface RuntimeCandidate {
+  pid: string
+  cwd: string
+}
+
+/**
+ * Multi-agent aware dev-vs-runtime match: on a fleet host several plugin
+ * servers run at once, and "the first pgrep PID" is usually ANOTHER agent's
+ * server — comparing its CWD to our plugin dir produced a false WARN. Match
+ * by CWD across all candidates instead.
+ */
+export function findMatchingRuntime(
+  candidates: RuntimeCandidate[],
+  pluginDir: string,
+): { match: RuntimeCandidate | null; others: number } {
+  const dir = resolve(pluginDir)
+  const match = candidates.find((c) => c.cwd !== '' && sameTree(dir, c.cwd)) ?? null
+  return { match, others: candidates.length - (match ? 1 : 0) }
+}
+
+export interface Listener {
+  addr: string
+  port: string
+}
+
+/**
+ * Parse `ss -ltn` / `lsof -nP -iTCP -sTCP:LISTEN` output into address:port
+ * pairs. Tolerates IPv4, bracketed IPv6, `*` wildcards and surrounding noise.
+ */
+export function parseListeners(text: string): Listener[] {
+  const out: Listener[] = []
+  for (const m of text.matchAll(/(?:^|\s)((?:\d{1,3}\.){3}\d{1,3}|\[[^\]\s]*\]|\*):(\d+)(?:\s|$)/gm)) {
+    const addr = m[1]
+    const port = m[2]
+    if (addr !== undefined && port !== undefined) out.push({ addr, port })
+  }
+  return out
+}
+
+const LOOPBACK_ADDR_RE = /^(127\.|\[::1\]$)/
+
+/**
+ * The plugin's hook webhook must listen on loopback ONLY. A 0.0.0.0 / public
+ * bind exposes the hook surface (and historically a webhook→sudo→root chain)
+ * to the network. FAIL is deliberate — this is a security boundary, not a
+ * style preference.
+ */
+export function checkWebhookBind(port: string | null, listeners: Listener[] | null): Check {
+  const id = 'webhook-bind'
+  const title = 'Webhook listens on loopback only'
+  if (!port) return { id, title, status: 'skip', detail: 'webhook port unknown (no env) — pass --env or run with autodetect' }
+  if (listeners === null) return { id, title, status: 'skip', detail: 'no listener probe available (ss/lsof missing)' }
+  const hits = listeners.filter((l) => l.port === port)
+  if (hits.length === 0) {
+    return { id, title, status: 'warn', detail: `nothing listens on port ${port} — the plugin server is not up (or runs on another host)`, fix: 'start the channel service, then re-run' }
+  }
+  const offending = hits.filter((l) => !LOOPBACK_ADDR_RE.test(l.addr))
+  if (offending.length > 0) {
+    return {
+      id,
+      title,
+      status: 'fail',
+      detail: `port ${port} is bound to ${offending.map((l) => l.addr).join(', ')} — the hook webhook is reachable from the network`,
+      fix: 'bind the webhook to 127.0.0.1 (TELEGRAM_WEBHOOK_HOST) — a public hook surface is a remote-control primitive',
+    }
+  }
+  return { id, title, status: 'pass', detail: `port ${port} bound to loopback only` }
+}
+
+/**
+ * The channel env file carries the bot token. World-readable mode means any
+ * local user can hijack the bot. Cheap stat check, big payoff.
+ */
+export function checkEnvFileMode(mode: number | null, path: string): Check {
+  const id = 'env-file-mode'
+  const title = 'Channel env file is private (token inside)'
+  if (mode === null) return { id, title, status: 'skip', detail: `cannot stat ${path}` }
+  const bits = mode & 0o777
+  if (bits & 0o004) {
+    return { id, title, status: 'fail', detail: `${path} is world-readable (mode ${bits.toString(8)})`, fix: 'chmod 600 the env file — it holds the bot token' }
+  }
+  if (bits & 0o040) {
+    return { id, title, status: 'warn', detail: `${path} is group-readable (mode ${bits.toString(8)})`, fix: 'chmod 600 unless the group share is deliberate' }
+  }
+  return { id, title, status: 'pass', detail: `mode ${bits.toString(8)}` }
+}
+
+const CHANNEL_HOOK_MARKERS_RE = /dashi-channel-hook|dashi-permission-gate-hook|dashi-ask-user-question-hook|post-hook\.ts|read-receipt-hook\.ts|fallback-reply-hook\.ts|permission-gate-hook\.ts/
+
+/**
+ * Channel hooks in the USER-level ~/.claude/settings.json fire in EVERY
+ * session of every agent on the host and route through one agent's bot/port
+ * (fleet invariant a). Previously only the --fleet mode caught this; a
+ * single-agent run must too.
+ */
+export function checkSharedSettingsClean(homeRaw: string | null, selectedIsHome: boolean): Check {
+  const id = 'shared-settings-clean'
+  const title = 'User-level ~/.claude/settings.json free of channel hooks'
+  if (selectedIsHome) {
+    // The operator deliberately keeps hooks in the user file (single-agent
+    // legacy layout). The per-event checks already validate it; flagging it
+    // here would contradict them.
+    return { id, title, status: 'skip', detail: 'user-level settings IS the inspected file (legacy single-agent layout)' }
+  }
+  if (homeRaw === null) return { id, title, status: 'pass', detail: 'no user-level settings.json' }
+  return CHANNEL_HOOK_MARKERS_RE.test(homeRaw)
+    ? { id, title, status: 'fail', detail: 'channel hook markers found in the user-level settings — they fire in EVERY agent session on this host', fix: 'move channel hooks into <plugin-dir>/.claude/settings.json (fleet invariant a)' }
+    : { id, title, status: 'pass', detail: 'no channel hook markers in the shared file' }
+}
+
+// ---------------------------------------------------------------------------
+// Permission-policy lint (P1). The gate's own zod schema rejects unknown
+// confirm_overrides at runtime; the doctor adds an OPERATOR-level lint:
+// even schema-valid overrides can be dangerous (lifting sudo / rm -rf), and
+// a policy that flips the default tier to allow deserves a flag. Minimal
+// line-based extraction — no YAML dependency, conservative on misses.
+// ---------------------------------------------------------------------------
+
+/** Built-in confirm rules that must NEVER be lifted via confirm_overrides. */
+export const DANGEROUS_OVERRIDE_RULES: readonly string[] = ['sudo ', 'rm -rf ', 'rm -fr ']
+
+/** Items of `confirm_overrides: { builtin_rules: [...] }` — block or inline form. */
+export function extractConfirmOverrides(policyText: string): string[] {
+  const lines = policyText.split('\n')
+  const out: string[] = []
+  let inOverrides = false
+  let inRules = false
+  let rulesIndent = 0
+  for (const line of lines) {
+    if (/^\s*#/.test(line)) continue
+    const overrides = line.match(/^(\s*)confirm_overrides:\s*$/)
+    if (overrides) {
+      inOverrides = true
+      inRules = false
+      continue
+    }
+    if (inOverrides) {
+      const inline = line.match(/^\s*builtin_rules:\s*\[(.*)\]\s*$/)
+      if (inline?.[1] !== undefined) {
+        out.push(...inline[1].split(',').map((s) => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean))
+        inOverrides = false
+        continue
+      }
+      const block = line.match(/^(\s*)builtin_rules:\s*$/)
+      if (block) {
+        inRules = true
+        rulesIndent = (block[1] ?? '').length
+        continue
+      }
+      if (inRules) {
+        const item = line.match(/^(\s*)-\s*(.+?)\s*$/)
+        if (item && (item[1] ?? '').length > rulesIndent) {
+          out.push((item[2] ?? '').replace(/^["']|["']$/g, ''))
+          continue
+        }
+        if (line.trim() !== '') {
+          inRules = false
+          inOverrides = false
+        }
+      } else if (/^\S/.test(line)) {
+        inOverrides = false
+      }
+    }
+  }
+  return out
+}
+
+/** First top-level `key: value` scalar in the policy text. */
+export function extractTopLevelScalar(policyText: string, key: string): string | null {
+  const m = policyText.match(new RegExp(`^${key}:\\s*["']?([^"'#\\n]+?)["']?\\s*(#.*)?$`, 'm'))
+  return m?.[1]?.trim() ?? null
+}
+
+export function checkPermissionPolicy(policyText: string | null, policyPath: string): Check[] {
+  const out: Check[] = []
+  if (policyText === null) {
+    return [{ id: 'permission-policy', title: 'Permission policy lint', status: 'skip', detail: `policy file not readable at ${policyPath}` }]
+  }
+  if (policyText.trim() === '') {
+    return [{ id: 'permission-policy', title: 'Permission policy lint', status: 'warn', detail: `${policyPath} is empty — the gate falls back to confirm-everything`, fix: 'write a policy or remove the env override' }]
+  }
+  const overrides = extractConfirmOverrides(policyText)
+  const dangerous = overrides.filter((o) => DANGEROUS_OVERRIDE_RULES.some((d) => o === d || o === d.trim()))
+  out.push(
+    dangerous.length > 0
+      ? {
+          id: 'permission-policy-risky-override',
+          title: 'confirm_overrides does not lift sudo / rm -rf',
+          status: 'fail',
+          detail: `confirm_overrides lifts catastrophic rule(s): ${dangerous.join(', ')} — these must always reach the owner`,
+          fix: 'remove sudo / rm -rf from confirm_overrides.builtin_rules; override only narrow rules like git push',
+        }
+      : { id: 'permission-policy-risky-override', title: 'confirm_overrides does not lift sudo / rm -rf', status: 'pass', detail: overrides.length > 0 ? `overrides: ${overrides.join(', ')}` : 'no confirm_overrides' },
+  )
+  const tier = extractTopLevelScalar(policyText, 'default_tier')
+  out.push(
+    tier === 'allow'
+      ? { id: 'permission-policy-default-tier', title: 'Policy default tier', status: 'warn', detail: 'default_tier: allow — anything the rules miss runs without confirmation', fix: 'prefer default_tier: confirm; allow-list specific safe patterns instead' }
+      : { id: 'permission-policy-default-tier', title: 'Policy default tier', status: 'pass', detail: tier ? `default_tier: ${tier}` : 'default_tier unset (gate default applies: confirm)' },
+  )
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Multichat lint (P1). chats/policy.yaml routes per-chat sessions. Two
+// invariants the plugin cannot enforce for the operator:
+//   - the terminal mirror is DM-only (a mirror in a public group leaks the
+//     kitchen: paths, repo names, sometimes redacted-adjacent output);
+//   - every chat directory on disk has a policy entry (an orphan dir means a
+//     chat is served by defaults nobody reviewed).
+// ---------------------------------------------------------------------------
+
+export interface ChatPolicy {
+  id: string
+  mode: string | null
+  tmuxMirror: boolean | null
+}
+
+/** Extract per-chat `mode:` and `tmux_mirror:` from the chats: block. */
+export function extractChatPolicies(policyText: string): ChatPolicy[] {
+  const lines = policyText.split('\n')
+  const out: ChatPolicy[] = []
+  let inChats = false
+  let chatsIndent = 0
+  let current: ChatPolicy | null = null
+  let currentIndent = 0
+  for (const line of lines) {
+    if (/^\s*#/.test(line) || line.trim() === '') continue
+    const indent = (line.match(/^(\s*)/)?.[1] ?? '').length
+    // Leaving the current block? The very same line may OPEN the real
+    // top-level chats: block (allowlist.chats: came first in the file), so
+    // fall through to the open-check instead of consuming the line.
+    if (inChats && indent <= chatsIndent) {
+      inChats = false
+      if (current) out.push(current)
+      current = null
+    }
+    if (!inChats) {
+      const chats = line.match(/^(\s*)chats:\s*$/)
+      if (chats) {
+        inChats = true
+        chatsIndent = (chats[1] ?? '').length
+      }
+      continue
+    }
+    const chatKey = line.match(/^(\s*)["']?(-?\d+)["']?:\s*$/)
+    if (chatKey && (current === null || (chatKey[1] ?? '').length <= currentIndent)) {
+      if (current) out.push(current)
+      current = { id: chatKey[2] ?? '', mode: null, tmuxMirror: null }
+      currentIndent = (chatKey[1] ?? '').length
+      continue
+    }
+    if (current) {
+      const mode = line.match(/^\s*mode:\s*["']?(\w+)["']?/)
+      if (mode) current.mode = mode[1] ?? null
+      const mirror = line.match(/^\s*tmux_mirror:\s*(true|false)/)
+      if (mirror) current.tmuxMirror = mirror[1] === 'true'
+    }
+  }
+  if (current) out.push(current)
+  return out
+}
+
+/** Mirror is DM-only: a public chat with tmux_mirror=true leaks the terminal. */
+export function checkMultichatMirror(policies: ChatPolicy[]): Check {
+  const id = 'multichat-dm-mirror'
+  const title = 'Terminal mirror is DM-only (public chats: no mirror)'
+  const leaking = policies.filter((p) => p.mode === 'public' && p.tmuxMirror === true)
+  if (leaking.length > 0) {
+    return { id, title, status: 'fail', detail: `public chat(s) with tmux_mirror=true: ${leaking.map((p) => p.id).join(', ')} — the terminal (paths, repos, tool output) streams into a group`, fix: 'set tmux_mirror: false for every mode: public chat' }
+  }
+  return { id, title, status: 'pass', detail: `${policies.length} chat polic(ies), no public mirror` }
+}
+
+/** Every chat dir on disk should have a policy entry (no unreviewed defaults). */
+export function checkMultichatDirs(policyIds: string[], dirIds: string[]): Check {
+  const id = 'multichat-dirs'
+  const title = 'Every chat directory has a policy entry'
+  const known = new Set(policyIds)
+  const orphans = dirIds.filter((d) => !known.has(d))
+  if (orphans.length > 0) {
+    return { id, title, status: 'warn', detail: `chat dir(s) without a policy entry: ${orphans.join(', ')} — these chats run on defaults nobody reviewed`, fix: 'add the chat to chats/policy.yaml or remove the stale directory' }
+  }
+  return { id, title, status: 'pass', detail: `${dirIds.length} chat dir(s), all covered` }
+}
+
+/** PR #32 regression guard: spawn-chat-shell must forward TMUX_PANE through env -i. */
+export function checkSpawnChatShell(scriptText: string | null): Check {
+  const id = 'spawn-chat-shell-tmux-pane'
+  const title = 'spawn-chat-shell forwards TMUX_PANE'
+  if (scriptText === null) return { id, title, status: 'skip', detail: 'spawn-chat-shell.sh not found (multichat shells not in use)' }
+  return /TMUX_PANE/.test(scriptText)
+    ? { id, title, status: 'pass', detail: 'TMUX_PANE forwarding present' }
+    : { id, title, status: 'fail', detail: 'no TMUX_PANE in spawn-chat-shell.sh — the per-chat inbox watcher silently dies (PR #32 regression)', fix: 'forward TMUX and TMUX_PANE through the env -i wipe' }
 }
 
 /**
@@ -713,15 +1137,39 @@ export interface FleetAgent {
   hookPorts: string[]
   /** Path of the workspace settings.json actually found; null = could not locate/read. */
   settingsPath: string | null
+  /** WorkingDirectory= from the unit (autodetect anchor). */
+  workingDirectory: string | null
+  /** tmux session name from ExecStart `new-session -s <name>`. */
+  sessionName: string | null
+  /** ExecStart carries --permission-mode bypassPermissions. */
+  bypassPermissions: boolean
 }
 
-/** Parse a systemd unit: EnvironmentFile + tmux socket per Exec line. Pure. */
-export function parseUnitFile(text: string): { envPath: string | null; sockets: string[] } {
+export interface ParsedUnit {
+  envPath: string | null
+  sockets: string[]
+  workingDirectory: string | null
+  /** tmux session name from `new-session … -s <name>` (ExecStart). */
+  sessionName: string | null
+  /** True when any ExecStart payload carries --permission-mode bypassPermissions. */
+  bypassPermissions: boolean
+}
+
+/** Parse a systemd unit: EnvironmentFile + tmux socket/session per Exec line. Pure. */
+export function parseUnitFile(text: string): ParsedUnit {
   let envPath: string | null = null
+  let workingDirectory: string | null = null
+  let sessionName: string | null = null
+  let bypassPermissions = false
   const sockets = new Set<string>()
   for (const line of text.split('\n')) {
     const env = line.match(/^\s*EnvironmentFile=-?(\S+)/)
     if (env?.[1]) envPath = env[1]
+    const wd = line.match(/^\s*WorkingDirectory=(\S+)/)
+    if (wd?.[1]) workingDirectory = wd[1]
+    if (/^\s*ExecStart=/.test(line) && /--permission-mode\s+bypassPermissions/.test(line)) {
+      bypassPermissions = true
+    }
     if (/^\s*Exec(Start|StartPost|Stop|StopPost)=.*tmux/.test(line)) {
       // Only inspect tmux's OWN argv: everything before the first quote is
       // tmux args, the quoted tail is the nested payload (`'claude ... -L x'`
@@ -731,9 +1179,11 @@ export function parseUnitFile(text: string): { envPath: string | null; sockets: 
       const argsPart = quoteIdx === -1 ? cmdPart : cmdPart.slice(0, quoteIdx)
       const sock = argsPart.match(/\s-L\s+(\S+)/)
       sockets.add(sock?.[1] ?? '')
+      const sess = argsPart.match(/\s-s\s+(\S+)/)
+      if (/^\s*ExecStart=/.test(line) && sess?.[1]) sessionName = sess[1]
     }
   }
-  return { envPath, sockets: [...sockets] }
+  return { envPath, sockets: [...sockets], workingDirectory, sessionName, bypassPermissions }
 }
 
 /** First value of KEY=... in env-file text. Pure. */
@@ -900,7 +1350,7 @@ export function scanFleet(unitDir: string): FleetAgent[] {
     const text = readFileSafe(unitPath)
     if (text == null) continue
     const name = f.replace(/^channel-/, '').replace(/\.service$/, '')
-    const { envPath, sockets } = parseUnitFile(text)
+    const { envPath, sockets, workingDirectory, sessionName, bypassPermissions } = parseUnitFile(text)
     // Not every channel-*.service is a channel: helper units (webhook
     // listeners, sync timers) share the prefix but never run tmux. A channel
     // unit always supervises a tmux session — skip anything that doesn't.
@@ -942,9 +1392,25 @@ export function scanFleet(unitDir: string): FleetAgent[] {
       webhookEnabled,
       hookPorts,
       settingsPath,
+      workingDirectory,
+      sessionName,
+      bypassPermissions,
     })
   }
   return agents
+}
+
+/**
+ * Find the fleet unit this plugin checkout belongs to: WorkingDirectory or
+ * TELEGRAM_WORKSPACE_ROOT shares a tree with the plugin dir. Pure.
+ */
+export function matchAgentForPlugin(agents: FleetAgent[], pluginDir: string): FleetAgent | null {
+  const dir = resolve(pluginDir)
+  return (
+    agents.find((a) => a.workingDirectory != null && sameTree(dir, a.workingDirectory)) ??
+    agents.find((a) => a.workspaceRoot != null && sameTree(dir, a.workspaceRoot)) ??
+    null
+  )
 }
 
 interface Options {
@@ -952,6 +1418,8 @@ interface Options {
   os: OS
   pluginDir: string
   settingsPath: string
+  /** True when --settings was given explicitly (never overridden by resolution). */
+  settingsExplicit: boolean
   mcpPath?: string
   settingsLocalPath?: string
   envPath?: string
@@ -961,6 +1429,7 @@ interface Options {
   queueJsonPath?: string
   fleet?: boolean
   fleetDir?: string
+  noAutodetect?: boolean
 }
 
 function parseArgs(argv: string[]): Options | { error: string } {
@@ -969,6 +1438,7 @@ function parseArgs(argv: string[]): Options | { error: string } {
     os: detectOS(),
     pluginDir: process.cwd(),
     settingsPath: join(homedir(), '.claude', 'settings.json'),
+    settingsExplicit: false,
   }
   let err = ''
   for (let i = 0; i < argv.length; i++) {
@@ -989,10 +1459,17 @@ function parseArgs(argv: string[]): Options | { error: string } {
         opts.json = true
         break
       case '--plugin-dir':
-        opts.pluginDir = next()
+        // Resolve once: every downstream comparison (sameTree, .claude/
+        // detection, unit matching) assumes an absolute path; a relative
+        // `--plugin-dir plugin` broke two checks (fleet sweep, 2026-06-09).
+        opts.pluginDir = resolve(next())
         break
       case '--settings':
         opts.settingsPath = next()
+        opts.settingsExplicit = true
+        break
+      case '--no-autodetect':
+        opts.noAutodetect = true
         break
       case '--mcp':
         opts.mcpPath = next()
@@ -1047,6 +1524,9 @@ Options:
   --chat <id>              a Telegram chat id to verify (group id is -100...)
   --session <name>         tmux channel session (e.g. channel-myagent)
   --queue-json <path>      a saved getUpdates JSON response to classify (409 / drain)
+  --no-autodetect          do not infer --env/--session from systemd channel-*.service
+                           units (default: infer when the unit's WorkingDirectory
+                           matches --plugin-dir)
   --fleet                  multi-agent mode: discover channel-*.service units and
                            verify the five isolation invariants ACROSS agents
                            (README section 14)
@@ -1088,31 +1568,98 @@ function gatherChecks(opts: Options): Check[] {
 
   // Workspace placement (identity)
   checks.push(checkWorkspacePlacement(opts.pluginDir))
+  const claudeMd = findEnclosingClaudeMd(opts.pluginDir)
+  const workspaceDir = claudeMd ? dirname(claudeMd) : null
 
-  // Dev-copy vs runtime-copy divergence (lessons §1). The service runs the
-  // RUNTIME copy; patching a different checkout silently does nothing. Read-only
-  // probe: find the live server's CWD and compare to the inspected plugin dir.
-  const live = probe('pgrep', ['-f', 'bun.*src/server.ts'])
-  const pid = live.stdout.trim().split(/\s+/).filter(Boolean)[0]
-  if (pid) {
-    const cwd = liveCwd(pid, opts.os)
-    if (cwd) {
-      checks.push(
-        sameTree(opts.pluginDir, cwd)
-          ? { id: 'dev-vs-runtime', title: 'Inspected plugin matches the running copy', status: 'pass', detail: `runtime CWD ${cwd}` }
-          : {
-              id: 'dev-vs-runtime',
-              title: 'Inspected plugin matches the running copy',
-              status: 'warn',
-              detail: `running copy CWD ${cwd} differs from --plugin-dir ${opts.pluginDir}`,
-              fix: 'patch the RUNTIME copy (the one the service runs), not just the dev/git checkout',
-            },
-      )
+  // Autodetect (P0): on a systemd host, find the unit whose WorkingDirectory /
+  // workspace covers this plugin dir and fill in --env/--session so the
+  // default flag-less run reaches full coverage. Explicit flags always win.
+  let unitAgent: FleetAgent | null = null
+  if (!opts.noAutodetect && opts.os === 'linux') {
+    const unitDir = opts.fleetDir ?? '/etc/systemd/system'
+    const agents = scanFleet(unitDir)
+    unitAgent = matchAgentForPlugin(agents, opts.pluginDir)
+    if (unitAgent) {
+      const inferred: string[] = []
+      if (!opts.envPath && unitAgent.envPath) {
+        opts.envPath = unitAgent.envPath
+        inferred.push('env')
+      }
+      if (!opts.tmuxSession) {
+        opts.tmuxSession = unitAgent.sessionName ?? `channel-${unitAgent.name}`
+        inferred.push('session')
+      }
+      checks.push({
+        id: 'autodetect',
+        title: 'Autodetect: systemd unit matched to this plugin',
+        status: 'pass',
+        detail: `unit channel-${unitAgent.name}${inferred.length > 0 ? ` — inferred: ${inferred.join(', ')}` : ' — all inputs were explicit'}`,
+      })
+    } else if (agents.length > 0) {
+      checks.push({
+        id: 'autodetect',
+        title: 'Autodetect: systemd unit matched to this plugin',
+        status: 'skip',
+        detail: `${agents.length} channel unit(s) found but none matches this plugin dir — pass --env/--session explicitly`,
+      })
     }
   }
 
+  // Dev-copy vs runtime-copy divergence (lessons §1). The service runs the
+  // RUNTIME copy; patching a different checkout silently does nothing. On a
+  // fleet host several plugin servers run at once — match by CWD across ALL
+  // of them ("first pgrep PID" compared another agent's server, 2026-06-09).
+  const live = probe('pgrep', ['-f', 'bun.*src/server.ts'])
+  const pids = live.stdout.trim().split(/\s+/).filter(Boolean)
+  if (pids.length > 0) {
+    const candidates: RuntimeCandidate[] = pids.map((p) => ({ pid: p, cwd: liveCwd(p, opts.os) }))
+    const { match, others } = findMatchingRuntime(candidates, opts.pluginDir)
+    checks.push(
+      match
+        ? { id: 'dev-vs-runtime', title: 'Inspected plugin matches a running copy', status: 'pass', detail: `runtime CWD ${match.cwd} (PID ${match.pid})${others > 0 ? `; ${others} other channel server(s) on this host` : ''}` }
+        : {
+            id: 'dev-vs-runtime',
+            title: 'Inspected plugin matches a running copy',
+            status: 'warn',
+            detail: `${candidates.length} channel server(s) running, none from ${opts.pluginDir} — this agent's service is down or runs another checkout`,
+            fix: 'if this agent should be live, check its service; if you are patching, remember the service runs ITS copy, not this one',
+          },
+    )
+  }
+
+  // Settings resolution (P0): hooks load from the session cwd's .claude/ —
+  // prefer <plugin-dir>/.claude/settings.json unless --settings was explicit.
+  let selectedIsHome = true
+  if (!opts.settingsExplicit) {
+    const resolved = resolveSettingsPath(opts.pluginDir, opts.settingsPath)
+    opts.settingsPath = resolved.path
+    selectedIsHome = resolved.source === 'home'
+    checks.push({
+      id: 'settings-source',
+      title: 'Settings file selected',
+      status: 'pass',
+      detail: resolved.source === 'plugin-dir' ? `plugin-level ${resolved.path} (session cwd layout)` : `user-level ${resolved.path} (no plugin-level settings.json found)`,
+    })
+  } else {
+    selectedIsHome = resolve(opts.settingsPath) === resolve(join(homedir(), '.claude', 'settings.json'))
+  }
+
+  // Channel hooks in the USER-level file fire in every agent session on the
+  // host (fleet invariant a) — checked always now, not only under --fleet.
+  checks.push(checkSharedSettingsClean(readFileSafe(join(homedir(), '.claude', 'settings.json')), selectedIsHome))
+
+  // Hook profile: read the state config (env → TELEGRAM_STATE_DIR → config.json)
+  // BEFORE judging hook registration, so a mirror-only setup is not punished
+  // for the feeder hooks it deliberately does not have.
+  const envText = opts.envPath ? readFileSafe(opts.envPath) : null
+  const stateDir = envText ? envValue(envText, 'TELEGRAM_STATE_DIR') : null
+  const rawStateText = stateDir ? readFileSafe(join(stateDir, 'config.json')) : null
+  const stateConfig = rawStateText == null ? null : parseJsonSafe(rawStateText)
+  const profile = selectHookProfile(stateConfig)
+
   // settings.json hooks + token leak
   const settings = parseJsonSafe(readFileSafe(opts.settingsPath))
+  let gateRegistered = false
   if (settings == null) {
     checks.push({
       id: 'settings-readable',
@@ -1122,17 +1669,87 @@ function gatherChecks(opts: Options): Check[] {
       fix: 'pass --settings <path> to the agent settings.json',
     })
   } else {
-    checks.push(...checkSettingsHooks(settings))
-    checks.push(...checkPermissionGate(settings))
+    checks.push(...checkSettingsHooks(settings, profile))
+    const gateChecks = checkPermissionGate(settings, existsSync, unitAgent ? unitAgent.bypassPermissions : null)
+    gateRegistered = gateChecks.some((c) => c.id === 'permission-gate' && c.status !== 'skip')
+    checks.push(...gateChecks)
+  }
+
+  // Permission policy lint (P1): the file the gate actually reads — path from
+  // the gate hook command, else the workspace convention.
+  if (gateRegistered) {
+    const gateEntry = ((settings as SettingsPermShape)?.hooks?.PreToolUse ?? []).find((e) => e.marker === GATE_MARKER)
+    const gateCmd = gateEntry ? entryCommands(gateEntry).join('\n') : ''
+    const policyPath =
+      extractEnvAssignment(gateCmd, 'TELEGRAM_PERMISSION_POLICY_PATH') ??
+      (workspaceDir ? join(workspaceDir, 'chats', 'permission-policy.yaml') : null)
+    if (policyPath) {
+      checks.push(...checkPermissionPolicy(readFileSafe(policyPath), policyPath))
+    }
+    // The unit must run bypassPermissions when the gate is the sole authority.
+    if (unitAgent) {
+      checks.push(
+        unitAgent.bypassPermissions
+          ? { id: 'unit-permission-mode', title: 'Unit runs --permission-mode bypassPermissions', status: 'pass', detail: `channel-${unitAgent.name} ExecStart carries the flag` }
+          : { id: 'unit-permission-mode', title: 'Unit runs --permission-mode bypassPermissions', status: 'warn', detail: `gate is registered but channel-${unitAgent.name} ExecStart does not carry --permission-mode bypassPermissions`, fix: 'without bypassPermissions native prompts still render in the unwatched pane and wedge the session' },
+      )
+    }
+  }
+
+  // Multichat lint (P1): only when the workspace uses chats/policy.yaml.
+  if (workspaceDir) {
+    const chatsDir = join(workspaceDir, 'chats')
+    const policyText = readFileSafe(join(chatsDir, 'policy.yaml'))
+    if (policyText !== null) {
+      const policies = extractChatPolicies(policyText)
+      checks.push(checkMultichatMirror(policies))
+      let dirIds: string[] = []
+      try {
+        dirIds = readdirSync(chatsDir).filter((d) => /^-?\d+$/.test(d))
+      } catch {
+        /* unreadable chats dir — dir consistency is simply not checkable */
+      }
+      checks.push(checkMultichatDirs(policies.map((p) => p.id), dirIds))
+      checks.push(checkSpawnChatShell(readFileSafe(join(opts.pluginDir, 'scripts', 'spawn-chat-shell.sh'))))
+    }
+  }
+
+  // Webhook bind (P0, security): the hook webhook must listen on loopback only.
+  const webhookPort = envText ? envValue(envText, 'TELEGRAM_WEBHOOK_PORT') : null
+  if (webhookPort) {
+    let listenersText: string | null = null
+    const ss = probe('ss', ['-ltn'])
+    if (ss.code === 0 && ss.stdout) {
+      listenersText = ss.stdout
+    } else {
+      const lsof = probe('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN'])
+      if (lsof.code === 0 && lsof.stdout) listenersText = lsof.stdout
+    }
+    checks.push(checkWebhookBind(webhookPort, listenersText == null ? null : parseListeners(listenersText)))
+  }
+
+  // Env file privacy (P0, security): the bot token lives here.
+  if (opts.envPath) {
+    let mode: number | null = null
+    try {
+      mode = statSync(opts.envPath).mode
+    } catch {
+      mode = null
+    }
+    checks.push(checkEnvFileMode(mode, opts.envPath))
   }
 
   // comms consistency (.mcp.json vs settings.local.json) — distinguish a missing
-  // file from one present but unparseable (a malformed .mcp.json is itself a bug).
-  if (opts.mcpPath || opts.settingsLocalPath) {
-    const mcpRaw = readFileSafe(opts.mcpPath ?? '')
-    const slRaw = readFileSafe(opts.settingsLocalPath ?? '')
-    if (opts.mcpPath && mcpRaw !== null && parseJsonSafe(mcpRaw) === null) {
-      checks.push({ id: 'comms-consistency', title: 'MCP comms servers enabled consistently', status: 'fail', detail: `${opts.mcpPath} is present but not valid JSON`, fix: 'fix the .mcp.json syntax' })
+  // file from one present but unparseable (a malformed .mcp.json is itself a
+  // bug). Defaults to the plugin-dir copies when no flags are given, so the
+  // silent-after-restart landmine is caught by the flag-less run too.
+  const mcpPath = opts.mcpPath ?? (existsSync(join(opts.pluginDir, '.mcp.json')) ? join(opts.pluginDir, '.mcp.json') : undefined)
+  const settingsLocalPath = opts.settingsLocalPath ?? (existsSync(join(opts.pluginDir, '.claude', 'settings.local.json')) ? join(opts.pluginDir, '.claude', 'settings.local.json') : undefined)
+  if (mcpPath || settingsLocalPath) {
+    const mcpRaw = readFileSafe(mcpPath ?? '')
+    const slRaw = readFileSafe(settingsLocalPath ?? '')
+    if (mcpPath && mcpRaw !== null && parseJsonSafe(mcpRaw) === null) {
+      checks.push({ id: 'comms-consistency', title: 'MCP comms servers enabled consistently', status: 'fail', detail: `${mcpPath} is present but not valid JSON`, fix: 'fix the .mcp.json syntax' })
     } else {
       checks.push(checkCommsConsistency(parseJsonSafe(mcpRaw), parseJsonSafe(slRaw)))
     }
@@ -1149,13 +1766,8 @@ function gatherChecks(opts: Options): Check[] {
   }
 
   // Exactly one progress surface (duplicate-windows guard, 2026-06-09)
-  if (opts.envPath) {
-    const envText = readFileSafe(opts.envPath)
-    const stateDir = envText ? envValue(envText, 'TELEGRAM_STATE_DIR') : null
-    if (stateDir) {
-      const rawState = readFileSafe(join(stateDir, 'config.json'))
-      checks.push(checkProgressSurfaces(rawState == null ? null : parseJsonSafe(rawState)))
-    }
+  if (stateDir) {
+    checks.push(checkProgressSurfaces(stateConfig))
   }
 
   // Telegram queue (409 / drain) from a saved getUpdates response

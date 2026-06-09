@@ -33,19 +33,28 @@ terminal, or another service. This is non-negotiable; see
 ### 1. Run the doctor
 
 ```bash
+# On a systemd host this is usually ALL you need — the doctor finds the
+# channel-*.service unit whose WorkingDirectory matches the plugin dir and
+# infers --env / --session / the state config from it (autodetect):
+bun skills/doctor-dashi-plugin/scripts/doctor.ts --plugin-dir <...>/plugin
+
+# Explicit flags always win over autodetect; pass them when the layout is unusual:
 bun skills/doctor-dashi-plugin/scripts/doctor.ts \
   --plugin-dir <workspace>/.claude/dashi-plugin-claude-code/plugin \
-  --settings ~/.claude/settings.json \
-  --mcp <workspace>/.claude/.mcp.json \
-  --settings-local <workspace>/.claude/settings.local.json \
+  --settings <plugin-dir>/.claude/settings.json \
+  --mcp <plugin-dir>/.mcp.json \
+  --settings-local <plugin-dir>/.claude/settings.local.json \
   --env <channel.env path> \
   --user <your numeric Telegram id> \
-  --session channel-<agent>      # only if the channel is already running
+  --session channel-<agent> \
+  --no-autodetect                # opt out of systemd unit discovery
 ```
 
 Every flag is optional — pass what you have. `--json` gives machine-readable
 output for an agent to parse. Exit code: `0` = no FAIL, `1` = at least one FAIL,
-`2` = usage error.
+`2` = usage error. Settings default to `<plugin-dir>/.claude/settings.json`
+when it exists (the session-cwd layout Claude Code actually loads hooks from),
+falling back to `~/.claude/settings.json`.
 
 **Multi-agent fleet mode** (README section 14): add `--fleet` to discover every
 `channel-*.service` unit on the host (helper units without a tmux Exec line are
@@ -60,9 +69,24 @@ before and after adding agent #2..N.
 
 The doctor checks, in order: toolchain floors (Claude Code ≥ 2.1, Bun ≥ 1.3.9,
 tmux), **workspace placement** (the #1 first-run failure — identity drift),
-settings.json hooks + token leak, **MCP comms consistency** (the latent
-silent-channel landmine), the Telegram allowlist, and live-session signals
-(welcome-prompt hang, expired auth, crash loop).
+systemd autodetect, dev-vs-runtime copy (multi-agent aware: matches the running
+server by CWD across ALL plugin processes on the host), settings selection +
+hooks + token leak, the **hook profile** (a tmux-mirror-only setup is NOT
+punished for the feeder hooks it deliberately lacks; feeders are demanded only
+when the state config enables a hook-driven status/progress surface), the
+**permission gate deep checks** (ask-relay registered next to the gate, the
+policy file the gate points at exists, `confirm_overrides` does not lift
+`sudo`/`rm -rf`, default tier, the unit carries `--permission-mode
+bypassPermissions`), **multichat** (per-chat policy parses, terminal mirror is
+DM-only — a public chat with `tmux_mirror: true` is a FAIL, every chat dir has
+a policy entry, spawn-chat-shell forwards `TMUX_PANE`), **security hygiene**
+(the hook webhook must listen on loopback ONLY — a `0.0.0.0` bind is a FAIL;
+the channel env file holding the bot token must not be world-readable; the
+user-level `~/.claude/settings.json` must be free of channel hooks), **MCP
+comms consistency** (the latent silent-channel landmine — now checked against
+the plugin-dir `.mcp.json`/`settings.local.json` by default), the Telegram
+allowlist, and live-session signals (welcome-prompt hang, expired auth, crash
+loop).
 
 ### 2. Read the result top-down and fix the first FAIL
 
