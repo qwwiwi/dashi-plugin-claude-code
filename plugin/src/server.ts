@@ -63,6 +63,8 @@ import {
   type AskCallbackContext,
   type AskUserQuestionUi,
 } from './telegram/ask-user-question.js'
+import { createPermissionGateRelay } from './channel/permission-gate-relay.js'
+import { createPermissionGateUi } from './telegram/permission-gate-ui.js'
 import { TelegramPoller, tokenLock } from './telegram/poller.js'
 import { describePidHolder, readLockHolder } from './telegram/pid-inspect.js'
 import { BOT_COMMANDS } from './commands/oob.js'
@@ -627,6 +629,21 @@ const askUserQuestionUi: AskUserQuestionUi = createAskUserQuestionUi({
   telegramApi,
   relay: askUserQuestionRelay,
 })
+// Permission gate (2026-06-09): interactive Allow/Deny confirm relay for the
+// bypassPermissions DM session. The PreToolUse hook POSTs confirm-tier calls
+// to /hooks/permission/request (webhook layer reads `permissionGateRelay`);
+// the UI's keyboard callback (`pgate:*`) is dispatched below. Dormant until
+// config.permission_gate.enabled — the route 503s and the hook fails closed.
+const permissionGateRelay = createPermissionGateRelay({
+  log,
+  defaultTimeoutMs: config.permission_gate.timeout_ms,
+})
+const permissionGateUi = createPermissionGateUi({
+  config,
+  log,
+  telegramApi,
+  relay: permissionGateRelay,
+})
 // Adapt grammY's Context to our structural CallbackQueryLike. grammY's
 // answerCallbackQuery returns Promise<true>; the structural type expects
 // Promise<void>. We wrap to drop the boolean and decouple from grammY types.
@@ -640,6 +657,25 @@ const askUserQuestionUi: AskUserQuestionUi = createAskUserQuestionUi({
 // in the chat.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data ?? ''
+  // Permission gate (pgate:*) — interactive Allow/Deny. Dispatched first so
+  // its prefix never collides with `ask:` or the headless `perm:*` flow.
+  if (data.startsWith('pgate:')) {
+    try {
+      await permissionGateUi.handlePgateCallback({
+        callbackQuery: { data },
+        from: { id: ctx.from.id },
+        answerCallbackQuery: async arg => {
+          if (arg) await ctx.answerCallbackQuery(arg)
+          else await ctx.answerCallbackQuery()
+        },
+      })
+    } catch (err) {
+      log.error('pgate callback_query handler threw', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+    return
+  }
   if (data.startsWith('ask:')) {
     const askCtx: AskCallbackContext = {
       callbackQuery: { data },
@@ -995,6 +1031,10 @@ try {
     // needs Promise<void>).
     sendMessage: (chatId, text) =>
       telegramApi.sendMessage(chatId, text, {}).then(() => undefined),
+    // Permission gate (2026-06-09): interactive confirm relay + Allow/Deny UI.
+    // The route gates on config.permission_gate.enabled internally.
+    permissionRelay: permissionGateRelay,
+    permissionUi: permissionGateUi,
   })
 } catch (err) {
   log.error('webhook server failed to start', {

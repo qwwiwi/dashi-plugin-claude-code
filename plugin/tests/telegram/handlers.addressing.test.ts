@@ -114,6 +114,7 @@ function makeStatePaths(): StatePaths {
       permissions: join(root, 'logs', 'permissions.jsonl'),
       webhook: join(root, 'logs', 'webhook.log'),
       ask_user_question: join(root, 'logs', 'ask-user-question.jsonl'),
+      permission_gate: join(root, 'logs', 'permission-gate.jsonl'),
     },
   }
 }

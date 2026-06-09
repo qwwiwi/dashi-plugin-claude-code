@@ -268,6 +268,28 @@ export const AppConfigSchema = z.object({
     allowed_user_ids: z.array(z.number().int().positive()).optional(),
     max_preview_chars: z.number().int().positive().default(1000),
   }).default({}),
+  // Permission gate (2026-06-09) — the INTERACTIVE confirm relay for the
+  // warchief's bypassPermissions DM session. The PreToolUse hook
+  // (scripts/permission-gate-hook.ts) classifies every tool call; `confirm`
+  // tier POSTs /hooks/permission/request, and this relay sends an Allow/Deny
+  // keyboard to Telegram. Distinct from `permission_relay` (the headless MCP
+  // `--permission-prompt-tool` path that never fires interactively).
+  //
+  // Default OFF: dormant until activation (flip bypassPermissions + register
+  // the hook + restart channel-thrall). While off, the HTTP route answers
+  // 503 and the hook's confirm tier fails closed to deny.
+  //
+  // `timeout_ms` caps how long the relay waits for a tap before fail-closing
+  // to deny — 2 min keeps a forgotten prompt from pinning a tool call for the
+  // hook's whole HTTP window.
+  //
+  // `allowed_user_ids` omitted → inherit permission_relay.allowed_user_ids
+  // (single source of truth; see resolvePermissionGateAllowedUserIds).
+  permission_gate: z.object({
+    enabled: z.boolean().default(false),
+    timeout_ms: z.number().int().positive().default(120_000),
+    allowed_user_ids: z.array(z.number().int().positive()).optional(),
+  }).default({}),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
 
@@ -549,6 +571,11 @@ export type StatePaths = {
      * Path is exposed here; TASK-1 is the only writer.
      */
     ask_user_question: string
+    /**
+     * Permission-gate relay audit JSONL (2026-06-09). Event types:
+     * `request_created`, `request_resolved`. Written by the webhook route.
+     */
+    permission_gate: string
   }
 }
 
@@ -578,6 +605,7 @@ export function getStatePaths(_config: AppConfig, env: RuntimeEnv): StatePaths {
       permissions: join(root, 'logs', 'permissions.jsonl'),
       webhook: join(root, 'logs', 'webhook.log'),
       ask_user_question: join(root, 'logs', 'ask-user-question.jsonl'),
+      permission_gate: join(root, 'logs', 'permission-gate.jsonl'),
     },
   }
 }
@@ -621,5 +649,28 @@ export function resolveAskUserQuestionAllowedUserIds(
       fallback: true,
     })
   }
+  return inherited
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolvePermissionGateAllowedUserIds — single source of truth for the
+// permission-gate Allow/Deny answerer set. Same inheritance contract as
+// AskUserQuestion: explicit `permission_gate.allowed_user_ids` wins,
+// otherwise inherit `permission_relay.allowed_user_ids`. This set
+// authorizes both who the prompt is sent to (DM chat == first id) and who
+// may resolve it.
+// ─────────────────────────────────────────────────────────────────────
+
+export function resolvePermissionGateAllowedUserIds(
+  config: AppConfig,
+  log?: AllowedUserIdsLogger,
+): readonly number[] {
+  const explicit = config.permission_gate.allowed_user_ids
+  if (explicit !== undefined) {
+    if (log) log.info('permission_gate: using explicit allowed_user_ids', { count: explicit.length, fallback: false })
+    return explicit
+  }
+  const inherited = config.permission_relay.allowed_user_ids
+  if (log) log.info('permission_gate: allowed_user_ids unset, inheriting from permission_relay', { count: inherited.length, fallback: true })
   return inherited
 }

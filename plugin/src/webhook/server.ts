@@ -27,12 +27,16 @@ import {
   AskUserQuestionAnswerSchema,
   AskUserQuestionRequestSchema,
   FallbackReplyRouteRequestSchema,
+  PermissionRequestRouteSchema,
   ReactRouteRequestSchema,
   WebhookPayloadSchema,
   type AskUserQuestionAnswer,
   type AskUserQuestionRequest,
+  type PermissionRequestRoute,
   type WebhookPayload,
 } from '../schemas.js'
+import { resolvePermissionGateAllowedUserIds } from '../config.js'
+import type { PermissionGateRelay } from '../channel/permission-gate-relay.js'
 import { sendChannelNotification, normalizeMeta } from '../channel/notify.js'
 import { toActivityEvent, toTodoWriteEvent } from '../hooks/claude-events.js'
 import type {
@@ -61,6 +65,14 @@ const REACT_BODY_LIMIT_BYTES = 4 * 1024
 // 4096-char text. 32 KB covers the worst-case multibyte body with headroom
 // while still cheap to abuse-proof.
 const FALLBACK_REPLY_BODY_LIMIT_BYTES = 32 * 1024
+// Permission-request bodies carry tool_name + a bounded preview/reason
+// (4096 + 1024 chars). 32 KB covers the worst-case multibyte body with
+// headroom while staying cheap to abuse-proof.
+const PERMISSION_REQUEST_BODY_LIMIT_BYTES = 32 * 1024
+// Margin added on top of the relay's logical timeout for the socket-level
+// request timeout, mirroring ASK_SOCKET_TIMEOUT_MARGIN_MS — the relay's clean
+// timeout verdict must win over a socket abort.
+const PERMISSION_SOCKET_TIMEOUT_MARGIN_MS = 15_000
 const DEFAULT_AGENT_ID = 'dashi-channel'
 
 // Margin added on top of the configured AskUserQuestion timeout to set
@@ -106,6 +118,27 @@ function writeAskAuditEvent(
     appendFileSync(auditPath, line, { mode: 0o600 })
   } catch (err) {
     log.warn('ask_user_question audit write failed', {
+      path: auditPath,
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+}
+
+// Append-only audit JSONL for the permission-gate route. Mirrors
+// writeAskAuditEvent; failures are swallowed (audit loss must never block a
+// route response). Single writer is handlePermissionRequest.
+function writePermissionAuditEvent(
+  statePaths: StatePaths,
+  log: Logger,
+  event: Record<string, unknown>,
+): void {
+  const auditPath = statePaths.logs.permission_gate
+  const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n'
+  try {
+    mkdirSync(dirname(auditPath), { recursive: true, mode: 0o700 })
+    appendFileSync(auditPath, line, { mode: 0o600 })
+  } catch (err) {
+    log.warn('permission_gate audit write failed', {
       path: auditPath,
       error: err instanceof Error ? err.message : String(err),
     })
@@ -187,6 +220,14 @@ export interface WebhookDeps {
   // Optional so tests/legacy paths can omit; when absent the route answers 503
   // and the hook degrades to a no-op (no fallback, no crash).
   sendMessage?: (chatId: string, text: string) => Promise<void>
+  // Permission gate (2026-06-09): the interactive confirm relay + its
+  // Telegram Allow/Deny UI. POST /hooks/permission/request submits to the
+  // relay, sends the keyboard via permissionUi.sendPrompt, and long-waits for
+  // the verdict. Both must be present for the route to handle requests; when
+  // either is undefined (or the feature is disabled in config) the route
+  // answers 503 / pass_through and the hook fails closed to deny.
+  permissionRelay?: PermissionGateRelay
+  permissionUi?: { sendPrompt(requestId: string): Promise<void> }
 }
 
 export interface WebhookServerHandle {
@@ -359,6 +400,14 @@ async function handleRequest(
   // text via deps.sendMessage when the DM turn ended without an MCP reply().
   if (method === 'POST' && path === '/hooks/fallback-reply') {
     await handleFallbackReply(req, res, deps, webhookToken)
+    return
+  }
+
+  // Permission gate (2026-06-09): interactive confirm relay. Wired before
+  // /hooks/agent so the more-specific path takes priority. Loopback + bearer,
+  // feature gate (config.permission_gate.enabled), then submit + long-wait.
+  if (method === 'POST' && path === '/hooks/permission/request') {
+    await handlePermissionRequest(req, res, deps, webhookToken)
     return
   }
 
@@ -879,6 +928,138 @@ async function handleFallbackReply(
   }
 
   reply(res, 200, { status: 'sent' })
+}
+
+// 2026-06-09: POST /hooks/permission/request — interactive permission confirm.
+// The PreToolUse permission-gate hook posts a `confirm`-tier tool call here.
+// We submit to the relay, send the Allow/Deny keyboard via permissionUi, and
+// long-wait for the verdict, then respond {status: 'allow'|'deny'|'timeout'}.
+// Auth: loopback origin + bearer (same fence as the ask routes). The hook is
+// fail-closed: any non-200 / non-allow verdict denies the tool, so the unhappy
+// paths here all map to a safe deny on the hook side.
+async function handlePermissionRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: WebhookDeps,
+  webhookToken: string | undefined,
+): Promise<void> {
+  const { config, statePaths, log, permissionRelay, permissionUi } = deps
+
+  if (!authGate(req, res, webhookToken)) return
+
+  // Feature gate: when the gate isn't enabled we tell the hook to fail closed
+  // (the hook treats a 503 as deny). We do NOT 200/pass_through here — unlike
+  // AskUserQuestion (which falls back to native UI), there is no native UI in
+  // bypassPermissions, so "disabled" must mean deny, not allow.
+  if (config.permission_gate.enabled !== true) {
+    reply(res, 503, { error: 'permission_gate disabled' })
+    return
+  }
+  if (!permissionRelay || !permissionUi) {
+    log.warn('permission/request received but relay or ui not wired', {
+      has_relay: permissionRelay !== undefined,
+      has_ui: permissionUi !== undefined,
+    })
+    reply(res, 503, { error: 'permission_gate relay not wired' })
+    return
+  }
+
+  const parsed = await readJsonBody(
+    req,
+    res,
+    log,
+    PERMISSION_REQUEST_BODY_LIMIT_BYTES,
+    PermissionRequestRouteSchema,
+    'permission/request',
+  )
+  if (!parsed.ok) return
+  // Cast: readJsonBody's generic binds to the schema INPUT shape, where
+  // `.default()` fields read as optional. The runtime values are guaranteed
+  // present (Zod applied the defaults) — cast to the output type.
+  const payload = parsed.value as PermissionRequestRoute
+
+  // Recipient = first allowed user id (DM chat == user id in Telegram). Same
+  // helper authorizes the answerer in the UI, so prompt destination and
+  // answer authz can never drift.
+  const allowed = resolvePermissionGateAllowedUserIds(config)
+  const chatId = allowed[0] === undefined ? undefined : String(allowed[0])
+  if (chatId === undefined) {
+    log.warn('permission/request no chatId available — fail-closed deny')
+    reply(res, 200, { status: 'deny', reason: 'no permission-gate recipient configured; fail-closed' })
+    return
+  }
+
+  const configTimeoutMs = config.permission_gate.timeout_ms
+  const requestedTimeoutMs = payload.timeout_ms ?? configTimeoutMs
+  const effectiveTimeoutMs = Math.min(requestedTimeoutMs, configTimeoutMs)
+
+  try {
+    req.setTimeout(effectiveTimeoutMs + PERMISSION_SOCKET_TIMEOUT_MARGIN_MS)
+    res.setTimeout(effectiveTimeoutMs + PERMISSION_SOCKET_TIMEOUT_MARGIN_MS)
+  } catch {
+    /* old runtime — best effort */
+  }
+
+  const { requestId, result } = permissionRelay.submit({
+    toolUseId: payload.tool_use_id,
+    sessionId: payload.session_id,
+    toolName: payload.tool_name,
+    preview: payload.preview,
+    reason: payload.reason,
+    chatId,
+    timeoutMs: effectiveTimeoutMs,
+  })
+
+  // Fresh request → send the keyboard. Replay / sync-resolution → skip
+  // (requestId undefined means the relay already has a verdict).
+  if (requestId !== undefined) {
+    writePermissionAuditEvent(statePaths, log, {
+      event: 'request_created',
+      request_id: requestId,
+      tool_use_id: payload.tool_use_id,
+      session_id: payload.session_id,
+      tool_name: payload.tool_name,
+      chat_id: chatId,
+      timeout_ms: effectiveTimeoutMs,
+    })
+    try {
+      await permissionUi.sendPrompt(requestId)
+    } catch (err) {
+      // If we can't deliver the keyboard the warchief can never tap → there is
+      // no point waiting out the timeout. Fail closed immediately.
+      log.warn('permission/request sendPrompt failed — fail-closed deny', {
+        request_id: requestId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      permissionRelay.expire(requestId, 'keyboard delivery failed; fail-closed')
+    }
+  }
+
+  const verdict = await result
+  writePermissionAuditEvent(statePaths, log, {
+    event: 'request_resolved',
+    request_id: verdict.requestId ?? requestId,
+    tool_use_id: payload.tool_use_id,
+    status: verdict.status,
+  })
+
+  // Map the relay status to the hook's {allow|deny|timeout} contract. Anything
+  // that isn't an explicit allow becomes deny on the hook side anyway, but we
+  // surface the precise status for the hook's reason string + audit.
+  switch (verdict.status) {
+    case 'allow':
+      reply(res, 200, { status: 'allow' })
+      return
+    case 'timeout':
+      reply(res, 200, { status: 'timeout', reason: verdict.reason ?? `no tap in ${effectiveTimeoutMs}ms` })
+      return
+    case 'deny':
+    case 'pass_through':
+    case 'idempotent':
+    default:
+      reply(res, 200, { status: 'deny', reason: verdict.reason ?? 'denied' })
+      return
+  }
 }
 
 async function handleAskRequest(
