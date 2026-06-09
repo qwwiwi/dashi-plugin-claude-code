@@ -2,7 +2,44 @@
   "mcpServers": {
     "dashi-channel": {
       "command": "bun",
-      "args": ["./src/server.ts"]
+      "args": [
+        "./src/server.ts"
+      ]
+    },
+    "chatplace": {
+      "type": "http",
+      "url": "https://mcp.chatplace.io/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CHATPLACE_API_KEY}"
+      }
+    },
+    "dashi-gbrain-memory": {
+      "type": "http",
+      "url": "https://mcp.orgrimmar.xyz/memory/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
+    },
+    "dashi-gbrain-recall": {
+      "type": "http",
+      "url": "https://mcp.orgrimmar.xyz/recall/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
+    },
+    "dashi-gbrain-swarm": {
+      "type": "http",
+      "url": "https://mcp.orgrimmar.xyz/swarm/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
+    },
+    "dashi-gbrain-tasks": {
+      "type": "http",
+      "url": "https://mcp.orgrimmar.xyz/task/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
     }
   }
 }
