@@ -133,6 +133,15 @@ describe('git-exec-surface is segment-scoped (live FP 2026-06-09)', () => {
     // The quoted | must NOT split the segment — the -c stays attributed to git.
     expect(classify('Bash', { command: 'git --work-tree="a|b" -c core.sshcommand=evil push' }, VARIANT1).matchedRule).toContain('git-exec-surface')
   })
+  test('shell indirection → whole-command scan, wrapper-fn -c still confirms (Codex Critical)', () => {
+    // A wrapper routes argv into git; the per-segment narrowing must NOT apply
+    // when indirection is present — it falls back to the whole-command scan,
+    // which catches the git…-c ordering across the wrapper.
+    expect(classify('Bash', { command: 'g(){ git "$@"; }; g -c core.sshcommand=evil fetch origin' }, VARIANT1).matchedRule).toContain('git-exec-surface')
+  })
+  test('indirection does not over-block a benign $() with no config flag', () => {
+    expect(classify('Bash', { command: 'B=$(git rev-parse --abbrev-ref HEAD); echo $B' }, VARIANT1).tier).toBe('allow')
+  })
   test('unbalanced quoting falls back to the conservative whole-string scan', () => {
     const v = classify('Bash', { command: 'git show "unterminated | grep -c x' }, VARIANT1)
     expect(v.matchedRule ?? '').toContain('git-exec-surface')

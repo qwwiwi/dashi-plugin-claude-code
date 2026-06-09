@@ -472,11 +472,26 @@ export function segmentBashQuoteAware(command: string): string[] | null {
 function gitExecSurface(commandLower: string): boolean {
   // Hook-path writes and env indirection are segment-independent.
   if (GIT_HOOKS_WRITE_RE.test(commandLower) || GIT_ENV_INDIRECTION_RE.test(commandLower)) return true
-  // The -c/--flag scan runs PER SEGMENT so a `-c` of another command in the
-  // pipeline does not implicate git; unparseable quoting → whole string.
+  // Fast path: if no config/exec flag appears ANYWHERE, no segmentation can
+  // create one (segments are substrings) — definitively safe.
+  if (!GIT_DASH_C_RE.test(commandLower) && !GIT_FLAG_RE.test(commandLower)) return false
+  // A flag matched somewhere. We only narrow to per-segment scanning (to
+  // suppress a pipeline neighbour's flag, e.g. `git show X | grep -c Y`) when
+  // there is NO shell indirection. Indirection ($var, $(...), `...`, arrays,
+  // wrapper functions) can route argv INTO git from another segment (Codex
+  // Critical: `g(){ git "$@"; }; g -c core.sshCommand=evil fetch`), so we fall
+  // back to the whole-command scan — at least as strict as the pre-segment
+  // behaviour. (Residual, pre-existing in that behaviour too: a flag that
+  // appears textually BEFORE git via a variable — `c='-c …'; git $c` — is not
+  // caught here; closing that needs real argv resolution, out of scope.)
+  if (/[$`]/.test(commandLower)) {
+    return GIT_DASH_C_RE.test(commandLower) || GIT_FLAG_RE.test(commandLower)
+  }
   const segs = segmentBashQuoteAware(commandLower)
-  const targets = segs === null ? [commandLower] : segs.filter((s) => /\bgit\b/.test(s))
-  return targets.some((s) => GIT_DASH_C_RE.test(s) || GIT_FLAG_RE.test(s))
+  if (segs === null) return true // unbalanced quotes → fail-closed
+  // Indirection-free, balanced: the flag can only belong to git if a
+  // git-bearing segment literally carries it.
+  return segs.some((s) => /\bgit\b/.test(s) && (GIT_DASH_C_RE.test(s) || GIT_FLAG_RE.test(s)))
 }
 
 const INTERPRETER_RE = /\b(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/
