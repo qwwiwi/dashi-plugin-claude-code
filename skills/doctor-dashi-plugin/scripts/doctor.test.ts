@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test'
+import { dirname, join } from 'path'
 import {
   checkAllowlist,
   checkProgressSurfaces,
+  findEnclosingClaudeMd,
   checkFleet,
   envValue,
   hookPortsInSettings,
@@ -628,5 +630,15 @@ describe('checkProgressSurfaces — exactly one activity surface', () => {
   test('unreadable config is a warn, not a crash', () => {
     const c = checkProgressSurfaces('not an object')
     expect(c.status).toBe('warn')
+  })
+})
+
+describe('findEnclosingClaudeMd — relative plugin dir', () => {
+  test('relative path is resolved against cwd before walking up', () => {
+    const cwd = process.cwd()
+    const found = new Set([join(dirname(dirname(cwd)), 'CLAUDE.md')])
+    const fe = (p: string) => found.has(p)
+    // grandparent of cwd holds CLAUDE.md: cwd/plugin -> cwd -> parent -> grandparent
+    expect(findEnclosingClaudeMd('plugin', fe)).not.toBeNull()
   })
 })

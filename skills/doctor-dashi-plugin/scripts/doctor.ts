@@ -17,7 +17,7 @@
 import { spawnSync } from 'child_process'
 import { createHash } from 'crypto'
 import { existsSync, readFileSync, readdirSync } from 'fs'
-import { dirname, join } from 'path'
+import { dirname, join, resolve } from 'path'
 import { homedir, platform } from 'os'
 
 export type Status = 'pass' | 'warn' | 'fail' | 'skip'
@@ -183,7 +183,12 @@ export function findEnclosingClaudeMd(
   pluginDir: string,
   fileExists: (p: string) => boolean = existsSync,
 ): string | null {
-  let dir = pluginDir
+  // A relative pluginDir (e.g. `--plugin-dir plugin`) must not break the
+  // upward walk: dirname('plugin') is '.', dirname('.') is '.', and the
+  // parent===dir guard exits after two levels — reporting a false FAIL
+  // even though <workspace>/.claude/CLAUDE.md exists (fleet doctor sweep,
+  // 2026-06-09). Resolve against cwd first so the walk sees real ancestors.
+  let dir = resolve(pluginDir)
   for (let i = 0; i < 12; i++) {
     const candidate = join(dir, 'CLAUDE.md')
     if (fileExists(candidate)) return candidate
