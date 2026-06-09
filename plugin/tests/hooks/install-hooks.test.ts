@@ -286,6 +286,68 @@ describe('applyPatch (pure)', () => {
     expect(ours[0]!.hooks?.[0]?.command).toContain('http://new')
     expect(ours[0]!.hooks?.[0]?.command).not.toContain('http://old')
   })
+
+  type GateHooks = { hooks: Record<string, Array<{ marker?: string; matcher?: string; hooks?: Array<{ command?: string }> }>> }
+
+  test('permission gate: registers a PreToolUse gate entry FIRST, only on PreToolUse', () => {
+    const out = applyPatch({}, {
+      settingsPath: '/tmp/x',
+      chatId: '164795011',
+      webhookUrl: 'http://127.0.0.1:8093/hooks/agent',
+      helperPath: '/p/scripts/post-hook.ts',
+      permissionGateHelperPath: '/p/scripts/permission-gate-hook.ts',
+    }) as GateHooks
+    const pre = out.hooks.PreToolUse ?? []
+    // Gate entry is first, notification mirror second.
+    expect(pre[0]!.marker).toBe('dashi-permission-gate-hook')
+    expect(pre[0]!.hooks?.[0]?.command).toContain('permission-gate-hook.ts')
+    // Hands the bare origin (no /hooks/agent path) to the gate hook.
+    expect(pre[0]!.hooks?.[0]?.command).toContain("TELEGRAM_WEBHOOK_URL='http://127.0.0.1:8093'")
+    expect(pre[0]!.hooks?.[0]?.command).not.toContain('/hooks/agent')
+    expect(pre.some((e) => e.marker === 'dashi-channel-hook')).toBe(true)
+    // No gate entry leaks onto other events.
+    for (const ev of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop']) {
+      expect((out.hooks[ev] ?? []).some((e) => e.marker === 'dashi-permission-gate-hook')).toBe(false)
+    }
+  })
+
+  test('permission gate: never writes the bearer token', () => {
+    const out = applyPatch({}, {
+      settingsPath: '/tmp/x',
+      chatId: '164795011',
+      webhookUrl: 'http://127.0.0.1:8093',
+      helperPath: '/p/post-hook.ts',
+      permissionGateHelperPath: '/p/permission-gate-hook.ts',
+      policyPath: '/p/policy.yaml',
+    }) as GateHooks
+    const cmd = out.hooks.PreToolUse![0]!.hooks![0]!.command!
+    expect(cmd).not.toContain('TELEGRAM_WEBHOOK_TOKEN')
+    expect(cmd).toContain("TELEGRAM_PERMISSION_POLICY_PATH='/p/policy.yaml'")
+  })
+
+  test('permission gate: re-run replaces the gate entry, no duplicates', () => {
+    const opts = {
+      settingsPath: '/tmp/x',
+      chatId: '164795011',
+      webhookUrl: 'http://127.0.0.1:8093',
+      helperPath: '/p/post-hook.ts',
+      permissionGateHelperPath: '/p/permission-gate-hook.ts',
+    }
+    let s = applyPatch({}, opts) as GateHooks
+    s = applyPatch(s, opts) as GateHooks
+    const gate = (s.hooks.PreToolUse ?? []).filter((e) => e.marker === 'dashi-permission-gate-hook')
+    expect(gate.length).toBe(1)
+  })
+
+  test('without permissionGateHelperPath, no gate entry is added (default off)', () => {
+    const out = applyPatch({}, {
+      settingsPath: '/tmp/x',
+      chatId: '1',
+      webhookUrl: 'http://x',
+      helperPath: '/p/post-hook.ts',
+    }) as GateHooks
+    expect((out.hooks.PreToolUse ?? []).some((e) => e.marker === 'dashi-permission-gate-hook')).toBe(false)
+  })
 })
 
 function countPluginEntries(parsed: Record<string, unknown>): number {

@@ -24,6 +24,10 @@ import { dirname, resolve as pathResolve } from 'path'
 import { fileURLToPath } from 'url'
 
 const MARKER = 'dashi-channel-hook'
+// Permission-gate PreToolUse hook (2026-06-09). Distinct marker so it
+// installs/updates alongside the notification-mirror hook without either
+// clobbering the other. Only added when --permission-gate-helper is given.
+const GATE_MARKER = 'dashi-permission-gate-hook'
 // Substring of the dashi helper script path used to identify *markerless*
 // legacy entries — re-running install over a settings file that was
 // hand-edited (no marker but pointing at our post-hook.ts) used to leave
@@ -51,6 +55,11 @@ export interface PatchOptions {
   readonly webhookUrl: string
   readonly agentId?: string
   readonly helperPath: string
+  /** When set, also register the permission-gate PreToolUse hook pointing at
+   *  this helper (scripts/permission-gate-hook.ts). */
+  readonly permissionGateHelperPath?: string
+  /** Optional explicit policy path for the gate hook (TELEGRAM_PERMISSION_POLICY_PATH). */
+  readonly policyPath?: string
 }
 
 interface HookEntry {
@@ -92,6 +101,42 @@ function buildEntryFor(event: HookEvent, opts: PatchOptions): HookEntry {
   return entry
 }
 
+function sq(v: string): string {
+  return `'${v.replace(/'/g, "'\\''")}'`
+}
+
+// Origin (scheme://host:port) of the webhook URL — the gate hook appends its
+// own /hooks/permission/request path, so we hand it the bare origin.
+function webhookOrigin(webhookUrl: string): string {
+  try {
+    const u = new URL(webhookUrl)
+    return `${u.protocol}//${u.host}`
+  } catch {
+    return webhookUrl
+  }
+}
+
+// PreToolUse command for the permission-gate hook. The bearer token is NOT
+// written here — the gate hook reads TELEGRAM_WEBHOOK_TOKEN from the agent's
+// runtime env, same invariant as the notification hook.
+function buildGateCommand(opts: PatchOptions): string {
+  const helper = opts.permissionGateHelperPath!
+  const envParts: string[] = [
+    `CHAT_ID=${sq(opts.chatId)}`,
+    `TELEGRAM_WEBHOOK_URL=${sq(webhookOrigin(opts.webhookUrl))}`,
+  ]
+  if (opts.policyPath) envParts.push(`TELEGRAM_PERMISSION_POLICY_PATH=${sq(opts.policyPath)}`)
+  return `${envParts.join(' ')} bun ${sq(helper)}`
+}
+
+function buildGateEntry(opts: PatchOptions): HookEntry {
+  return {
+    marker: GATE_MARKER,
+    matcher: '.*',
+    hooks: [{ type: 'command', command: buildGateCommand(opts) }],
+  }
+}
+
 // True if an entry's command string points at our helper script, even if
 // the marker was hand-stripped or never present. Survives different
 // absolute prefixes (e.g. user moved the plugin between dirs) by matching
@@ -109,16 +154,23 @@ function isLegacyDashiEntry(entry: HookEntry | undefined): boolean {
 /** Pure patcher — exposed for unit tests. */
 export function applyPatch(settings: SettingsShape, opts: PatchOptions): SettingsShape {
   const hooks: NonNullable<SettingsShape['hooks']> = { ...(settings.hooks ?? {}) }
+  const withGate = opts.permissionGateHelperPath !== undefined
   for (const event of HOOK_EVENTS) {
     const next = buildEntryFor(event, opts)
     const existing = hooks[event] ?? []
-    // Drop anything that's clearly ours: either marker match OR a markerless
-    // entry whose command path resolves to our helper. Unrelated entries
-    // (someone-else marker, unrelated command) survive untouched.
+    // Drop anything that's clearly ours: notification marker, legacy
+    // markerless notification entry, OR the gate marker (re-added below for
+    // PreToolUse). Unrelated entries survive untouched.
     const filtered = existing.filter(
-      (e) => !e || (e.marker !== MARKER && !isLegacyDashiEntry(e)),
+      (e) => !e || (e.marker !== MARKER && e.marker !== GATE_MARKER && !isLegacyDashiEntry(e)),
     )
-    hooks[event] = [...filtered, next]
+    const rebuilt = [...filtered, next]
+    // The gate hook lives on PreToolUse only, and is registered FIRST so its
+    // deny verdict is evaluated before the notification mirror runs.
+    if (event === 'PreToolUse' && withGate) {
+      rebuilt.unshift(buildGateEntry(opts))
+    }
+    hooks[event] = rebuilt
   }
   return { ...settings, hooks }
 }
@@ -129,6 +181,8 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
   let webhookUrl = ''
   let agentId: string | undefined
   let helperPath = ''
+  let permissionGateHelperPath: string | undefined
+  let policyPath: string | undefined
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     const next = argv[i + 1]
@@ -137,6 +191,8 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
     if (a === '--webhook-url' && next) { webhookUrl = next; i++; continue }
     if (a === '--agent-id' && next) { agentId = next; i++; continue }
     if (a === '--helper' && next) { helperPath = next; i++; continue }
+    if (a === '--permission-gate-helper' && next) { permissionGateHelperPath = next; i++; continue }
+    if (a === '--policy-path' && next) { policyPath = next; i++; continue }
   }
   if (!settingsPath || !chatId || !webhookUrl) {
     process.stderr.write(
@@ -151,9 +207,15 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
     const scriptDir = dirname(fileURLToPath(import.meta.url))
     helperPath = pathResolve(scriptDir, 'post-hook.ts')
   }
-  const opts: PatchOptions = agentId
-    ? { settingsPath, chatId, webhookUrl, agentId, helperPath }
-    : { settingsPath, chatId, webhookUrl, helperPath }
+  const opts: PatchOptions = {
+    settingsPath,
+    chatId,
+    webhookUrl,
+    helperPath,
+    ...(agentId ? { agentId } : {}),
+    ...(permissionGateHelperPath ? { permissionGateHelperPath } : {}),
+    ...(policyPath ? { policyPath } : {}),
+  }
   return opts
 }
 

@@ -1,0 +1,67 @@
+# Permission gate policy — Variant 1 (recommended: smooth autonomy).
+#
+# The owner drives this Claude Code session from Telegram. The session runs
+# under `--permission-mode bypassPermissions`, so NO Allow/Deny prompt ever
+# appears in the terminal. This file is the only gate. Copy it to your
+# workspace as `chats/permission-policy.yaml` (or point
+# TELEGRAM_PERMISSION_POLICY_PATH at it) and tune the lists.
+#
+# Tiers (precedence: deny > confirm > allow > default_tier):
+#   deny    — blocked hard, never reaches you.
+#   confirm — you get an Allow/Deny button in Telegram; 2-min timeout = deny.
+#   allow   — runs silently.
+#
+# A built-in hard-deny ALWAYS fires regardless of this file: reads/writes of
+# .env, *.pem, *.key, .ssh, .aws, gcloud, /proc/*/environ, and catastrophic
+# shell (rm -rf /, fork bombs, mkfs, dd to a disk). You cannot un-deny those.
+# A built-in confirm ALWAYS fires for sudo, git push, rm -rf, curl|sh,
+# base64 -d|sh, systemctl, kill/pkill, docker, npm publish, package installs —
+# unless you explicitly allow-list the exact form below.
+
+version: 1
+
+# Unmatched mutating tools run silently. Read-only tools (Read/Grep/Glob/...)
+# always auto-allow. Set to `confirm` for Variant 2 (tap to approve every edit).
+default_tier: allow
+
+# Operator confirm — risky-but-legitimate operations you want to wave through
+# by tapping a Telegram button. Add your project's deploy/DB entrypoints here.
+confirm:
+  bash_patterns:
+    - "deploy.sh"
+    - "infra/deploy"
+    - "psql"
+    - "supabase db"
+    - "pm2 restart"
+    - "pm2 delete"
+    - "rsync"          # production sync
+  tools:
+    - "mcp__*__task_done"   # marking team tasks done is a real-world side effect
+
+# Operator deny — things you never want to happen, even by tap. Optional;
+# the built-in hard-deny already covers secrets and catastrophic shell.
+deny:
+  bash_patterns:
+    - "git push --force"
+    - "git push -f"
+  read_paths:
+    - "**/secrets/**"
+
+# Operator allow — explicit forms that should run silently. NOTE: the built-in
+# confirm tier is UNCONDITIONAL — it CANNOT be overridden by an allow rule
+# (sudo / git push / rm -rf / curl|sh always reach you as a Telegram confirm).
+# So an allow rule only takes effect for commands NOT caught by a built-in
+# confirm/deny. Keep this list tight.
+allow:
+  bash_patterns:
+    - "gh pr view"     # read-only gh subcommands you want silent
+    - "bun test"
+
+# Per-scope overrides (keyed by CHAT_ID; "main" = the owner's DM session).
+# Scope rules are ADDITIVE to the globals above. Example: make the main
+# session confirm every package install even if globals allowed it.
+# scopes:
+#   main:
+#     confirm:
+#       bash_patterns:
+#         - "npm install"

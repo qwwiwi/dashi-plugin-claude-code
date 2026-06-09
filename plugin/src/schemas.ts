@@ -61,6 +61,22 @@ export const FallbackReplyRouteRequestSchema = z.object({
 })
 export type FallbackReplyRouteRequest = z.infer<typeof FallbackReplyRouteRequestSchema>
 
+// Webhook route body — POST /hooks/permission/request (2026-06-09). The
+// PreToolUse permission-gate hook posts a `confirm`-tier tool call here; the
+// plugin sends an Allow/Deny keyboard to the warchief and long-waits for the
+// tap. preview/reason are bounded so a hostile/huge tool input can't blow the
+// body cap; the safe-telegram-api redacts secrets before any of it reaches the
+// chat. timeout_ms is optional (server clamps to permission_gate.timeout_ms).
+export const PermissionRequestRouteSchema = z.object({
+  session_id: z.string().max(256).default(''),
+  tool_use_id: z.string().max(256).default(''),
+  tool_name: z.string().min(1).max(256),
+  preview: z.string().max(4096).default(''),
+  reason: z.string().max(1024).default(''),
+  timeout_ms: z.number().int().positive().optional(),
+})
+export type PermissionRequestRoute = z.infer<typeof PermissionRequestRouteSchema>
+
 // Tool args - download_attachment. chat_id is required so the tool can
 // gate the download through the chat allowlist — without it, Claude could
 // be tricked into fetching an arbitrary file_id (e.g. one leaked into a

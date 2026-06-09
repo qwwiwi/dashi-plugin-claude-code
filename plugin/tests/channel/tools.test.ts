@@ -85,6 +85,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     tmux_mirror: { enabled: false, pane_target: '', socket_name: '', poll_interval_ms: 5000, line_count: 50, hide_segments: ['boot_banner', 'inbound_warning', 'footer_hints', 'input_box'], mode: 'latest_inbound_only', max_lines: 14 },
     multichat: { enabled: false },
     ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
+    permission_gate: { enabled: false, timeout_ms: 120_000 },
     ...overrides,
   }
 }
@@ -109,6 +110,7 @@ function makeStatePaths(): StatePaths {
       permissions: join(root, 'logs', 'permissions.jsonl'),
       webhook: join(root, 'logs', 'webhook.log'),
       ask_user_question: join(root, 'logs', 'ask-user-question.jsonl'),
+      permission_gate: join(root, 'logs', 'permission-gate.jsonl'),
     },
   }
 }

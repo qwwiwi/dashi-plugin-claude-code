@@ -52,6 +52,9 @@ export const REQUIRED_HOOK_EVENTS = [
 
 export const HOOK_MARKER = 'dashi-channel-hook'
 export const FALLBACK_MARKER = 'dashi-channel-fallback-reply'
+// Permission-gate PreToolUse hook marker (2026-06-09). Written by
+// patch-claude-settings.ts when --permission-gate-helper is given.
+export const GATE_MARKER = 'dashi-permission-gate-hook'
 export const LIVE_MARKER = 'Listening for channel messages from: server:dashi-channel'
 
 // ---------------------------------------------------------------------------
@@ -312,6 +315,77 @@ export function checkSettingsHooks(settings: unknown): Check[] {
           status: 'warn',
           detail: 'no fallback-reply Stop-hook — a forgotten reply will be silently lost in DMs',
           fix: 'register the fallback-reply Stop-hook so a silent turn still reaches the chief',
+        },
+  )
+  return out
+}
+
+interface SettingsPermShape {
+  permissions?: { defaultMode?: string }
+  hooks?: Record<string, SettingsHookEntry[]>
+}
+
+/**
+ * Permission gate (2026-06-09) — the interactive Allow/Deny confirm hook for a
+ * bypassPermissions DM session. Optional: when no gate hook is registered the
+ * checks are skipped (the feature is off). When it IS registered we verify:
+ *   - the PreToolUse entry has a runnable command pointing at the gate helper;
+ *   - no bearer token leaked into the command (defence-in-depth over the global
+ *     leak check);
+ *   - the session is (or claims to be) in bypassPermissions — the gate is the
+ *     SOLE authority only in that mode; otherwise native prompts still wedge.
+ */
+export function checkPermissionGate(settings: unknown): Check[] {
+  const s = (settings as SettingsPermShape) ?? {}
+  const pre = Array.isArray(s.hooks?.PreToolUse) ? s.hooks!.PreToolUse! : []
+  const gate = pre.find((e) => e.marker === GATE_MARKER)
+  if (!gate) {
+    return [{
+      id: 'permission-gate',
+      title: 'Permission gate (interactive Allow/Deny)',
+      status: 'skip',
+      detail: 'no permission-gate PreToolUse hook — interactive confirm is off (optional)',
+    }]
+  }
+  const out: Check[] = []
+  const cmds = entryCommands(gate)
+  const runnable = cmds.some((c) => c.length > 0)
+  const pointsAtHelper = cmds.some((c) => c.includes('permission-gate-hook.ts'))
+  out.push(
+    runnable && pointsAtHelper
+      ? { id: 'permission-gate', title: 'Permission gate (interactive Allow/Deny)', status: 'pass', detail: `${GATE_MARKER} registered on PreToolUse` }
+      : {
+          id: 'permission-gate',
+          title: 'Permission gate (interactive Allow/Deny)',
+          status: 'warn',
+          detail: runnable ? `${GATE_MARKER} entry does not point at permission-gate-hook.ts` : `${GATE_MARKER} entry has no runnable command`,
+          fix: 'run plugin/scripts/install-hooks.sh --permission-gate to (re)register the gate hook',
+        },
+  )
+  // Bearer-token leak in the gate command (the patcher refuses to write it).
+  if (cmds.some((c) => c.includes('TELEGRAM_WEBHOOK_TOKEN'))) {
+    out.push({
+      id: 'permission-gate-token',
+      title: 'Permission gate: no bearer token in the hook command',
+      status: 'fail',
+      detail: 'TELEGRAM_WEBHOOK_TOKEN is hard-coded in the gate hook command',
+      fix: 'remove it — the gate hook reads the token from the agent runtime env, never from settings.json',
+    })
+  }
+  // bypassPermissions advisory — the gate is the SOLE permission authority only
+  // when the session runs --permission-mode bypassPermissions. We can read an
+  // explicit settings.permissions.defaultMode but the flag is usually on the
+  // CLI/systemd ExecStart, so a non-match is unverified, not a hard fail.
+  const mode = s.permissions?.defaultMode
+  out.push(
+    mode === 'bypassPermissions'
+      ? { id: 'permission-gate-mode', title: 'Permission gate: session in bypassPermissions', status: 'pass', detail: 'permissions.defaultMode=bypassPermissions' }
+      : {
+          id: 'permission-gate-mode',
+          title: 'Permission gate: session in bypassPermissions',
+          status: 'warn',
+          detail: mode ? `permissions.defaultMode=${mode} (not bypassPermissions)` : 'permissions.defaultMode unset in settings — verify the session runs with --permission-mode bypassPermissions',
+          fix: 'the gate only suppresses native prompts under bypassPermissions; otherwise interactive prompts still wedge the headless session',
         },
   )
   return out
@@ -1013,6 +1087,7 @@ function gatherChecks(opts: Options): Check[] {
     })
   } else {
     checks.push(...checkSettingsHooks(settings))
+    checks.push(...checkPermissionGate(settings))
   }
 
   // comms consistency (.mcp.json vs settings.local.json) — distinguish a missing

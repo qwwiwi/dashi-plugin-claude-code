@@ -7,6 +7,7 @@ import {
   parseUnitFile,
   type FleetAgent,
   checkCommsConsistency,
+  checkPermissionGate,
   checkSettingsHooks,
   checkVersion,
   checkWorkspacePlacement,
@@ -215,6 +216,57 @@ describe('checkSettingsHooks', () => {
   test('no fallback hook → warn', () => {
     const noFallback = { hooks: { ...good.hooks, Stop: [hookEntry('dashi-channel-hook')] } }
     expect(checkSettingsHooks(noFallback).find((c) => c.id === 'fallback-reply-hook')?.status).toBe('warn')
+  })
+})
+
+describe('checkPermissionGate', () => {
+  const gateEntry = {
+    marker: 'dashi-permission-gate-hook',
+    matcher: '.*',
+    hooks: [{ type: 'command', command: "CHAT_ID='164795011' TELEGRAM_WEBHOOK_URL='http://127.0.0.1:8093' bun '/p/scripts/permission-gate-hook.ts'" }],
+  }
+
+  test('no gate hook → skip (optional feature off)', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [hookEntry('dashi-channel-hook')] } })
+    expect(checks).toHaveLength(1)
+    expect(checks[0]!.status).toBe('skip')
+  })
+
+  test('gate registered + bypassPermissions → pass on both', () => {
+    const checks = checkPermissionGate({
+      permissions: { defaultMode: 'bypassPermissions' },
+      hooks: { PreToolUse: [gateEntry, hookEntry('dashi-channel-hook')] },
+    })
+    const byId = Object.fromEntries(checks.map((c) => [c.id, c.status]))
+    expect(byId['permission-gate']).toBe('pass')
+    expect(byId['permission-gate-mode']).toBe('pass')
+  })
+
+  test('gate registered but mode not bypassPermissions → warn (native prompts wedge)', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [gateEntry] } })
+    expect(checks.find((c) => c.id === 'permission-gate-mode')?.status).toBe('warn')
+  })
+
+  test('bearer token in the gate command → FAIL', () => {
+    const leaked = {
+      hooks: { PreToolUse: [{
+        marker: 'dashi-permission-gate-hook',
+        matcher: '.*',
+        hooks: [{ type: 'command', command: "TELEGRAM_WEBHOOK_TOKEN='abc' bun '/p/scripts/permission-gate-hook.ts'" }],
+      }] },
+    }
+    expect(checkPermissionGate(leaked).find((c) => c.id === 'permission-gate-token')?.status).toBe('fail')
+  })
+
+  test('gate marker present but command does not point at the helper → warn', () => {
+    const bogus = {
+      hooks: { PreToolUse: [{
+        marker: 'dashi-permission-gate-hook',
+        matcher: '.*',
+        hooks: [{ type: 'command', command: "bun '/p/scripts/post-hook.ts'" }],
+      }] },
+    }
+    expect(checkPermissionGate(bogus).find((c) => c.id === 'permission-gate')?.status).toBe('warn')
   })
 })
 

@@ -8,7 +8,14 @@
 #     --settings /path/to/agent/settings.json \
 #     --chat-id 164795011 \
 #     --webhook-url http://127.0.0.1:8089/hooks/agent \
-#     [--agent-id dashi-channel]
+#     [--agent-id dashi-channel] \
+#     [--permission-gate] [--gate-helper /abs/permission-gate-hook.ts] \
+#     [--policy-path /abs/permission-policy.yaml]
+#
+# --permission-gate also registers the interactive permission-gate PreToolUse
+# hook (Allow/Deny via Telegram for a bypassPermissions session). The gate
+# hook reads TELEGRAM_WEBHOOK_TOKEN from the agent runtime env — never written
+# to settings.json.
 #
 # Hard rules:
 #   * The bearer token (TELEGRAM_WEBHOOK_TOKEN) is NEVER written to
@@ -23,6 +30,9 @@ CHAT_ID=""
 WEBHOOK_URL=""
 AGENT_ID=""
 HELPER=""
+PERMISSION_GATE=""
+GATE_HELPER=""
+POLICY_PATH=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -36,6 +46,14 @@ while [ $# -gt 0 ]; do
       AGENT_ID="$2"; shift 2;;
     --helper)
       HELPER="$2"; shift 2;;
+    --permission-gate)
+      # Also register the PreToolUse permission-gate hook (interactive
+      # Allow/Deny via Telegram for a bypassPermissions session).
+      PERMISSION_GATE="1"; shift 1;;
+    --gate-helper)
+      GATE_HELPER="$2"; shift 2;;
+    --policy-path)
+      POLICY_PATH="$2"; shift 2;;
     -h|--help)
       sed -n 's/^# \{0,1\}//p' "$0" | head -n 18
       exit 0;;
@@ -82,6 +100,19 @@ ARGS=(
 )
 if [ -n "$AGENT_ID" ]; then
   ARGS+=(--agent-id "$AGENT_ID")
+fi
+if [ -n "$PERMISSION_GATE" ] || [ -n "$GATE_HELPER" ]; then
+  if [ -z "$GATE_HELPER" ]; then
+    GATE_HELPER="$SCRIPT_DIR/permission-gate-hook.ts"
+  fi
+  if [ ! -f "$GATE_HELPER" ]; then
+    echo "install-hooks.sh: gate helper '$GATE_HELPER' not found" >&2
+    exit 3
+  fi
+  ARGS+=(--permission-gate-helper "$GATE_HELPER")
+  if [ -n "$POLICY_PATH" ]; then
+    ARGS+=(--policy-path "$POLICY_PATH")
+  fi
 fi
 
 # Ensure the parent dir exists so `bun` can write the file atomically.
