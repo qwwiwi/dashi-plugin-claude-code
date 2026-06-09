@@ -188,6 +188,23 @@ function stripAnsi(text: string): string {
   return text.replace(ANSI_RE, '').replace(CTRL_RE, '')
 }
 
+// Claude Code's pane decorates output with glyphs that iOS Telegram renders
+// with EMOJI presentation (⏺ U+23FA tool bullet, ⚠ U+26A0 warning). The
+// owner's style forbids emoji in any surface, so the mirror swaps them for
+// text-presentation equivalents and drops variation selectors entirely
+// (U+FE0E/U+FE0F would re-toggle presentation on some clients).
+const GLYPH_MAP: ReadonlyArray<readonly [RegExp, string]> = [
+  [/⏺/g, '●'], // ⏺ -> ● (BLACK CIRCLE renders as text)
+  [/⚠/g, '(!)'], // ⚠ -> (!)
+  [/[\uFE0E\uFE0F]/g, ''], // variation selectors (invisible — keep as escapes)
+]
+
+function sanitizeTerminalGlyphs(text: string): string {
+  let out = text
+  for (const [re, repl] of GLYPH_MAP) out = out.replace(re, repl)
+  return out
+}
+
 function htmlEscape(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -337,6 +354,10 @@ export class TmuxMirror {
     let filtered = needsFilter
       ? filterPane(cleaned, { hide: this.hideSegments, mode: this.mode })
       : cleaned
+    // Glyph sanitization runs AFTER the structural pane filter (its anchors
+    // read the raw pane layout) and BEFORE redaction/rendering, so no
+    // emoji-presentation glyph survives into the Telegram message.
+    filtered = sanitizeTerminalGlyphs(filtered)
     // Line cap runs AFTER the segment filter so the warchief's iPhone
     // sees a tidy ~14-line tail of the post-filter content, not a
     // 14-line slice of raw tmux output that includes hidden segments.

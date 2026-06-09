@@ -45,8 +45,13 @@ export const AppConfigSchema = z.object({
   allowed_user_ids: z.array(z.number().int().positive()).min(1).default([164795011]),
   allowed_chat_ids: z.array(z.union([z.number(), z.string()])).default([164795011]),
   workspace_root: z.string().optional(),
+  // 2026-06-09 duplicate-windows fix: StatusManager and ProgressReporter
+  // both defaulted ON, so a fresh install with hooks registered rendered two
+  // hook-driven «working/running» Telegram windows next to the tmux mirror.
+  // Exactly one progress surface should be a deliberate operator choice —
+  // both hook-driven reporters are now opt-in (config.json / state config).
   status: z.object({
-    enabled: z.boolean().default(true),
+    enabled: z.boolean().default(false),
     interval_ms: z.number().int().positive().default(700),
     ttl_ms: z.number().int().positive().default(300_000),
     delete_on_complete: z.boolean().default(true),
@@ -127,7 +132,7 @@ export const AppConfigSchema = z.object({
   // recent_buffer aligned with StatusManager.ACTIVITY_MAX_BUFFER (10)
   // so the two surfaces report the same "+N earlier" tail count.
   progress: z.object({
-    enabled: z.boolean().default(true),
+    enabled: z.boolean().default(false),
     edit_throttle_ms: z.number().int().nonnegative().default(3000),
     recent_buffer: z.number().int().positive().default(10),
     session_ttl_ms: z.number().int().positive().default(10 * 60 * 1000),

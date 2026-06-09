@@ -502,6 +502,37 @@ export function checkAllowlist(envText: string, userId?: string, chatId?: string
 }
 
 /**
+ * Exactly one progress surface should be enabled in the channel state config.
+ * 2026-06-09 (Mac mini migration): StatusManager + ProgressReporter both
+ * defaulted ON, so a fresh install with hooks rendered two hook-driven
+ * «working/running» Telegram windows next to the tmux mirror — the owner saw
+ * duplicate windows. Defaults are all-off now; this check catches explicit
+ * double-enables so the bug cannot quietly return.
+ *
+ * Scope: validates <TELEGRAM_STATE_DIR>/config.json ONLY. That is the single
+ * layer able to enable these surfaces — the env schema has no
+ * status/progress enable switches (TELEGRAM_WEBHOOK_* set host/port only),
+ * and since 2026-06-09 the schema defaults are all-off.
+ */
+export function checkProgressSurfaces(stateConfig: unknown): Check {
+  const id = 'progress-surfaces'
+  const title = 'Single progress surface (status / progress / tmux_mirror)'
+  if (stateConfig === null || typeof stateConfig !== 'object') {
+    return { id, title, status: 'warn', detail: 'state config.json missing or not an object — cannot verify progress surfaces', fix: 'create <TELEGRAM_STATE_DIR>/config.json or check its JSON syntax' }
+  }
+  const cfg = stateConfig as Record<string, { enabled?: boolean } | undefined>
+  const enabled: string[] = []
+  for (const key of ['status', 'progress', 'tmux_mirror'] as const) {
+    if (cfg[key]?.enabled === true) enabled.push(key)
+  }
+  if (enabled.length > 1) {
+    return { id, title, status: 'warn', detail: `${enabled.length} surfaces enabled together (${enabled.join(' + ')}) — the owner gets duplicate Telegram windows`, fix: 'keep exactly one: tmux_mirror for a terminal view, or one hook-driven reporter. Disable the rest in the state config.json' }
+  }
+  const detail = enabled.length === 1 ? `exactly one surface enabled (${enabled[0]})` : 'no surface explicitly enabled (defaults are all-off)'
+  return { id, title, status: 'ok', detail }
+}
+
+/**
  * Interpret a getUpdates response. A 409 means a second consumer holds the same
  * bot token — the most common migration landmine. Do NOT theorise about a
  * Claude version regression; hunt the second process.
@@ -1109,6 +1140,16 @@ function gatherChecks(opts: Options): Check[] {
       checks.push({ id: 'allowlist-user', title: 'Telegram user allowlist', status: 'warn', detail: `could not read ${opts.envPath}` })
     } else {
       checks.push(...checkAllowlist(env, opts.userId, opts.chatId))
+    }
+  }
+
+  // Exactly one progress surface (duplicate-windows guard, 2026-06-09)
+  if (opts.envPath) {
+    const envText = readFileSafe(opts.envPath)
+    const stateDir = envText ? envValue(envText, 'TELEGRAM_STATE_DIR') : null
+    if (stateDir) {
+      const rawState = readFileSafe(join(stateDir, 'config.json'))
+      checks.push(checkProgressSurfaces(rawState == null ? null : parseJsonSafe(rawState)))
     }
   }
 

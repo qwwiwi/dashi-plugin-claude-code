@@ -1066,3 +1066,36 @@ describe('TmuxMirror — multichat policy isolation', () => {
     await mirror.stop()
   })
 })
+
+describe('TmuxMirror — terminal glyph sanitization (no emoji in the mirror)', () => {
+  // Claude Code's pane uses ⏺ (U+23FA) as a tool bullet and ⚠ (U+26A0) for
+  // warnings. iOS Telegram renders both with EMOJI presentation, which
+  // violates the owner's no-emoji style. The mirror must replace them with
+  // text-presentation equivalents before sending (2026-06-09, Mac mini
+  // migration smoke).
+  test('emoji-presentation glyphs are replaced with text-safe equivalents', async () => {
+    const stub = makeStubApi()
+    const pane = '⏺ Bash(ls -la)\n⚠ 1 setup issue: MCP\n❯ ok'
+    const exec = makeExec([ok(pane)])
+    const mirror = new TmuxMirror({
+      api: stub.api,
+      log: stubLog,
+      chatId: '100',
+      paneTarget: 'channel-thrall:0.0',
+      pollIntervalMs: 1000,
+      lineCount: 50,
+      exec,
+    })
+    await mirror.start()
+    const sent = stub.ops.find((o) => o.method === 'sendMessage')
+    expect(sent).toBeDefined()
+    expect(sent?.text).not.toContain('⏺')
+    expect(sent?.text).not.toContain('⚠')
+    // replacements keep the line readable
+    expect(sent?.text).toContain('● Bash(ls -la)')
+    expect(sent?.text).toContain('(!) 1 setup issue: MCP')
+    // emoji variation selectors never reach Telegram
+    expect(sent?.text).not.toContain('️')
+    await mirror.stop()
+  })
+})

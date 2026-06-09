@@ -464,3 +464,27 @@ describe('loadConfig', () => {
     expect(paths.logs.ask_user_question).toBe(join(stateDir, 'logs', 'ask-user-question.jsonl'))
   })
 })
+
+describe('single progress surface defaults (2026-06-09 duplicate-windows fix)', () => {
+  // Mac mini migration: ProgressReporter + StatusManager both defaulted ON,
+  // so a fresh install with hooks registered rendered two «working/running»
+  // Telegram windows next to the tmux mirror. The owner wants exactly one
+  // surface; the hook-driven reporters are now opt-in.
+  test('progress reporter is disabled by default', () => {
+    const cfg = loadConfig(env())
+    expect(cfg.progress.enabled).toBe(false)
+  })
+  test('status manager is disabled by default', () => {
+    const cfg = loadConfig(env())
+    expect(cfg.status.enabled).toBe(false)
+  })
+  test('explicit config.json can still enable the reporters', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      status: { enabled: true },
+      progress: { enabled: true },
+    }))
+    const cfg = loadConfig(env())
+    expect(cfg.status.enabled).toBe(true)
+    expect(cfg.progress.enabled).toBe(true)
+  })
+})

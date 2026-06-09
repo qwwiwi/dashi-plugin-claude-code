@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   checkAllowlist,
+  checkProgressSurfaces,
   checkFleet,
   envValue,
   hookPortsInSettings,
@@ -602,5 +603,30 @@ describe('fleet checks — review fixes (Codex HOLD round)', () => {
   test('-L in tmux argv before the quoted payload IS the socket', () => {
     const unit = "ExecStart=/usr/bin/tmux -L real new-session -d -s s 'claude -L sneaky'"
     expect(parseUnitFile(unit).sockets).toEqual(['real'])
+  })
+})
+
+describe('checkProgressSurfaces — exactly one activity surface', () => {
+  test('two hook-driven reporters enabled together is a warn', () => {
+    const c = checkProgressSurfaces({ status: { enabled: true }, progress: { enabled: true } })
+    expect(c.status).toBe('warn')
+    expect(c.detail).toContain('status')
+    expect(c.detail).toContain('progress')
+  })
+  test('reporter enabled next to the tmux mirror is a warn', () => {
+    const c = checkProgressSurfaces({ progress: { enabled: true }, tmux_mirror: { enabled: true } })
+    expect(c.status).toBe('warn')
+  })
+  test('tmux mirror alone passes', () => {
+    const c = checkProgressSurfaces({ tmux_mirror: { enabled: true, pane_target: 'channel-x:0.0' } })
+    expect(c.status).toBe('ok')
+  })
+  test('empty config passes (defaults are all-off since 2026-06-09)', () => {
+    const c = checkProgressSurfaces({})
+    expect(c.status).toBe('ok')
+  })
+  test('unreadable config is a warn, not a crash', () => {
+    const c = checkProgressSurfaces('not an object')
+    expect(c.status).toBe('warn')
   })
 })

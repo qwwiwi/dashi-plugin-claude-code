@@ -69,6 +69,10 @@ afterEach(async () => {
 function enabledConfig(overrides: Partial<AppConfig['webhook']> = {}): AppConfig {
   return {
     ...baseConfig,
+    // These tests exercise the hook->status dispatch path; status.enabled
+    // defaults to false since the 2026-06-09 duplicate-windows fix, so the
+    // fixture opts in explicitly.
+    status: { ...baseConfig.status, enabled: true },
     webhook: {
       enabled: true,
       host: '127.0.0.1',
