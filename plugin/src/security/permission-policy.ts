@@ -536,11 +536,28 @@ function gitExecSurface(rawCommand: string): boolean {
 //     textual mention (`grep -rn "systemctl" src/`), safe. A real invocation
 //     needs a verb to mutate anything (`systemctl` alone just lists units).
 // Occurrences are OR'ed — a read-only hit cannot mask a mutating sibling.
+//
+// Separator-aware (live FP round 2, 2026-06-10): a systemd verb is
+// WHITESPACE-separated from `systemctl`. `grep -nE 'a|systemctl|launchctl' f`
+// glued `launchctl` to `systemctl` with a `|` inside the quoted regex and the
+// old whitespace+`|`+quote tokenizer read it as the verb → false card. We now
+// require the char immediately after `systemctl` to be whitespace before
+// parsing a verb; a glued `|`/quote/`.` marks pattern data, not argv. This
+// keeps the genuine cases (`ssh host 'systemctl restart w'` — quote BEFORE
+// systemctl, space AFTER → still confirms; detached value flags intact).
+//
 // Accepted residuals under the agent-mistake threat model (mirrors the
 // gitExecSurface note): a verb arriving through a pipe
-// (`echo "restart foo" | xargs systemctl`) is not resolved here, and a
+// (`echo "restart foo" | xargs systemctl`) is not resolved here; a
 // flagless non-verb-shaped first argument (`systemctl ./restart`) reads as
-// a mention — systemd itself rejects such argv, so nothing mutates.
+// a mention — systemd itself rejects such argv, so nothing mutates; and a
+// QUOTED command NAME (`'systemctl' restart w`) is indistinguishable, by
+// local context alone, from a quoted search pattern (`grep 'systemctl' src/`)
+// — catching the former would re-introduce the exact mention false positive
+// this fix exists to kill. An agent never quotes its own command name, so we
+// accept this over a flood of `grep 'systemctl'` cards (Codex Critical #1,
+// consciously declined 2026-06-10 — the threat model is agent mistakes, not a
+// shell-quoting adversary).
 //
 // MIGRATION (2026-06-10): the literal 'systemctl' entry left
 // BUILTIN_CONFIRM_BASH, so a confirm_overrides list naming it now fails
@@ -562,31 +579,57 @@ const SYSTEMCTL_VALUE_FLAGS = new Set([
   '--output', '--signal', '--kill-who', '--state', '--job-mode',
 ])
 const SYSTEMCTL_FLAG_RE = /^--?[a-z0-9-]+(=.*)?$/
-const SYSTEMCTL_VERB_SHAPED_RE = /^[a-z][a-z-]*$/
+const SYSTEMCTL_VERB_LEAD_RE = /^[a-z][a-z-]*/
+// Command-position occurrences of `systemctl` (optionally path-qualified like
+// `/usr/bin/systemctl`), bounded by a shell separator / quote / start so a
+// verb glued by `|` inside a regex alternation isn't read as argv. The
+// trailing context (separator vs whitespace vs end) is inspected by the caller.
+// NOTE the leading boundary deliberately excludes `=`: `FOO=systemctl restart`
+// is a shell assignment of FOO followed by `restart`, not a systemctl call
+// (Codex review 2026-06-10). `env FOO=x systemctl restart` still resolves via
+// the space before `systemctl`. `=` stays in the TRAILING lookahead only as a
+// generic separator.
+const SYSTEMCTL_OCCURRENCE_RE =
+  /(?:^|[\s"'`;|&()<>\\])(?:[^\s"'`;|&()<>=\\]*\/)?systemctl(?=[\s"'`;|&()<>=\\]|$)/g
 
 function systemctlMutation(commandLower: string): boolean {
   if (!commandLower.includes('systemctl')) return false
-  const tokens = commandLower.split(/[\s"'`;|&()<>\\]+/).filter((t) => t.length > 0)
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i] as string
-    if (t !== 'systemctl' && !t.endsWith('/systemctl')) continue
-    let j = i + 1
+  // Fold backslash line-continuations so `systemctl \<nl> restart` is one call.
+  const cmd = commandLower.replace(/\\\r?\n/g, ' ')
+  SYSTEMCTL_OCCURRENCE_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = SYSTEMCTL_OCCURRENCE_RE.exec(cmd)) !== null) {
+    const after = cmd.slice(m.index + m[0].length)
+    // A systemd verb is whitespace-separated from `systemctl`. End-of-string
+    // (bare `systemctl`, lists units) or a glued non-space char (a `|` from a
+    // regex alternation, a closing quote from `grep 'systemctl'`) means this
+    // occurrence is read-only / a mention — not an invocation. Skip it.
+    if (!/^\s/.test(after)) continue
+    const tokens = after.trim().split(/\s+/).filter((t) => t.length > 0)
+    let k = 0
     let sawFlag = false
-    while (j < tokens.length) {
-      const tok = tokens[j] as string
-      if (SYSTEMCTL_VALUE_FLAGS.has(tok)) { sawFlag = true; j += 2; continue }
-      if (SYSTEMCTL_FLAG_RE.test(tok)) { sawFlag = true; j++; continue }
+    while (k < tokens.length) {
+      const tok = tokens[k] as string
+      if (SYSTEMCTL_VALUE_FLAGS.has(tok)) { sawFlag = true; k += 2; continue }
+      if (SYSTEMCTL_FLAG_RE.test(tok)) { sawFlag = true; k++; continue }
       break
     }
-    const verb = tokens[j]
-    if (verb === undefined) continue // bare systemctl lists units — read-only
-    if (verb.startsWith('$')) return true // variable verb — cannot prove safe
-    if (SYSTEMCTL_READONLY_VERBS.has(verb)) continue
-    if (SYSTEMCTL_VERB_SHAPED_RE.test(verb)) return true // mutating or unknown
-    // Not verb-shaped. Flags between `systemctl` and here prove invocation
-    // shape (a mention carries no systemctl flags) — fail safe to confirm.
-    if (sawFlag) return true
-    // Otherwise a mention (path / number / pattern tail), not a call.
+    const vtok = tokens[k]
+    if (vtok === undefined) continue // only flags, no verb (e.g. `-h`) — read-only
+    // Strip surrounding quotes (`systemctl 'restart' x`) BEFORE the `$`
+    // check, else `systemctl "$verb" unit` strips to `$verb` only after the
+    // check and slips through as a mention (Codex review 2026-06-10).
+    const normalizedVerb = vtok.replace(/^['"]+|['"]+$/g, '')
+    if (normalizedVerb.startsWith('$')) return true // variable verb — cannot prove safe
+    const verbMatch = normalizedVerb.match(SYSTEMCTL_VERB_LEAD_RE)
+    if (verbMatch === null) {
+      // Not verb-shaped (path `./restart`, number). Flags before it prove an
+      // invocation → fail safe; otherwise a mention.
+      if (sawFlag) return true
+      continue
+    }
+    if (SYSTEMCTL_READONLY_VERBS.has(verbMatch[0])) continue
+    return true // mutating OR unknown verb — fail safe to confirm
   }
   return false
 }
