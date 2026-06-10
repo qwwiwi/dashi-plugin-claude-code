@@ -635,19 +635,44 @@ function systemctlMutation(commandLower: string): boolean {
 }
 
 const INTERPRETER_RE = /\b(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/
-const DOWNLOADER_RE = /\b(curl|wget|fetch)\b/
+// Network/exfil source tokens. `fetch` is deliberately EXCLUDED: Linux has no
+// `fetch` downloader CLI, so including it only false-positives on `git fetch`.
+// (macOS `fetch(1)` exists — flag for Mac-resident agents if they share this.)
+const DOWNLOADER_RE = /\b(curl|wget|nc|ncat|socat)\b|\/dev\/tcp/
+// Pipe chain ending in an interpreter (sudo/env wrappers + absolute paths ok).
+const PIPE_TO_INTERPRETER_RE = /\|\s*(?:sudo\s+|env\s+)*(?:\/\S+\/)?(?:sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/
+// An untrusted NETWORK source appears to the LEFT of a pipe-to-interpreter.
+// `[^|]*` keeps the source in the same pipe stage as (or upstream of) the
+// interpreter without crossing into the interpreter's own segment.
+const SOURCE_TO_INTERPRETER_RE = new RegExp(
+  `(?:\\b(?:curl|wget|nc|ncat|socat)\\b|\\/dev\\/tcp)[^|]*${PIPE_TO_INTERPRETER_RE.source}`,
+)
 
+// The RCE primitive is UNTRUSTED (network) bytes reaching an interpreter — NOT
+// any pipe-to-interpreter (2026-06-10 ultra-autonomy FP, Codex + Fable double
+// audit). A LOCAL command piped to an interpreter (`git show X|python3 -c`,
+// `cat f|python3`, `jq …|python3`) is the agent's own code over its own data,
+// exactly as trusted as the agent typing `python3 -c …` directly (already
+// allowed) — so it must run SILENTLY under ultra-autonomy.
+//
+// Accepted residuals under the agent-mistake threat model (mirrors the
+// gitExecSurface posture): `ssh host 'cmd' | bash` flows (ssh is omitted from
+// the source set — ssh|grep/ssh|python parsing is constant benign ops work, and
+// the malicious case needs the agent to have already chosen a hostile remote);
+// two-step download-then-exec (`curl -o x; sh x`) is never caught by a single-
+// command detector (same as `python3 downloaded.py`, allowed today); deep
+// obfuscation is out of scope (env -i isolation + fail-closed default backstop).
 function bashConfirmEvasion(commandLower: string): boolean {
-  // Pipe to an interpreter, allowing sudo/env wrappers and absolute paths.
-  if (/\|\s*(sudo\s+|env\s+)*(\/\S+\/)?(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/.test(commandLower)) {
-    return true
-  }
-  // Downloader + interpreter present anywhere in the command — covers pipes,
-  // process substitution `<(curl …)`, and command substitution `$(curl …)`.
+  // (A) Untrusted network source piped to an interpreter (`curl … | sh`,
+  //     `nc host port | bash`, `cat /dev/tcp/… | bash`). A LOCAL command piped
+  //     to an interpreter is NOT a network source and flows silently.
+  if (SOURCE_TO_INTERPRETER_RE.test(commandLower)) return true
+  // (B) Downloader + interpreter present anywhere — covers process substitution
+  //     `bash <(curl …)` and command substitution `sh -c "$(curl …)"`.
   if (DOWNLOADER_RE.test(commandLower) && INTERPRETER_RE.test(commandLower)) return true
-  // base64 decode feeding an interpreter.
+  // (C) base64 decode feeding an interpreter.
   if (/\bbase64\s+(-d|--decode)\b/.test(commandLower) && INTERPRETER_RE.test(commandLower)) return true
-  // Pipe to sudo (privilege escalation of piped data).
+  // (D) Pipe to sudo (privilege escalation of piped data).
   if (/\|\s*sudo\b/.test(commandLower)) return true
   return false
 }
