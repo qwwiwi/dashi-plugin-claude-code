@@ -405,7 +405,17 @@ function bashReferencesSecret(command: string): boolean {
 // owner has accepted that only a clean `git push` auto-allows (Codex High
 // round 3 — tokenizing the shell is overkill; confirm-on-any-`-c` is the
 // minimal safe patch).
-const GIT_DASH_C_RE = /\bgit\b[^\n]*?(\s-c(\s|=|["'])|--config(\s|=|-env))/i
+//
+// `-c` is matched CASE-SENSITIVELY (lowercase only). git's `-C <dir>` (change
+// working directory) is a completely safe, extremely common flag that differs
+// from `-c <cfg>` (config injection) ONLY by case. The classifier lowercases
+// the command for substring matching, which collapsed `-C`→`-c` and raised a
+// confirm card on every `git -C …` — the single biggest false-positive in the
+// gate (2026-06-10). So gitExecSurface takes the RAW command and the `-c`
+// regex below has NO `/i` flag; `git` itself stays case-insensitive via the
+// explicit char classes, and the long forms keep `/i` (they are lowercase).
+const GIT_DASH_C_RE = /[Gg][Ii][Tt]\b[^\n]*?\s-c(\s|=|["'])/
+const GIT_CONFIG_LONG_RE = /\bgit\b[^\n]*?--config(\s|=|-env)/i
 const GIT_FLAG_RE =
   /\bgit\b[^\n]*?(--config-env|--upload-pack|--receive-pack|--exec)\b/i
 const GIT_HOOKS_WRITE_RE = /(\.git\/hooks\/|core\.hookspath)/i
@@ -469,12 +479,21 @@ export function segmentBashQuoteAware(command: string): string[] | null {
   return segs.map((s) => s.trim()).filter((s) => s.length > 0)
 }
 
-function gitExecSurface(commandLower: string): boolean {
-  // Hook-path writes and env indirection are segment-independent.
-  if (GIT_HOOKS_WRITE_RE.test(commandLower) || GIT_ENV_INDIRECTION_RE.test(commandLower)) return true
+/** Any git config/exec flag in a segment. `-c` is case-sensitive (see RE); the
+ *  long forms are case-insensitive. Operates on the RAW (case-preserved) text. */
+function gitFlagPresent(s: string): boolean {
+  return GIT_DASH_C_RE.test(s) || GIT_CONFIG_LONG_RE.test(s) || GIT_FLAG_RE.test(s)
+}
+
+function gitExecSurface(rawCommand: string): boolean {
+  const lower = rawCommand.toLowerCase()
+  // Hook-path writes and env indirection are segment-independent and
+  // case-insensitive (GIT_SSH_COMMAND= etc. are uppercase env vars).
+  if (GIT_HOOKS_WRITE_RE.test(lower) || GIT_ENV_INDIRECTION_RE.test(lower)) return true
   // Fast path: if no config/exec flag appears ANYWHERE, no segmentation can
-  // create one (segments are substrings) — definitively safe.
-  if (!GIT_DASH_C_RE.test(commandLower) && !GIT_FLAG_RE.test(commandLower)) return false
+  // create one (segments are substrings) — definitively safe. Match on the RAW
+  // command so `-c` keeps its case (`git -C` change-dir must NOT trip here).
+  if (!gitFlagPresent(rawCommand)) return false
   // A flag matched somewhere. We only narrow to per-segment scanning (to
   // suppress a pipeline neighbour's flag, e.g. `git show X | grep -c Y`) when
   // there is NO shell indirection. Indirection ($var, $(...), `...`, arrays,
@@ -484,14 +503,14 @@ function gitExecSurface(commandLower: string): boolean {
   // behaviour. (Residual, pre-existing in that behaviour too: a flag that
   // appears textually BEFORE git via a variable — `c='-c …'; git $c` — is not
   // caught here; closing that needs real argv resolution, out of scope.)
-  if (/[$`]/.test(commandLower)) {
-    return GIT_DASH_C_RE.test(commandLower) || GIT_FLAG_RE.test(commandLower)
+  if (/[$`]/.test(rawCommand)) {
+    return gitFlagPresent(rawCommand)
   }
-  const segs = segmentBashQuoteAware(commandLower)
+  const segs = segmentBashQuoteAware(rawCommand)
   if (segs === null) return true // unbalanced quotes → fail-closed
   // Indirection-free, balanced: the flag can only belong to git if a
   // git-bearing segment literally carries it.
-  return segs.some((s) => /\bgit\b/.test(s) && (GIT_DASH_C_RE.test(s) || GIT_FLAG_RE.test(s)))
+  return segs.some((s) => /\bgit\b/i.test(s) && gitFlagPresent(s))
 }
 
 const INTERPRETER_RE = /\b(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/
@@ -808,8 +827,10 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
       return { tier: 'confirm', reason: 'pipe-to-interpreter download needs confirmation', matchedRule: 'builtin:confirm_bash:pipe-interpreter' }
     }
     // Non-overridable: git config/hook execution surfaces (a downgraded
-    // `git push` must never become arbitrary local code execution).
-    if (gitExecSurface(commandLower)) {
+    // `git push` must never become arbitrary local code execution). Pass the
+    // RAW command (commandLower !== undefined ⇒ rawCommand defined) so the
+    // case-sensitive `-c` check distinguishes `git -C` from `git -c`.
+    if (gitExecSurface(rawCommand!)) {
       return { tier: 'confirm', reason: 'git config/hook execution surface needs confirmation', matchedRule: 'builtin:confirm_bash:git-exec-surface' }
     }
   }

@@ -118,6 +118,20 @@ describe('built-in confirm bash (interpreter/exfil evasion)', () => {
   })
 })
 
+describe('git -C (change-dir) is NOT git -c (config) — case-sensitive (live FP 2026-06-10)', () => {
+  test('`git -C <dir> …` auto-allows — uppercase -C must not trip the -c surface', () => {
+    expect(classify('Bash', { command: 'git -C /home/x/repo log --oneline -1' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'git -C . show HEAD:file.ts' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'git -C /srv/app status' }, VARIANT1).matchedRule ?? '').not.toContain('git-exec-surface')
+  })
+  test('lowercase `git -c <cfg>` still confirms (the real config-injection surface)', () => {
+    expect(classify('Bash', { command: 'git -c core.sshcommand=evil push' }, VARIANT1).matchedRule).toContain('git-exec-surface')
+  })
+  test('`git -C dir -c cfg` (both flags) still confirms — the lowercase -c is present', () => {
+    expect(classify('Bash', { command: 'git -C /repo -c core.pager=evil log' }, VARIANT1).matchedRule).toContain('git-exec-surface')
+  })
+})
+
 describe('git-exec-surface is segment-scoped (live FP 2026-06-09)', () => {
   test('`git show X | grep -c` does NOT confirm — the -c belongs to grep', () => {
     const v = classify('Bash', { command: 'git show origin/main:file.ts | grep -c "MARKER"' }, VARIANT1)
