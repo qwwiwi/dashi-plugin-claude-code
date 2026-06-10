@@ -135,6 +135,15 @@ describe('systemctl is verb-aware — read-only verbs and mentions do not confir
     expect(classify('Bash', { command: 'grep -rn "systemctl" src/security/' }, VARIANT1).tier).toBe('allow')
     expect(classify('Bash', { command: 'echo systemctl' }, VARIANT1).tier).toBe('allow')
   })
+  test('grep alternation pattern with a verb-word after systemctl does not confirm (live FP round 2, 2026-06-10)', () => {
+    // `grep -nE 'a|systemctl|launchctl|restart' file` raised a real card: the
+    // `|` inside the quoted regex was treated as a shell pipe, so `launchctl`
+    // read as systemctl's verb. A systemd verb is whitespace-separated — a `|`
+    // or quote glued right after `systemctl` is pattern data, not argv.
+    expect(classify('Bash', { command: "grep -nE 'permission-gate|systemctl|launchctl|restart' file.sh" }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: "rg 'systemctl|restart|reload' docs/" }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'echo "see systemctl|launchctl mess"' }, VARIANT1).tier).toBe('allow')
+  })
   test('mutating systemctl verbs confirm, local and remote', () => {
     expect(classify('Bash', { command: 'systemctl restart dashi-brain-swarm-worker' }, VARIANT1).tier).toBe('confirm')
     expect(classify('Bash', { command: 'systemctl daemon-reload' }, VARIANT1).tier).toBe('confirm')
@@ -147,6 +156,17 @@ describe('systemctl is verb-aware — read-only verbs and mentions do not confir
   test('unknown or indirect systemctl verbs fail safe to confirm', () => {
     expect(classify('Bash', { command: 'systemctl frobnicate x' }, VARIANT1).tier).toBe('confirm')
     expect(classify('Bash', { command: 'v=restart; systemctl $v foo' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('quoted variable verb still fails safe (Codex Critical #2, 2026-06-10)', () => {
+    // Quotes must be stripped BEFORE the `$` check, else `systemctl "$verb"`
+    // slips through as a mention.
+    expect(classify('Bash', { command: 'systemctl "$verb" unit' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: "systemctl '$action' foo" }, VARIANT1).tier).toBe('confirm')
+  })
+  test('shell assignment FOO=systemctl is not an invocation (Codex Medium, 2026-06-10)', () => {
+    // `FOO=systemctl restart` assigns FOO and runs `restart` — not systemctl.
+    expect(classify('Bash', { command: 'FOO=systemctl restart' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'UNIT=systemctl status x' }, VARIANT1).tier).toBe('allow')
   })
   test('a read-only verb cannot mask a mutating sibling occurrence', () => {
     expect(
