@@ -392,30 +392,59 @@ interface SettingsPermShape {
 }
 
 /**
- * Permission gate (2026-06-09) — the interactive Allow/Deny confirm hook for a
- * bypassPermissions DM session. Optional: when no gate hook is registered the
- * checks are skipped (the feature is off). When it IS registered we verify:
+ * Permission gate (2026-06-09, hardened 2026-06-10) — the interactive
+ * Allow/Deny confirm hook for a bypassPermissions DM session. Under
+ * --permission-mode bypassPermissions the native terminal prompt is suppressed,
+ * so the gate is the SOLE confirmation path that reaches the warchief: a bypass
+ * session without it silently renders confirms in an unwatched pane (the Silvana
+ * incident). The feature is therefore only "optional" when the session is NOT a
+ * bypass session and the gate is not configured on. When it IS registered we
+ * verify:
  *   - the PreToolUse entry has a runnable command pointing at the gate helper;
  *   - no bearer token leaked into the command (defence-in-depth over the global
  *     leak check);
  *   - the session is (or claims to be) in bypassPermissions — the gate is the
- *     SOLE authority only in that mode; otherwise native prompts still wedge.
+ *     SOLE authority only in that mode; otherwise native prompts still wedge;
+ *   - the state-config feature flag (permission_gate.enabled) matches the hook —
+ *     a hook with enabled=false makes /hooks/permission/request answer 503, so
+ *     every confirm fails closed to DENY.
  */
 export function checkPermissionGate(
   settings: unknown,
   fileExists: (p: string) => boolean = existsSync,
   /** True when the supervising unit's ExecStart carries --permission-mode bypassPermissions. */
   unitBypass: boolean | null = null,
+  /** permission_gate.enabled from the state config; null = state config unreadable. */
+  gateEnabled: boolean | null = null,
+  /** ask_user_question.enabled from the state config; null = state config unreadable. */
+  askEnabled: boolean | null = null,
 ): Check[] {
   const s = (settings as SettingsPermShape) ?? {}
   const pre = Array.isArray(s.hooks?.PreToolUse) ? s.hooks!.PreToolUse! : []
   const gate = pre.find((e) => e.marker === GATE_MARKER)
   if (!gate) {
+    // The gate is the sole confirm path ONLY under bypassPermissions. A bypass
+    // session (or one with permission_gate.enabled=true) that lacks the hook is
+    // the incident class — FAIL, do not silently SKIP. When neither signal is
+    // present (no bypass, gate disabled, or host unknown) the feature is
+    // genuinely off and SKIP is correct (don't over-fail an unreadable host).
+    if (unitBypass === true || gateEnabled === true) {
+      const cause = unitBypass === true
+        ? 'the unit runs --permission-mode bypassPermissions (native prompts are suppressed) but no gate hook is registered — confirms never reach the warchief'
+        : 'permission_gate.enabled=true in the state config but no gate PreToolUse hook is registered — the configured gate never fires'
+      return [{
+        id: 'permission-gate',
+        title: 'Permission gate (interactive Allow/Deny)',
+        status: 'fail',
+        detail: cause,
+        fix: 'run plugin/scripts/install-hooks.sh --permission-gate to register the gate hook',
+      }]
+    }
     return [{
       id: 'permission-gate',
       title: 'Permission gate (interactive Allow/Deny)',
       status: 'skip',
-      detail: 'no permission-gate PreToolUse hook — interactive confirm is off (optional)',
+      detail: 'no permission-gate PreToolUse hook — interactive confirm is off (not a bypass session)',
     }]
   }
   const out: Check[] = []
@@ -433,6 +462,24 @@ export function checkPermissionGate(
           fix: 'run plugin/scripts/install-hooks.sh --permission-gate to (re)register the gate hook',
         },
   )
+  // Config↔hook match: the gate hook only works when permission_gate.enabled is
+  // true in the state config. With the hook registered but the flag off, the
+  // /hooks/permission/request route is feature-gated to 503 — the gate helper
+  // then fails CLOSED to DENY on every command, silently wedging the session.
+  if (gateEnabled === false) {
+    out.push({
+      id: 'permission-gate-config-match',
+      title: 'Permission gate: hook matches permission_gate.enabled',
+      status: 'fail',
+      detail: 'gate hook registered but permission_gate.enabled is not true → /hooks/permission/request answers 503, every confirm fails closed to DENY',
+      fix: 'set permission_gate.enabled=true in <TELEGRAM_STATE_DIR>/config.json so the route is live',
+    })
+  } else if (gateEnabled === true) {
+    out.push({ id: 'permission-gate-config-match', title: 'Permission gate: hook matches permission_gate.enabled', status: 'pass', detail: 'permission_gate.enabled=true and the gate hook is registered' })
+  } else {
+    out.push({ id: 'permission-gate-config-match', title: 'Permission gate: hook matches permission_gate.enabled', status: 'warn', detail: 'gate hook registered but state config unreadable — cannot confirm permission_gate.enabled', fix: 'pass --env so the doctor can read the state config and verify the flag' })
+  }
+
   // Bearer-token leak in the gate command (the patcher refuses to write it).
   if (cmds.some((c) => c.includes('TELEGRAM_WEBHOOK_TOKEN'))) {
     out.push({
@@ -482,6 +529,34 @@ export function checkPermissionGate(
         },
   )
 
+  // Ask-relay config↔hook match. Two failure shapes:
+  //   - relay hook registered but ask_user_question.enabled=false → the relay
+  //     route is feature-gated off, so the hook posts into a dead endpoint;
+  //   - ask enabled AND this is a bypass session but NO relay hook → the first
+  //     AskUserQuestion renders in the unwatched pane and hangs the session.
+  // askEnabled===null (state unreadable) → no opinion; the warn above already
+  // flags a missing relay.
+  const bypassActive = unitBypass === true || s.permissions?.defaultMode === 'bypassPermissions'
+  if (askEnabled === false && askWorking) {
+    out.push({
+      id: 'permission-gate-ask-config-match',
+      title: 'AskUserQuestion relay: hook matches ask_user_question.enabled',
+      status: 'fail',
+      detail: 'ask relay hook registered but ask_user_question.enabled is not true → the relay route is off and questions never reach Telegram',
+      fix: 'set ask_user_question.enabled=true in <TELEGRAM_STATE_DIR>/config.json',
+    })
+  } else if (askEnabled === true && bypassActive && !askWorking) {
+    out.push({
+      id: 'permission-gate-ask-config-match',
+      title: 'AskUserQuestion relay: hook matches ask_user_question.enabled',
+      status: 'fail',
+      detail: 'ask_user_question.enabled=true under bypassPermissions but no ask relay hook is registered → the first question wedges the unwatched pane',
+      fix: 'register the ask-user-question PreToolUse hook alongside the gate',
+    })
+  } else if (askEnabled === true && askWorking) {
+    out.push({ id: 'permission-gate-ask-config-match', title: 'AskUserQuestion relay: hook matches ask_user_question.enabled', status: 'pass', detail: 'ask_user_question.enabled=true and the relay hook is registered' })
+  }
+
   // The policy file the gate command points at must exist. A missing file is
   // not fatal at runtime (the hook falls back to confirm-everything) but it
   // means the operator's policy — including confirm_overrides — is silently
@@ -501,6 +576,62 @@ export function checkPermissionGate(
     )
   }
   return out
+}
+
+/** Result of a safe HTTP liveness probe — the status code only, never a body. */
+export interface ProbeCode {
+  code: number
+}
+
+/**
+ * SAFE liveness probe for the permission webhook (gap 5, 2026-06-10).
+ *
+ * The gate is the sole confirm path under bypassPermissions, so a dead webhook
+ * means every confirm silently fails closed. We MUST verify the endpoint is up
+ * WITHOUT ever exercising the real permission route — POSTing
+ * /hooks/permission/request would card the warchief. Two layers:
+ *   (a) the parsed listener table — gate required but nothing on the port = FAIL;
+ *   (b) GET /health (unauthenticated, 200, no side effects) via an injected
+ *       probe so the check is pure-unit-testable.
+ *
+ * Criteria: gate not required → skip; port/listeners unknown → skip; required +
+ * no listener → fail; required + /health 200 → pass; required + listening but
+ * non-200 → warn; required + listening but probe error/missing → warn.
+ */
+export function checkPermissionEndpoint(
+  gateRequired: boolean,
+  port: string | null,
+  listeners: Listener[] | null,
+  httpProbe: ((url: string) => ProbeCode | null) | null,
+): Check {
+  const id = 'permission-endpoint'
+  const title = 'Permission webhook reachable (safe /health probe)'
+  if (!gateRequired) return { id, title, status: 'skip', detail: 'gate not required (not a bypass session / gate off) — endpoint probe skipped' }
+  if (!port) return { id, title, status: 'skip', detail: 'webhook port unknown (no env) — pass --env or run with autodetect' }
+  if (listeners === null) return { id, title, status: 'skip', detail: 'no listener probe available (ss/lsof missing)' }
+
+  const listening = listeners.some((l) => l.port === port)
+  if (!listening) {
+    return {
+      id,
+      title,
+      status: 'fail',
+      detail: `gate is required but nothing listens on webhook port ${port} — confirms cannot be delivered and every gated command fails closed`,
+      fix: 'start the channel service so the permission webhook is up, then re-run',
+    }
+  }
+  if (httpProbe === null) {
+    return { id, title, status: 'warn', detail: `port ${port} is listening but no /health probe is available — endpoint health unverified`, fix: 'no action needed if the service is up; the socket bind alone is a good sign' }
+  }
+  // GET /health only — never the real permission route.
+  const res = httpProbe(`http://127.0.0.1:${port}/health`)
+  if (res === null) {
+    return { id, title, status: 'warn', detail: `port ${port} is listening but GET /health did not respond — endpoint may be wedged`, fix: 'check the channel service logs' }
+  }
+  if (res.code === 200) {
+    return { id, title, status: 'pass', detail: `GET http://127.0.0.1:${port}/health → 200` }
+  }
+  return { id, title, status: 'warn', detail: `port ${port} is listening but GET /health → ${res.code} (expected 200) — the webhook is up but unhealthy`, fix: 'check the channel service logs' }
 }
 
 /**
@@ -1188,6 +1319,30 @@ function readFileSafe(p: string): string | null {
   }
 }
 
+/**
+ * Synchronous, SAFE HTTP probe for the permission webhook's GET /health.
+ *
+ * gatherChecks is synchronous and the doctor must not pull in an external curl,
+ * so we run a short bun one-liner under spawnSync (same shape as every other
+ * `probe`): it does a `fetch` with a 2s AbortController and prints only the
+ * numeric status code. Returns null on any error / timeout / non-bun host.
+ * The one-liner only ever issues a GET to /health — it never touches the real
+ * /hooks/permission/request route, so probing cannot card the warchief.
+ */
+function healthHttpProbe(url: string): ProbeCode | null {
+  // Only loopback /health is ever probed — refuse anything else as defence in
+  // depth (a malformed env should never make the doctor hit a foreign host).
+  if (!/^http:\/\/127\.0\.0\.1:\d+\/health$/.test(url)) return null
+  const bun = process.execPath.endsWith('bun') ? process.execPath : 'bun'
+  const script =
+    `const c=new AbortController();const t=setTimeout(()=>c.abort(),2000);` +
+    `fetch(${JSON.stringify(url)},{signal:c.signal}).then(r=>{clearTimeout(t);process.stdout.write(String(r.status))}).catch(()=>{clearTimeout(t);process.exit(1)})`
+  const r = probe(bun, ['-e', script], 4000)
+  if (r.code !== 0) return null
+  const code = parseInt(r.stdout.trim(), 10)
+  return Number.isFinite(code) ? { code } : null
+}
+
 /** Working directory of a live PID — cross-platform (no `pwdx`, absent on macOS). */
 function liveCwd(pid: string, os: OS): string {
   if (os === 'linux') {
@@ -1242,6 +1397,10 @@ export interface FleetAgent {
   sessionName: string | null
   /** ExecStart carries --permission-mode bypassPermissions. */
   bypassPermissions: boolean
+  /** permission_gate.enabled from <state-dir>/config.json; null = config missing/unreadable. */
+  gateEnabled: boolean | null
+  /** A dashi-permission-gate-hook PreToolUse entry is registered in the agent's workspace settings. */
+  gateHookRegistered: boolean
 }
 
 export interface ParsedUnit {
@@ -1442,6 +1601,33 @@ export function checkFleet(agents: FleetAgent[], sharedSettingsRaw: string | nul
     out.push({ id: 'fleet-hook-ports', title: 'Each agent\'s hooks point at its own port', status: 'pass', detail: 'no foreign-port hooks' })
   }
 
+  // Fleet-wide gate invariant (2026-06-10, the Silvana incident generalised):
+  // EVERY bypassPermissions agent must have the gate hook registered AND
+  // permission_gate.enabled=true. A bypass agent without it confirms into an
+  // unwatched pane (incident) or fails closed to DENY (config off). Non-bypass
+  // agents are exempt — they still get native prompts.
+  //
+  // State config unreadable (gateEnabled===null) does NOT pass: emitting PASS
+  // would claim "enabled=true" for an agent whose config we never read (Codex
+  // review 2026-06-10 — against the incident-lock goal). It downgrades to WARN
+  // instead, distinct from the hard FAIL of a known-missing/disabled gate.
+  const bypassAgents = agents.filter((a) => a.bypassPermissions)
+  const gateGaps = bypassAgents
+    .filter((a) => !a.gateHookRegistered || a.gateEnabled === false)
+    .map((a) => `${a.name} (${!a.gateHookRegistered ? 'no gate hook' : 'permission_gate.enabled=false'})`)
+  const gateUnknown = bypassAgents
+    .filter((a) => a.gateHookRegistered && a.gateEnabled === null)
+    .map((a) => `${a.name} (permission_gate.enabled unverified — state config unreadable)`)
+  if (bypassAgents.length === 0) {
+    out.push({ id: 'fleet-gate', title: 'Every bypass agent has the permission gate wired', status: 'pass', detail: 'no bypassPermissions agents — native prompts still apply' })
+  } else if (gateGaps.length > 0) {
+    out.push({ id: 'fleet-gate', title: 'Every bypass agent has the permission gate wired', status: 'fail', detail: `${gateGaps.join('; ')} — confirms render in an unwatched pane or fail closed to DENY`, fix: 'run install-hooks.sh --permission-gate for that agent and set permission_gate.enabled=true in its state config' })
+  } else if (gateUnknown.length > 0) {
+    out.push({ id: 'fleet-gate', title: 'Every bypass agent has the permission gate wired', status: 'warn', detail: `${gateUnknown.join('; ')} — gate hook registered but enabled flag could not be verified`, fix: 'ensure the agent\'s state config is readable and permission_gate.enabled=true' })
+  } else {
+    out.push({ id: 'fleet-gate', title: 'Every bypass agent has the permission gate wired', status: 'pass', detail: `${bypassAgents.map((a) => a.name).join(', ')}: gate hook registered + permission_gate.enabled=true` })
+  }
+
   return out
 }
 
@@ -1469,21 +1655,28 @@ export function scanFleet(unitDir: string): FleetAgent[] {
     const stateDir = envText ? envValue(envText, 'TELEGRAM_STATE_DIR') : null
     const workspaceRoot = envText ? envValue(envText, 'TELEGRAM_WORKSPACE_ROOT') : null
     let webhookEnabled: boolean | null = null
+    let gateEnabled: boolean | null = null
     if (stateDir) {
-      const stateConfig = parseJsonSafe(readFileSafe(join(stateDir, 'config.json'))) as { webhook?: { enabled?: boolean } } | null
+      const stateConfig = parseJsonSafe(readFileSafe(join(stateDir, 'config.json'))) as { webhook?: { enabled?: boolean }; permission_gate?: { enabled?: boolean } } | null
       webhookEnabled = stateConfig?.webhook?.enabled === true ? true : stateConfig ? false : null
+      gateEnabled = stateConfig?.permission_gate?.enabled === true ? true : stateConfig ? false : null
     }
     // Workspace settings: both layouts exist in the wild — the workspace root
     // IS the .claude dir (settings.json directly inside), or the root contains
     // a .claude/ subdir.
     let hookPorts: string[] = []
     let settingsPath: string | null = null
+    let gateHookRegistered = false
     if (workspaceRoot) {
       for (const cand of [join(workspaceRoot, 'settings.json'), join(workspaceRoot, '.claude', 'settings.json')]) {
         const raw = readFileSafe(cand)
         if (raw != null) {
           hookPorts = hookPortsInSettings(raw)
           settingsPath = cand
+          // A gate PreToolUse hook with a runnable command pointing at the helper.
+          const pre = (parseJsonSafe(raw) as SettingsPermShape | null)?.hooks?.PreToolUse ?? []
+          const gate = Array.isArray(pre) ? pre.find((e) => e.marker === GATE_MARKER) : undefined
+          gateHookRegistered = gate !== undefined && entryCommands(gate).some((c) => c.includes('permission-gate-hook.ts'))
           break
         }
       }
@@ -1504,6 +1697,8 @@ export function scanFleet(unitDir: string): FleetAgent[] {
       workingDirectory,
       sessionName,
       bypassPermissions,
+      gateEnabled,
+      gateHookRegistered,
     })
   }
   return agents
@@ -1778,6 +1973,13 @@ function gatherChecks(opts: Options): Check[] {
   const rawStateText = stateDir ? readFileSafe(join(stateDir, 'config.json')) : null
   const stateConfig = rawStateText == null ? null : parseJsonSafe(rawStateText)
   const profile = selectHookProfile(stateConfig)
+  // Feature flags from the state config (gap 1/2). null = state config
+  // unreadable — keep the gate checks conservative, never over-fail a host we
+  // simply could not read.
+  const gateCfg = stateConfig as { permission_gate?: { enabled?: boolean }; ask_user_question?: { enabled?: boolean } } | null
+  const gateEnabled: boolean | null = stateConfig == null ? null : gateCfg?.permission_gate?.enabled === true
+  const askEnabled: boolean | null = stateConfig == null ? null : gateCfg?.ask_user_question?.enabled === true
+  const unitBypass = unitAgent ? unitAgent.bypassPermissions : null
 
   // settings.json hooks + token leak
   const settings = parseJsonSafe(readFileSafe(opts.settingsPath))
@@ -1790,10 +1992,27 @@ function gatherChecks(opts: Options): Check[] {
       detail: `could not read/parse ${opts.settingsPath}`,
       fix: 'pass --settings <path> to the agent settings.json',
     })
+    // Unreadable settings must NOT mask the incident: under bypassPermissions
+    // (or with the gate configured on) we cannot confirm the gate hook exists,
+    // so an unreadable settings file is itself a gate failure, not a quiet warn.
+    if (unitBypass === true || gateEnabled === true) {
+      checks.push({
+        id: 'permission-gate',
+        title: 'Permission gate (interactive Allow/Deny)',
+        status: 'fail',
+        detail: `${unitBypass === true ? 'unit runs --permission-mode bypassPermissions' : 'permission_gate.enabled=true'} but settings.json is unreadable — cannot confirm the gate hook is registered`,
+        fix: 'make the agent settings.json readable, then re-run; the gate is the sole confirm path under bypassPermissions',
+      })
+    }
   } else {
     checks.push(...checkSettingsHooks(settings, profile))
-    const gateChecks = checkPermissionGate(settings, existsSync, unitAgent ? unitAgent.bypassPermissions : null)
-    gateRegistered = gateChecks.some((c) => c.id === 'permission-gate' && c.status !== 'skip')
+    const gateChecks = checkPermissionGate(settings, existsSync, unitBypass, gateEnabled, askEnabled)
+    // gateRegistered drives the policy-lint below — it must mean "a gate hook
+    // is actually present", NOT "the gate check is non-skip". After the
+    // incident-lock change a MISSING hook under bypass yields a FAIL check, so
+    // keying off status!=='skip' would lint a non-existent hook (Codex review
+    // 2026-06-10). Derive it from the real hook entry instead.
+    gateRegistered = ((settings as SettingsPermShape)?.hooks?.PreToolUse ?? []).some((e) => e.marker === GATE_MARKER)
     checks.push(...gateChecks)
   }
 
@@ -1838,6 +2057,7 @@ function gatherChecks(opts: Options): Check[] {
 
   // Webhook bind (P0, security): the hook webhook must listen on loopback only.
   const webhookPort = envText ? envValue(envText, 'TELEGRAM_WEBHOOK_PORT') : null
+  let parsedListeners: Listener[] | null = null
   if (webhookPort) {
     let listenersText: string | null = null
     const ss = probe('ss', ['-ltn'])
@@ -1847,7 +2067,17 @@ function gatherChecks(opts: Options): Check[] {
       const lsof = probe('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN'])
       if (lsof.code === 0 && lsof.stdout) listenersText = lsof.stdout
     }
-    checks.push(checkWebhookBind(webhookPort, listenersText == null ? null : parseListeners(listenersText)))
+    parsedListeners = listenersText == null ? null : parseListeners(listenersText)
+    checks.push(checkWebhookBind(webhookPort, parsedListeners))
+  }
+
+  // Permission endpoint liveness (gap 5): the gate is the sole confirm path
+  // under bypassPermissions, so a dead webhook fails every confirm closed. SAFE
+  // probe only — GET /health (unauthenticated, no side effects); NEVER POST the
+  // real /hooks/permission/request route (it would card the warchief).
+  const gateRequired = unitBypass === true || gateEnabled === true
+  if (gateRequired) {
+    checks.push(checkPermissionEndpoint(true, webhookPort, parsedListeners, healthHttpProbe))
   }
 
   // Env file privacy (P0, security): the bot token lives here.

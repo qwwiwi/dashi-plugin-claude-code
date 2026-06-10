@@ -48,10 +48,14 @@ import {
   checkMultichatDirs,
   checkSpawnChatShell,
   matchAgentForPlugin,
+  // 2026-06-10 permission-gate hardening (incident lock + safe liveness probe)
+  checkPermissionEndpoint,
 } from './doctor.ts'
 
 /** A settings hook entry with a runnable command (what install-hooks writes). */
 const hookEntry = (marker: string) => ({ marker, hooks: [{ type: 'command', command: "bun 'scripts/post-hook.ts'" }] })
+/** A fileExists stub that reports everything present (gate hardening tests don't probe disk). */
+const existsSync0 = (_p: string): boolean => true
 
 describe('detectOS', () => {
   test('maps node platform strings', () => {
@@ -442,6 +446,11 @@ describe('fleet (multi-agent) checks', () => {
     webhookEnabled: true,
     hookPorts: ['8089'],
     settingsPath: '/srv/agents/a/settings.json',
+    workingDirectory: '/srv/agents/a/.claude/jc/plugin',
+    sessionName: 'channel-a',
+    bypassPermissions: false,
+    gateEnabled: null,
+    gateHookRegistered: false,
     ...over,
   })
   const byId = (checks: Check[]): Record<string, Check> => Object.fromEntries(checks.map((c) => [c.id, c]))
@@ -583,6 +592,11 @@ describe('fleet checks — review fixes (Codex HOLD round)', () => {
     webhookEnabled: true,
     hookPorts: ['8089'],
     settingsPath: '/srv/agents/a/settings.json',
+    workingDirectory: '/srv/agents/a/.claude/jc/plugin',
+    sessionName: 'channel-a',
+    bypassPermissions: false,
+    gateEnabled: null,
+    gateHookRegistered: false,
     ...over,
   })
   const byId = (checks: Check[]): Record<string, Check> => Object.fromEntries(checks.map((c) => [c.id, c]))
@@ -976,6 +990,8 @@ describe('matchAgentForPlugin', () => {
     workingDirectory: wd,
     sessionName: `channel-${name}`,
     bypassPermissions: false,
+    gateEnabled: null,
+    gateHookRegistered: false,
   })
   test('matches by WorkingDirectory first', () => {
     const a = matchAgentForPlugin([agent('arthas', '/srv/a/plugin', null), agent('thrall', '/srv/t/plugin', null)], '/srv/t/plugin')
@@ -1065,5 +1081,200 @@ describe('extractChatPolicies — bleed hardening (review M2)', () => {
     const p = extractChatPolicies(y)
     expect(p[0]?.mode).toBeNull()
     expect(p[0]?.tmuxMirror).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Permission-gate HARDENING (2026-06-10). The gate is the SOLE confirm path
+// under bypassPermissions; the Silvana incident shipped a bypass session with
+// NO gate hook and the doctor only SKIPPED. These tests lock the class of
+// failure so it can never ship undetected again.
+// ---------------------------------------------------------------------------
+
+describe('checkPermissionGate — incident lock (no gate under bypass = FAIL, not skip)', () => {
+  const settingsNoGate = { hooks: { PreToolUse: [hookEntry('dashi-channel-hook')] } }
+
+  test('no gate hook BUT unit runs bypassPermissions → FAIL (the Silvana incident)', () => {
+    const checks = checkPermissionGate(settingsNoGate, existsSync0, /*unitBypass*/ true)
+    const gate = checks.find((c) => c.id === 'permission-gate')
+    expect(gate?.status).toBe('fail')
+    expect(gate?.detail.toLowerCase()).toContain('bypass')
+  })
+
+  test('no gate hook BUT permission_gate.enabled=true in state config → FAIL', () => {
+    const checks = checkPermissionGate(settingsNoGate, existsSync0, /*unitBypass*/ null, /*gateEnabled*/ true)
+    expect(checks.find((c) => c.id === 'permission-gate')?.status).toBe('fail')
+  })
+
+  test('no gate hook, no bypass, gate disabled → skip (negative control, feature genuinely off)', () => {
+    const checks = checkPermissionGate(settingsNoGate, existsSync0, /*unitBypass*/ false, /*gateEnabled*/ false)
+    expect(checks).toHaveLength(1)
+    expect(checks[0]!.status).toBe('skip')
+  })
+
+  test('no gate hook, host unknown (unitBypass=null, gateEnabled=null) → skip (do not over-fail)', () => {
+    const checks = checkPermissionGate(settingsNoGate, existsSync0, /*unitBypass*/ null, /*gateEnabled*/ null)
+    expect(checks.find((c) => c.id === 'permission-gate')?.status).toBe('skip')
+  })
+})
+
+describe('checkPermissionGate — config↔hook mismatch (fails closed to DENY)', () => {
+  const gate = { marker: 'dashi-permission-gate-hook', hooks: [{ type: 'command', command: "bun '/p/scripts/permission-gate-hook.ts'" }] }
+  const ask = { marker: 'dashi-ask-user-question-hook', hooks: [{ type: 'command', command: "bun '/p/scripts/ask-user-question-hook.ts'" }] }
+
+  test('gate hook present but permission_gate.enabled=false → config-match FAIL (503 = DENY)', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [gate, ask] } }, existsSync0, true, /*gateEnabled*/ false)
+    const m = checks.find((c) => c.id === 'permission-gate-config-match')
+    expect(m?.status).toBe('fail')
+    expect(m?.detail).toContain('503')
+  })
+
+  test('gate hook present and permission_gate.enabled=true → config-match pass', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [gate, ask] } }, existsSync0, true, /*gateEnabled*/ true)
+    expect(checks.find((c) => c.id === 'permission-gate-config-match')?.status).toBe('pass')
+  })
+
+  test('gate hook present, gateEnabled unknown (null) → config-match warn', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [gate, ask] } }, existsSync0, true, /*gateEnabled*/ null)
+    expect(checks.find((c) => c.id === 'permission-gate-config-match')?.status).toBe('warn')
+  })
+
+  test('ask hook present but ask_user_question.enabled=false → ask-config-match FAIL', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [gate, ask] } }, existsSync0, true, true, /*askEnabled*/ false)
+    expect(checks.find((c) => c.id === 'permission-gate-ask-config-match')?.status).toBe('fail')
+  })
+
+  test('ask enabled + bypass but NO ask hook → ask-config-match FAIL (question wedges the pane)', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [gate] } }, existsSync0, true, true, /*askEnabled*/ true)
+    expect(checks.find((c) => c.id === 'permission-gate-ask-config-match')?.status).toBe('fail')
+  })
+
+  test('ask enabled + ask hook present → ask-config-match pass', () => {
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [gate, ask] } }, existsSync0, true, true, /*askEnabled*/ true)
+    expect(checks.find((c) => c.id === 'permission-gate-ask-config-match')?.status).toBe('pass')
+  })
+})
+
+describe('checkPermissionEndpoint — SAFE liveness probe (never POSTs the real route)', () => {
+  const listening = [{ addr: '127.0.0.1', port: '8093' }]
+  const ok = (_url: string) => ({ code: 200 })
+  const refused = (_url: string) => null
+  const unhealthy = (_url: string) => ({ code: 503 })
+
+  test('gate not required → skip', () => {
+    const c = checkPermissionEndpoint(false, '8093', listening, ok)
+    expect(c.status).toBe('skip')
+  })
+
+  test('gate required + nothing listening on the port → FAIL', () => {
+    const c = checkPermissionEndpoint(true, '8093', [], ok)
+    expect(c.status).toBe('fail')
+  })
+
+  test('gate required + listener up + /health 200 → pass', () => {
+    const c = checkPermissionEndpoint(true, '8093', listening, ok)
+    expect(c.status).toBe('pass')
+  })
+
+  test('gate required + listener up + /health 503 → warn (up but unhealthy)', () => {
+    const c = checkPermissionEndpoint(true, '8093', listening, unhealthy)
+    expect(c.status).toBe('warn')
+  })
+
+  test('gate required + listener up + probe refused/error → warn', () => {
+    const c = checkPermissionEndpoint(true, '8093', listening, refused)
+    expect(c.status).toBe('warn')
+  })
+
+  test('gate required + socket up but no probe function → warn', () => {
+    const c = checkPermissionEndpoint(true, '8093', listening, null)
+    expect(c.status).toBe('warn')
+  })
+
+  test('gate required but listeners unknown (null) → skip (no probe available)', () => {
+    const c = checkPermissionEndpoint(true, '8093', null, ok)
+    expect(c.status).toBe('skip')
+  })
+
+  test('gate required but port unknown → skip', () => {
+    const c = checkPermissionEndpoint(true, null, listening, ok)
+    expect(c.status).toBe('skip')
+  })
+})
+
+describe('fleet — Arthas-style bypass unit is detected as bypassPermissions:true', () => {
+  test('an Arthas-style ExecStart yields bypassPermissions:true', () => {
+    const unit = [
+      '[Service]',
+      'EnvironmentFile=/srv/arthas/private/channel.env',
+      'WorkingDirectory=/srv/arthas/.claude/jc/plugin',
+      `ExecStart=/usr/bin/tmux -L channel-arthas new-session -d -s channel-arthas 'claude --model sonnet --permission-mode bypassPermissions server:dashi-channel'`,
+    ].join('\n')
+    expect(parseUnitFile(unit).bypassPermissions).toBe(true)
+  })
+})
+
+describe('checkFleet — every bypass agent has the gate enabled + hook registered', () => {
+  const base = (name: string): FleetAgent => ({
+    name,
+    unitPath: `/etc/systemd/system/channel-${name}.service`,
+    sockets: [`channel-${name}`],
+    envPath: `/srv/${name}/channel.env`,
+    envReadable: true,
+    port: name === 'thrall' ? '8093' : '8103',
+    tokenDigest: `digest-${name}`,
+    stateDir: `/srv/${name}/state`,
+    workspaceRoot: `/srv/${name}/ws`,
+    webhookEnabled: true,
+    hookPorts: [],
+    settingsPath: `/srv/${name}/ws/.claude/settings.json`,
+    workingDirectory: `/srv/${name}/.claude/jc/plugin`,
+    sessionName: `channel-${name}`,
+    bypassPermissions: true,
+    gateEnabled: true,
+    gateHookRegistered: true,
+  })
+
+  test('all bypass agents gate-enabled + hook-registered → fleet-gate pass', () => {
+    const checks = checkFleet([base('thrall'), base('arthas')], null)
+    expect(checks.find((c) => c.id === 'fleet-gate')?.status).toBe('pass')
+  })
+
+  test('a bypass agent missing the gate hook → fleet-gate FAIL (the Silvana incident, fleet-wide)', () => {
+    const bad = { ...base('silvana'), gateHookRegistered: false }
+    const checks = checkFleet([base('thrall'), bad], null)
+    const fg = checks.find((c) => c.id === 'fleet-gate')
+    expect(fg?.status).toBe('fail')
+    expect(fg?.detail).toContain('silvana')
+  })
+
+  test('a bypass agent with gate hook but permission_gate.enabled=false → fleet-gate FAIL', () => {
+    const bad = { ...base('silvana'), gateEnabled: false }
+    const checks = checkFleet([base('thrall'), bad], null)
+    expect(checks.find((c) => c.id === 'fleet-gate')?.status).toBe('fail')
+  })
+
+  test('non-bypass agents are exempt from the gate requirement', () => {
+    const nonBypass = { ...base('garrosh'), bypassPermissions: false, gateEnabled: false, gateHookRegistered: false }
+    const checks = checkFleet([base('thrall'), nonBypass], null)
+    expect(checks.find((c) => c.id === 'fleet-gate')?.status).toBe('pass')
+  })
+
+  test('a bypass agent with gate hook but UNREADABLE config (gateEnabled=null) → fleet-gate WARN, not PASS (Codex review 2026-06-10)', () => {
+    // Emitting PASS here would claim "enabled=true" for an agent whose config
+    // we never read — against the incident-lock goal.
+    const unknown = { ...base('silvana'), gateEnabled: null }
+    const checks = checkFleet([base('thrall'), unknown], null)
+    const fg = checks.find((c) => c.id === 'fleet-gate')
+    expect(fg?.status).toBe('warn')
+    expect(fg?.detail).toContain('silvana')
+    expect(fg?.detail).toContain('unverified')
+  })
+
+  test('a known FAIL outranks an unverified config (fail beats warn)', () => {
+    const unknown = { ...base('silvana'), gateEnabled: null }
+    const missing = { ...base('kaelthas'), gateHookRegistered: false }
+    const checks = checkFleet([base('thrall'), unknown, missing], null)
+    expect(checks.find((c) => c.id === 'fleet-gate')?.status).toBe('fail')
   })
 })
