@@ -118,6 +118,73 @@ describe('built-in confirm bash (interpreter/exfil evasion)', () => {
   })
 })
 
+describe('systemctl is verb-aware — read-only verbs and mentions do not confirm (live FP 2026-06-10)', () => {
+  test('read-only systemctl verbs auto-allow', () => {
+    // `systemctl cat channel-thrall.service` raised a real confirm card while
+    // diagnosing a service — reading a unit file mutates nothing.
+    expect(classify('Bash', { command: 'systemctl cat channel-thrall.service' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl status nginx' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl show -p MainPID foo.service' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl list-units --failed' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl is-active dashi-worker' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl --user is-enabled foo' }, VARIANT1).tier).toBe('allow')
+  })
+  test('mentioning systemctl in a grep pattern / text does not confirm', () => {
+    // `grep -rn "systemctl" src/security/` raised a real confirm card — the
+    // word appeared as a search pattern, not as an invocation.
+    expect(classify('Bash', { command: 'grep -rn "systemctl" src/security/' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'echo systemctl' }, VARIANT1).tier).toBe('allow')
+  })
+  test('mutating systemctl verbs confirm, local and remote', () => {
+    expect(classify('Bash', { command: 'systemctl restart dashi-brain-swarm-worker' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'systemctl daemon-reload' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'systemctl enable --now foo' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'systemctl --user restart foo' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: "ssh root@65.109.137.239 'systemctl restart worker'" }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'systemctl stop gateway && echo done' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: '/usr/bin/systemctl kill foo' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('unknown or indirect systemctl verbs fail safe to confirm', () => {
+    expect(classify('Bash', { command: 'systemctl frobnicate x' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'v=restart; systemctl $v foo' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('a read-only verb cannot mask a mutating sibling occurrence', () => {
+    expect(
+      classify('Bash', { command: 'systemctl cat foo.service && systemctl restart foo' }, VARIANT1).tier,
+    ).toBe('confirm')
+  })
+  test('detached flag values cannot displace the verb (Fable review 2026-06-10)', () => {
+    // `-H host` / `--root /mnt` put a non-verb token in verb position; the
+    // mutating verb after it must still confirm — these are remote/offline
+    // service mutations, the exact thing the gate exists for.
+    expect(classify('Bash', { command: 'systemctl -H root@65.109.137.239 restart worker' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'systemctl -H my.host.example restart worker' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'systemctl -M mycontainer.raw restart worker' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'systemctl --root /mnt enable foo' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'systemctl -o cat restart foo' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'systemctl -n 50 restart foo' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('unknown flag with a path value still fails safe — flags prove invocation shape', () => {
+    expect(classify('Bash', { command: 'systemctl --future-flag /some/path restart x' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('bare systemctl and bare help flag stay read-only', () => {
+    expect(classify('Bash', { command: 'systemctl' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl -h' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl -H root@host status worker' }, VARIANT1).tier).toBe('allow')
+  })
+  test('quoted verbs resolve through tokenization', () => {
+    expect(classify('Bash', { command: "systemctl 'restart' foo" }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'backslash does not hide it: \\systemctl restart foo' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('attached/equals flag forms and wrappers still confirm (Codex review 2026-06-10)', () => {
+    expect(classify('Bash', { command: 'systemctl --root=/mnt enable foo' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'systemctl -proot restart x' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'sudo systemctl restart nginx' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'SYSTEMD_PAGER=cat systemctl restart worker' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'systemctl \\\n  restart worker' }, VARIANT1).tier).toBe('confirm')
+  })
+})
+
 describe('git -C (change-dir) is NOT git -c (config) — case-sensitive (live FP 2026-06-10)', () => {
   test('`git -C <dir> …` auto-allows — uppercase -C must not trip the -c surface', () => {
     expect(classify('Bash', { command: 'git -C /home/x/repo log --oneline -1' }, VARIANT1).tier).toBe('allow')

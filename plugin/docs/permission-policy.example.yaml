@@ -15,8 +15,9 @@
 # .env, *.pem, *.key, .ssh, .aws, gcloud, /proc/*/environ, and catastrophic
 # shell (rm -rf /, fork bombs, mkfs, dd to a disk). You cannot un-deny those.
 # A built-in confirm ALWAYS fires for sudo, git push, rm -rf, curl|sh,
-# base64 -d|sh, systemctl, kill/pkill, docker, npm publish, package installs —
-# unless you explicitly allow-list the exact form below.
+# base64 -d|sh, mutating systemctl (verb-aware: status/cat/show/list-* flow,
+# start/stop/restart/enable/… confirm), kill/pkill, docker, npm publish,
+# package installs — unless you explicitly allow-list the exact form below.
 
 version: 1
 

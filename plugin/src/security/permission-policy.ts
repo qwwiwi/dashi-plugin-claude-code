@@ -203,7 +203,6 @@ const BUILTIN_CONFIRM_BASH: readonly string[] = [
   'git clean -',
   'chmod -r',
   'chown -r',
-  'systemctl',
   'kill ',
   'pkill',
   'docker ',
@@ -511,6 +510,85 @@ function gitExecSurface(rawCommand: string): boolean {
   // Indirection-free, balanced: the flag can only belong to git if a
   // git-bearing segment literally carries it.
   return segs.some((s) => /\bgit\b/i.test(s) && gitFlagPresent(s))
+}
+
+// ── systemctl: verb-aware confirm (live FPs 2026-06-10) ─────────────────
+//
+// The blanket `systemctl` substring rule fired on `systemctl cat <unit>`
+// (read-only diagnostics) and even on `grep -rn "systemctl" src/` (the word
+// as a search pattern) — both raised real confirm cards. Only MUTATING
+// systemd operations need the owner's tap; reads and mere mentions must
+// flow. Like gitExecSurface this check is non-overridable: a mutating
+// systemctl (service stop/restart — including the agent's own comms
+// channel) always reaches the owner.
+//
+// Per `systemctl` token occurrence we look at the first non-flag token that
+// follows — systemd's subcommand position (flags that take a DETACHED value,
+// `-H host` / `--root /mnt`, consume that value so it can't be mistaken for
+// the verb — Fable review 2026-06-10: `systemctl -H root@host restart x`
+// must not slip through as a "mention"):
+//   * read-only verb (status/cat/show/list-*/is-*…) → safe;
+//   * `$`/backtick verb (variable indirection)       → confirm (fail-safe);
+//   * any other verb-shaped word — mutating OR unknown → confirm (fail-safe
+//     for future/unknown verbs);
+//   * not verb-shaped (a path, a number, a pattern tail) → if flags were
+//     skipped to get here this is invocation-shaped, confirm; otherwise a
+//     textual mention (`grep -rn "systemctl" src/`), safe. A real invocation
+//     needs a verb to mutate anything (`systemctl` alone just lists units).
+// Occurrences are OR'ed — a read-only hit cannot mask a mutating sibling.
+// Accepted residuals under the agent-mistake threat model (mirrors the
+// gitExecSurface note): a verb arriving through a pipe
+// (`echo "restart foo" | xargs systemctl`) is not resolved here, and a
+// flagless non-verb-shaped first argument (`systemctl ./restart`) reads as
+// a mention — systemd itself rejects such argv, so nothing mutates.
+//
+// MIGRATION (2026-06-10): the literal 'systemctl' entry left
+// BUILTIN_CONFIRM_BASH, so a confirm_overrides list naming it now fails
+// schema validation — delete that override; the verb-aware rule is
+// non-overridable by design (like gitExecSurface).
+const SYSTEMCTL_READONLY_VERBS = new Set([
+  'status', 'cat', 'show', 'help',
+  'is-active', 'is-enabled', 'is-failed', 'is-system-running',
+  'list-units', 'list-unit-files', 'list-dependencies', 'list-timers',
+  'list-sockets', 'list-jobs', 'list-machines', 'list-paths', 'list-automounts',
+  'get-default', 'show-environment',
+])
+// Flags whose value is a SEPARATE token. Lowercased command collapses
+// `-H` (--host) into `-h` (help) — treating `-h` as value-taking is safe in
+// both readings (bare `systemctl -h` just ends with no verb → allow).
+const SYSTEMCTL_VALUE_FLAGS = new Set([
+  '-h', '-m', '-p', '-t', '-n', '-o', '-s',
+  '--host', '--machine', '--root', '--property', '--type', '--lines',
+  '--output', '--signal', '--kill-who', '--state', '--job-mode',
+])
+const SYSTEMCTL_FLAG_RE = /^--?[a-z0-9-]+(=.*)?$/
+const SYSTEMCTL_VERB_SHAPED_RE = /^[a-z][a-z-]*$/
+
+function systemctlMutation(commandLower: string): boolean {
+  if (!commandLower.includes('systemctl')) return false
+  const tokens = commandLower.split(/[\s"'`;|&()<>\\]+/).filter((t) => t.length > 0)
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i] as string
+    if (t !== 'systemctl' && !t.endsWith('/systemctl')) continue
+    let j = i + 1
+    let sawFlag = false
+    while (j < tokens.length) {
+      const tok = tokens[j] as string
+      if (SYSTEMCTL_VALUE_FLAGS.has(tok)) { sawFlag = true; j += 2; continue }
+      if (SYSTEMCTL_FLAG_RE.test(tok)) { sawFlag = true; j++; continue }
+      break
+    }
+    const verb = tokens[j]
+    if (verb === undefined) continue // bare systemctl lists units — read-only
+    if (verb.startsWith('$')) return true // variable verb — cannot prove safe
+    if (SYSTEMCTL_READONLY_VERBS.has(verb)) continue
+    if (SYSTEMCTL_VERB_SHAPED_RE.test(verb)) return true // mutating or unknown
+    // Not verb-shaped. Flags between `systemctl` and here prove invocation
+    // shape (a mention carries no systemctl flags) — fail safe to confirm.
+    if (sawFlag) return true
+    // Otherwise a mention (path / number / pattern tail), not a call.
+  }
+  return false
 }
 
 const INTERPRETER_RE = /\b(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/
@@ -832,6 +910,11 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // case-sensitive `-c` check distinguishes `git -C` from `git -c`.
     if (gitExecSurface(rawCommand!)) {
       return { tier: 'confirm', reason: 'git config/hook execution surface needs confirmation', matchedRule: 'builtin:confirm_bash:git-exec-surface' }
+    }
+    // Non-overridable: mutating systemd operations (verb-aware — read-only
+    // verbs and textual mentions of "systemctl" flow through).
+    if (systemctlMutation(commandLower)) {
+      return { tier: 'confirm', reason: 'mutating systemctl needs confirmation', matchedRule: 'builtin:confirm_bash:systemctl-mutation' }
     }
   }
 
