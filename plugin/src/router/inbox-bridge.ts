@@ -124,9 +124,10 @@ export const OutboxMessageSchema = z
     reply_to: z.string().optional(),
     timestamp: z.string().min(1),
     format: OutboxMessageFormatSchema,
-    // Absolute paths of attachments to send AFTER the text. The router
-    // validates each path server-side (workspace-confined + secret denylist +
-    // size cap) before sending — the writer/session never holds the bot token.
+    // Absolute paths of attachments to send AFTER the text. The router checks
+    // each path server-side (secret denylist on path AND realpath + symlink
+    // reject + size cap; NOT workspace-confined, per owner) before sending — the
+    // writer/session never holds the bot token.
     files: z.array(z.string().min(1)).optional(),
   })
   .refine(

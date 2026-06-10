@@ -25,7 +25,7 @@
 //   does not keep the process alive when server.ts shuts down without
 //   an explicit stop() — defence in depth.
 
-import { readdir, stat, unlink } from 'node:fs/promises'
+import { lstat, readdir, realpath, unlink } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 
 import type { TelegramApi } from '../channel/tools.js'
@@ -106,16 +106,35 @@ function parseMessageId(raw: string): number | undefined {
 }
 
 // The ONLY hard limit on multichat attachments (warchief 2026-06-10: «только
-// секреты не слать, всё остальное можно»). Matches secret material by path so a
-// public-group session — or a prompt injected by a group member — cannot exfil
-// credentials via sendDocument. Deliberately narrow (env files, private-key
-// extensions, a `secrets/` segment, ssh keys, service-account json) so it does
-// NOT over-block ordinary files that merely contain a word like "token".
-const SECRET_ATTACHMENT_RE =
-  /(?:^|\/)\.env(?:\.[^/]*)?$|(?:^|\/)\.?secrets?\/|\.(?:pem|key|p12|pfx|asc|gpg|ppk|jks|keystore)$|(?:^|\/)\.ssh\/|(?:^|\/)id_(?:rsa|ed25519|ecdsa|dsa)$|(?:^|\/)\.(?:npmrc|netrc|pgpass)$|(?:^|\/)sa-[\w-]*\.json$|\.secret$/i
+// секреты не слать, всё остальное можно» — deny secrets by path, allow every
+// other file; NO workspace confinement). This is the exfil gate for a session
+// that may live in a PUBLIC group: a group member's prompt injection must not be
+// able to attach a credential file. The check runs server-side, on BOTH the
+// raw path AND its realpath (a non-secret-named symlink can resolve into a
+// secret — see sendOutboxFiles). Covers the real credential STORES, not just a
+// casual word, so it neither under-blocks (Codex/automated review HIGH) nor
+// over-blocks ordinary files named e.g. "token-economy.md".
+const SECRET_ATTACHMENT_PATTERNS: RegExp[] = [
+  /\.env$|\.envrc$|\.env\.[^/]*$/i, //                          env files (.env, prod.env, .env.production, .envrc)
+  /\.(?:pem|key|p12|pfx|asc|gpg|ppk|jks|keystore|kdbx)(?:\.(?:bak|old|orig|txt|save|[0-9]+))?$/i, // private-key material (+ backups)
+  /(?:^|\/)\.?secrets?(?:\.d)?\//i, //                          a secrets/ directory
+  /(?:^|\/)\.ssh\//i, //                                        ssh dir
+  /(?:^|\/)id_(?:rsa|ed25519|ecdsa|dsa)(?:\.[^/]*)?$/i, //      ssh private keys (+ .pub/.bak)
+  /(?:^|\/)\.(?:npmrc|netrc|pgpass|pypirc|git-credentials)$/i,
+  /(?:^|\/)\.(?:aws|kube|gnupg|codex)\//i, //                   credential-store dirs
+  /(?:^|\/)\.docker\/config\.json$/i,
+  /(?:^|\/)\.config\/(?:gcloud|gh)\//i,
+  /(?:^|\/)\.cargo\/credentials/i,
+  /(?:^|\/)\.gem\/credentials$/i,
+  /(?:^|\/)\.(?:claude|credentials)\.json$/i, //                .claude.json / .credentials.json
+  /(?:^|\/)sa-[\w-]*\.json$/i,
+  /(?:^|\/)(?:service[_-]?account|firebase-adminsdk)[\w.-]*\.json$/i,
+  /(?:^|\/)(?:credentials?|auth|secret|token|apikey|api[_-]?key)\.(?:json|ya?ml|toml|txt|ini|env)$/i,
+  /\.secrets?$/i,
+]
 
 export function isSecretAttachmentPath(filePath: string): boolean {
-  return SECRET_ATTACHMENT_RE.test(filePath)
+  return SECRET_ATTACHMENT_PATTERNS.some((re) => re.test(filePath))
 }
 
 // Per-chat outbox loop bookkeeping. fs.watch is intentionally NOT used
@@ -948,8 +967,19 @@ export class MultichatRouter {
           })
           continue
         }
-        const st = await stat(filePath)
-        if (!st.isFile()) {
+        // lstat (does NOT follow symlinks) so a symlink named like an innocuous
+        // file cannot smuggle a secret target past the name-based denylist.
+        const ls = await lstat(filePath)
+        if (ls.isSymbolicLink()) {
+          this.logger.warn('router.outbox.file_rejected', {
+            chat_id: chatId,
+            original: origin,
+            file: basename(filePath),
+            reason: 'symlink',
+          })
+          continue
+        }
+        if (!ls.isFile()) {
           this.logger.warn('router.outbox.file_rejected', {
             chat_id: chatId,
             original: origin,
@@ -958,13 +988,28 @@ export class MultichatRouter {
           })
           continue
         }
-        if (st.size > MAX_ATTACHMENT_BYTES) {
+        if (ls.size > MAX_ATTACHMENT_BYTES) {
           this.logger.warn('router.outbox.file_rejected', {
             chat_id: chatId,
             original: origin,
             file: basename(filePath),
             reason: 'too_large',
-            size: st.size,
+            size: ls.size,
+          })
+          continue
+        }
+        // Re-check the CANONICAL path: a symlinked PARENT directory could route
+        // an innocuous-looking path into a secret store. realpath resolves all
+        // links; if the real target is a secret, refuse. (Residual: a TOCTOU
+        // swap after this check, or the agent copying a secret to an innocuous
+        // name, is active-agent malice the owner accepted — its Bash is gated.)
+        const realPath = await realpath(filePath)
+        if (isSecretAttachmentPath(realPath)) {
+          this.logger.warn('router.outbox.file_rejected_secret', {
+            chat_id: chatId,
+            original: origin,
+            file: basename(filePath),
+            reason: 'resolved_to_secret',
           })
           continue
         }

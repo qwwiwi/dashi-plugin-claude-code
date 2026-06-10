@@ -83,8 +83,9 @@ _CHAT_ID_RE = re.compile(r"-?\d+")
 # `[[file: /abs/path]]`. The capture is the path; the router validates it
 # authoritatively (secret denylist + size cap) before sending. We never read or
 # shell out to the path here, so a marker can never leak file content via the
-# hook. Newlines excluded so a marker stays single-line.
-_FILE_MARKER_RE = re.compile(r"\[\[file:\s*([^\]\n]+?)\s*\]\]")
+# hook. Single-line only: [ \t]* (NOT \s*, which would swallow a newline before
+# the path) plus a newline-free capture keep a marker on one line.
+_FILE_MARKER_RE = re.compile(r"\[\[file:[ \t]*([^\]\n]+?)[ \t]*\]\]")
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger("stop-to-outbox")
