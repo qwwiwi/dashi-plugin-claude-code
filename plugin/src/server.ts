@@ -823,6 +823,12 @@ if (
           telegramApi.sendMessage(chatId, text, opts),
         sendChatAction: (chatId, action) =>
           telegramApi.sendChatAction(chatId, action),
+        // Outbox attachments — the safe-wrapped API holds the token; the
+        // router validates each path before calling this.
+        sendDocument: (chatId, filePath, opts) =>
+          telegramApi.sendDocument(chatId, filePath, opts),
+        sendPhoto: (chatId, filePath, opts) =>
+          telegramApi.sendPhoto(chatId, filePath, opts),
       },
       logger: log,
     })

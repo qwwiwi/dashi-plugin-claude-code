@@ -682,3 +682,65 @@ describe('stop-to-outbox.py — transcript-flush race (extended-thinking)', () =
     expect(listOutboxJson().length).toBe(0)
   })
 })
+
+describe('attachment markers ([[file: …]])', () => {
+  const baseEnv = () => ({ CHAT_ID, MULTICHAT_STATE_DIR: stateDir })
+
+  test('extracts a [[file: …]] marker into files[] and strips it from text', () => {
+    const transcript = writeTranscript([
+      userLine('скинь презентацию'),
+      assistantLine([
+        { type: 'text', text: 'Вот файл. [[file: /home/openclaw/x/present.html]] Готово.' },
+      ]),
+    ])
+    const r = run(baseEnv(), { transcript_path: transcript, session_id: 's1' })
+    expect(r.code).toBe(0)
+    const files = listOutboxJson()
+    expect(files.length).toBe(1)
+    const msg = readOutboxPayload(files[0] as string)
+    expect(msg.files).toEqual(['/home/openclaw/x/present.html'])
+    // marker removed from the visible text
+    expect(String(msg.text)).not.toContain('[[file:')
+    expect(String(msg.text)).toContain('Вот файл.')
+    expect(String(msg.text)).toContain('Готово.')
+  })
+
+  test('file-only reply (text is only the marker) omits text, keeps files', () => {
+    const transcript = writeTranscript([
+      userLine('файл'),
+      assistantLine([{ type: 'text', text: '[[file: /tmp/a.pdf]]' }]),
+    ])
+    const r = run(baseEnv(), { transcript_path: transcript, session_id: 's1' })
+    expect(r.code).toBe(0)
+    const files = listOutboxJson()
+    expect(files.length).toBe(1)
+    const msg = readOutboxPayload(files[0] as string)
+    expect(msg.files).toEqual(['/tmp/a.pdf'])
+    expect(msg.text).toBeUndefined()
+  })
+
+  test('multiple markers collect into files[] in order', () => {
+    const transcript = writeTranscript([
+      userLine('два файла'),
+      assistantLine([
+        { type: 'text', text: 'Оба тут [[file: /tmp/1.png]] и [[file: /tmp/2.txt]].' },
+      ]),
+    ])
+    const r = run(baseEnv(), { transcript_path: transcript, session_id: 's1' })
+    expect(r.code).toBe(0)
+    const msg = readOutboxPayload(listOutboxJson()[0] as string)
+    expect(msg.files).toEqual(['/tmp/1.png', '/tmp/2.txt'])
+  })
+
+  test('no marker → no files key (unchanged text-only behaviour)', () => {
+    const transcript = writeTranscript([
+      userLine('привет'),
+      assistantLine([{ type: 'text', text: 'Здравствуй, вождь.' }]),
+    ])
+    const r = run(baseEnv(), { transcript_path: transcript, session_id: 's1' })
+    expect(r.code).toBe(0)
+    const msg = readOutboxPayload(listOutboxJson()[0] as string)
+    expect(msg.files).toBeUndefined()
+    expect(msg.text).toBe('Здравствуй, вождь.')
+  })
+})

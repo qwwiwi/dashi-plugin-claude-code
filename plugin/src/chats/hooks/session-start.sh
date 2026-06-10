@@ -129,6 +129,17 @@ parts = [persona.rstrip()]
 if reminder:
     parts.append('---')
     parts.append(reminder.strip())
+# Capability note (all chats): how to attach a file from a multichat session,
+# which has no reply tool. The Stop hook turns the marker into an outbox
+# attachment and the router sends it AFTER the text. Secrets are refused.
+parts.append('---')
+parts.append(
+    'Отправка файла в чат: в этой сессии нет reply-инструмента, поэтому чтобы '
+    'прикрепить файл, добавь в текст ответа маркер [[file: /абсолютный/путь]] '
+    '(можно несколько). Файл уйдёт после текста. НЕ читай токен и не дёргай '
+    'Telegram API напрямую. Секреты (.env, ключи, *.pem/*.key, secrets/) '
+    'отправлять нельзя — они будут отклонены.'
+)
 additional_context = '\n\n'.join(parts)
 
 payload = {

@@ -25,12 +25,13 @@
 //   does not keep the process alive when server.ts shuts down without
 //   an explicit stop() — defence in depth.
 
-import { readdir, unlink } from 'node:fs/promises'
-import { join } from 'node:path'
+import { lstat, readdir, realpath, unlink } from 'node:fs/promises'
+import { basename, join } from 'node:path'
 
 import type { TelegramApi } from '../channel/tools.js'
 import { splitMessage } from '../format/chunk.js'
 import { markdownToTelegramHtml } from '../format/html.js'
+import { isPhotoExtension, MAX_ATTACHMENT_BYTES } from '../security/paths.js'
 import type { Logger } from '../log.js'
 import {
   assertValidChatId,
@@ -56,6 +57,13 @@ import type { TmuxSessionPool } from './tmux-session-pool.js'
 export interface MultichatTelegramApi {
   sendMessage: TelegramApi['sendMessage']
   sendChatAction: TelegramApi['sendChatAction']
+  // Outbox attachments (parity with the launcher reply tool). Optional so the
+  // many existing router test fixtures (text-only) need no change; production
+  // (server.ts) always wires both. When absent, file sends are skipped. The
+  // router checks each path (secret denylist + size cap) before calling these;
+  // the bot token stays inside the safe-wrapped API.
+  sendDocument?: TelegramApi['sendDocument']
+  sendPhoto?: TelegramApi['sendPhoto']
 }
 
 export interface RouterDeps {
@@ -95,6 +103,38 @@ function parseMessageId(raw: string): number | undefined {
   const n = Number(raw)
   if (!Number.isSafeInteger(n) || n <= 0) return undefined
   return n
+}
+
+// The ONLY hard limit on multichat attachments (warchief 2026-06-10: «только
+// секреты не слать, всё остальное можно» — deny secrets by path, allow every
+// other file; NO workspace confinement). This is the exfil gate for a session
+// that may live in a PUBLIC group: a group member's prompt injection must not be
+// able to attach a credential file. The check runs server-side, on BOTH the
+// raw path AND its realpath (a non-secret-named symlink can resolve into a
+// secret — see sendOutboxFiles). Covers the real credential STORES, not just a
+// casual word, so it neither under-blocks (Codex/automated review HIGH) nor
+// over-blocks ordinary files named e.g. "token-economy.md".
+const SECRET_ATTACHMENT_PATTERNS: RegExp[] = [
+  /\.env$|\.envrc$|\.env\.[^/]*$/i, //                          env files (.env, prod.env, .env.production, .envrc)
+  /\.(?:pem|key|p12|pfx|asc|gpg|ppk|jks|keystore|kdbx)(?:\.(?:bak|old|orig|txt|save|[0-9]+))?$/i, // private-key material (+ backups)
+  /(?:^|\/)\.?secrets?(?:\.d)?\//i, //                          a secrets/ directory
+  /(?:^|\/)\.ssh\//i, //                                        ssh dir
+  /(?:^|\/)id_(?:rsa|ed25519|ecdsa|dsa)(?:\.[^/]*)?$/i, //      ssh private keys (+ .pub/.bak)
+  /(?:^|\/)\.(?:npmrc|netrc|pgpass|pypirc|git-credentials)$/i,
+  /(?:^|\/)\.(?:aws|kube|gnupg|codex)\//i, //                   credential-store dirs
+  /(?:^|\/)\.docker\/config\.json$/i,
+  /(?:^|\/)\.config\/(?:gcloud|gh)\//i,
+  /(?:^|\/)\.cargo\/credentials/i,
+  /(?:^|\/)\.gem\/credentials$/i,
+  /(?:^|\/)\.(?:claude|credentials)\.json$/i, //                .claude.json / .credentials.json
+  /(?:^|\/)sa-[\w-]*\.json$/i,
+  /(?:^|\/)(?:service[_-]?account|firebase-adminsdk)[\w.-]*\.json$/i,
+  /(?:^|\/)(?:credentials?|auth|secret|token|apikey|api[_-]?key)\.(?:json|ya?ml|toml|txt|ini|env)$/i,
+  /\.secrets?$/i,
+]
+
+export function isSecretAttachmentPath(filePath: string): boolean {
+  return SECRET_ATTACHMENT_PATTERNS.some((re) => re.test(filePath))
 }
 
 // Per-chat outbox loop bookkeeping. fs.watch is intentionally NOT used
@@ -801,71 +841,83 @@ export class MultichatRouter {
     // the same 4000-char boundary so a long group answer doesn't trip
     // Telegram's 4096 cap. safe-telegram-api still validates/redacts
     // each chunk on the way out.
-    let text = message.text
-    if (message.format === 'auto') {
-      text = markdownToTelegramHtml(text)
-      opts.parse_mode = 'HTML'
-    } else if (message.format === 'html') {
-      opts.parse_mode = 'HTML'
-    } else if (message.format === 'markdown') {
-      opts.parse_mode = 'MarkdownV2'
-    }
-    // format === 'text' → omit parse_mode entirely.
-    //
-    // Partial-delivery policy for multi-chunk sends (Codex review
-    // 2026-06-05, MED #1): if chunk 0 fails, nothing reached the user —
-    // dead-letter the claim like any single-message failure (operator
-    // retry is safe). If a LATER chunk fails, the head of the answer is
-    // already user-visible — retrying the whole payload would duplicate
-    // it, so we log `partial_delivery` and CONFIRM the claim instead
-    // (same «never duplicate the user-visible message» stance as the
-    // confirm-failure path below).
-    let sentChunks = 0
-    try {
-      const chunks = message.format === 'auto' ? splitMessage(text) : [text]
-      for (let i = 0; i < chunks.length; i++) {
-        // reply_to threads only the first chunk — mirrors the reply
-        // tool's chunking contract (no quote-spam on long answers).
-        const chunkOpts = i === 0 ? opts : { ...opts }
-        if (i > 0) delete chunkOpts.reply_to_message_id
-        await this.telegramApi.sendMessage(chatId, chunks[i] as string, chunkOpts)
-        sentChunks++
+    // text is optional (a file-only reply has none — schema requires text OR
+    // files). format === 'text' → omit parse_mode entirely.
+    const body = message.text ?? ''
+    if (body.length > 0) {
+      let text = body
+      if (message.format === 'auto') {
+        text = markdownToTelegramHtml(body)
+        opts.parse_mode = 'HTML'
+      } else if (message.format === 'html') {
+        opts.parse_mode = 'HTML'
+      } else if (message.format === 'markdown') {
+        opts.parse_mode = 'MarkdownV2'
       }
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err)
-      if (sentChunks > 0) {
-        this.logger.error('router.outbox.partial_delivery', {
+      // Partial-delivery policy for multi-chunk sends (Codex review
+      // 2026-06-05, MED #1): if chunk 0 fails, nothing reached the user —
+      // dead-letter the claim like any single-message failure (operator
+      // retry is safe). If a LATER chunk fails, the head of the answer is
+      // already user-visible — retrying the whole payload would duplicate
+      // it, so we log `partial_delivery` and CONFIRM the claim instead
+      // (same «never duplicate the user-visible message» stance as the
+      // confirm-failure path below).
+      let sentChunks = 0
+      try {
+        const chunks = message.format === 'auto' ? splitMessage(text) : [text]
+        for (let i = 0; i < chunks.length; i++) {
+          // reply_to threads only the first chunk — mirrors the reply
+          // tool's chunking contract (no quote-spam on long answers).
+          const chunkOpts = i === 0 ? opts : { ...opts }
+          if (i > 0) delete chunkOpts.reply_to_message_id
+          await this.telegramApi.sendMessage(chatId, chunks[i] as string, chunkOpts)
+          sentChunks++
+        }
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err)
+        if (sentChunks > 0) {
+          this.logger.error('router.outbox.partial_delivery', {
+            chat_id: chatId,
+            original: claim.originalName,
+            sent_chunks: sentChunks,
+            error: reason,
+          })
+          await confirmOutboxClaim(claim).catch((confirmErr: unknown) => {
+            this.logger.warn('router.outbox.confirm_failed', {
+              chat_id: chatId,
+              original: claim.originalName,
+              error:
+                confirmErr instanceof Error
+                  ? confirmErr.message
+                  : String(confirmErr),
+            })
+          })
+          return
+        }
+        this.logger.warn('router.outbox.send_failed', {
           chat_id: chatId,
-          original: claim.originalName,
-          sent_chunks: sentChunks,
           error: reason,
+          original: claim.originalName,
         })
-        await confirmOutboxClaim(claim).catch((confirmErr: unknown) => {
-          this.logger.warn('router.outbox.confirm_failed', {
+        await rejectOutboxClaim(claim, { reason }).catch((rejectErr: unknown) => {
+          this.logger.error('router.outbox.dead_letter_failed', {
             chat_id: chatId,
             original: claim.originalName,
             error:
-              confirmErr instanceof Error
-                ? confirmErr.message
-                : String(confirmErr),
+              rejectErr instanceof Error ? rejectErr.message : String(rejectErr),
           })
         })
         return
       }
-      this.logger.warn('router.outbox.send_failed', {
-        chat_id: chatId,
-        error: reason,
-        original: claim.originalName,
-      })
-      await rejectOutboxClaim(claim, { reason }).catch((rejectErr: unknown) => {
-        this.logger.error('router.outbox.dead_letter_failed', {
-          chat_id: chatId,
-          original: claim.originalName,
-          error:
-            rejectErr instanceof Error ? rejectErr.message : String(rejectErr),
-        })
-      })
-      return
+    }
+
+    // Attachments (best-effort, sent AFTER the text). Each path is checked
+    // server-side (NOT a secret + exists + not a dir + size cap) before the
+    // token-holding API is touched. A rejected/failed attachment is logged and
+    // skipped — it never undoes an already-sent text reply, and a secret/size
+    // rejection is permanent so we do NOT dead-letter/retry the claim.
+    if (message.files !== undefined && message.files.length > 0) {
+      await this.sendOutboxFiles(chatId, message.files, claim.originalName)
     }
     await confirmOutboxClaim(claim).catch((confirmErr: unknown) => {
       // Confirm failure means the file lingers in processing/ but the
@@ -879,6 +931,102 @@ export class MultichatRouter {
           confirmErr instanceof Error ? confirmErr.message : String(confirmErr),
       })
     })
+  }
+
+  /**
+   * Send outbox attachments AFTER the text. Best-effort and independent: each
+   * file is validated (NOT a secret, exists, regular file, ≤ MAX_ATTACHMENT_BYTES)
+   * then sent through the token-holding safe API; a rejected/failed file is
+   * logged and skipped so it never undoes an already-sent text reply. Per the
+   * warchief the ONLY hard limit is the secret denylist — any other file (any
+   * path) is allowed. Photos go via sendPhoto (inline preview), the rest via
+   * sendDocument.
+   */
+  private async sendOutboxFiles(
+    chatId: string,
+    files: string[],
+    origin: string,
+  ): Promise<void> {
+    const sendDoc = this.telegramApi.sendDocument
+    const sendImg = this.telegramApi.sendPhoto
+    if (sendDoc === undefined || sendImg === undefined) {
+      this.logger.warn('router.outbox.file_unsupported', {
+        chat_id: chatId,
+        original: origin,
+        count: files.length,
+      })
+      return
+    }
+    for (const filePath of files) {
+      try {
+        if (isSecretAttachmentPath(filePath)) {
+          this.logger.warn('router.outbox.file_rejected_secret', {
+            chat_id: chatId,
+            original: origin,
+            file: basename(filePath),
+          })
+          continue
+        }
+        // lstat (does NOT follow symlinks) so a symlink named like an innocuous
+        // file cannot smuggle a secret target past the name-based denylist.
+        const ls = await lstat(filePath)
+        if (ls.isSymbolicLink()) {
+          this.logger.warn('router.outbox.file_rejected', {
+            chat_id: chatId,
+            original: origin,
+            file: basename(filePath),
+            reason: 'symlink',
+          })
+          continue
+        }
+        if (!ls.isFile()) {
+          this.logger.warn('router.outbox.file_rejected', {
+            chat_id: chatId,
+            original: origin,
+            file: basename(filePath),
+            reason: 'not_a_file',
+          })
+          continue
+        }
+        if (ls.size > MAX_ATTACHMENT_BYTES) {
+          this.logger.warn('router.outbox.file_rejected', {
+            chat_id: chatId,
+            original: origin,
+            file: basename(filePath),
+            reason: 'too_large',
+            size: ls.size,
+          })
+          continue
+        }
+        // Re-check the CANONICAL path: a symlinked PARENT directory could route
+        // an innocuous-looking path into a secret store. realpath resolves all
+        // links; if the real target is a secret, refuse. (Residual: a TOCTOU
+        // swap after this check, or the agent copying a secret to an innocuous
+        // name, is active-agent malice the owner accepted — its Bash is gated.)
+        const realPath = await realpath(filePath)
+        if (isSecretAttachmentPath(realPath)) {
+          this.logger.warn('router.outbox.file_rejected_secret', {
+            chat_id: chatId,
+            original: origin,
+            file: basename(filePath),
+            reason: 'resolved_to_secret',
+          })
+          continue
+        }
+        if (isPhotoExtension(filePath)) {
+          await sendImg(chatId, filePath, {})
+        } else {
+          await sendDoc(chatId, filePath, {})
+        }
+      } catch (err) {
+        this.logger.warn('router.outbox.file_send_failed', {
+          chat_id: chatId,
+          original: origin,
+          file: basename(filePath),
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
   }
 }
 

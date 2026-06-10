@@ -79,6 +79,14 @@ TAIL_BYTES = 1024 * 1024
 # / wrong-chat writes from a malformed env value.
 _CHAT_ID_RE = re.compile(r"-?\d+")
 
+# Attachment marker the multichat agent writes in its reply to send a file —
+# `[[file: /abs/path]]`. The capture is the path; the router validates it
+# authoritatively (secret denylist + size cap) before sending. We never read or
+# shell out to the path here, so a marker can never leak file content via the
+# hook. Single-line only: [ \t]* (NOT \s*, which would swallow a newline before
+# the path) plus a newline-free capture keep a marker on one line.
+_FILE_MARKER_RE = re.compile(r"\[\[file:[ \t]*([^\]\n]+?)[ \t]*\]\]")
+
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger("stop-to-outbox")
 
@@ -384,11 +392,26 @@ def main() -> int:
         _debug_log(hook_state_dir, "no_text", session_id=session_id, reason="tool_only_turn")
         return 0
     assistant_text, assistant_uuid = extracted
-    if not assistant_text.strip():
+
+    # Attachment markers. A multichat session has no reply tool, so it signals
+    # files with `[[file: /abs/path]]` in its reply text. Extract the paths and
+    # strip the markers from the visible text. The ROUTER validates each path
+    # authoritatively (secret denylist + size cap) before sending — this hook
+    # only collects paths and never reads/opens/shells out to the files.
+    attach_files = [m.strip() for m in _FILE_MARKER_RE.findall(assistant_text) if m.strip()]
+    if attach_files:
+        assistant_text = _FILE_MARKER_RE.sub("", assistant_text).strip()
+
+    # Nothing to deliver: neither visible text nor any attachment.
+    if not assistant_text.strip() and not attach_files:
         _debug_log(hook_state_dir, "no_text", session_id=session_id, reason="blank")
         return 0
 
-    assistant_hash = hashlib.sha256(assistant_text.encode("utf-8")).hexdigest()
+    # Dedupe basis folds in the files so a re-fire of the same turn dedupes; the
+    # transcript uuid below is the primary discriminator either way.
+    assistant_hash = hashlib.sha256(
+        "\x00".join([assistant_text, *attach_files]).encode("utf-8")
+    ).hexdigest()
     # Dedupe discriminator: the transcript line's uuid uniquely identifies the
     # turn, so two DIFFERENT turns with identical text (e.g. "Готово." twice)
     # are NOT suppressed. Fall back to the text hash only when the transcript
@@ -418,7 +441,6 @@ def main() -> int:
 
     now_iso = datetime.now(timezone.utc).isoformat()
     message: dict[str, Any] = {
-        "text": assistant_text,
         "chat_id": chat_id,  # strictly from env, never from transcript
         "timestamp": now_iso,
         # 'auto' (2026-06-05): the router converts markdown -> Telegram HTML
@@ -427,6 +449,13 @@ def main() -> int:
         # group chats (no parse_mode at all).
         "format": "auto",
     }
+    # text is omitted entirely for a file-only reply (OutboxMessage.text is
+    # min(1) optional — an empty string would fail the schema); attachments are
+    # added when the reply carried `[[file:…]]` markers.
+    if assistant_text.strip():
+        message["text"] = assistant_text
+    if attach_files:
+        message["files"] = attach_files
 
     final_path = outbox_dir / build_filename()
     try:

@@ -114,13 +114,26 @@ export const OutboxMessageFormatSchema = z
   .default('html')
 export type OutboxMessageFormat = z.infer<typeof OutboxMessageFormatSchema>
 
-export const OutboxMessageSchema = z.object({
-  text: z.string().min(1),
-  chat_id: z.string().min(1),
-  reply_to: z.string().optional(),
-  timestamp: z.string().min(1),
-  format: OutboxMessageFormatSchema,
-})
+export const OutboxMessageSchema = z
+  .object({
+    // Optional when `files` is present (a file-only reply has no text body);
+    // the refine below still requires at least one of text/files so an empty
+    // message can never be claimed/sent.
+    text: z.string().min(1).optional(),
+    chat_id: z.string().min(1),
+    reply_to: z.string().optional(),
+    timestamp: z.string().min(1),
+    format: OutboxMessageFormatSchema,
+    // Absolute paths of attachments to send AFTER the text. The router checks
+    // each path server-side (secret denylist on path AND realpath + symlink
+    // reject + size cap; NOT workspace-confined, per owner) before sending — the
+    // writer/session never holds the bot token.
+    files: z.array(z.string().min(1)).optional(),
+  })
+  .refine(
+    (m) => (m.text !== undefined && m.text.length > 0) || (m.files !== undefined && m.files.length > 0),
+    { message: 'OutboxMessage must carry text or files' },
+  )
 export type OutboxMessage = z.infer<typeof OutboxMessageSchema>
 
 const INBOX_SUBDIR = 'inbox'
