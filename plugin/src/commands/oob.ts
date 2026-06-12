@@ -29,9 +29,9 @@ import type { Logger } from '../log.js'
 import type { TelegramApi } from '../channel/tools.js'
 import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
-import { parseKeyTokens, sendKeys, type KeysExec, type TmuxKeysTarget } from './keys.js'
+import { parseKeyTokens, sendKeys, parseCcCommand, sendSlashCommand, sendNamedKey, type KeysExec, type TmuxKeysTarget } from './keys.js'
 
-export type OobCommandName = 'help' | 'status' | 'stop' | 'reset' | 'new' | 'mirror' | 'key'
+export type OobCommandName = 'help' | 'status' | 'stop' | 'reset' | 'new' | 'mirror' | 'key' | 'cc'
 
 const KNOWN_COMMANDS = new Set<OobCommandName>([
   'help',
@@ -41,6 +41,7 @@ const KNOWN_COMMANDS = new Set<OobCommandName>([
   'new',
   'mirror',
   'key',
+  'cc',
 ])
 
 // Sub-actions for /mirror. We accept the bare command (= same as `status`),
@@ -168,7 +169,8 @@ function helpText(): string {
     + '<code>/reset force</code> — сбросить состояние сессии (подтверди флагом <code>force</code>)\n'
     + '<code>/new force</code> — начать новую сессию (подтверди флагом <code>force</code>)\n'
     + '<code>/mirror on|off|status</code> — управлять зеркалом терминала (tmux, обновляется в реальном времени)\n'
-    + '<code>/key 1|2|3|y|n|enter|esc…</code> — нажать клавишу в терминале агента (ответить на диалог)\n\n'
+    + '<code>/key 1|2|3|y|n|enter|esc…</code> — нажать клавишу в терминале агента (ответить на диалог)\n'
+    + '<code>/cc &lt;команда&gt;</code> — встроенная команда Claude Code: <code>/cc compact</code>, <code>/cc model opus</code>, <code>/cc context</code>\n\n'
     + '<i>примечание: /stop — best-effort: плагин передаёт сигнал остановки через '
     + 'канал, но не может гарантировать прерывание посреди вызова инструмента.</i>'
   )
@@ -188,6 +190,7 @@ export const BOT_COMMANDS: ReadonlyArray<BotCommandSpec> = [
   { command: 'new', description: 'начать новую сессию (нужен force)' },
   { command: 'mirror', description: 'зеркало терминала: on | off | status' },
   { command: 'key', description: 'нажать клавишу в терминале: 1 | 2 | y | n | enter | esc' },
+  { command: 'cc', description: 'встроенная команда Claude Code: compact | model | context …' },
 ]
 
 function statusText(ctx: OobContext): string {
@@ -283,6 +286,21 @@ export async function handleOobCommand(
           })
         }
       }
+      // Real interrupt: Escape stops Claude's current generation/tool. Falls
+      // back to the channel-notification signal when no pane is resolvable.
+      if (ctx.tmuxKeys) {
+        const sent = await sendNamedKey(ctx.tmuxKeys.target, 'Escape', ctx.tmuxKeys.exec)
+        return {
+          handled: true,
+          command: 'stop',
+          replyToTelegram: {
+            text: sent.ok
+              ? '<b>stop</b> — Escape отправлен в сессию (прерывание).'
+              : `<b>stop</b> — tmux ошибка: <code>${escapeHtml(sent.error)}</code>`,
+            parseMode: 'HTML',
+          },
+        }
+      }
       return {
         handled: true,
         command: 'stop',
@@ -309,6 +327,21 @@ export async function handleOobCommand(
         }
       }
       ctx.log.info('oob /reset force', { chat_id: ctx.chatId })
+      // Real reset: type Claude Code's own /clear into the pane. Fallback to
+      // the (best-effort) channel signal when no pane is resolvable.
+      if (ctx.tmuxKeys) {
+        const sent = await sendSlashCommand(ctx.tmuxKeys.target, { name: 'clear', rest: '' }, ctx.tmuxKeys.exec)
+        return {
+          handled: true,
+          command: 'reset',
+          replyToTelegram: {
+            text: sent.ok
+              ? '<b>сессия сброшена</b> — отправил <code>/clear</code> в сессию.'
+              : `<b>reset</b> — tmux ошибка: <code>${escapeHtml(sent.error)}</code>`,
+            parseMode: 'HTML',
+          },
+        }
+      }
       return {
         handled: true,
         command: 'reset',
@@ -332,6 +365,20 @@ export async function handleOobCommand(
         }
       }
       ctx.log.info('oob /new force', { chat_id: ctx.chatId })
+      // Claude Code has no separate «new session» — /clear IS the reset.
+      if (ctx.tmuxKeys) {
+        const sent = await sendSlashCommand(ctx.tmuxKeys.target, { name: 'clear', rest: '' }, ctx.tmuxKeys.exec)
+        return {
+          handled: true,
+          command: 'new',
+          replyToTelegram: {
+            text: sent.ok
+              ? '<b>новая сессия</b> — отправил <code>/clear</code> в сессию.'
+              : `<b>new</b> — tmux ошибка: <code>${escapeHtml(sent.error)}</code>`,
+            parseMode: 'HTML',
+          },
+        }
+      }
       return {
         handled: true,
         command: 'new',
@@ -470,6 +517,42 @@ export async function handleOobCommand(
         command: 'key',
         replyToTelegram: {
           text: `<b>нажато:</b> <code>${escapeHtml(parsed.args.trim().toLowerCase())}</code>`,
+          parseMode: 'HTML',
+        },
+      }
+    }
+
+    case 'cc': {
+      // Passthrough to Claude Code's OWN slash commands (/compact, /model,
+      // /context, custom skills…) by typing them into the agent pane.
+      if (!ctx.tmuxKeys) {
+        return {
+          handled: true,
+          command: 'cc',
+          replyToTelegram: {
+            text: '<b>/cc</b> — недоступно: плагин не знает tmux-pane сессии.',
+            parseMode: 'HTML',
+          },
+        }
+      }
+      const cc = parseCcCommand(parsed.args)
+      if ('error' in cc) {
+        return {
+          handled: true,
+          command: 'cc',
+          replyToTelegram: { text: escapeHtml(cc.error), parseMode: 'HTML' },
+        }
+      }
+      ctx.log.info('oob /cc', { chat_id: ctx.chatId, name: cc.name })
+      const sent = await sendSlashCommand(ctx.tmuxKeys.target, cc, ctx.tmuxKeys.exec)
+      const shown = cc.rest ? `/${cc.name} ${cc.rest}` : `/${cc.name}`
+      return {
+        handled: true,
+        command: 'cc',
+        replyToTelegram: {
+          text: sent.ok
+            ? `<b>отправлено в сессию:</b> <code>${escapeHtml(shown)}</code>`
+            : `<b>/cc</b> — tmux ошибка: <code>${escapeHtml(sent.error)}</code>`,
           parseMode: 'HTML',
         },
       }

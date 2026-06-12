@@ -127,3 +127,87 @@ export async function sendKeys(
   }
   return { ok: true }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// /cc — passthrough to Claude Code's own slash commands (/compact, /clear,
+// /model, /context, custom skills, …) by typing them into the agent pane.
+// ─────────────────────────────────────────────────────────────────────
+
+// Slash-command NAME: a leading letter then letters/digits/colon/dash.
+// Colon allows plugin-namespaced commands (e.g. superpowers:brainstorm).
+export const SLASH_NAME_RE = /^[a-z][a-z0-9:-]{0,40}$/
+// ARGS: a deliberately narrow set — alphanumerics, space, and a few path/flag
+// punctuation marks. NO shell metacharacters ($ ` ; | & > < ( ) { } " ' \\),
+// so even if the pane were at a shell prompt the text can't compose a command.
+export const SLASH_ARGS_RE = /^[A-Za-z0-9 ._:/@=-]{0,200}$/
+
+export interface ParsedCc {
+  name: string
+  rest: string
+}
+
+export function parseCcCommand(args: string): ParsedCc | { error: string } {
+  const trimmed = args.trim()
+  if (trimmed.length === 0) {
+    return { error: 'usage: /cc <команда> [аргументы] — напр. /cc compact, /cc model opus' }
+  }
+  const wsIdx = trimmed.search(/\s/)
+  const rawName = wsIdx === -1 ? trimmed : trimmed.slice(0, wsIdx)
+  const name = rawName.toLowerCase().replace(/^\//, '')
+  const rest = wsIdx === -1 ? '' : trimmed.slice(wsIdx + 1).trim()
+  if (!SLASH_NAME_RE.test(name)) {
+    return { error: `недопустимое имя команды: ${rawName}` }
+  }
+  if (!SLASH_ARGS_RE.test(rest)) {
+    return { error: 'аргументы содержат недопустимые символы (разрешены буквы, цифры, . _ : / @ = -)' }
+  }
+  return { name, rest }
+}
+
+// Type `/<name> [rest]` into the pane and submit with Enter. Clears the input
+// line first (C-u) so a leftover draft can't corrupt the command — the same
+// hygiene used when driving another agent's pane by hand.
+export async function sendSlashCommand(
+  target: TmuxKeysTarget,
+  parsed: ParsedCc,
+  exec: KeysExec = defaultKeysExec,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const socketArgs = target.socketPath
+    ? ['-S', target.socketPath]
+    : target.socketName
+      ? ['-L', target.socketName]
+      : []
+  const text = parsed.rest ? `/${parsed.name} ${parsed.rest}` : `/${parsed.name}`
+  // `text` always starts with '/', so it can never be parsed as a tmux flag.
+  const steps: Array<readonly string[]> = [
+    [...socketArgs, 'send-keys', '-t', target.paneTarget, 'C-u'],
+    [...socketArgs, 'send-keys', '-t', target.paneTarget, '-l', text],
+    [...socketArgs, 'send-keys', '-t', target.paneTarget, 'Enter'],
+  ]
+  for (const args of steps) {
+    const res = await exec(args)
+    if (res.exitCode !== 0) {
+      return { ok: false, error: res.stderr.slice(0, 200) || `tmux exited ${res.exitCode}` }
+    }
+  }
+  return { ok: true }
+}
+
+// Send a single named key (Escape, Enter, …) to the pane — used by /stop to
+// interrupt Claude, and reusable by other control commands.
+export async function sendNamedKey(
+  target: TmuxKeysTarget,
+  key: string,
+  exec: KeysExec = defaultKeysExec,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const socketArgs = target.socketPath
+    ? ['-S', target.socketPath]
+    : target.socketName
+      ? ['-L', target.socketName]
+      : []
+  const res = await exec([...socketArgs, 'send-keys', '-t', target.paneTarget, key])
+  if (res.exitCode !== 0) {
+    return { ok: false, error: res.stderr.slice(0, 200) || `tmux exited ${res.exitCode}` }
+  }
+  return { ok: true }
+}
