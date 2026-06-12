@@ -384,3 +384,60 @@ describe('/mirror command', () => {
     expect(result.replyToTelegram!.text).toContain('on')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// /key — deterministic dialog answers (2026-06-12).
+// ─────────────────────────────────────────────────────────────────────
+
+describe('/key command', () => {
+  test('parses as known command with args', () => {
+    const p = parseOobCommand('/key 2 enter')
+    expect(p?.name).toBe('key')
+    expect(p?.args).toBe('2 enter')
+  })
+
+  test('without tmuxKeys ctx replies "недоступно"', async () => {
+    const parsed = parseOobCommand('/key 2')
+    if (!parsed) throw new Error('parse failed')
+    const ctx = makeCtx()
+    const res = await handleOobCommand(parsed, ctx)
+    expect(res.command).toBe('key')
+    expect(res.replyToTelegram?.text).toContain('недоступно')
+    expect(res.notifyChannel).toBeUndefined()
+  })
+
+  test('sends whitelisted keys via injected exec and confirms', async () => {
+    const parsed = parseOobCommand('/key 2')
+    if (!parsed) throw new Error('parse failed')
+    const calls: string[][] = []
+    const ctx = makeCtx()
+    ctx.tmuxKeys = {
+      target: { paneTarget: '%1', socketPath: '/tmp/s' },
+      exec: async (args) => {
+        calls.push([...args])
+        return { exitCode: 0, stderr: '' }
+      },
+    }
+    const res = await handleOobCommand(parsed, ctx)
+    expect(calls).toEqual([['-S', '/tmp/s', 'send-keys', '-t', '%1', '-l', '2']])
+    expect(res.replyToTelegram?.text).toContain('нажато')
+    expect(res.notifyChannel).toBeUndefined() // never wakes Claude
+  })
+
+  test('rejects non-whitelisted token without touching tmux', async () => {
+    const parsed = parseOobCommand('/key rm')
+    if (!parsed) throw new Error('parse failed')
+    const calls: string[][] = []
+    const ctx = makeCtx()
+    ctx.tmuxKeys = {
+      target: { paneTarget: '%1' },
+      exec: async (args) => {
+        calls.push([...args])
+        return { exitCode: 0, stderr: '' }
+      },
+    }
+    const res = await handleOobCommand(parsed, ctx)
+    expect(calls.length).toBe(0)
+    expect(res.replyToTelegram?.text).toContain('неизвестная клавиша')
+  })
+})

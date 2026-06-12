@@ -46,6 +46,7 @@ import {
   type OobContext,
   type TmuxMirrorControl,
 } from '../commands/oob.js'
+import type { TmuxKeysTarget } from '../commands/keys.js'
 import {
   isPermissionApprover,
   parsePermissionTextReply,
@@ -147,6 +148,8 @@ export interface HandlerDeps {
   // when tmux_mirror.enabled=false at startup the mirror instance is
   // never created and the OOB handler replies «disabled in config».
   tmuxMirror?: TmuxMirrorControl
+  // /key target — resolved tmux pane of the agent session (server.ts wiring).
+  tmuxKeys?: { target: TmuxKeysTarget }
   // Multichat router. When present together with `policy`, all gated
   // inbound traffic is dispatched to the per-chat tmux session via
   // `router.dispatch(InboundMessage)` instead of the legacy
@@ -1125,6 +1128,7 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
             }
           : {}),
         ...(deps.tmuxMirror ? { tmuxMirror: deps.tmuxMirror } : {}),
+        ...(deps.tmuxKeys ? { tmuxKeys: deps.tmuxKeys } : {}),
       }
       const result = await handleOobCommand(parsed, oobCtx)
       await executeOobResult(result, oobCtx, deps.server)

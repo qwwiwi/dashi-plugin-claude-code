@@ -849,6 +849,43 @@ if (
   }
 }
 
+// /key target resolution (OOB dialog answers from Telegram). Explicit
+// tmux_mirror config wins; otherwise fall back to our own $TMUX/$TMUX_PANE —
+// the plugin process lives inside the agent's tmux session, so its env
+// names exactly the pane the warchief sees. Works with the mirror disabled.
+function resolveTmuxKeysTarget():
+  | { paneTarget: string; socketName?: string; socketPath?: string }
+  | undefined {
+  if (config.tmux_mirror.pane_target) {
+    return {
+      paneTarget: config.tmux_mirror.pane_target,
+      ...(config.tmux_mirror.socket_name ? { socketName: config.tmux_mirror.socket_name } : {}),
+    }
+  }
+  const tmuxEnv = process.env['TMUX'] // "socketPath,pid,sessionIdx"
+  const pane = process.env['TMUX_PANE'] // "%N"
+  if (tmuxEnv && pane) {
+    const socketPath = tmuxEnv.split(',')[0]
+    if (socketPath) return { paneTarget: pane, socketPath }
+  }
+  return undefined
+}
+const tmuxKeysTarget = resolveTmuxKeysTarget()
+if (tmuxKeysTarget === undefined) {
+  log.warn('/key disabled: no tmux pane resolvable (no config, no $TMUX env)')
+} else {
+  // Log the resolved target + how we got it (Codex review #79 Medium): the
+  // $TMUX env fallback could point at the wrong pane if the plugin is ever
+  // launched outside the agent session. Startup visibility makes a stale-env
+  // mis-target diagnosable rather than silent.
+  const via = config.tmux_mirror.pane_target ? 'config' : 'env'
+  log.info('/key enabled', {
+    pane: tmuxKeysTarget.paneTarget,
+    socket: tmuxKeysTarget.socketPath ?? tmuxKeysTarget.socketName ?? 'default',
+    via,
+  })
+}
+
 const handlerDeps: HandlerDeps = {
   server: mcp,
   config,
@@ -867,6 +904,8 @@ const handlerDeps: HandlerDeps = {
   watcher: inboundWatcher,
   // Optional /mirror control surface — undefined when tmux_mirror.enabled=false.
   ...(tmuxMirror !== null ? { tmuxMirror } : {}),
+  // /key — deterministic keystrokes into the agent pane (DM allowlist only).
+  ...(tmuxKeysTarget !== undefined ? { tmuxKeys: { target: tmuxKeysTarget } } : {}),
   // Multichat router + policy. Both must be present for handlers.ts to
   // take the router path; passing one without the other is a wiring bug
   // (handlers.ts treats the pair atomically).

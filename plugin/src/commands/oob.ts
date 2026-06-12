@@ -29,8 +29,9 @@ import type { Logger } from '../log.js'
 import type { TelegramApi } from '../channel/tools.js'
 import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
+import { parseKeyTokens, sendKeys, type KeysExec, type TmuxKeysTarget } from './keys.js'
 
-export type OobCommandName = 'help' | 'status' | 'stop' | 'reset' | 'new' | 'mirror'
+export type OobCommandName = 'help' | 'status' | 'stop' | 'reset' | 'new' | 'mirror' | 'key'
 
 const KNOWN_COMMANDS = new Set<OobCommandName>([
   'help',
@@ -39,6 +40,7 @@ const KNOWN_COMMANDS = new Set<OobCommandName>([
   'reset',
   'new',
   'mirror',
+  'key',
 ])
 
 // Sub-actions for /mirror. We accept the bare command (= same as `status`),
@@ -137,6 +139,9 @@ export interface OobContext {
   // /mirror control — undefined when tmux_mirror.enabled=false at startup.
   // The handler then replies «mirror disabled in config».
   tmuxMirror?: TmuxMirrorControl
+  // /key target — the pane of the agent's Claude session. Undefined when the
+  // plugin can't resolve a pane (no tmux config); the handler then explains.
+  tmuxKeys?: { target: TmuxKeysTarget; exec?: KeysExec }
   // Identity bits surfaced by /status.
   botId?: number
   stateDir?: string
@@ -162,7 +167,8 @@ function helpText(): string {
     + '<code>/stop</code> — попросить Claude остановить текущую задачу\n'
     + '<code>/reset force</code> — сбросить состояние сессии (подтверди флагом <code>force</code>)\n'
     + '<code>/new force</code> — начать новую сессию (подтверди флагом <code>force</code>)\n'
-    + '<code>/mirror on|off|status</code> — управлять зеркалом терминала (tmux, обновляется в реальном времени)\n\n'
+    + '<code>/mirror on|off|status</code> — управлять зеркалом терминала (tmux, обновляется в реальном времени)\n'
+    + '<code>/key 1|2|3|y|n|enter|esc…</code> — нажать клавишу в терминале агента (ответить на диалог)\n\n'
     + '<i>примечание: /stop — best-effort: плагин передаёт сигнал остановки через '
     + 'канал, но не может гарантировать прерывание посреди вызова инструмента.</i>'
   )
@@ -181,6 +187,7 @@ export const BOT_COMMANDS: ReadonlyArray<BotCommandSpec> = [
   { command: 'reset', description: 'сбросить сессию (нужен force)' },
   { command: 'new', description: 'начать новую сессию (нужен force)' },
   { command: 'mirror', description: 'зеркало терминала: on | off | status' },
+  { command: 'key', description: 'нажать клавишу в терминале: 1 | 2 | y | n | enter | esc' },
 ]
 
 function statusText(ctx: OobContext): string {
@@ -420,6 +427,49 @@ export async function handleOobCommand(
         command: 'mirror',
         replyToTelegram: {
           text: lines.join('\n'),
+          parseMode: 'HTML',
+        },
+      }
+    }
+
+    case 'key': {
+      // Deterministic dialog answers: press whitelisted keys in the agent's
+      // pane. Reached only via the DM+allowlist OOB gate in handlers.ts.
+      if (!ctx.tmuxKeys) {
+        return {
+          handled: true,
+          command: 'key',
+          replyToTelegram: {
+            text: '<b>/key</b> — недоступно: плагин не знает tmux-pane сессии (нет tmux-конфига).',
+            parseMode: 'HTML',
+          },
+        }
+      }
+      const parsedKeys = parseKeyTokens(parsed.args)
+      if ('error' in parsedKeys) {
+        return {
+          handled: true,
+          command: 'key',
+          replyToTelegram: { text: escapeHtml(parsedKeys.error), parseMode: 'HTML' },
+        }
+      }
+      ctx.log.info('oob /key', { chat_id: ctx.chatId, keys: parsed.args.trim() })
+      const sent = await sendKeys(ctx.tmuxKeys.target, parsedKeys, ctx.tmuxKeys.exec)
+      if (!sent.ok) {
+        return {
+          handled: true,
+          command: 'key',
+          replyToTelegram: {
+            text: `<b>/key</b> — tmux ошибка: <code>${escapeHtml(sent.error)}</code>`,
+            parseMode: 'HTML',
+          },
+        }
+      }
+      return {
+        handled: true,
+        command: 'key',
+        replyToTelegram: {
+          text: `<b>нажато:</b> <code>${escapeHtml(parsed.args.trim().toLowerCase())}</code>`,
           parseMode: 'HTML',
         },
       }

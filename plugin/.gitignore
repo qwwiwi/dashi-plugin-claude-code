@@ -3,6 +3,15 @@ bun.lockb
 bun.lock
 *.log
 .env
+# Light FTS local SQLite store (2026-05-29) + WAL/SHM sidecars. The DB can
+# contain the prince's chat history (demo content) and is local-recall state,
+# never committed.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 # Ignore runtime state directories (e.g. plugin/state/ created when a dev runs
 # the plugin in-place), but NOT the source directory plugin/src/state/.
 # Issue #7: the bare `state/` pattern recursively excluded the source tree's

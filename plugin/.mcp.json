@@ -6,13 +6,6 @@
         "./src/server.ts"
       ]
     },
-    "chatplace": {
-      "type": "http",
-      "url": "https://mcp.chatplace.io/mcp",
-      "headers": {
-        "Authorization": "Bearer ${CHATPLACE_API_KEY}"
-      }
-    },
     "dashi-gbrain-memory": {
       "type": "http",
       "url": "https://mcp.orgrimmar.xyz/memory/mcp",
