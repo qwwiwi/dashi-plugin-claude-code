@@ -441,3 +441,55 @@ describe('/key command', () => {
     expect(res.replyToTelegram?.text).toContain('неизвестная клавиша')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// /keys — inline-button keypad panel (2026-06-13).
+// ─────────────────────────────────────────────────────────────────────
+
+describe('/keys command', () => {
+  test('parses as a known command', () => {
+    const p = parseOobCommand('/keys')
+    expect(p?.name).toBe('keys')
+    expect(p?.args).toBe('')
+  })
+
+  test('without tmuxKeys ctx replies «недоступно», no keyboard, no channel notify', async () => {
+    const parsed = parseOobCommand('/keys')
+    if (!parsed) throw new Error('parse failed')
+    const res = await handleOobCommand(parsed, makeCtx())
+    expect(res.command).toBe('keys')
+    expect(res.replyToTelegram?.text).toContain('недоступно')
+    expect(res.replyToTelegram?.inlineKeyboard).toBeUndefined()
+    expect(res.notifyChannel).toBeUndefined()
+  })
+
+  test('with tmuxKeys ctx replies with the keypad and never wakes Claude', async () => {
+    const parsed = parseOobCommand('/keys')
+    if (!parsed) throw new Error('parse failed')
+    const ctx = makeCtx()
+    ctx.tmuxKeys = { target: { paneTarget: '%1', socketPath: '/tmp/s' } }
+    const res = await handleOobCommand(parsed, ctx)
+    expect(res.command).toBe('keys')
+    expect(res.replyToTelegram?.parseMode).toBe('HTML')
+    expect(res.replyToTelegram?.text).toContain('Управление сессией')
+    const kb = res.replyToTelegram?.inlineKeyboard
+    expect(kb).toBeDefined()
+    expect(kb!.inline_keyboard.length).toBe(5)
+    expect(kb!.inline_keyboard[0]!.map((b) => b.callback_data)).toEqual([
+      'kkey:1', 'kkey:2', 'kkey:3', 'kkey:4', 'kkey:5',
+    ])
+    expect(res.notifyChannel).toBeUndefined()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// /help lists /keys (autocomplete + help parity).
+// ─────────────────────────────────────────────────────────────────────
+
+describe('/help lists /keys', () => {
+  test('help text mentions /keys', async () => {
+    const parsed = parseOobCommand('/help')!
+    const result = await handleOobCommand(parsed, makeCtx())
+    expect(result.replyToTelegram!.text).toContain('/keys')
+  })
+})

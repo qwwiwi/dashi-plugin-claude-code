@@ -26,10 +26,49 @@ const execFileAsync = promisify(execFile)
 
 // Literal characters are sent with `send-keys -l` (no name lookup);
 // named keys are sent without -l so tmux resolves Enter/Escape/arrows.
-const LITERAL_TOKENS = new Set([
+// Exported so the /keys inline-button panel (telegram/keys-panel-ui.ts)
+// derives its accepted token set from THESE structures — a single whitelist
+// shared by the `/key` text command and the tap keypad.
+//
+// RUNTIME TAMPER-RESISTANCE (the whole point — this is a pane-injection
+// security surface):
+//   - `LITERAL_TOKEN_LIST` is a `Object.freeze`d array. Freezing an ARRAY
+//     genuinely blocks `push`/index-assignment/`length` mutation at runtime,
+//     so its `.includes()` membership cannot be widened — this is the single
+//     source of truth literal-token validation checks against.
+//   - `NAMED_TOKENS` is a `Object.freeze`d plain object. Freezing an object
+//     blocks adding/reassigning own properties at runtime, so its own keys
+//     cannot be widened. Membership is checked with `Object.hasOwn` (NOT a
+//     bare `t in NAMED_TOKENS`) so a polluted `Object.prototype` cannot smuggle
+//     an un-whitelisted token through the prototype chain.
+//   - We deliberately do NOT export a `Set` of literal tokens. A `Set`'s
+//     contents live in internal slots, so `Object.freeze(new Set(...))` does
+//     NOT stop `.add('rm')` — an importer could cast the `ReadonlySet` back to
+//     `Set` and widen the injectable keystroke set. The frozen array + the
+//     `isLiteralToken` predicate below close that hole.
+
+// Canonical literal-token list (readonly tuple, frozen at runtime). Digits
+// 0-9 + y/n. SINGLE SOURCE OF TRUTH — literal-token validation and the panel
+// both derive from this exact frozen array.
+export const LITERAL_TOKEN_LIST = Object.freeze([
   '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'y', 'n',
-])
-const NAMED_TOKENS: Record<string, string> = {
+] as const)
+
+// Immutable literal-token predicate. Membership is checked against the FROZEN
+// `LITERAL_TOKEN_LIST` (whose `.includes` cannot be widened at runtime), so
+// there is no mutable `Set` an importer could cast-and-`.add()` to inject a
+// new keystroke. The function itself is frozen so it cannot be monkey-patched.
+export const isLiteralToken: (t: string) => boolean = Object.freeze(
+  (t: string): boolean => (LITERAL_TOKEN_LIST as readonly string[]).includes(t),
+)
+
+// Canonical named-token map (frozen at runtime). lower-case token → tmux key
+// name. `esc` and `escape` are intentional ALIASES for the same Escape key —
+// the /keys panel surfaces `esc` only (both parse identically). Freezing a
+// plain object hard-stops adding/reassigning own properties; membership is
+// tested with `Object.hasOwn` (not a prototype-walking `in`) so the frozen own
+// keys are the genuine, immutable whitelist at runtime.
+export const NAMED_TOKENS: Readonly<Record<string, string>> = Object.freeze({
   enter: 'Enter',
   esc: 'Escape',
   escape: 'Escape',
@@ -39,7 +78,7 @@ const NAMED_TOKENS: Record<string, string> = {
   down: 'Down',
   left: 'Left',
   right: 'Right',
-}
+} as const)
 
 export const MAX_KEY_TOKENS = 5
 
@@ -60,9 +99,15 @@ export function parseKeyTokens(args: string): ParsedKeys | { error: string } {
   }
   const steps: ParsedKeys['steps'] = []
   for (const t of tokens) {
-    if (LITERAL_TOKENS.has(t)) {
+    // Validate against the FROZEN list (not a mutable Set) so a runtime
+    // `(structure as Set).add('rm')` cannot widen the injectable keystrokes.
+    if (isLiteralToken(t)) {
       steps.push({ literal: true, key: t })
-    } else if (t in NAMED_TOKENS) {
+    } else if (Object.hasOwn(NAMED_TOKENS, t)) {
+      // OWN-property check (not `t in NAMED_TOKENS`): a bare `in` walks the
+      // prototype chain, so `Object.prototype.rm = 'Enter'` would make
+      // `parseKeyTokens('rm')` accept an un-whitelisted token (prototype
+      // pollution). `Object.hasOwn` only sees the frozen own keys, closing it.
       steps.push({ literal: false, key: NAMED_TOKENS[t]! })
     } else {
       return { error: `неизвестная клавиша: ${t} — разрешены цифры, y/n, enter, esc, tab, space, стрелки` }

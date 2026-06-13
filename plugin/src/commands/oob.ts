@@ -26,12 +26,13 @@
 
 import type { AppConfig } from '../config.js'
 import type { Logger } from '../log.js'
-import type { TelegramApi } from '../channel/tools.js'
+import type { TelegramApi, InlineKeyboardLike } from '../channel/tools.js'
 import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { parseKeyTokens, sendKeys, parseCcCommand, sendSlashCommand, sendNamedKey, type KeysExec, type TmuxKeysTarget } from './keys.js'
+import { buildKeysKeyboard, KEYS_PANEL_HEADER } from '../telegram/keys-panel-ui.js'
 
-export type OobCommandName = 'help' | 'status' | 'stop' | 'reset' | 'new' | 'mirror' | 'key' | 'cc'
+export type OobCommandName = 'help' | 'status' | 'stop' | 'reset' | 'new' | 'mirror' | 'key' | 'keys' | 'cc'
 
 const KNOWN_COMMANDS = new Set<OobCommandName>([
   'help',
@@ -41,6 +42,7 @@ const KNOWN_COMMANDS = new Set<OobCommandName>([
   'new',
   'mirror',
   'key',
+  'keys',
   'cc',
 ])
 
@@ -152,7 +154,11 @@ export interface OobResult {
   handled: true
   command: OobCommandName
   notifyChannel?: { content: string; meta: Record<string, string> }
-  replyToTelegram?: { text: string; parseMode?: 'HTML' }
+  // `inlineKeyboard` (optional, additive) attaches a reply_markup keypad to
+  // the Telegram reply — used by /keys to render the tap panel. Mirrors how
+  // the permission gate sends its Allow/Deny keyboard. Existing replies omit
+  // it and Telegram sends a plain message.
+  replyToTelegram?: { text: string; parseMode?: 'HTML'; inlineKeyboard?: InlineKeyboardLike }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -170,6 +176,7 @@ function helpText(): string {
     + '<code>/new force</code> — начать новую сессию (подтверди флагом <code>force</code>)\n'
     + '<code>/mirror on|off|status</code> — управлять зеркалом терминала (tmux, обновляется в реальном времени)\n'
     + '<code>/key 1|2|3|y|n|enter|esc…</code> — нажать клавишу в терминале агента (ответить на диалог)\n'
+    + '<code>/keys</code> — панель кнопок: тап = нажатие в сессии (ответить на нативный диалог Claude Code)\n'
     + '<code>/cc &lt;команда&gt;</code> — встроенная команда Claude Code: <code>/cc compact</code>, <code>/cc model opus</code>, <code>/cc context</code>\n\n'
     + '<i>примечание: /stop — best-effort: плагин передаёт сигнал остановки через '
     + 'канал, но не может гарантировать прерывание посреди вызова инструмента.</i>'
@@ -190,6 +197,7 @@ export const BOT_COMMANDS: ReadonlyArray<BotCommandSpec> = [
   { command: 'new', description: 'начать новую сессию (нужен force)' },
   { command: 'mirror', description: 'зеркало терминала: on | off | status' },
   { command: 'key', description: 'нажать клавишу в терминале: 1 | 2 | y | n | enter | esc' },
+  { command: 'keys', description: 'панель кнопок для подтверждений (нажатия в сессию)' },
   { command: 'cc', description: 'встроенная команда Claude Code: compact | model | context …' },
 ]
 
@@ -522,6 +530,33 @@ export async function handleOobCommand(
       }
     }
 
+    case 'keys': {
+      // Render the one-tap keypad. The buttons inject the SAME whitelisted
+      // keystrokes /key does — their `kkey:` callbacks are dispatched in
+      // server.ts with the same fail-closed allowlist auth. We only need a
+      // resolvable pane to make the panel useful; if none, explain like /key.
+      if (!ctx.tmuxKeys) {
+        return {
+          handled: true,
+          command: 'keys',
+          replyToTelegram: {
+            text: '<b>/keys</b> — недоступно: плагин не знает tmux-pane сессии (нет tmux-конфига).',
+            parseMode: 'HTML',
+          },
+        }
+      }
+      ctx.log.info('oob /keys', { chat_id: ctx.chatId })
+      return {
+        handled: true,
+        command: 'keys',
+        replyToTelegram: {
+          text: KEYS_PANEL_HEADER,
+          parseMode: 'HTML',
+          inlineKeyboard: buildKeysKeyboard(),
+        },
+      }
+    }
+
     case 'cc': {
       // Passthrough to Claude Code's OWN slash commands (/compact, /model,
       // /context, custom skills…) by typing them into the agent pane.
@@ -577,6 +612,9 @@ export async function executeOobResult(
       await ctx.telegramApi.sendMessage(ctx.chatId, result.replyToTelegram.text, {
         ...(result.replyToTelegram.parseMode !== undefined
           ? { parse_mode: result.replyToTelegram.parseMode }
+          : {}),
+        ...(result.replyToTelegram.inlineKeyboard !== undefined
+          ? { reply_markup: result.replyToTelegram.inlineKeyboard }
           : {}),
       })
     } catch (err) {
