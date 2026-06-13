@@ -27,6 +27,7 @@ import type { InboundMessage } from '../router/inbox-bridge.js'
 import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
 import { gateTelegramMessage, type GateInput } from './gate.js'
 import { isAddressedToBot } from './addressing.js'
+import { textWithEntities } from './entities.js'
 import {
   buildChannelContent,
   type BotIdentity,
@@ -667,7 +668,7 @@ async function tryRouteToAlbumBuffer(
 
   const descriptors = await buildDescriptors()
   const rendered = descriptors.map(renderMediaDescriptor)
-  const caption = (ctx.message?.caption ?? '').trim()
+  const caption = textWithEntities(ctx.message).trim()
   const reply = ctx.message?.reply_to_message
     ? adaptReply(ctx.message.reply_to_message)
     : undefined
@@ -1145,7 +1146,7 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
   maybeTriggerWatcher(ctx, deps)
   maybeBumpMirror(ctx, deps)
 
-  await gateAndNotify(ctx, deps, () => text, undefined, 'text')
+  await gateAndNotify(ctx, deps, () => textWithEntities(ctx.message), undefined, 'text')
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1183,7 +1184,7 @@ export async function handleInboundPhoto(ctx: Context, deps: HandlerDeps): Promi
     return [md]
   }
   if (await tryRouteToAlbumBuffer(ctx, deps, buildPhoto, 'photo')) return
-  await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildPhoto, 'photo')
+  await gateAndNotify(ctx, deps, () => textWithEntities(ctx.message), buildPhoto, 'photo')
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1207,7 +1208,7 @@ export async function handleInboundDocument(ctx: Context, deps: HandlerDeps): Pr
     return [md]
   }
   if (await tryRouteToAlbumBuffer(ctx, deps, buildDoc, 'document')) return
-  await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildDoc, 'document')
+  await gateAndNotify(ctx, deps, () => textWithEntities(ctx.message), buildDoc, 'document')
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1221,7 +1222,7 @@ export async function handleInboundVoice(ctx: Context, deps: HandlerDeps): Promi
   await gateAndNotify(
     ctx,
     deps,
-    () => ctx.message?.caption ?? '',
+    () => textWithEntities(ctx.message),
     async () => {
       const voice = ctx.message?.voice
       if (!voice) return []
@@ -1286,7 +1287,7 @@ export async function handleInboundAudio(ctx: Context, deps: HandlerDeps): Promi
     return [md]
   }
   if (await tryRouteToAlbumBuffer(ctx, deps, buildAudio, 'audio')) return
-  await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildAudio, 'audio')
+  await gateAndNotify(ctx, deps, () => textWithEntities(ctx.message), buildAudio, 'audio')
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1312,7 +1313,7 @@ export async function handleInboundVideo(ctx: Context, deps: HandlerDeps): Promi
     return [md]
   }
   if (await tryRouteToAlbumBuffer(ctx, deps, buildVideo, 'video')) return
-  await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildVideo, 'video')
+  await gateAndNotify(ctx, deps, () => textWithEntities(ctx.message), buildVideo, 'video')
 }
 
 // ─────────────────────────────────────────────────────────────────────
