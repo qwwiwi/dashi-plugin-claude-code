@@ -331,8 +331,13 @@ export function markdownToTelegramHtml(text: string): string {
   work = stashSafeTags(work, tagStore)
 
   // 5. Escape remaining raw text.
+  //   Bare `&` is escaped, but NOT one that already begins a valid HTML
+  //   entity (named/decimal/hex) — else agent-emitted `&lt;` / `&amp;` gets
+  //   double-escaped to `&amp;lt;` and the warchief sees a literal `&lt;`
+  //   in chat (2026-06-13). escapeHtml() keeps its unconditional behaviour:
+  //   it wraps raw user content where a literal `&lt;` is the right output.
   work = work
-    .replace(/&/g, '&amp;')
+    .replace(/&(?!(?:[a-zA-Z][a-zA-Z0-9]*|#\d+|#x[0-9a-fA-F]+);)/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
 
