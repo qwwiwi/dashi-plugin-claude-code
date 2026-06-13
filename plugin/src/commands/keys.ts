@@ -37,8 +37,10 @@ const execFileAsync = promisify(execFile)
 //     so its `.includes()` membership cannot be widened — this is the single
 //     source of truth literal-token validation checks against.
 //   - `NAMED_TOKENS` is a `Object.freeze`d plain object. Freezing an object
-//     blocks adding/reassigning own properties at runtime, so `t in
-//     NAMED_TOKENS` cannot be widened either.
+//     blocks adding/reassigning own properties at runtime, so its own keys
+//     cannot be widened. Membership is checked with `Object.hasOwn` (NOT a
+//     bare `t in NAMED_TOKENS`) so a polluted `Object.prototype` cannot smuggle
+//     an un-whitelisted token through the prototype chain.
 //   - We deliberately do NOT export a `Set` of literal tokens. A `Set`'s
 //     contents live in internal slots, so `Object.freeze(new Set(...))` does
 //     NOT stop `.add('rm')` — an importer could cast the `ReadonlySet` back to
@@ -63,8 +65,9 @@ export const isLiteralToken: (t: string) => boolean = Object.freeze(
 // Canonical named-token map (frozen at runtime). lower-case token → tmux key
 // name. `esc` and `escape` are intentional ALIASES for the same Escape key —
 // the /keys panel surfaces `esc` only (both parse identically). Freezing a
-// plain object hard-stops adding/reassigning own properties, so `t in
-// NAMED_TOKENS` is genuinely immutable at runtime.
+// plain object hard-stops adding/reassigning own properties; membership is
+// tested with `Object.hasOwn` (not a prototype-walking `in`) so the frozen own
+// keys are the genuine, immutable whitelist at runtime.
 export const NAMED_TOKENS: Readonly<Record<string, string>> = Object.freeze({
   enter: 'Enter',
   esc: 'Escape',
@@ -100,7 +103,11 @@ export function parseKeyTokens(args: string): ParsedKeys | { error: string } {
     // `(structure as Set).add('rm')` cannot widen the injectable keystrokes.
     if (isLiteralToken(t)) {
       steps.push({ literal: true, key: t })
-    } else if (t in NAMED_TOKENS) {
+    } else if (Object.hasOwn(NAMED_TOKENS, t)) {
+      // OWN-property check (not `t in NAMED_TOKENS`): a bare `in` walks the
+      // prototype chain, so `Object.prototype.rm = 'Enter'` would make
+      // `parseKeyTokens('rm')` accept an un-whitelisted token (prototype
+      // pollution). `Object.hasOwn` only sees the frozen own keys, closing it.
       steps.push({ literal: false, key: NAMED_TOKENS[t]! })
     } else {
       return { error: `неизвестная клавиша: ${t} — разрешены цифры, y/n, enter, esc, tab, space, стрелки` }

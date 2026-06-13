@@ -119,6 +119,50 @@ describe('literal-token whitelist is tamper-proof at runtime', () => {
       expect(accepted.steps).toEqual([{ literal: true, key: '1' }])
     }
   })
+
+  // LOW #3 (fix-loop): named-token membership must be an OWN-property check
+  // (Object.hasOwn), not a prototype-walking `t in NAMED_TOKENS`. A polluted
+  // Object.prototype must NOT smuggle an un-whitelisted token into the pane.
+  test('prototype pollution cannot widen the named-token whitelist', () => {
+    // Save a clean baseline so we can prove behaviour is unchanged AFTER the
+    // pollution is removed too.
+    expect('error' in parseKeyTokens('rm')).toBe(true)
+    expect('error' in parseKeyTokens('enter')).toBe(false)
+
+    try {
+      // (a) classic prototype pollution: a non-own key reachable via the chain.
+      ;(Object.prototype as unknown as Record<string, string>).rm = 'Enter'
+      // (b) literal-style pollution of another plausible attacker token.
+      ;(Object.prototype as unknown as Record<string, string>).reboot = 'Escape'
+
+      // `rm` IS now visible via `'rm' in NAMED_TOKENS` (prototype chain) — that
+      // is exactly the hole. Object.hasOwn must still reject it.
+      expect('rm' in NAMED_TOKENS).toBe(true) // proves the pollution is live
+      expect(Object.hasOwn(NAMED_TOKENS, 'rm')).toBe(false)
+
+      // PROOF: parseKeyTokens STILL rejects the polluted tokens (no step
+      // produced), so no un-whitelisted keystroke can reach the tmux pane.
+      const polluted = parseKeyTokens('rm')
+      expect('error' in polluted).toBe(true)
+      expect('error' in parseKeyTokens('reboot')).toBe(true)
+
+      // And a legitimate named token STILL parses to its real Escape/Enter key.
+      const enter = parseKeyTokens('enter')
+      expect('error' in enter).toBe(false)
+      if (!('error' in enter)) {
+        expect(enter.steps).toEqual([{ literal: false, key: 'Enter' }])
+      }
+    } finally {
+      // Remove the pollution so it cannot leak into any other test.
+      delete (Object.prototype as unknown as Record<string, string>).rm
+      delete (Object.prototype as unknown as Record<string, string>).reboot
+    }
+
+    // Clean-state sanity AFTER cleanup: chain is no longer polluted.
+    expect('rm' in NAMED_TOKENS).toBe(false)
+    expect('error' in parseKeyTokens('rm')).toBe(true)
+    expect('error' in parseKeyTokens('enter')).toBe(false)
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────
