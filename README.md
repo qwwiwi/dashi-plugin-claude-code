@@ -30,7 +30,7 @@ One plugin process = one Telegram bot = one agent. By default it serves **a sing
 2. [Personal session + channel tmux, and how to add your user_id](#2-personal-session--channel-tmux-and-how-to-add-your-user_id)
 3. [Multichat — how it works and why](#3-multichat--how-it-works-and-why)
 4. [Plugin hooks](#4-plugin-hooks)
-5. [Interactive commands: permission prompts (sudo) and AskUserQuestion](#5-interactive-commands-permission-prompts-sudo-and-askuserquestion)
+5. [Interactive commands and channel control: permission prompts, AskUserQuestion, OOB slash commands](#5-interactive-commands-and-channel-control-permission-prompts-askuserquestion-oob-slash-commands)
 6. [Terminal mirror — how it works and why](#6-terminal-mirror--how-it-works-and-why)
 7. [Media, audio, and voice-message transcription](#7-media-audio-and-voice-message-transcription)
 8. [Session auto-restart — so the link never drops](#8-session-auto-restart--so-the-link-never-drops)
@@ -204,7 +204,7 @@ Event mapping:
 
 ---
 
-## 5. Interactive commands: permission prompts (sudo) and AskUserQuestion
+## 5. Interactive commands and channel control: permission prompts, AskUserQuestion, OOB slash commands
 
 When Claude hits an interactive prompt inside the session, the plugin surfaces it in Telegram and feeds the answer back — the operator drives the agent from the chat, no SSH needed.
 
@@ -230,28 +230,72 @@ The `AskUserQuestion` tool renders in Telegram as an inline keyboard (`src/chann
 
 Both `/hooks/ask-user-question/*` endpoints accept **loopback only** (127.0.0.1 / localhost / ::1) + a bearer token — so the question and the token never leak to an external host.
 
-### OOB commands (slash commands in Telegram)
+### Channel control commands (OOB slash commands)
 
-These are "out-of-band" commands for managing the plugin and the session — the plugin intercepts them and they don't reach Claude as a normal prompt (except those that deliberately relay a signal into the session). They're registered via `setMyCommands`, so they show up in Telegram's "/" menu and are localized to Russian (PR #18):
+These are "out-of-band" commands for driving the plugin and the live session from Telegram. The plugin intercepts them *before* they reach Claude as a normal prompt — so `/status` never wakes the model, and the keystroke commands (`/key`, `/keys`, `/cc`, `/stop`, `/reset`, `/new`) drive the agent's tmux pane directly. They're registered via `setMyCommands`, so they appear in Telegram's "/" menu (descriptions localized to Russian, PR #18).
 
-| Command | What it does | How to use |
+The full, authoritative list lives in the code: `plugin/src/commands/oob.ts` (`helpText()` + `BOT_COMMANDS` + the `OobCommandName` union) and `plugin/src/commands/keys.ts` (the `/key` token whitelist and `/cc` passthrough).
+
+| Command | What it does | Usage / when to use |
 |---|---|---|
-| `/help` | Help — list of all commands | `/help` |
-| `/status` | State snapshot: bot_id, state_dir, poller offset, webhook status, mirror state (message_id, last_poll, errors) | `/status` |
-| `/stop` | Asks Claude to stop the current task. Cancels the active status bubble and sends a `/stop` signal into the session | `/stop` |
-| `/reset force` | Resets the session state — the next message starts from a clean slate | `/reset` without the flag only re-asks; confirm with `/reset force` |
-| `/new force` | Starts a new session | Same idea: `/new` re-asks, `/new force` does it |
-| `/mirror on\|off\|status` | Turns the terminal mirror on/off without restarting the plugin (section 6) | `/mirror on` · `/mirror off` · `/mirror status` |
+| `/help` | Prints the command list. Replies in Telegram, does **not** wake Claude. | `/help` |
+| `/status` | Plugin + session snapshot: `bot_id`, `state_dir`, allowed user, poller offset/error, status-manager state, webhook on/off + port. Reply-only, doesn't wake Claude. | `/status` |
+| `/stop` | Interrupts Claude's current generation/tool. When a tmux pane is resolvable it presses **Escape** in the pane (a real interrupt) and cancels the "typing…" bubble; otherwise it falls back to relaying a `/stop` signal Claude reads on its next channel turn. | `/stop` — use when the agent is running off in the wrong direction. |
+| `/reset force` | Resets the session. With a pane resolvable it types Claude Code's own `/clear` into the session (fresh context); otherwise it relays the reset signal. Bare `/reset` only re-asks for confirmation. | `/reset force` — wipe context and start clean. |
+| `/new force` | Starts a "new session". Claude Code has no separate new-session primitive, so this is the same `/clear` action as `/reset force`. Bare `/new` only re-asks. | `/new force` |
+| `/mirror on\|off\|status` | Toggles the terminal mirror (section 6) at runtime — no plugin restart. `status` (or bare `/mirror`) prints enabled/off, message_id, last-poll age, last error. | `/mirror on` · `/mirror off` · `/mirror status` |
+| `/key <tokens>` | Presses one or more **whitelisted** keystrokes in the agent's tmux pane — the way you **answer a native Claude Code dialog** from Telegram. Up to 5 tokens per command. | `/key 1` · `/key 3` · `/key y` · `/key esc` · `/key 2 enter` |
+| `/keys` | Opens a one-tap inline-button keypad — the same keystrokes as `/key`, but tappable. One tap = one key into the session. | `/keys`, then tap a button. The easy way to answer a dialog. |
+| `/cc <command>` | Passes a command through to **Claude Code's own slash commands** by typing it into the session (`/compact`, `/model`, `/context`, custom skills, …). Narrow charset — no shell metacharacters, can't compose a shell command. | `/cc compact` · `/cc model opus` · `/cc context` |
 
-Behavior worth knowing:
+#### Answering native confirmation dialogs (the main use-case)
 
-- **`/stop` is best-effort.** The plugin passes a stop signal into the session, but it doesn't "kill" the process — Claude stops at the nearest safe point, not instantly.
-- **`/reset` and `/new` require `force`.** Without the flag the command returns a hint ("add `force` to confirm") — protection against an accidental context reset.
-- **The `@botname` suffix is stripped** — `/status@trallvibecoderbot` in a group works the same as `/status`.
-- **Access.** Commands are only honored from allowed chats / allowed user_ids (the same allowlist, section 10) — an outsider in a public group can't reset your session.
-- In multichat, `/mirror` availability is controlled by the `tmux_mirror` flag in `policy.yaml` per chat.
+When Claude Code hits a native terminal dialog — e.g. a permission rule like
 
-> Testing: automatic command parsing and routing is covered by `tests/commands/oob.test.ts` (23 assertions). A live run against a real bot — the operator smoke matrix [`plugin/docs/canary-smoke.md`](plugin/docs/canary-smoke.md) (rows `/status`, `/help`, `/stop`, `/reset`, `/new`, `/mirror`).
+```
+Permission rule Bash(rm:*) requires confirmation
+  1. Yes
+  2. Yes, and don't ask again
+  3. No
+```
+
+— it blocks in the pane. The **terminal mirror** (section 6) shows that dialog in Telegram, and you answer it without SSH in one of two ways:
+
+- **`/keys`** → tap a button. The panel is one tap per key, laid out as:
+  - Row 1: `[1][2][3][4][5]` — dialog option selectors
+  - Row 2: `[6][7][8][9][0]`
+  - Row 3: `[✓ y][✗ n][⏎ enter][⎋ esc]`
+  - Row 4: `[↑ up][↓ down][← left][→ right]`
+  - Row 5: `[⇥ tab][␣ space]`
+
+  Tap the same keypad repeatedly across a multi-step dialog — it isn't consumed.
+- **`/key <tokens>`** → type the keystroke: `/key 1` to pick option 1, `/key 3` to pick "No", `/key esc` to cancel.
+
+`/keys` is exactly `/key` as tappable buttons — both inject the same closed whitelist into the pane.
+
+**`/key` accepted tokens (the complete whitelist):**
+
+| Group | Tokens |
+|---|---|
+| Digits | `0` `1` `2` `3` `4` `5` `6` `7` `8` `9` |
+| Yes / No | `y` `n` |
+| Confirm / cancel | `enter` · `esc` (alias `escape`) |
+| Editing | `tab` · `space` |
+| Arrows | `up` · `down` · `left` · `right` |
+
+Anything outside this set is rejected; the limit is **5 tokens** per `/key` (it's a dialog answer, not a macro language). Because the set is a closed whitelist with no free text, a pane that dropped out of Claude into a raw shell still can't be driven to run a command.
+
+#### Behavior worth knowing
+
+- **`/stop` is best-effort.** With a pane it sends a real Escape; without one it only relays a signal Claude notices on its next channel read — it does not kill the process.
+- **`/reset` and `/new` require `force`.** Bare `/reset` / `/new` just return a hint ("add `force` to confirm") — protection against an accidental context wipe.
+- **The `@botname` suffix is stripped** — `/status@yourbot` in a group works the same as `/status`.
+- In multichat, `/mirror` availability is controlled by the per-chat `tmux_mirror` flag in `policy.yaml`.
+- `/key`, `/keys`, `/cc`, and the pane-driven branches of `/stop`/`/reset`/`/new` need a resolvable tmux pane. Without one (no tmux config / no `$TMUX`) the plugin replies that the pane is unavailable.
+
+> **Security (fail-closed).** Every control command — and every `/keys` button tap — is honored **only** in a **private chat**, from a Telegram **user id on the allow-list** (`allowed_user_ids`), in a chat on the **chat allow-list** (`allowed_chat_ids`). All three must hold (defence-in-depth — see `src/telegram/handlers.ts` and the `kkey:` auth in `src/telegram/keys-panel-ui.ts`). They **never** run in groups, and **never** from a non-allowed user — an outsider can't reset your session or press keys in your terminal. A non-allowed tap gets only a "not authorized" toast and no keystroke is sent.
+
+> Testing: command parsing/routing is covered by `tests/commands/oob.test.ts` and the keypad by `tests/telegram/keys-panel.test.ts`. A live run against a real bot — the operator smoke matrix [`plugin/docs/canary-smoke.md`](plugin/docs/canary-smoke.md).
 
 ---
 
