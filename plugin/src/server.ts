@@ -84,6 +84,7 @@ import {
   type AlbumEntry,
   type HandlerDeps,
 } from './telegram/handlers.js'
+import { buildCallbackInboundMessage, isForwardableCallback } from './telegram/callback-forward.js'
 import { AlbumBuffer } from './telegram/album-buffer.js'
 import {
   ensureAlbumsDir,
@@ -779,6 +780,33 @@ bot.on('callback_query:data', async ctx => {
       log.error('ask callback_query handler threw', {
         error: err instanceof Error ? err.message : String(err),
       })
+    }
+    return
+  }
+  // Unhandled tap (not ask:/perm:) — forward to the agent so a skill can
+  // act on it (e.g. medicine reminder taken::course::<id>). Gate on the
+  // same allowlist as inbound messages; ack immediately so the spinner
+  // clears, then dispatch a synthetic inbound through the router.
+  if (isForwardableCallback(data)) {
+    await ctx.answerCallbackQuery().catch(() => {})
+    if (config.allowed_user_ids.includes(ctx.from.id) && multichatRouter !== undefined) {
+      const inbound = buildCallbackInboundMessage({
+        data,
+        chatId: ctx.chat?.id !== undefined ? String(ctx.chat.id) : String(ctx.from.id),
+        userId: String(ctx.from.id),
+        user: ctx.from.username ?? ctx.from.first_name ?? 'unknown',
+        timestamp: new Date().toISOString(),
+        ...(ctx.callbackQuery.message?.message_id !== undefined
+          ? { messageId: String(ctx.callbackQuery.message.message_id) }
+          : {}),
+      })
+      try {
+        await multichatRouter.dispatch(inbound)
+      } catch (err) {
+        log.error('callback forward dispatch threw', {
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
     }
     return
   }
