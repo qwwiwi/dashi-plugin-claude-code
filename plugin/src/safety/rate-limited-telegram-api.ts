@@ -33,6 +33,8 @@ import type {
   EditOpts,
   SendDocumentOpts,
   SendMessageOpts,
+  SendRichMessageOpts,
+  SendRichMessageResult,
   TelegramApi,
 } from '../channel/tools.js'
 
@@ -236,6 +238,18 @@ export function createRateLimitedTelegramApi(
       sendOpts: SendMessageOpts,
     ): Promise<{ message_id: number }> {
       return enqueueSend(chatId, () => raw.sendMessage(chatId, text, sendOpts))
+    },
+
+    // Rich messages consume the same per-chat send budget as a normal
+    // sendMessage (one outbound bubble), so they route through the identical
+    // FIFO + token-bucket + 429-retry path. Ordering with sibling sends to
+    // the same chat is preserved.
+    async sendRichMessage(
+      chatId: string,
+      rawMarkdown: string,
+      richOpts: SendRichMessageOpts,
+    ): Promise<SendRichMessageResult> {
+      return enqueueSend(chatId, () => raw.sendRichMessage(chatId, rawMarkdown, richOpts))
     },
 
     async editMessageText(

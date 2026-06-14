@@ -54,6 +54,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     multichat: { enabled: false },
     ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
     permission_gate: { enabled: false, timeout_ms: 120_000 },
+    richMessages: { enabled: false, perChatOptOut: [] },
     ...overrides,
   }
 }
@@ -79,6 +80,7 @@ function makeTelegramApi(): TelegramApi {
   }
   return {
     sendMessage: fail('sendMessage') as TelegramApi['sendMessage'],
+    sendRichMessage: fail('sendRichMessage') as unknown as TelegramApi['sendRichMessage'],
     editMessageText: fail('editMessageText') as TelegramApi['editMessageText'],
     setMessageReaction: fail(
       'setMessageReaction',

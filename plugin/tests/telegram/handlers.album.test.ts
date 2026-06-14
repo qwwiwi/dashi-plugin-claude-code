@@ -159,6 +159,7 @@ function makeTelegramApi(): TelegramApi {
   }
   return {
     sendMessage: noop as unknown as TelegramApi['sendMessage'],
+    sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
     editMessageText: noop as unknown as TelegramApi['editMessageText'],
     setMessageReaction: async () => undefined,
     sendChatAction: async () => undefined,

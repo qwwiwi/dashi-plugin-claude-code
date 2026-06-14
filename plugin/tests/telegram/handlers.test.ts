@@ -79,6 +79,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     multichat: { enabled: false },
     ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
     permission_gate: { enabled: false, timeout_ms: 120_000 },
+    richMessages: { enabled: false, perChatOptOut: [] },
     ...overrides,
   }
 }
@@ -160,6 +161,7 @@ function makeTelegramApi(): {
   }
   const api: TelegramApi = {
     sendMessage: noop as unknown as TelegramApi['sendMessage'],
+    sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
     editMessageText: noop as unknown as TelegramApi['editMessageText'],
     setMessageReaction: async (chatId, messageId, emoji): Promise<void> => {
       reactions.push({ chatId, messageId, emoji })

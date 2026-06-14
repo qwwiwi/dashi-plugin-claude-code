@@ -30,6 +30,9 @@ function makeStubApi(): { api: TelegramApi; calls: SentCall[] } {
       calls.push({ method: 'sendMessage', chatId, text, opts })
       return { message_id: 42 }
     },
+    async sendRichMessage(_chatId, _rawMarkdown, _opts) {
+      return { message_id: 99 }
+    },
     async editMessageText(chatId, messageId, text, opts) {
       calls.push({ method: 'editMessageText', chatId, messageId, text, opts })
     },

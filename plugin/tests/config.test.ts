@@ -465,6 +465,59 @@ describe('loadConfig', () => {
   })
 })
 
+describe('richMessages config (M1, 2026-06-14)', () => {
+  test('defaults: enabled=true, perChatOptOut=[]', () => {
+    const cfg = loadConfig(env())
+    expect(cfg.richMessages.enabled).toBe(true)
+    expect(cfg.richMessages.perChatOptOut).toEqual([])
+  })
+
+  test('config.json values are loaded when no env override', () => {
+    writeFileSync(
+      join(stateDir, 'config.json'),
+      JSON.stringify({ richMessages: { enabled: false, perChatOptOut: ['164795011'] } }),
+    )
+    const cfg = loadConfig(env())
+    expect(cfg.richMessages.enabled).toBe(false)
+    expect(cfg.richMessages.perChatOptOut).toEqual(['164795011'])
+  })
+
+  test('TELEGRAM_RICH_MESSAGES=0 kill-switch forces enabled=false', () => {
+    const cfg = loadConfig(env({ TELEGRAM_RICH_MESSAGES: '0' }))
+    expect(cfg.richMessages.enabled).toBe(false)
+  })
+
+  test('TELEGRAM_RICH_MESSAGES=false kill-switch forces enabled=false', () => {
+    const cfg = loadConfig(env({ TELEGRAM_RICH_MESSAGES: 'false' }))
+    expect(cfg.richMessages.enabled).toBe(false)
+  })
+
+  test('TELEGRAM_RICH_MESSAGES=1 forces enabled=true', () => {
+    writeFileSync(
+      join(stateDir, 'config.json'),
+      JSON.stringify({ richMessages: { enabled: false } }),
+    )
+    const cfg = loadConfig(env({ TELEGRAM_RICH_MESSAGES: '1' }))
+    expect(cfg.richMessages.enabled).toBe(true)
+  })
+
+  test('env kill-switch overrides config.json enabled=true', () => {
+    writeFileSync(
+      join(stateDir, 'config.json'),
+      JSON.stringify({ richMessages: { enabled: true } }),
+    )
+    const cfg = loadConfig(env({ TELEGRAM_RICH_MESSAGES: 'off' }))
+    expect(cfg.richMessages.enabled).toBe(false)
+  })
+
+  test('TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT CSV parses to string ids', () => {
+    const cfg = loadConfig(
+      env({ TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT: '164795011, -100123' }),
+    )
+    expect(cfg.richMessages.perChatOptOut).toEqual(['164795011', '-100123'])
+  })
+})
+
 describe('single progress surface defaults (2026-06-09 duplicate-windows fix)', () => {
   // Mac mini migration: ProgressReporter + StatusManager both defaulted ON,
   // so a fresh install with hooks registered rendered two «working/running»

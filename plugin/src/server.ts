@@ -38,6 +38,7 @@ import {
 } from './channel/tools.js'
 import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
 import { createRateLimitedTelegramApi } from './safety/rate-limited-telegram-api.js'
+import { createRichLatch } from './safety/rich-latch.js'
 import { redactSecrets } from './safety/redact.js'
 import { StatusManager } from './status/status-manager.js'
 import { ProgressReporter } from './status/progress-reporter.js'
@@ -425,7 +426,13 @@ const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log)
 // accidentally tries to ship the token (e.g. error message including a
 // URL-with-token from grammy) gets it scrubbed before the bytes leave us.
 const apiSecrets: string[] = [...logSecrets, env.TELEGRAM_BOT_TOKEN]
-const telegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSecrets)
+// M1 Rich Messages (2026-06-14): one process-scoped capability latch shared
+// between the safe wrapper (flips sendDisabled on a `capability` error) and
+// the reply tool (reads sendDisabled to skip rich attempts cheaply). A
+// restart re-probes capability, which is correct — Telegram may roll the
+// method out between restarts.
+const richLatch = createRichLatch()
+const telegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSecrets, richLatch)
 
 const mcp = new Server(
   { name: 'dashi-channel', version: '1.0.0' },
@@ -578,6 +585,9 @@ const toolDeps: ToolDeps = {
   telegramApi,
   log,
   statusManager,
+  // M1 Rich Messages: the reply tool reads richLatch.sendDisabled to skip
+  // rich attempts once a capability error has latched it off.
+  richLatch,
   // H4 fix (2026-05-23): outbound assertAllowedChat now consults the
   // multichat policy when present. Falls back to legacy config-only
   // behaviour when multichat is disabled or policy load failed.
