@@ -386,46 +386,20 @@ describe('/mirror command', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────
-// /key — deterministic dialog answers (2026-06-12).
+// /key was removed 2026-06-14 (redundant: the /keys tap panel covers it).
+// /cc gained a bare-command button panel (2026-06-14).
 // ─────────────────────────────────────────────────────────────────────
 
-describe('/key command', () => {
-  test('parses as known command with args', () => {
+describe('/key removed', () => {
+  test('/key is no longer a known OOB command', () => {
     const p = parseOobCommand('/key 2 enter')
-    expect(p?.name).toBe('key')
-    expect(p?.args).toBe('2 enter')
+    expect(p).toBeNull()
   })
+})
 
-  test('without tmuxKeys ctx replies "недоступно"', async () => {
-    const parsed = parseOobCommand('/key 2')
-    if (!parsed) throw new Error('parse failed')
-    const ctx = makeCtx()
-    const res = await handleOobCommand(parsed, ctx)
-    expect(res.command).toBe('key')
-    expect(res.replyToTelegram?.text).toContain('недоступно')
-    expect(res.notifyChannel).toBeUndefined()
-  })
-
-  test('sends whitelisted keys via injected exec and confirms', async () => {
-    const parsed = parseOobCommand('/key 2')
-    if (!parsed) throw new Error('parse failed')
-    const calls: string[][] = []
-    const ctx = makeCtx()
-    ctx.tmuxKeys = {
-      target: { paneTarget: '%1', socketPath: '/tmp/s' },
-      exec: async (args) => {
-        calls.push([...args])
-        return { exitCode: 0, stderr: '' }
-      },
-    }
-    const res = await handleOobCommand(parsed, ctx)
-    expect(calls).toEqual([['-S', '/tmp/s', 'send-keys', '-t', '%1', '-l', '2']])
-    expect(res.replyToTelegram?.text).toContain('нажато')
-    expect(res.notifyChannel).toBeUndefined() // never wakes Claude
-  })
-
-  test('rejects non-whitelisted token without touching tmux', async () => {
-    const parsed = parseOobCommand('/key rm')
+describe('/cc panel', () => {
+  test('bare /cc renders the command keyboard (no keystroke sent)', async () => {
+    const parsed = parseOobCommand('/cc')
     if (!parsed) throw new Error('parse failed')
     const calls: string[][] = []
     const ctx = makeCtx()
@@ -437,59 +411,26 @@ describe('/key command', () => {
       },
     }
     const res = await handleOobCommand(parsed, ctx)
-    expect(calls.length).toBe(0)
-    expect(res.replyToTelegram?.text).toContain('неизвестная клавиша')
-  })
-})
-
-// ─────────────────────────────────────────────────────────────────────
-// /keys — inline-button keypad panel (2026-06-13).
-// ─────────────────────────────────────────────────────────────────────
-
-describe('/keys command', () => {
-  test('parses as a known command', () => {
-    const p = parseOobCommand('/keys')
-    expect(p?.name).toBe('keys')
-    expect(p?.args).toBe('')
-  })
-
-  test('without tmuxKeys ctx replies «недоступно», no keyboard, no channel notify', async () => {
-    const parsed = parseOobCommand('/keys')
-    if (!parsed) throw new Error('parse failed')
-    const res = await handleOobCommand(parsed, makeCtx())
-    expect(res.command).toBe('keys')
-    expect(res.replyToTelegram?.text).toContain('недоступно')
-    expect(res.replyToTelegram?.inlineKeyboard).toBeUndefined()
+    expect(res.command).toBe('cc')
+    expect(res.replyToTelegram?.inlineKeyboard).toBeDefined()
+    expect(calls.length).toBe(0) // rendering the panel sends nothing
     expect(res.notifyChannel).toBeUndefined()
   })
 
-  test('with tmuxKeys ctx replies with the keypad and never wakes Claude', async () => {
-    const parsed = parseOobCommand('/keys')
+  test('/cc <command> still types the command into the pane', async () => {
+    const parsed = parseOobCommand('/cc compact')
     if (!parsed) throw new Error('parse failed')
+    const calls: string[][] = []
     const ctx = makeCtx()
-    ctx.tmuxKeys = { target: { paneTarget: '%1', socketPath: '/tmp/s' } }
+    ctx.tmuxKeys = {
+      target: { paneTarget: '%1', socketPath: '/tmp/s' },
+      exec: async (args) => {
+        calls.push([...args])
+        return { exitCode: 0, stderr: '' }
+      },
+    }
     const res = await handleOobCommand(parsed, ctx)
-    expect(res.command).toBe('keys')
-    expect(res.replyToTelegram?.parseMode).toBe('HTML')
-    expect(res.replyToTelegram?.text).toContain('Управление сессией')
-    const kb = res.replyToTelegram?.inlineKeyboard
-    expect(kb).toBeDefined()
-    expect(kb!.inline_keyboard.length).toBe(5)
-    expect(kb!.inline_keyboard[0]!.map((b) => b.callback_data)).toEqual([
-      'kkey:1', 'kkey:2', 'kkey:3', 'kkey:4', 'kkey:5',
-    ])
-    expect(res.notifyChannel).toBeUndefined()
-  })
-})
-
-// ─────────────────────────────────────────────────────────────────────
-// /help lists /keys (autocomplete + help parity).
-// ─────────────────────────────────────────────────────────────────────
-
-describe('/help lists /keys', () => {
-  test('help text mentions /keys', async () => {
-    const parsed = parseOobCommand('/help')!
-    const result = await handleOobCommand(parsed, makeCtx())
-    expect(result.replyToTelegram!.text).toContain('/keys')
+    expect(res.command).toBe('cc')
+    expect(calls.some((c) => c.includes('/compact'))).toBe(true)
   })
 })

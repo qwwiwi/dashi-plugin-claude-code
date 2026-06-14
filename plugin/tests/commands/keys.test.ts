@@ -22,9 +22,16 @@ describe('parseKeyTokens', () => {
     expect('steps' in r3 && r3.steps).toEqual([{ literal: false, key: 'Escape' }])
   })
 
-  test('empty args -> usage error', () => {
+  test('backspace and clear map to BSpace and C-u (input editing)', () => {
+    const rb = parseKeyTokens('backspace')
+    expect('steps' in rb && rb.steps).toEqual([{ literal: false, key: 'BSpace' }])
+    const rc = parseKeyTokens('clear')
+    expect('steps' in rc && rc.steps).toEqual([{ literal: false, key: 'C-u' }])
+  })
+
+  test('empty args -> no-key error', () => {
     const r = parseKeyTokens('   ')
-    expect('error' in r && r.error).toContain('usage')
+    expect('error' in r && r.error).toContain('нет клавиши')
   })
 
   test('arbitrary text is rejected (no shell injection surface)', () => {

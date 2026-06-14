@@ -78,7 +78,7 @@ export function parseKkeyCallback(data: string): string | null {
 // Row2: dialog option selectors 6-9 + 0
 // Row3: yes/no + confirm/cancel
 // Row4: arrow navigation
-// Row5: tab / space (Claude Code "Tab to amend", whitespace)
+// Row5: tab / space + input editing — backspace (one char), clear (whole line, C-u)
 export function buildKeysKeyboard(): InlineKeyboardLike {
   return {
     inline_keyboard: [
@@ -111,6 +111,8 @@ export function buildKeysKeyboard(): InlineKeyboardLike {
       [
         { text: '⇥ tab', callback_data: `${KKEY_PREFIX}tab` },
         { text: '␣ space', callback_data: `${KKEY_PREFIX}space` },
+        { text: '⌫ backspace', callback_data: `${KKEY_PREFIX}backspace` },
+        { text: '🧹 clear', callback_data: `${KKEY_PREFIX}clear` },
       ],
     ],
   }
@@ -120,7 +122,7 @@ export function buildKeysKeyboard(): InlineKeyboardLike {
 export const KEYS_PANEL_HEADER =
   '<b>Управление сессией</b> — тап = нажатие в моей сессии. '
   + 'Для диалога Claude Code: 1/2/3 = выбор пункта, y/n = да/нет, '
-  + '⏎ подтвердить, ⎋ отмена.'
+  + '⏎ подтвердить, ⎋ отмена. ⌫ стереть символ, 🧹 очистить ввод.'
 
 // ─────────────────────────────────────────────────────────────────────
 // Callback handler (extracted from server.ts so it is unit-testable in

@@ -78,6 +78,13 @@ export const NAMED_TOKENS: Readonly<Record<string, string>> = Object.freeze({
   down: 'Down',
   left: 'Left',
   right: 'Right',
+  // Input-field editing for the /keys panel. `backspace` deletes ONE char to
+  // the left; `clear` (Ctrl-U) erases the whole input line at once. Both are
+  // control keys — they can only DELETE in the input field, never inject text,
+  // so they don't widen the pane-injection surface. C-u is the same line-clear
+  // already used by sendSlashCommand below.
+  backspace: 'BSpace',
+  clear: 'C-u',
 } as const)
 
 export const MAX_KEY_TOKENS = 5
@@ -92,7 +99,7 @@ export interface ParsedKeys {
 export function parseKeyTokens(args: string): ParsedKeys | { error: string } {
   const tokens = args.trim().toLowerCase().split(/\s+/).filter((t) => t.length > 0)
   if (tokens.length === 0) {
-    return { error: 'usage: /key <1-9|0|y|n|enter|esc|tab|space|up|down|left|right> …' }
+    return { error: 'нет клавиши: <1-9|0|y|n|enter|esc|tab|space|up|down|left|right|backspace|clear> …' }
   }
   if (tokens.length > MAX_KEY_TOKENS) {
     return { error: `слишком много нажатий за раз (максимум ${MAX_KEY_TOKENS})` }
@@ -110,7 +117,7 @@ export function parseKeyTokens(args: string): ParsedKeys | { error: string } {
       // pollution). `Object.hasOwn` only sees the frozen own keys, closing it.
       steps.push({ literal: false, key: NAMED_TOKENS[t]! })
     } else {
-      return { error: `неизвестная клавиша: ${t} — разрешены цифры, y/n, enter, esc, tab, space, стрелки` }
+      return { error: `неизвестная клавиша: ${t} — разрешены цифры, y/n, enter, esc, tab, space, стрелки, backspace, clear` }
     }
   }
   return { steps }
