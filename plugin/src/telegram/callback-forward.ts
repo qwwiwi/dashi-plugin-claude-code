@@ -23,9 +23,17 @@ export function buildCallbackInboundMessage(opts: {
   user: string
   timestamp: string
   messageId?: string
+  /** Text of the message the tapped keyboard belonged to. Appended so the
+   *  agent's keyword routing (e.g. a medicine name) can pick the right skill. */
+  cardText?: string
 }): InboundMessage {
+  const text =
+    opts.cardText !== undefined && opts.cardText.length > 0
+      ? `[inline-button] ${opts.data}
+${opts.cardText}`
+      : `[inline-button] ${opts.data}`
   return {
-    text: `[inline-button] ${opts.data}`,
+    text,
     chat_id: opts.chatId,
     user_id: opts.userId,
     user: opts.user,

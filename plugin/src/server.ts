@@ -799,6 +799,10 @@ bot.on('callback_query:data', async ctx => {
         ...(ctx.callbackQuery.message?.message_id !== undefined
           ? { messageId: String(ctx.callbackQuery.message.message_id) }
           : {}),
+        ...(ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+        && typeof ctx.callbackQuery.message.text === 'string'
+          ? { cardText: ctx.callbackQuery.message.text }
+          : {}),
       })
       try {
         await multichatRouter.dispatch(inbound)

@@ -45,4 +45,16 @@ describe('buildCallbackInboundMessage', () => {
     })
     expect('message_id' in msg).toBe(false)
   })
+
+  test('appends the original card text so keyword routing can fire', () => {
+    const msg = buildCallbackInboundMessage({
+      data: 'taken::course::55ba6618',
+      chatId: 'c', userId: 'u', user: 'n', timestamp: 't',
+      cardText: 'Время принять Детралекс',
+    })
+    expect(msg.text).toBe(
+      `[inline-button] taken::course::55ba6618
+Время принять Детралекс`,
+    )
+  })
 })
