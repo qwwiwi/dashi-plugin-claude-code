@@ -91,6 +91,8 @@ import {
   recoverPendingAlbums,
 } from './telegram/album-persistence.js'
 import type { BotIdentity } from './prompt/build.js'
+import { buildChannelContent } from './prompt/build.js'
+import { sendChannelNotification, type ChannelEvent } from './channel/notify.js'
 
 const INSTRUCTIONS_TEMPLATE = [
   'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
@@ -789,10 +791,12 @@ bot.on('callback_query:data', async ctx => {
   // clears, then dispatch a synthetic inbound through the router.
   if (isForwardableCallback(data)) {
     await ctx.answerCallbackQuery().catch(() => {})
-    if (config.allowed_user_ids.includes(ctx.from.id) && multichatRouter !== undefined) {
+    if (config.allowed_user_ids.includes(ctx.from.id)) {
+      const chatId =
+        ctx.chat?.id !== undefined ? String(ctx.chat.id) : String(ctx.from.id)
       const inbound = buildCallbackInboundMessage({
         data,
-        chatId: ctx.chat?.id !== undefined ? String(ctx.chat.id) : String(ctx.from.id),
+        chatId,
         userId: String(ctx.from.id),
         user: ctx.from.username ?? ctx.from.first_name ?? 'unknown',
         timestamp: new Date().toISOString(),
@@ -805,7 +809,17 @@ bot.on('callback_query:data', async ctx => {
           : {}),
       })
       try {
-        await multichatRouter.dispatch(inbound)
+        if (multichatRouter !== undefined) {
+          await multichatRouter.dispatch(inbound)
+        } else {
+          // Legacy DM mode: inject straight into the master session — the
+          // same transport handleInboundText uses when no router is wired.
+          const event: ChannelEvent = {
+            content: buildChannelContent({ text: inbound.text, bot: botIdentity }),
+            meta: { chat_id: chatId },
+          }
+          await sendChannelNotification(mcp, event, log)
+        }
       } catch (err) {
         log.error('callback forward dispatch threw', {
           error: err instanceof Error ? err.message : String(err),
