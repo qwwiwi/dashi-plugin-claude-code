@@ -177,6 +177,21 @@ describe('humanizeTool', () => {
     expect(humanizeTool('Agent', { subagent_type: 'mystery' })).toBe('<b>running mystery</b>')
   })
 
+  test('Agent appends task description when present', () => {
+    expect(
+      humanizeTool('Agent', {
+        subagent_type: 'Explore',
+        description: 'Find UIS client and check call history',
+      }),
+    ).toBe('<b>exploring structure</b> -- Find UIS client and check call history')
+  })
+
+  test('Agent escapes HTML in description', () => {
+    expect(humanizeTool('Agent', { subagent_type: 'mystery', description: '<b>x</b>' })).toBe(
+      '<b>running mystery</b> -- &lt;b&gt;x&lt;/b&gt;',
+    )
+  })
+
   test('TodoWrite and unknown tools return null', () => {
     expect(humanizeTool('TodoWrite', { todos: [] })).toBeNull()
     expect(humanizeTool('Hypothetical', {})).toBeNull()
@@ -221,7 +236,7 @@ describe('renderActivityBlock', () => {
     expect(out).toContain('▸ bash bun test')
   })
 
-  test('rolling overflow shows +N earlier', () => {
+  test('rolling overflow shows steps (N total) header and last window', () => {
     const snap: ActivitySnapshot = {
       startedAtMs: baseStart,
       calls: [
@@ -238,8 +253,11 @@ describe('renderActivityBlock', () => {
     }
     const out = renderActivityBlock(snap, baseStart + 25_000)
     expect(out).toContain('working -- 25s')
-    expect(out).toContain('+3 earlier')
+    // Header carries the running total; the older "+N earlier" line is gone.
+    expect(out).toContain('steps (8 total):')
+    expect(out).not.toContain('earlier')
     expect(out).toContain('▸ bash eight')
+    // Only the last window (5) renders; older calls are implied by the total.
     expect(out).not.toContain('bash one')
   })
 

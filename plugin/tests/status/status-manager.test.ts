@@ -612,8 +612,8 @@ describe('StatusManager.recordActivityByChatId', () => {
     expect(last.text).not.toMatch(/subagent-1[^0-9]/)
     expect(last.text).toContain('subagent-11')
     expect(last.text).toContain('subagent-10')
-    // Renderer window is 5 → "+N earlier" line appears (10 retained, 5 shown).
-    expect(last.text).toContain('earlier')
+    // Renderer header carries the buffered total (10 retained, 5 shown).
+    expect(last.text).toContain('steps (10 total):')
   })
 
   test('Visibility failure during lazy-open is swallowed', async () => {
@@ -698,8 +698,8 @@ describe('StatusManager.recordActivityByChatId', () => {
     await mgr.recordActivityByChatId('164795011', { kind: 'reasoning' })
     const last = api.calls.filter((c) => c.kind === 'edit').pop()!
     // Buffer kept the last 10 (cmd-02..cmd-11). Renderer window is 5 →
-    // show cmd-07..cmd-11 + a `+5 earlier` line (10 buffered − 5 shown).
-    expect(last.text).toContain('+5 earlier')
+    // show cmd-07..cmd-11 under a `steps (10 total):` header (no +N line).
+    expect(last.text).toContain('steps (10 total):')
     expect(last.text).toContain('cmd-11')
     expect(last.text).toContain('cmd-07')
     // cmd-00 and cmd-01 evicted; cmd-02..cmd-06 in the +5 collapse.
