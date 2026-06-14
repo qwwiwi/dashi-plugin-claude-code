@@ -634,6 +634,28 @@ function systemctlMutation(commandLower: string): boolean {
   return false
 }
 
+// ── own comms channel — the ONE systemctl mutation that stays a hard brake ──
+//
+// Warchief 2026-06-14: zero confirm cards (he drives the session via send-keys),
+// so a mutating systemctl on a NORMAL service runs silently. The single
+// exception is the agent's OWN comms channel: stopping/restarting it severs the
+// warchief's Telegram link to the agent mid-task. That is irreversible-in-the-
+// moment, so it stays a HARD-DENY (it never showed a card anyway — it's a brake,
+// not a prompt). Matches the channel systemd units and the gateway daemon by
+// name, anywhere in a mutating systemctl invocation. The bare `gateway`
+// alternative covers systemd shorthand (`systemctl stop gateway` ≡
+// `gateway.service`) and instance units (`gateway@0.service`); the trailing
+// `(?![a-z0-9_])` boundary keeps it from over-matching a different daemon whose
+// name merely starts with "gateway" (e.g. `gatewayd`) — Codex review HIGH.
+// `[a-z0-9_]+-gateway` (no `-` inside the prefix class) keeps the alternative
+// linear — `[a-z0-9_-]*-gateway` is O(n²) on a long hyphen run (Opus review LOW).
+const OWN_CHANNEL_UNIT_RE =
+  /(?:channel-[a-z0-9_-]+|[a-z0-9_]+-gateway|gateway(?:@[a-z0-9_.:-]+)?(?:\.(?:service|py))?)(?![a-z0-9_-])/i
+
+function mutatesOwnChannel(commandLower: string): boolean {
+  return systemctlMutation(commandLower) && OWN_CHANNEL_UNIT_RE.test(commandLower)
+}
+
 // ── pipe-to-interpreter: STRUCTURAL network-source → exec detection ──────
 //
 // The RCE primitive we card is UNTRUSTED (network/decode) bytes reaching an
@@ -1678,6 +1700,15 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     if (bashReferencesSecret(rawCommand)) {
       return { tier: 'deny', reason: 'secret/credential reference in Bash command blocked', matchedRule: 'builtin:deny_bash_secret' }
     }
+    // Non-overridable HARD-DENY: a mutating systemctl on the agent's OWN comms
+    // channel (channel-*/gateway) would sever the warchief's Telegram link to
+    // the agent — blocked outright (warchief 2026-06-14: this is the one brake
+    // kept; it never showed a card). Lives in the hard-deny pass (NOT step 4) so
+    // a mixed command that also trips a confirm builtin (git-exec-surface, sudo,
+    // pipe-interpreter) cannot downgrade this deny to confirm — Codex review HIGH.
+    if (commandLower !== undefined && mutatesOwnChannel(commandLower)) {
+      return { tier: 'deny', reason: 'mutating the agent own comms channel (systemctl) would sever the warchief link', matchedRule: 'builtin:deny:own-channel' }
+    }
   }
 
   const scopeCfg = scope && policy.scopes ? policy.scopes[scope] : undefined
@@ -1716,11 +1747,8 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     if (gitExecSurface(rawCommand!)) {
       return { tier: 'confirm', reason: 'git config/hook execution surface needs confirmation', matchedRule: 'builtin:confirm_bash:git-exec-surface' }
     }
-    // Non-overridable: mutating systemd operations (verb-aware — read-only
-    // verbs and textual mentions of "systemctl" flow through).
-    if (systemctlMutation(commandLower)) {
-      return { tier: 'confirm', reason: 'mutating systemctl needs confirmation', matchedRule: 'builtin:confirm_bash:systemctl-mutation' }
-    }
+    // (own-channel systemctl hard-deny was hoisted into the step-2b hard-deny
+    // pass above so a co-located confirm builtin can't downgrade it — Codex HIGH.)
   }
 
   // 5. Operator confirm.
