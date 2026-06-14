@@ -179,7 +179,7 @@ describe('buildKeysKeyboard', () => {
     expect(cb(1)).toEqual(['kkey:6', 'kkey:7', 'kkey:8', 'kkey:9', 'kkey:0'])
     expect(cb(2)).toEqual(['kkey:y', 'kkey:n', 'kkey:enter', 'kkey:esc'])
     expect(cb(3)).toEqual(['kkey:up', 'kkey:down', 'kkey:left', 'kkey:right'])
-    expect(cb(4)).toEqual(['kkey:tab', 'kkey:space'])
+    expect(cb(4)).toEqual(['kkey:tab', 'kkey:space', 'kkey:backspace', 'kkey:clear'])
   })
 
   test('panel coverage = full /key whitelist (no UI/parser mismatch)', () => {

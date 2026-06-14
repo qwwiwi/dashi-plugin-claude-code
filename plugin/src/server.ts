@@ -69,6 +69,7 @@ import { TelegramPoller, tokenLock } from './telegram/poller.js'
 import { describePidHolder, readLockHolder } from './telegram/pid-inspect.js'
 import { BOT_COMMANDS } from './commands/oob.js'
 import { handleKkeyCallback } from './telegram/keys-panel-ui.js'
+import { handleCcmdCallback } from './telegram/cc-panel-ui.js'
 import { startWebhookServer, type WebhookServerHandle } from './webhook/server.js'
 import {
   handleInboundAudio,
@@ -720,6 +721,41 @@ bot.on('callback_query:data', async ctx => {
         await ctx.answerCallbackQuery({ text: 'ошибка' })
       } catch (ackErr) {
         log.warn('kkey error-ack answerCallbackQuery failed', {
+          error: ackErr instanceof Error ? ackErr.message : String(ackErr),
+        })
+      }
+    }
+    return
+  }
+  // /cc command panel (ccmd:*) — one-tap run of a whitelisted Claude Code
+  // slash command in the agent pane. Same fail-closed allowlist auth as kkey:
+  // (config.allowed_user_ids === the /cc OOB command's gate). A tap types
+  // `/<name>` into the pane and submits — identical to typing `/cc <name>`.
+  // Never mutates the keyboard message — the warchief taps it repeatedly.
+  if (data.startsWith('ccmd:')) {
+    try {
+      await handleCcmdCallback(
+        {
+          callbackQuery: { data },
+          from: { id: ctx.from?.id },
+          answerCallbackQuery: async arg => {
+            await ctx.answerCallbackQuery(arg)
+          },
+        },
+        {
+          allowedUserIds: config.allowed_user_ids,
+          log,
+          ...(tmuxKeysTarget !== undefined ? { tmuxKeysTarget } : {}),
+        },
+      )
+    } catch (err) {
+      log.error('ccmd callback_query handler threw', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+      try {
+        await ctx.answerCallbackQuery({ text: 'ошибка' })
+      } catch (ackErr) {
+        log.warn('ccmd error-ack answerCallbackQuery failed', {
           error: ackErr instanceof Error ? ackErr.message : String(ackErr),
         })
       }

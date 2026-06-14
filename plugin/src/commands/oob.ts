@@ -29,10 +29,11 @@ import type { Logger } from '../log.js'
 import type { TelegramApi, InlineKeyboardLike } from '../channel/tools.js'
 import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
-import { parseKeyTokens, sendKeys, parseCcCommand, sendSlashCommand, sendNamedKey, type KeysExec, type TmuxKeysTarget } from './keys.js'
+import { parseCcCommand, sendSlashCommand, sendNamedKey, type KeysExec, type TmuxKeysTarget } from './keys.js'
 import { buildKeysKeyboard, KEYS_PANEL_HEADER } from '../telegram/keys-panel-ui.js'
+import { buildCcKeyboard, CC_PANEL_HEADER } from '../telegram/cc-panel-ui.js'
 
-export type OobCommandName = 'help' | 'status' | 'stop' | 'reset' | 'new' | 'mirror' | 'key' | 'keys' | 'cc'
+export type OobCommandName = 'help' | 'status' | 'stop' | 'reset' | 'new' | 'mirror' | 'keys' | 'cc'
 
 const KNOWN_COMMANDS = new Set<OobCommandName>([
   'help',
@@ -41,7 +42,6 @@ const KNOWN_COMMANDS = new Set<OobCommandName>([
   'reset',
   'new',
   'mirror',
-  'key',
   'keys',
   'cc',
 ])
@@ -175,9 +175,8 @@ function helpText(): string {
     + '<code>/reset force</code> — сбросить состояние сессии (подтверди флагом <code>force</code>)\n'
     + '<code>/new force</code> — начать новую сессию (подтверди флагом <code>force</code>)\n'
     + '<code>/mirror on|off|status</code> — управлять зеркалом терминала (tmux, обновляется в реальном времени)\n'
-    + '<code>/key 1|2|3|y|n|enter|esc…</code> — нажать клавишу в терминале агента (ответить на диалог)\n'
-    + '<code>/keys</code> — панель кнопок: тап = нажатие в сессии (ответить на нативный диалог Claude Code)\n'
-    + '<code>/cc &lt;команда&gt;</code> — встроенная команда Claude Code: <code>/cc compact</code>, <code>/cc model opus</code>, <code>/cc context</code>\n\n'
+    + '<code>/keys</code> — панель кнопок: тап = нажатие в сессии (ответить на нативный диалог Claude Code; есть ⌫ backspace и 🧹 clear)\n'
+    + '<code>/cc</code> — панель команд Claude Code (тап = выполнить); либо <code>/cc &lt;команда&gt;</code>: <code>/cc compact</code>, <code>/cc model opus</code>\n\n'
     + '<i>примечание: /stop — best-effort: плагин передаёт сигнал остановки через '
     + 'канал, но не может гарантировать прерывание посреди вызова инструмента.</i>'
   )
@@ -196,9 +195,8 @@ export const BOT_COMMANDS: ReadonlyArray<BotCommandSpec> = [
   { command: 'reset', description: 'сбросить сессию (нужен force)' },
   { command: 'new', description: 'начать новую сессию (нужен force)' },
   { command: 'mirror', description: 'зеркало терминала: on | off | status' },
-  { command: 'key', description: 'нажать клавишу в терминале: 1 | 2 | y | n | enter | esc' },
   { command: 'keys', description: 'панель кнопок для подтверждений (нажатия в сессию)' },
-  { command: 'cc', description: 'встроенная команда Claude Code: compact | model | context …' },
+  { command: 'cc', description: 'панель команд Claude Code (тап) или /cc <команда>' },
 ]
 
 function statusText(ctx: OobContext): string {
@@ -487,49 +485,6 @@ export async function handleOobCommand(
       }
     }
 
-    case 'key': {
-      // Deterministic dialog answers: press whitelisted keys in the agent's
-      // pane. Reached only via the DM+allowlist OOB gate in handlers.ts.
-      if (!ctx.tmuxKeys) {
-        return {
-          handled: true,
-          command: 'key',
-          replyToTelegram: {
-            text: '<b>/key</b> — недоступно: плагин не знает tmux-pane сессии (нет tmux-конфига).',
-            parseMode: 'HTML',
-          },
-        }
-      }
-      const parsedKeys = parseKeyTokens(parsed.args)
-      if ('error' in parsedKeys) {
-        return {
-          handled: true,
-          command: 'key',
-          replyToTelegram: { text: escapeHtml(parsedKeys.error), parseMode: 'HTML' },
-        }
-      }
-      ctx.log.info('oob /key', { chat_id: ctx.chatId, keys: parsed.args.trim() })
-      const sent = await sendKeys(ctx.tmuxKeys.target, parsedKeys, ctx.tmuxKeys.exec)
-      if (!sent.ok) {
-        return {
-          handled: true,
-          command: 'key',
-          replyToTelegram: {
-            text: `<b>/key</b> — tmux ошибка: <code>${escapeHtml(sent.error)}</code>`,
-            parseMode: 'HTML',
-          },
-        }
-      }
-      return {
-        handled: true,
-        command: 'key',
-        replyToTelegram: {
-          text: `<b>нажато:</b> <code>${escapeHtml(parsed.args.trim().toLowerCase())}</code>`,
-          parseMode: 'HTML',
-        },
-      }
-    }
-
     case 'keys': {
       // Render the one-tap keypad. The buttons inject the SAME whitelisted
       // keystrokes /key does — their `kkey:` callbacks are dispatched in
@@ -567,6 +522,21 @@ export async function handleOobCommand(
           replyToTelegram: {
             text: '<b>/cc</b> — недоступно: плагин не знает tmux-pane сессии.',
             parseMode: 'HTML',
+          },
+        }
+      }
+      // Bare `/cc` (no args) → render the one-tap command panel. The buttons
+      // run the SAME passthrough `/cc <command>` does — their `ccmd:` callbacks
+      // are dispatched in server.ts with the same fail-closed allowlist auth.
+      if (parsed.args.trim() === '') {
+        ctx.log.info('oob /cc panel', { chat_id: ctx.chatId })
+        return {
+          handled: true,
+          command: 'cc',
+          replyToTelegram: {
+            text: CC_PANEL_HEADER,
+            parseMode: 'HTML',
+            inlineKeyboard: buildCcKeyboard(),
           },
         }
       }
