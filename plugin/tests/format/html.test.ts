@@ -185,3 +185,16 @@ describe('isTelegramHtmlParseError', () => {
     expect(isTelegramHtmlParseError(42)).toBe(false)
   })
 })
+
+describe('markdownToTelegramHtml — entity double-escape (2026-06-13)', () => {
+  test('preserves already-valid HTML entities instead of double-escaping', () => {
+    expect(markdownToTelegramHtml('4 &lt; 5 и a &gt; b')).toBe('4 &lt; 5 и a &gt; b')
+    expect(markdownToTelegramHtml('Tom &amp; Jerry')).toBe('Tom &amp; Jerry')
+    expect(markdownToTelegramHtml('&#39;quote&#39;')).toBe('&#39;quote&#39;')
+  })
+
+  test('still escapes a bare ampersand and bare angle brackets', () => {
+    expect(markdownToTelegramHtml('R&D and AT&T')).toBe('R&amp;D and AT&amp;T')
+    expect(markdownToTelegramHtml('a < b и c > d')).toBe('a &lt; b и c &gt; d')
+  })
+})
