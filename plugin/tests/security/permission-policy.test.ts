@@ -144,64 +144,114 @@ describe('systemctl is verb-aware — read-only verbs and mentions do not confir
     expect(classify('Bash', { command: "rg 'systemctl|restart|reload' docs/" }, VARIANT1).tier).toBe('allow')
     expect(classify('Bash', { command: 'echo "see systemctl|launchctl mess"' }, VARIANT1).tier).toBe('allow')
   })
-  test('mutating systemctl verbs confirm, local and remote', () => {
-    expect(classify('Bash', { command: 'systemctl restart dashi-brain-swarm-worker' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'systemctl daemon-reload' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'systemctl enable --now foo' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'systemctl --user restart foo' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: "ssh root@65.109.137.239 'systemctl restart worker'" }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'systemctl stop gateway && echo done' }, VARIANT1).tier).toBe('confirm')
+  test('mutating systemctl on normal services now auto-allows (warchief 2026-06-14: zero cards)', () => {
+    // The warchief drives the session via send-keys and asked for ZERO confirm
+    // cards. A mutating systemctl on a NORMAL service therefore flows straight
+    // through to default_tier (allow) — no card. The ONE survivor is the agent's
+    // own comms channel, hard-DENIED separately (see the own-channel block).
+    expect(classify('Bash', { command: 'systemctl restart dashi-brain-swarm-worker' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl daemon-reload' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl enable --now foo' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl --user restart foo' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: "ssh root@65.109.137.239 'systemctl restart worker'" }, VARIANT1).tier).toBe('allow')
+  })
+  test('substring rules (sudo/kill) still card a systemctl invocation — independent of systemctl semantics', () => {
+    // `kill `/`sudo ` are their own BUILTIN_CONFIRM_BASH substring rules and
+    // fire BEFORE the systemctl logic, so these still confirm — not because
+    // systemctl mutates, but because the line contains sudo/kill.
     expect(classify('Bash', { command: '/usr/bin/systemctl kill foo' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'sudo systemctl restart nginx' }, VARIANT1).tier).toBe('confirm')
   })
-  test('unknown or indirect systemctl verbs fail safe to confirm', () => {
-    expect(classify('Bash', { command: 'systemctl frobnicate x' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'v=restart; systemctl $v foo' }, VARIANT1).tier).toBe('confirm')
-  })
-  test('quoted variable verb still fails safe (Codex Critical #2, 2026-06-10)', () => {
-    // Quotes must be stripped BEFORE the `$` check, else `systemctl "$verb"`
-    // slips through as a mention.
-    expect(classify('Bash', { command: 'systemctl "$verb" unit' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: "systemctl '$action' foo" }, VARIANT1).tier).toBe('confirm')
+  test('unknown or indirect systemctl verbs on normal units now auto-allow (no card)', () => {
+    // With cards gone, an unknown/indirect verb on a NORMAL unit no longer
+    // fails safe to a card — it flows to default_tier (allow). Only an
+    // own-channel unit would still hard-deny.
+    expect(classify('Bash', { command: 'systemctl frobnicate x' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'v=restart; systemctl $v foo' }, VARIANT1).tier).toBe('allow')
+    // quoted-variable verbs (was Codex Critical #2 confirm) now allow too
+    expect(classify('Bash', { command: 'systemctl "$verb" unit' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: "systemctl '$action' foo" }, VARIANT1).tier).toBe('allow')
   })
   test('shell assignment FOO=systemctl is not an invocation (Codex Medium, 2026-06-10)', () => {
     // `FOO=systemctl restart` assigns FOO and runs `restart` — not systemctl.
     expect(classify('Bash', { command: 'FOO=systemctl restart' }, VARIANT1).tier).toBe('allow')
     expect(classify('Bash', { command: 'UNIT=systemctl status x' }, VARIANT1).tier).toBe('allow')
   })
-  test('a read-only verb cannot mask a mutating sibling occurrence', () => {
+  test('a read-only verb beside a mutating sibling on normal units now allows', () => {
+    // Was confirm under the verb-aware card era; with zero cards both reads and
+    // the normal-service restart flow to allow.
     expect(
       classify('Bash', { command: 'systemctl cat foo.service && systemctl restart foo' }, VARIANT1).tier,
-    ).toBe('confirm')
+    ).toBe('allow')
   })
-  test('detached flag values cannot displace the verb (Fable review 2026-06-10)', () => {
-    // `-H host` / `--root /mnt` put a non-verb token in verb position; the
-    // mutating verb after it must still confirm — these are remote/offline
-    // service mutations, the exact thing the gate exists for.
-    expect(classify('Bash', { command: 'systemctl -H root@65.109.137.239 restart worker' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'systemctl -H my.host.example restart worker' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'systemctl -M mycontainer.raw restart worker' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'systemctl --root /mnt enable foo' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'systemctl -o cat restart foo' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'systemctl -n 50 restart foo' }, VARIANT1).tier).toBe('confirm')
+  test('detached flag values and attached/equals forms on normal units now allow', () => {
+    // `-H host` / `--root /mnt` / `--root=/mnt` used to confirm a mutating
+    // systemctl; on a NORMAL unit they now flow to allow (zero cards).
+    expect(classify('Bash', { command: 'systemctl -H root@65.109.137.239 restart worker' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl -H my.host.example restart worker' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl -M mycontainer.raw restart worker' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl --root /mnt enable foo' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl -o cat restart foo' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl -n 50 restart foo' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl --root=/mnt enable foo' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl -proot restart x' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl --future-flag /some/path restart x' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'SYSTEMD_PAGER=cat systemctl restart worker' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl \\\n  restart worker' }, VARIANT1).tier).toBe('allow')
   })
-  test('unknown flag with a path value still fails safe — flags prove invocation shape', () => {
-    expect(classify('Bash', { command: 'systemctl --future-flag /some/path restart x' }, VARIANT1).tier).toBe('confirm')
-  })
-  test('bare systemctl and bare help flag stay read-only', () => {
+  test('bare systemctl and bare help flag stay read-only (allow)', () => {
     expect(classify('Bash', { command: 'systemctl' }, VARIANT1).tier).toBe('allow')
     expect(classify('Bash', { command: 'systemctl -h' }, VARIANT1).tier).toBe('allow')
     expect(classify('Bash', { command: 'systemctl -H root@host status worker' }, VARIANT1).tier).toBe('allow')
   })
-  test('quoted verbs resolve through tokenization', () => {
-    expect(classify('Bash', { command: "systemctl 'restart' foo" }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'backslash does not hide it: \\systemctl restart foo' }, VARIANT1).tier).toBe('confirm')
+  test('quoted/backslash verbs on normal units now allow', () => {
+    expect(classify('Bash', { command: "systemctl 'restart' foo" }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'backslash does not hide it: \\systemctl restart foo' }, VARIANT1).tier).toBe('allow')
   })
-  test('attached/equals flag forms and wrappers still confirm (Codex review 2026-06-10)', () => {
-    expect(classify('Bash', { command: 'systemctl --root=/mnt enable foo' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'systemctl -proot restart x' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'sudo systemctl restart nginx' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'SYSTEMD_PAGER=cat systemctl restart worker' }, VARIANT1).tier).toBe('confirm')
-    expect(classify('Bash', { command: 'systemctl \\\n  restart worker' }, VARIANT1).tier).toBe('confirm')
+})
+
+describe('systemctl on the agent own comms channel is hard-denied (warchief 2026-06-14: the one surviving brake)', () => {
+  // Cards are gone, but stopping/restarting the agent's OWN comms channel
+  // (channel-*/…-gateway/gateway.service/gateway.py) severs the warchief's
+  // Telegram link mid-task — irreversible in the moment. That single mutating
+  // systemctl stays a HARD-DENY (it never showed a card anyway — it's a brake).
+  const denyOwnChannel = (cmd: string) => {
+    const v = classify('Bash', { command: cmd }, VARIANT1)
+    expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toBe('builtin:deny:own-channel')
+  }
+  test('mutating systemctl on a channel/gateway unit is denied', () => {
+    denyOwnChannel('systemctl restart channel-thrall.service')
+    denyOwnChannel('systemctl stop thrall-gateway.service')
+    denyOwnChannel('systemctl restart gateway.service')
+    denyOwnChannel('systemctl restart gateway.py')
+    denyOwnChannel('systemctl restart channel-arthas.service')
+  })
+  test('remote (ssh) mutation of the channel/gateway is denied too', () => {
+    denyOwnChannel("ssh host 'systemctl stop gateway.service'")
+    denyOwnChannel("ssh root@mac 'systemctl restart channel-silvana.service'")
+  })
+  test('a READ-ONLY systemctl on the channel still allows — read verb wins, no mutation', () => {
+    // status/cat are not mutations, so the own-channel deny never engages.
+    expect(classify('Bash', { command: 'systemctl status channel-thrall.service' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl cat thrall-gateway.service' }, VARIANT1).tier).toBe('allow')
+  })
+  test('bare/instance gateway shorthand is denied (Codex HIGH: `stop gateway` ≡ gateway.service)', () => {
+    denyOwnChannel('systemctl stop gateway')
+    denyOwnChannel('systemctl restart gateway@0.service')
+    denyOwnChannel("ssh host 'systemctl stop gateway'")
+  })
+  test('a different daemon that merely starts with "gateway" still allows (FP boundary)', () => {
+    // `gatewayd` is not our comms channel — the `(?![a-z0-9_])` boundary must not
+    // over-match it into the own-channel deny.
+    expect(classify('Bash', { command: 'systemctl restart gatewayd.service' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'systemctl restart gateway-metrics.service' }, VARIANT1).tier).toBe('allow')
+  })
+  test('a co-located confirm builtin CANNOT downgrade the own-channel deny (Codex HIGH: precedence)', () => {
+    // git-exec-surface would normally return confirm; because own-channel lives
+    // in the hard-deny pass (step 2b) it wins regardless of command ordering.
+    denyOwnChannel('git -c core.pager=evil log && systemctl restart channel-thrall.service')
+    denyOwnChannel('systemctl restart channel-thrall.service && git -c core.x=y log')
   })
 })
 
