@@ -116,8 +116,10 @@ export interface HandlerDeps {
   // populated by grammy's onStart callback before any update reaches us.
   bot: BotIdentity
   // Bot.api passthrough for photo download (getFile). Kept narrow so the
-  // handler module never reaches into grammY internals.
-  botApi: BotApiForDownload
+  // handler module never reaches into grammY internals. Absent in
+  // webhook-only mode (no bot) — media handlers are unregistered there, so
+  // this is never read; the guard at the download site fails loud if it is.
+  botApi?: BotApiForDownload | undefined
   // Telegram bot token, used to build file-CDN URLs. Redacted in logs by
   // config.redactToken before any error escapes the process.
   botToken: string
@@ -1156,6 +1158,11 @@ export async function handleInboundPhoto(ctx: Context, deps: HandlerDeps): Promi
     const largest = sizes[sizes.length - 1]
     if (!largest) return []
 
+    // Unreachable in webhook-only mode (media handlers unregistered), but
+    // guard so an undefined botApi fails loud instead of NPE-ing.
+    if (deps.botApi === undefined) {
+      throw new Error('webhook-only mode: media download unavailable (no bot token)')
+    }
     const localPath = await downloadPhotoToInbox(
       deps.botApi,
       deps.botToken,
