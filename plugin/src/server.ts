@@ -196,8 +196,10 @@ loadEnvFile(ENV_FILE)
 // Webhook-only mode (DASHI_WEBHOOK_ONLY=1): start tokenless — no bot token,
 // no grammY Bot, no Telegram API. Inbound turns arrive via /hooks/agent;
 // replies leave via the worker Stop-hook → outbox. Each token-dependent
-// block below is gated on this flag.
-const WEBHOOK_ONLY = process.env.DASHI_WEBHOOK_ONLY === '1'
+// block below is gated on this flag. Accepts the same truthy strings as the
+// other env flags (TELEGRAM_MEMORY_ENABLED etc.) so operators memorise one
+// mental model — DASHI_WEBHOOK_ONLY=true/yes/on/1 all work, case-insensitive.
+const WEBHOOK_ONLY = /^(1|true|yes|on)$/i.test(process.env.DASHI_WEBHOOK_ONLY ?? '')
 
 if (!WEBHOOK_ONLY && !process.env.TELEGRAM_BOT_TOKEN) {
   process.stderr.write(
@@ -1057,18 +1059,21 @@ try {
     // at runtime via env without a restart.
     askRelay: askUserQuestionRelay,
     askUi: askUserQuestionUi,
-    // fix/eyes-on-read (2026-05-28): read-receipt route capability. Uses
-    // the same safe-wrapped, rate-limited telegramApi every other outbound
-    // call goes through, so 👀 reactions share the per-chat rate budget.
-    reactToMessage: (chatId, messageId, emoji) =>
-      telegramApi.setMessageReaction(chatId, messageId, emoji),
-    // 2026-06-03 (feature/dm-fallback-reply-hook): DM fallback-reply route
-    // capability. Fire-and-forget plain-text send through the same
-    // safe-wrapped, rate-limited telegramApi so the fallback shares the
-    // per-chat rate budget. Drops the returned message_id (the route only
-    // needs Promise<void>).
-    sendMessage: (chatId, text) =>
-      telegramApi.sendMessage(chatId, text, {}).then(() => undefined),
+    // Outbound Telegram route capabilities: eyes-on-read 👀 (reactToMessage)
+    // and DM fallback-reply (sendMessage). Both go through the safe-wrapped,
+    // rate-limited telegramApi. OMITTED in webhook-only mode — there
+    // telegramApi is the fail-loud noop, so passing these would make the
+    // routes call it and swallow the throw as a misleading 'react_failed' /
+    // 'send_failed'. Omitting makes handleReact/handleFallbackReply
+    // fail-closed cleanly (they early-return on an absent capability).
+    ...(WEBHOOK_ONLY
+      ? {}
+      : {
+          reactToMessage: (chatId: string, messageId: number, emoji: string) =>
+            telegramApi.setMessageReaction(chatId, messageId, emoji),
+          sendMessage: (chatId: string, text: string) =>
+            telegramApi.sendMessage(chatId, text, {}).then(() => undefined),
+        }),
     // Permission gate (2026-06-09): interactive confirm relay + Allow/Deny UI.
     // The route gates on config.permission_gate.enabled internally.
     permissionRelay: permissionGateRelay,

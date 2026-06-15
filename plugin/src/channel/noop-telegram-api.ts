@@ -1,12 +1,22 @@
 //
 // Webhook-only mode (DASHI_WEBHOOK_ONLY=1) starts tokenless: there is no
 // grammY Bot, so the real TelegramApi chain (safe→rateLimited→raw) is not
-// constructed. Downstream wiring (handlerDeps.telegramApi, StatusManager)
-// still expects a non-null TelegramApi, so we inject this fail-loud noop.
-// In worker mode replies go out via the Stop-hook → outbox → driver, NOT
-// via Telegram, so no method here should ever be called. If one is, we
-// throw rather than silently no-op — an unexpected Telegram send in
-// webhook-only mode is a bug worth surfacing.
+// constructed. Downstream wiring (handlerDeps.telegramApi, StatusManager,
+// ProgressReporter, TaskMirror) still expects a non-null TelegramApi, so we
+// inject this fail-loud noop.
+//
+// In worker mode replies leave via the Stop-hook → outbox → driver, NOT via
+// Telegram, and the inbound-turn path (/hooks/agent message variant) uses
+// the MCP notification, not telegramApi — so the canary never calls this.
+// The few features that WOULD reach telegramApi are structurally absent in
+// webhook-only: the eyes-on-read/DM-fallback route capabilities are not
+// passed to startWebhookServer (server.ts), and status/progress/multichat
+// are off by config default. If any of those is enabled, the relevant
+// surface is simply unavailable here.
+//
+// We throw (rather than silently no-op) so that a NEW, unguarded caller
+// added in the future surfaces loudly in tests/dev instead of silently
+// dropping a Telegram send.
 import type { TelegramApi } from './tools.js'
 
 const ERR = 'webhook-only mode: Telegram API unavailable (no bot token)'

@@ -12,8 +12,11 @@ import { join } from 'path'
 let proc: ReturnType<typeof Bun.spawn> | undefined
 let stateDir = ''
 
-afterEach(() => {
+afterEach(async () => {
   proc?.kill()
+  // Await exit so the child releases its port + fds before the next test
+  // (kill() alone is async — without this the port can linger).
+  await proc?.exited
   if (stateDir) rmSync(stateDir, { recursive: true, force: true })
 })
 
@@ -36,7 +39,7 @@ async function drain(stream: ReadableStream<Uint8Array>, sink: { text: string })
 describe('webhook-only tokenless boot', () => {
   test('server starts WITHOUT a bot token and opens the webhook port', async () => {
     stateDir = mkdtempSync(join(tmpdir(), 'dashi-tokenless-'))
-    const PORT = '9176' // заведомо свободный в тесте
+    const PORT = '0' // ephemeral — реальный порт берём из лога (server.address().port)
     const configFile = join(stateDir, 'config.json')
     writeFileSync(configFile, JSON.stringify({ webhook: { enabled: true } }))
 
@@ -78,10 +81,16 @@ describe('webhook-only tokenless boot', () => {
     // Подтверждаем, что webhook-only режим действительно активен (не реальный бот).
     expect(sink.text).toContain('webhook-only')
 
+    // Реальный bound-порт из лога (server.address().port — ephemeral 0 → OS-assigned).
+    const m = sink.text.match(/webhook server listening.*?"port":\s*(\d+)/)
+    expect(m).not.toBeNull()
+    const boundPort = Number(m![1])
+    expect(boundPort).toBeGreaterThan(0)
+
     // Порт реально слушает — TCP connect.
     const sock = await Bun.connect({
       hostname: '127.0.0.1',
-      port: Number(PORT),
+      port: boundPort,
       socket: { data() {} },
     })
     expect(sock).toBeTruthy()
