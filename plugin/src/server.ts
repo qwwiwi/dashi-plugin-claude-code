@@ -35,9 +35,11 @@ import {
   createTelegramApi,
   listTools,
   type ToolDeps,
+  type TelegramApi,
 } from './channel/tools.js'
 import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
 import { createRateLimitedTelegramApi } from './safety/rate-limited-telegram-api.js'
+import { createNoopTelegramApi } from './channel/noop-telegram-api.js'
 import { redactSecrets } from './safety/redact.js'
 import { StatusManager } from './status/status-manager.js'
 import { ProgressReporter } from './status/progress-reporter.js'
@@ -193,7 +195,13 @@ try {
 }
 loadEnvFile(ENV_FILE)
 
-if (!process.env.TELEGRAM_BOT_TOKEN) {
+// Webhook-only mode (DASHI_WEBHOOK_ONLY=1): start tokenless — no bot token,
+// no grammY Bot, no Telegram API. Inbound turns arrive via /hooks/agent;
+// replies leave via the worker Stop-hook → outbox. Each token-dependent
+// block below is gated on this flag.
+const WEBHOOK_ONLY = process.env.DASHI_WEBHOOK_ONLY === '1'
+
+if (!WEBHOOK_ONLY && !process.env.TELEGRAM_BOT_TOKEN) {
   process.stderr.write(
     `telegram channel: TELEGRAM_BOT_TOKEN required\n` +
       `  set in ${ENV_FILE}\n` +
@@ -404,28 +412,34 @@ if (!tokenLock.acquire(statePaths)) {
 // Telegram client + MCP server
 // ─────────────────────────────────────────────────────────────────────
 
-const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
-// Raw API talks to grammy. Safe wrapper sits in front of every downstream
-// consumer (StatusManager, oob, handlers, poller, webhook). The wrapper:
-//   1. redactSecrets(text, logSecrets) before delegating to raw API.
-//   2. validateTelegramHtml(text) when parse_mode=='HTML'; downgrade on
-//      invalid markup (strip parse_mode, ship escaped plain).
-// No call site can bypass — the raw `telegramApi` reference is shadowed
-// after this line. Anything that imports TelegramApi from channel/tools
-// receives the wrapped instance via toolDeps / handlerDeps / StatusManager.
-const rawTelegramApi = createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN)
-// Composition: caller → safeTelegramApi (sanitize) → rateLimitedTelegramApi
-// (queue + 429 retry) → rawTelegramApi (grammY). Sanitize runs FIRST so the
-// queue holds already-redacted/validated payloads (no secret leak if a
-// queued op gets logged; no time wasted enqueueing text that would later be
-// downgraded). A burst of replies now paces itself instead of surfacing as
-// a 429 to the agent.
-const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log)
-// The bot token itself is included in extraSecrets so any code path that
-// accidentally tries to ship the token (e.g. error message including a
-// URL-with-token from grammy) gets it scrubbed before the bytes leave us.
-const apiSecrets: string[] = [...logSecrets, env.TELEGRAM_BOT_TOKEN]
-const telegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSecrets)
+// Webhook-only mode: NO bot token → NO grammY Bot, NO real Telegram API.
+// `bot` is null; consumers that need bot.api (media download via botApi,
+// poller, setMyCommands, bot.init) are gated below. `telegramApi` falls
+// back to the fail-loud noop — in worker mode replies leave via the
+// Stop-hook → outbox, so no outbound Telegram call should ever fire.
+const bot = WEBHOOK_ONLY ? null : new Bot(env.TELEGRAM_BOT_TOKEN!)
+
+// Bot token in extraSecrets so any path that accidentally ships it (e.g. a
+// grammY URL-with-token in an error) gets it scrubbed. Module-scoped: also
+// consumed by tmux-mirror redact and the callback_query edit path. In
+// webhook-only mode there is no token, so it contributes nothing.
+const apiSecrets: string[] = WEBHOOK_ONLY
+  ? [...logSecrets]
+  : [...logSecrets, env.TELEGRAM_BOT_TOKEN!]
+
+let telegramApi: TelegramApi
+if (WEBHOOK_ONLY) {
+  telegramApi = createNoopTelegramApi()
+  log.info('DASHI_WEBHOOK_ONLY=1 — Telegram API disabled (noop)')
+} else {
+  // Composition: caller → safeTelegramApi (sanitize) → rateLimitedTelegramApi
+  // (queue + 429 retry) → rawTelegramApi (grammY). Sanitize runs FIRST so the
+  // queue holds already-redacted/validated payloads. The raw reference is
+  // not exposed — every consumer receives the wrapped instance.
+  const rawTelegramApi = createTelegramApi(bot!, env.TELEGRAM_BOT_TOKEN!)
+  const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log)
+  telegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSecrets)
+}
 
 const mcp = new Server(
   { name: 'dashi-channel', version: '1.0.0' },
@@ -657,7 +671,8 @@ const permissionGateUi = createPermissionGateUi({
 // vs isPermissionApprover); the silent-ack on unknown payloads at the
 // bottom of each handler keeps a foreign callback from leaving a spinner
 // in the chat.
-bot.on('callback_query:data', async ctx => {
+// Webhook-only: no bot → no inline-button callbacks (gated as a single stmt).
+if (!WEBHOOK_ONLY) bot!.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data ?? ''
   // Permission gate (pgate:*) — interactive Allow/Deny. Dispatched first so
   // its prefix never collides with `ask:` or the headless `perm:*` flow.
@@ -976,9 +991,10 @@ const handlerDeps: HandlerDeps = {
   log,
   bot: botIdentity,
   // bot.api implements getFile — handlers.ts narrows it to BotApiForDownload
-  // so the media module never reaches into grammY internals.
-  botApi: { api: bot.api },
-  botToken: env.TELEGRAM_BOT_TOKEN,
+  // so the media module never reaches into grammY internals. Absent in
+  // webhook-only mode (no bot) — the media handler guards on its absence.
+  botApi: WEBHOOK_ONLY ? undefined : { api: bot!.api },
+  botToken: env.TELEGRAM_BOT_TOKEN ?? '',
   env: env.GROQ_API_KEY !== undefined ? { GROQ_API_KEY: env.GROQ_API_KEY } : {},
   permissionHooks,
   statusManager,
@@ -999,16 +1015,21 @@ const handlerDeps: HandlerDeps = {
   askUserQuestionUi,
 }
 
-bot.on('message:text', ctx => handleInboundText(ctx, handlerDeps))
-bot.on('message:photo', ctx => handleInboundPhoto(ctx, handlerDeps))
-bot.on('message:document', ctx => handleInboundDocument(ctx, handlerDeps))
-bot.on('message:voice', ctx => handleInboundVoice(ctx, handlerDeps))
-bot.on('message:audio', ctx => handleInboundAudio(ctx, handlerDeps))
-bot.on('message:video', ctx => handleInboundVideo(ctx, handlerDeps))
-bot.on('message:video_note', ctx => handleInboundVideoNote(ctx, handlerDeps))
-bot.on('message:sticker', ctx => handleInboundSticker(ctx, handlerDeps))
+// Webhook-only: no bot → inbound updates arrive via /hooks/agent, not these
+// poller-dispatched handlers. Skip registration entirely.
+if (!WEBHOOK_ONLY) {
+  bot!.on('message:text', ctx => handleInboundText(ctx, handlerDeps))
+  bot!.on('message:photo', ctx => handleInboundPhoto(ctx, handlerDeps))
+  bot!.on('message:document', ctx => handleInboundDocument(ctx, handlerDeps))
+  bot!.on('message:voice', ctx => handleInboundVoice(ctx, handlerDeps))
+  bot!.on('message:audio', ctx => handleInboundAudio(ctx, handlerDeps))
+  bot!.on('message:video', ctx => handleInboundVideo(ctx, handlerDeps))
+  bot!.on('message:video_note', ctx => handleInboundVideoNote(ctx, handlerDeps))
+  bot!.on('message:sticker', ctx => handleInboundSticker(ctx, handlerDeps))
+}
 
-bot.catch(err => {
+// Webhook-only: no bot → no grammY error handler to register.
+if (!WEBHOOK_ONLY) bot!.catch(err => {
   log.error('grammy handler error (polling continues)', { error: String(err.error) })
 })
 
@@ -1078,7 +1099,7 @@ function shutdown(): void {
   const stopPoller = poller ? poller.stop() : Promise.resolve()
   const stopWebhook = webhookHandle ? webhookHandle.close() : Promise.resolve()
   void Promise.all([stopPoller, stopWebhook])
-    .then(() => Promise.resolve(bot.stop()))
+    .then(() => (bot ? bot.stop() : Promise.resolve()))
     .finally(() => process.exit(0))
 }
 process.stdin.on('end', shutdown)
@@ -1112,18 +1133,25 @@ await mcp.connect(new StdioServerTransport())
 // of `agent_previous_message`. Failing fast here lets shutdown clean up.
 // ─────────────────────────────────────────────────────────────────────
 
-try {
-  if (!bot.isInited()) await bot.init()
-  botIdentity.id = bot.botInfo.id
-  botIdentity.username = bot.botInfo.username ?? ''
-  log.info('bot identity initialised', { username: botIdentity.username, id: botIdentity.id })
-} catch (err) {
-  log.error('bot.init() failed — refusing to start poller/webhook', {
-    error: err instanceof Error ? err.message : String(err),
-  })
-  shutdown()
-  // shutdown() schedules process.exit; throw so the async stack stops.
-  throw err
+if (!WEBHOOK_ONLY) {
+  try {
+    if (!bot!.isInited()) await bot!.init()
+    botIdentity.id = bot!.botInfo.id
+    botIdentity.username = bot!.botInfo.username ?? ''
+    log.info('bot identity initialised', { username: botIdentity.username, id: botIdentity.id })
+  } catch (err) {
+    log.error('bot.init() failed — refusing to start poller/webhook', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+    shutdown()
+    // shutdown() schedules process.exit; throw so the async stack stops.
+    throw err
+  }
+} else {
+  // Webhook-only: botIdentity stays {id:0, username:''}. The poller (the
+  // only consumer of botIdentity.id for anti-spoof) is disabled below, so
+  // the unset identity is never read.
+  log.info('DASHI_WEBHOOK_ONLY=1 — skipping bot.init (webhook-only mode)')
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1181,31 +1209,35 @@ try {
 // which dispatches to the bot.on(...) handlers registered above.
 // ─────────────────────────────────────────────────────────────────────
 
-poller = new TelegramPoller({
-  bot,
-  config,
-  statePaths,
-  log,
-  onUpdate: async (update) => {
-    await bot.handleUpdate(update)
-  },
-})
+if (!WEBHOOK_ONLY) {
+  poller = new TelegramPoller({
+    bot: bot!,
+    config,
+    statePaths,
+    log,
+    onUpdate: async (update) => {
+      await bot!.handleUpdate(update)
+    },
+  })
+}
 
 // Register the OOB command list with Telegram so they appear in the
 // client autocomplete («/» prefix in chat). Best-effort: a failure here
 // (no internet, token revoked) must not block the poller from starting.
-void (async () => {
-  try {
-    await bot.api.setMyCommands(
-      BOT_COMMANDS.map((c) => ({ command: c.command, description: c.description })),
-    )
-    log.info('telegram commands registered', { count: BOT_COMMANDS.length })
-  } catch (err) {
-    log.warn('setMyCommands failed (ignored)', {
-      error: err instanceof Error ? err.message : String(err),
-    })
-  }
-})()
+if (!WEBHOOK_ONLY) {
+  void (async () => {
+    try {
+      await bot!.api.setMyCommands(
+        BOT_COMMANDS.map((c) => ({ command: c.command, description: c.description })),
+      )
+      log.info('telegram commands registered', { count: BOT_COMMANDS.length })
+    } catch (err) {
+      log.warn('setMyCommands failed (ignored)', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  })()
+}
 
 // FIX-G / M1 (Codex review 2026-05-27 #2): ordered async startup.
 // Previously `recoverPendingAlbums` ran via `void` and `poller.start()`
@@ -1274,9 +1306,10 @@ void (async () => {
   }
 
   // Poller starts ONLY after recovery has resolved. The await chain
-  // above is what closes the race in M1.
+  // above is what closes the race in M1. Skipped in webhook-only mode
+  // (no bot, no poller — inbound arrives via /hooks/agent).
   try {
-    await poller!.start()
+    if (!WEBHOOK_ONLY) await poller!.start()
   } catch (err) {
     if (shuttingDown) return
     log.error('poller exited with error', {

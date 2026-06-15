@@ -303,7 +303,11 @@ export type AppConfig = z.infer<typeof AppConfigSchema>
 // ─────────────────────────────────────────────────────────────────────
 
 export const RuntimeEnvSchema = z.object({
-  TELEGRAM_BOT_TOKEN: z.string().min(1),
+  // Optional at schema level so webhook-only mode (DASHI_WEBHOOK_ONLY=1) can
+  // start tokenless. The non-webhook requirement is enforced by the
+  // token-gate in server.ts (process.exit(1) when token missing & !WEBHOOK_ONLY).
+  // `.min(1)` still rejects an empty-string token (a config typo).
+  TELEGRAM_BOT_TOKEN: z.string().min(1).optional(),
   TELEGRAM_STATE_DIR: z.string().optional(),
   TELEGRAM_CONFIG_FILE: z.string().optional(),
   TELEGRAM_EXPECTED_BOT_ID: z.coerce.number().int().positive().optional(),
