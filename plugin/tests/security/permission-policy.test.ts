@@ -118,6 +118,76 @@ describe('built-in confirm bash (interpreter/exfil evasion)', () => {
   })
 })
 
+describe('built-in confirm is command-position aware — a risky WORD as an argument/mention does not confirm (live FP 2026-06-16)', () => {
+  test('the live FP: `command -v docker` in a for-list install check auto-allows', () => {
+    // `for c in … docker …; do command -v "$c"; done` raised a real confirm card
+    // (matchedRule builtin:confirm_bash:`docker `) while checking which tools are
+    // installed — "docker" is a for-list item / `command -v` argument, never a
+    // docker invocation. (NB: operator bash_patterns like `psql`/`rsync` are a
+    // separate substring layer and are intentionally left untouched here, so the
+    // for-list below avoids those words to isolate the built-in fix.)
+    expect(classify('Bash', { command: 'for c in docker podman buildah; do printf "%s: " "$c"; command -v "$c" || echo MISSING; done' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'command -v docker' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'which docker' }, VARIANT1).tier).toBe('allow')
+  })
+  test('risky words as arguments / inside strings do not confirm', () => {
+    expect(classify('Bash', { command: 'grep -rn "kill" logs/' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'echo "remember to run sudo later"' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'echo "git push to deploy"' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'cat notes-about-docker.md' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'ls /usr/bin | grep docker' }, VARIANT1).tier).toBe('allow')
+  })
+  test('REGRESSION: real invocations still confirm — bare, piped, compound, wrapped', () => {
+    expect(classify('Bash', { command: 'docker run -it ubuntu' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'kill 1234' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'pkill -f gateway' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'git push origin main' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'rm -rf /tmp/junk' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'pip install requests' }, VARIANT1).tier).toBe('confirm')
+    // piped invocation: docker is the head of a later pipeline stage
+    expect(classify('Bash', { command: 'cat img.tar | docker load' }, VARIANT1).tier).toBe('confirm')
+    // compound: kill is the head of a later `&&` segment
+    expect(classify('Bash', { command: 'cd /x && kill -9 99' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('REGRESSION: wrappers are descended — sudo/env/timeout in front of a risky command still confirm', () => {
+    // sudo X matches both `sudo ` and the wrapped command.
+    expect(classify('Bash', { command: 'sudo docker ps' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'env FOO=bar docker ps' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'timeout 5 docker ps' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'nohup kill 1' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('SAFETY: a risky command hidden in a substitution / subshell still confirms (no miss — substring fallback)', () => {
+    // splitPipelines treats `$(…)` / `(…)` as opaque, so a real invocation inside
+    // them would not surface as a head; we fall back to substring so it still
+    // confirms rather than silently running.
+    expect(classify('Bash', { command: 'echo $(docker ps)' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: '(cd /srv && docker build .)' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'x=`kill 1`' }, VARIANT1).tier).toBe('confirm')
+  })
+})
+
+describe('operator confirm bash_patterns are command-position aware for command-NAME patterns (live FP 2026-06-16)', () => {
+  // VARIANT1 operator confirm = ['deploy.sh', 'psql', 'supabase db'].
+  test('a MENTION of a command-name confirm pattern (psql) does not card', () => {
+    expect(classify('Bash', { command: 'command -v psql' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'for c in psql redis; do command -v "$c"; done' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'grep -rn "psql" docs/' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'echo "run psql later"' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'command -v supabase' }, VARIANT1).tier).toBe('allow')
+  })
+  test('REGRESSION: a real invocation of an operator pattern still confirms', () => {
+    expect(classify('Bash', { command: 'psql -h db -c "select 1"' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'sudo -u postgres psql' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'supabase db push' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('REGRESSION: path/script operator patterns keep substring matching (deploy.sh)', () => {
+    // `deploy.sh` runs path-qualified / behind an interpreter — never at a bare
+    // head position — so it must stay substring-matched.
+    expect(classify('Bash', { command: './scripts/deploy.sh --prod' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'bash deploy.sh' }, VARIANT1).tier).toBe('confirm')
+  })
+})
+
 describe('systemctl is verb-aware — read-only verbs and mentions do not confirm (live FP 2026-06-10)', () => {
   test('read-only systemctl verbs auto-allow', () => {
     // `systemctl cat channel-thrall.service` raised a real confirm card while
