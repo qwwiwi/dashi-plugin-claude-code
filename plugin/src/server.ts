@@ -84,12 +84,15 @@ import {
   type AlbumEntry,
   type HandlerDeps,
 } from './telegram/handlers.js'
+import { buildCallbackInboundMessage, isForwardableCallback } from './telegram/callback-forward.js'
 import { AlbumBuffer } from './telegram/album-buffer.js'
 import {
   ensureAlbumsDir,
   recoverPendingAlbums,
 } from './telegram/album-persistence.js'
 import type { BotIdentity } from './prompt/build.js'
+import { buildChannelContent } from './prompt/build.js'
+import { sendChannelNotification, type ChannelEvent } from './channel/notify.js'
 
 const INSTRUCTIONS_TEMPLATE = [
   'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
@@ -779,6 +782,49 @@ bot.on('callback_query:data', async ctx => {
       log.error('ask callback_query handler threw', {
         error: err instanceof Error ? err.message : String(err),
       })
+    }
+    return
+  }
+  // Unhandled tap (not ask:/perm:) — forward to the agent so a skill can
+  // act on it (e.g. medicine reminder taken::course::<id>). Gate on the
+  // same allowlist as inbound messages; ack immediately so the spinner
+  // clears, then dispatch a synthetic inbound through the router.
+  if (isForwardableCallback(data)) {
+    await ctx.answerCallbackQuery().catch(() => {})
+    if (config.allowed_user_ids.includes(ctx.from.id)) {
+      const chatId =
+        ctx.chat?.id !== undefined ? String(ctx.chat.id) : String(ctx.from.id)
+      const inbound = buildCallbackInboundMessage({
+        data,
+        chatId,
+        userId: String(ctx.from.id),
+        user: ctx.from.username ?? ctx.from.first_name ?? 'unknown',
+        timestamp: new Date().toISOString(),
+        ...(ctx.callbackQuery.message?.message_id !== undefined
+          ? { messageId: String(ctx.callbackQuery.message.message_id) }
+          : {}),
+        ...(ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+        && typeof ctx.callbackQuery.message.text === 'string'
+          ? { cardText: ctx.callbackQuery.message.text }
+          : {}),
+      })
+      try {
+        if (multichatRouter !== undefined) {
+          await multichatRouter.dispatch(inbound)
+        } else {
+          // Legacy DM mode: inject straight into the master session — the
+          // same transport handleInboundText uses when no router is wired.
+          const event: ChannelEvent = {
+            content: buildChannelContent({ text: inbound.text, bot: botIdentity }),
+            meta: { chat_id: chatId },
+          }
+          await sendChannelNotification(mcp, event, log)
+        }
+      } catch (err) {
+        log.error('callback forward dispatch threw', {
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
     }
     return
   }
