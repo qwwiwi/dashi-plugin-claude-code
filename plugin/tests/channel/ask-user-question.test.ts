@@ -332,6 +332,63 @@ describe('submit() — multiSelect', () => {
   })
 })
 
+// ─────────────────────────────────────────────────────────────────────
+// AskAnswerOutcome (Codex HIGH 2026-07-02) — the answer methods report
+// applied/advanced/final SYNCHRONOUSLY at mutation time so the UI never
+// infers finality from getPending() after an await (timeout race).
+// ─────────────────────────────────────────────────────────────────────
+
+describe('AskAnswerOutcome contract', () => {
+  test('single-select: non-final advance vs final answer', () => {
+    const relay = mkRelay()
+    const { requestId } = relay.submit({
+      toolUseId: 'toolu_oc_1',
+      sessionId: 'sess',
+      chatId: '164795011',
+      questions: [
+        { question: 'Q1', options: [{ label: 'A' }, { label: 'B' }] },
+        { question: 'Q2', options: [{ label: 'C' }] },
+      ],
+    })
+    const reqId = requestId!
+    expect(relay.answerChoice(reqId, 0, 0)).toEqual({ applied: true, advanced: true, final: false })
+    expect(relay.answerChoice(reqId, 1, 0)).toEqual({ applied: true, advanced: true, final: true })
+  })
+
+  test('multiSelect: accumulate (choice-as-toggle / other) then final done', () => {
+    const relay = mkRelay()
+    const { requestId } = relay.submit(multiSelectQ())
+    const reqId = requestId!
+    // choice-as-toggle safety net + Other free-text accumulate — applied, not advanced.
+    expect(relay.answerChoice(reqId, 0, 0)).toEqual({ applied: true, advanced: false, final: false })
+    expect(relay.answerOther(reqId, 0, 'SolidJS')).toEqual({ applied: true, advanced: false, final: false })
+    // Commit — final (single question).
+    expect(relay.done(reqId, 0)).toEqual({ applied: true, advanced: true, final: true })
+  })
+
+  test('no-op paths report applied=false', () => {
+    const relay = mkRelay()
+    const { requestId } = relay.submit(singleQ())
+    const reqId = requestId!
+    expect(relay.answerChoice('zzzzz', 0, 0)).toEqual({ applied: false, advanced: false, final: false }) // unknown id
+    expect(relay.answerChoice(reqId, 5, 0)).toEqual({ applied: false, advanced: false, final: false }) // stale index
+    expect(relay.answerChoice(reqId, 0, 99)).toEqual({ applied: false, advanced: false, final: false }) // opt out of range
+    expect(relay.answerOther(reqId, 0, '   ')).toEqual({ applied: false, advanced: false, final: false }) // empty text
+    expect(relay.done(reqId, 0)).toEqual({ applied: false, advanced: false, final: false }) // done on non-multiselect
+    expect(relay.isPending(reqId)).toBe(true)
+    relay.expire(reqId, 'test cleanup')
+  })
+
+  test('answer after settle reports applied=false (timeout raced the tap)', async () => {
+    const relay = mkRelay({ defaultTimeoutMs: 15 })
+    const { requestId, result } = relay.submit(singleQ())
+    const reqId = requestId!
+    const verdict = await result // internal timeout settles it
+    expect(verdict.status).toBe('timeout')
+    expect(relay.answerChoice(reqId, 0, 0)).toEqual({ applied: false, advanced: false, final: false })
+  })
+})
+
 describe('timeout + expire', () => {
   test('timeout fires → status=timeout, map cleaned up', async () => {
     const relay = mkRelay({ defaultTimeoutMs: 20 })

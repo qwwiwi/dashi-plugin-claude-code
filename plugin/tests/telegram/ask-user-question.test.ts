@@ -347,11 +347,17 @@ describe('handleAskCallback — choose', () => {
     await ui.handleAskCallback(ctx)
 
     expect(answers.length).toBeGreaterThanOrEqual(1)
-    // Previous keyboard cleared via editMessageText with empty inline_keyboard
+    // Answered card closed via editMessageText with empty inline_keyboard,
+    // keeping the question text and appending the chosen answer.
     expect(send.editCalls.length).toBe(1)
     expect(send.editCalls[0]?.messageId).toBe(1001)
     expect(send.editCalls[0]?.opts.reply_markup?.inline_keyboard).toEqual([])
-    expect(send.editCalls[0]?.text).toContain('Ответ принят')
+    expect(send.editCalls[0]?.text).toContain('Q') // original question kept
+    expect(send.editCalls[0]?.text).toContain('✅ Ответ:')
+    expect(send.editCalls[0]?.text).toContain('B') // chosen label echoed
+    // Exactly one completion message after the last question.
+    expect(send.sendCalls.length).toBe(1)
+    expect(send.sendCalls[0]?.text).toBe('Ответы принял, продолжаю ✅')
     // Single question; promise resolves answered.
     const result = await handle.result
     expect(result.status).toBe('answered')
@@ -621,6 +627,352 @@ describe('FIX-T1 F4 — Other prompt force_reply contract', () => {
     const result = await submitted.result
     expect(result.status).toBe('answered')
     expect(result.updatedInput?.answers).toEqual({ Q: 'explicit reply' })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Card-close UX (2026-07-02, warchief feedback) — on answer the card is
+// closed (keyboard stripped + chosen answer appended); after the last
+// question ONE completion message is sent; on timeout the open card is
+// closed with «время истекло». Edits are best-effort.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('card-close on answer + completion message', () => {
+  test('multiSelect commit closes the card with the joined labels + completion', async () => {
+    const { ui, relay, send } = await mkUi()
+    const handle = relay.submit({
+      toolUseId: 'toolu_ms_done',
+      sessionId: 'sess',
+      chatId: '164795011',
+      questions: [{
+        question: 'Pick frameworks',
+        multiSelect: true,
+        options: [{ label: 'React' }, { label: 'Vue' }, { label: 'Svelte' }],
+      }],
+    })
+    const reqId = handle.requestId!
+    await ui.startQuestion(reqId)
+
+    // Toggle two options on, then commit with «Готово».
+    await ui.handleAskCallback(mkCtx(`ask:toggle:${reqId}:0:0`, 164795011).ctx)
+    await ui.handleAskCallback(mkCtx(`ask:toggle:${reqId}:0:2`, 164795011).ctx)
+    send.editCalls.length = 0
+    send.sendCalls.length = 0
+
+    await ui.handleAskCallback(mkCtx(`ask:done:${reqId}:0`, 164795011).ctx)
+
+    // Card closed: keyboard stripped, both labels echoed on one line.
+    expect(send.editCalls.length).toBe(1)
+    expect(send.editCalls[0]?.opts.reply_markup?.inline_keyboard).toEqual([])
+    expect(send.editCalls[0]?.text).toContain('✅ Ответ:')
+    expect(send.editCalls[0]?.text).toContain('React, Svelte')
+    // Exactly one completion message.
+    expect(send.sendCalls.length).toBe(1)
+    expect(send.sendCalls[0]?.text).toBe('Ответы принял, продолжаю ✅')
+
+    const result = await handle.result
+    expect(result.status).toBe('answered')
+    expect(result.updatedInput?.answers).toEqual({ 'Pick frameworks': 'React, Svelte' })
+  })
+
+  test('«Другое» free-text is truncated to ~100 chars in the closed card', async () => {
+    const { ui, relay, send } = await mkUi()
+    const handle = relay.submit({
+      toolUseId: 'toolu_other_trunc',
+      sessionId: 'sess',
+      chatId: '164795011',
+      questions: [{ question: 'Q', options: [{ label: 'A' }] }],
+    })
+    const reqId = handle.requestId!
+    await ui.startQuestion(reqId)
+    await ui.handleAskCallback(mkCtx(`ask:other:${reqId}:0`, 164795011).ctx)
+    // startQuestion used 1001; Other prompt is 1002.
+    send.editCalls.length = 0
+    send.sendCalls.length = 0
+
+    const longText = 'z'.repeat(250)
+    const consumed = await ui.tryHandleOtherText({
+      chatId: '164795011',
+      fromUserId: 164795011,
+      text: longText,
+      replyToMessageId: 1002,
+    })
+    expect(consumed).toBe(true)
+
+    // Card closed; the echoed answer is capped (clipRaw → 99 chars + ellipsis),
+    // never the full 250.
+    expect(send.editCalls.length).toBe(1)
+    const closedText = send.editCalls[0]!.text
+    expect(closedText).toContain('✅ Ответ:')
+    expect(closedText.includes('z'.repeat(250))).toBe(false)
+    expect(closedText).toContain('z'.repeat(99))
+    // Completion still fires once.
+    expect(send.sendCalls.length).toBe(1)
+    expect(send.sendCalls[0]?.text).toBe('Ответы принял, продолжаю ✅')
+
+    const result = await handle.result
+    expect(result.status).toBe('answered')
+    expect((result.updatedInput?.answers.Q as string).length).toBe(250)
+  })
+
+  test('completion message is sent exactly once — a stale re-tap does not re-send', async () => {
+    const { ui, relay, send } = await mkUi()
+    const handle = relay.submit({
+      toolUseId: 'toolu_once',
+      sessionId: 'sess',
+      chatId: '164795011',
+      questions: [{ question: 'Q', options: [{ label: 'A' }, { label: 'B' }] }],
+    })
+    const reqId = handle.requestId!
+    await ui.startQuestion(reqId)
+    send.sendCalls.length = 0
+
+    await ui.handleAskCallback(mkCtx(`ask:choose:${reqId}:0:0`, 164795011).ctx)
+    expect(send.sendCalls.length).toBe(1)
+
+    // Telegram replays the same tap after the request already settled.
+    const { ctx, answers } = mkCtx(`ask:choose:${reqId}:0:0`, 164795011)
+    await ui.handleAskCallback(ctx)
+    expect(answers[0]?.text).toBe('Запрос уже закрыт')
+    // No second completion message.
+    expect(send.sendCalls.length).toBe(1)
+
+    await handle.result
+  })
+
+  test('multi-question flow: each answered card is closed with its own answer', async () => {
+    const { ui, relay, send } = await mkUi()
+    const handle = relay.submit({
+      toolUseId: 'toolu_two',
+      sessionId: 'sess',
+      chatId: '164795011',
+      questions: [
+        { question: 'Q1', options: [{ label: 'X' }, { label: 'Y' }] },
+        { question: 'Q2', options: [{ label: 'P' }, { label: 'Q' }] },
+      ],
+    })
+    const reqId = handle.requestId!
+    await ui.startQuestion(reqId) // Q1 = msg 1001
+    send.editCalls.length = 0
+    send.sendCalls.length = 0
+
+    // Answer Q1 → Q1 card closed with «X», Q2 rendered fresh (msg 1002).
+    await ui.handleAskCallback(mkCtx(`ask:choose:${reqId}:0:0`, 164795011).ctx)
+    expect(send.editCalls.length).toBe(1)
+    expect(send.editCalls[0]?.messageId).toBe(1001)
+    expect(send.editCalls[0]?.text).toContain('Q1')
+    expect(send.editCalls[0]?.text).toContain('X')
+    expect(send.sendCalls.length).toBe(1) // Q2 sent, NO completion yet
+    expect(send.sendCalls[0]?.text).toContain('Q2')
+
+    send.editCalls.length = 0
+    send.sendCalls.length = 0
+
+    // Answer Q2 → Q2 card closed with «Q», completion sent.
+    await ui.handleAskCallback(mkCtx(`ask:choose:${reqId}:1:1`, 164795011).ctx)
+    expect(send.editCalls.length).toBe(1)
+    expect(send.editCalls[0]?.messageId).toBe(1002)
+    expect(send.editCalls[0]?.text).toContain('Q2')
+    expect(send.editCalls[0]?.text).toContain('Q')
+    expect(send.sendCalls.length).toBe(1)
+    expect(send.sendCalls[0]?.text).toBe('Ответы принял, продолжаю ✅')
+
+    const result = await handle.result
+    expect(result.updatedInput?.answers).toEqual({ Q1: 'X', Q2: 'Q' })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Codex HIGH regression (2026-07-02) — timeout racing a non-final answer.
+// Pre-fix, the handler awaited ctx.answerCallbackQuery() between the relay
+// mutation and advanceAfterAnswer(); if the internal timeout settled the
+// request during that await, advanceAfterAnswer saw getPending()===undefined
+// and took the «answered final» path — closing the card + sending «Ответы
+// принял, продолжаю ✅» although the request settled as timeout. The fix:
+// finality comes from the relay's synchronous AskAnswerOutcome, and the
+// completion message fires ONLY when THIS callback settled the request as
+// answered.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('Codex regression — timeout during a non-final answer', () => {
+  test('callback-ack delayed past timeout after Q1 → timeout verdict, NO completion, NO render after settle', async () => {
+    const config = mkConfig({ timeoutMs: 30 })
+    const send: FakeTelegramSends = { sendCalls: [], editCalls: [], nextMessageId: 1001 }
+    const api = fakeTelegram(send)
+    let uiRef: ReturnType<typeof createAskUserQuestionUi> | undefined
+    const relay = createAskUserQuestionRelay({
+      log: silentLog(),
+      defaultTimeoutMs: 30,
+      onSettle: (event) => { void uiRef?.handleSettle(event) },
+    })
+    const ui = createAskUserQuestionUi({ config, log: silentLog(), telegramApi: api, relay })
+    uiRef = ui
+
+    const handle = relay.submit({
+      toolUseId: 'toolu_race_ack',
+      sessionId: 'sess',
+      chatId: '164795011',
+      timeoutMs: 30,
+      questions: [
+        { question: 'Q1', options: [{ label: 'X' }, { label: 'Y' }] },
+        { question: 'Q2', options: [{ label: 'P' }, { label: 'Q' }] },
+      ],
+    })
+    const reqId = handle.requestId!
+    await ui.startQuestion(reqId)
+    send.sendCalls.length = 0
+
+    // Answer Q1 with a callback whose ack stalls PAST the relay timeout —
+    // exactly the pre-fix race window.
+    const ctx: AskCallbackContext = {
+      callbackQuery: { data: `ask:choose:${reqId}:0:0` },
+      from: { id: 164795011 },
+      chatId: '164795011',
+      async answerCallbackQuery() {
+        await new Promise((r) => setTimeout(r, 90))
+      },
+    }
+    await ui.handleAskCallback(ctx)
+
+    const result = await handle.result
+    expect(result.status).toBe('timeout')
+    // Flush any fire-and-forget settle edits.
+    await new Promise((r) => setTimeout(r, 10))
+
+    // The poison symptom: NO completion message may exist anywhere.
+    const sentTexts = send.sendCalls.map((c) => c.text)
+    expect(sentTexts.some((t) => t.includes('Ответы принял'))).toBe(false)
+    // Nothing was sent after the request settled (Q2's render — if any —
+    // happened strictly before the timeout; record the count now and give
+    // the loop another tick to prove no trailing sends).
+    const sendsAtSettle = send.sendCalls.length
+    await new Promise((r) => setTimeout(r, 20))
+    expect(send.sendCalls.length).toBe(sendsAtSettle)
+  })
+
+  test('card-close edit stalls past timeout on a non-final answer → no Q2 render, no completion', async () => {
+    // Residual window: with the ack moved AFTER the render, the remaining
+    // await between the relay mutation and the pending re-check is the
+    // clearKeyboard edit itself. Stall that edit past the timeout: the
+    // outcome (final=false) must suppress the completion, and the settled
+    // relay must suppress the Q2 render.
+    const config = mkConfig({ timeoutMs: 30 })
+    const send: FakeTelegramSends = { sendCalls: [], editCalls: [], nextMessageId: 1001 }
+    const api: TelegramApi = {
+      ...fakeTelegram(send),
+      async editMessageText(chatId, messageId, text, editOpts) {
+        send.editCalls.push({ chatId, messageId, text, opts: editOpts })
+        await new Promise((r) => setTimeout(r, 90)) // straddle the timeout
+      },
+    }
+    let uiRef: ReturnType<typeof createAskUserQuestionUi> | undefined
+    const relay = createAskUserQuestionRelay({
+      log: silentLog(),
+      defaultTimeoutMs: 30,
+      onSettle: (event) => { void uiRef?.handleSettle(event) },
+    })
+    const ui = createAskUserQuestionUi({ config, log: silentLog(), telegramApi: api, relay })
+    uiRef = ui
+
+    const handle = relay.submit({
+      toolUseId: 'toolu_race_edit',
+      sessionId: 'sess',
+      chatId: '164795011',
+      timeoutMs: 30,
+      questions: [
+        { question: 'Q1', options: [{ label: 'X' }, { label: 'Y' }] },
+        { question: 'Q2', options: [{ label: 'P' }, { label: 'Q' }] },
+      ],
+    })
+    const reqId = handle.requestId!
+    await ui.startQuestion(reqId)
+    send.sendCalls.length = 0
+
+    await ui.handleAskCallback(mkCtx(`ask:choose:${reqId}:0:0`, 164795011).ctx)
+
+    const result = await handle.result
+    expect(result.status).toBe('timeout')
+    await new Promise((r) => setTimeout(r, 10))
+
+    // Q1's card WAS closed with the chosen answer (the warchief did answer
+    // it) — but Q2 was never rendered and no completion was sent.
+    expect(send.editCalls.some((c) => c.text.includes('✅ Ответ:'))).toBe(true)
+    expect(send.sendCalls.length).toBe(0)
+  })
+})
+
+describe('handleSettle — timeout closes the open card (relay onSettle seam)', () => {
+  test('internal timeout fires onSettle → open keyboard stripped + «время истекло» note', async () => {
+    // Wire the relay's onSettle to the UI exactly as server.ts does, with a
+    // tiny timeout so the internal timer fires on its own.
+    const config = mkConfig({ timeoutMs: 20 })
+    const send: FakeTelegramSends = { sendCalls: [], editCalls: [], nextMessageId: 1001 }
+    const api = fakeTelegram(send)
+    let uiRef: ReturnType<typeof createAskUserQuestionUi> | undefined
+    const relay = createAskUserQuestionRelay({
+      log: silentLog(),
+      defaultTimeoutMs: 20,
+      onSettle: (event) => { void uiRef?.handleSettle(event) },
+    })
+    const ui = createAskUserQuestionUi({ config, log: silentLog(), telegramApi: api, relay })
+    uiRef = ui
+
+    const handle = relay.submit({
+      toolUseId: 'toolu_timeout',
+      sessionId: 'sess',
+      chatId: '164795011',
+      timeoutMs: 20,
+      questions: [{ question: 'Pick a stack', options: [{ label: 'A' }, { label: 'B' }] }],
+    })
+    const reqId = handle.requestId!
+    await ui.startQuestion(reqId)
+    send.editCalls.length = 0
+
+    const result = await handle.result
+    expect(result.status).toBe('timeout')
+    // Give the fire-and-forget handleSettle a tick to run its edit.
+    await new Promise((r) => setTimeout(r, 5))
+
+    expect(send.editCalls.length).toBe(1)
+    expect(send.editCalls[0]?.messageId).toBe(1001)
+    expect(send.editCalls[0]?.opts.reply_markup?.inline_keyboard).toEqual([])
+    expect(send.editCalls[0]?.text).toContain('Pick a stack') // question kept
+    expect(send.editCalls[0]?.text).toContain('⏰ Время истекло')
+  })
+
+  test('handleSettle is a no-op for answered (driven path already closed it)', async () => {
+    const { ui, send } = await mkUi()
+    await ui.handleSettle({
+      requestId: 'aaaaa',
+      toolUseId: 'toolu_x',
+      status: 'answered',
+      chatId: '164795011',
+      telegramMessageId: 1001,
+      currentIndex: 0,
+      totalQuestions: 1,
+      questionText: 'Q',
+      reason: undefined,
+    })
+    expect(send.editCalls.length).toBe(0)
+  })
+
+  test('handleSettle tolerates an edit failure (best-effort, never throws)', async () => {
+    const { ui, send } = await mkUi({}, { editThrows: true })
+    await expect(
+      ui.handleSettle({
+        requestId: 'bbbbb',
+        toolUseId: 'toolu_y',
+        status: 'timeout',
+        chatId: '164795011',
+        telegramMessageId: 1001,
+        currentIndex: 0,
+        totalQuestions: 1,
+        questionText: 'Q',
+        reason: 'ask_user_question timed out',
+      }),
+    ).resolves.toBeUndefined()
+    // The edit was attempted (and threw) — swallowed, no crash.
+    expect(send.editCalls.length).toBe(1)
   })
 })
 
