@@ -79,6 +79,30 @@ export type AskUserQuestionStatus =
   | 'unauthorized'
   | 'idempotent'
 
+// Fired by the relay whenever a request reaches a terminal state (answered
+// / timeout / expire). The relay owns lifecycle (the internal timeout timer
+// + external expire()), so this is the ONLY seam through which the UI (which
+// owns rendering/edits) learns about a settle it did NOT drive itself — most
+// importantly the internal timeout, where no callback path runs. The snapshot
+// carries just enough render state (chatId, the currently-open keyboard's
+// message id, the current question text/index) for the UI to close the open
+// card. Pure data — the relay never touches Telegram.
+export interface AskSettleEvent {
+  requestId: string
+  toolUseId: string
+  status: AskUserQuestionStatus
+  // The chat + message id of the CURRENTLY-OPEN question keyboard at settle
+  // time. On `answered` the relay has already cleared the anchor (undefined);
+  // on `timeout`/expire it points at the card the warchief left un-answered.
+  chatId: string | undefined
+  telegramMessageId: number | undefined
+  currentIndex: number
+  totalQuestions: number
+  // Text of the currently-open question (for the closed-card re-render).
+  questionText: string | undefined
+  reason: string | undefined
+}
+
 export interface AskUserQuestionResult {
   status: AskUserQuestionStatus
   requestId?: string
@@ -93,6 +117,27 @@ export interface AskUserQuestionResult {
   }
   reason?: string
 }
+
+// Return shape of the answer-mutation methods (answerChoice / answerOther /
+// done). Computed SYNCHRONOUSLY at mutation time so the UI can decide the
+// follow-up rendering without re-inferring state after an await — inferring
+// finality from `getPending() === undefined` later is racy: the internal
+// timeout can settle the request during the await, making a NON-final answer
+// look like «answered final» (Codex HIGH, 2026-07-02).
+export interface AskAnswerOutcome {
+  /** The call mutated state (recorded/accumulated an answer). False for
+   *  missing request, stale questionIndex, out-of-range option, empty
+   *  Other-text, done() on non-multiSelect or with empty selection. */
+  applied: boolean
+  /** The call moved PAST the question (single-select pick / multiSelect
+   *  commit) — as opposed to accumulating into the in-flight list. */
+  advanced: boolean
+  /** THIS call settled the whole request as `answered` (it was the final
+   *  question). The ONLY trustworthy trigger for the completion message. */
+  final: boolean
+}
+
+const NOOP_OUTCOME: AskAnswerOutcome = { applied: false, advanced: false, final: false }
 
 // ─────────────────────────────────────────────────────────────────────
 // PendingAskRequest — the mutable per-request record.
@@ -133,6 +178,12 @@ export interface AskUserQuestionRelayDeps {
   // window, shorter than the typical timeout itself so we don't bloat
   // memory under load.
   completedTtlMs?: number
+  // Terminal-state notifier. Fired once per request on settle (answered /
+  // timeout / expire), AFTER the result Promise resolves. The UI registers
+  // this to close the open keyboard on the paths it can't observe itself
+  // (chiefly the internal timeout). Never awaited — best-effort, and a
+  // throwing handler is logged, never allowed to break settle.
+  onSettle?: (event: AskSettleEvent) => void
 }
 
 // Phase 5 FIX-T3 F1 (2026-05-27): submit() returns the requestId
@@ -154,15 +205,17 @@ export interface AskUserQuestionRelay {
   submit(input: SubmitInput): SubmittedRequest
   // Record an option pick for the current question and advance.
   // `optionIndex` indexes into the current question's `options`.
-  answerChoice(requestId: string, questionIndex: number, optionIndex: number): void
+  // Returns the mutation outcome (applied / advanced / final) computed
+  // synchronously so the caller never has to re-infer it post-await.
+  answerChoice(requestId: string, questionIndex: number, optionIndex: number): AskAnswerOutcome
   // Record free-form text (the "Other" button path) as the answer for
   // the current question. For multiSelect, appends to the in-flight
   // list; for single-select, advances immediately.
-  answerOther(requestId: string, questionIndex: number, otherText: string): void
+  answerOther(requestId: string, questionIndex: number, otherText: string): AskAnswerOutcome
   // Toggle a multi-select option on/off. No-op if not multiSelect.
   toggle(requestId: string, questionIndex: number, optionIndex: number): void
   // Commit the multi-select in-flight list as the answer and advance.
-  done(requestId: string, questionIndex: number): void
+  done(requestId: string, questionIndex: number): AskAnswerOutcome
   // External "give up" — resolves with status='timeout' and reason.
   expire(requestId: string, reason?: string): void
   isPending(requestId: string): boolean
@@ -189,6 +242,7 @@ export function createAskUserQuestionRelay(
   const now = deps.now ?? (() => Date.now())
   const defaultTimeoutMs = deps.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS
   const completedTtlMs = deps.completedTtlMs ?? DEFAULT_COMPLETED_TTL_MS
+  const onSettle = deps.onSettle
 
   const pending = new Map<string, PendingAskRequest>()
   // toolUseId → live requestId (only while pending; cleared on settle so
@@ -235,6 +289,32 @@ export function createAskUserQuestionRelay(
         request_id: req.requestId,
         error: err instanceof Error ? err.message : String(err),
       })
+    }
+    // Notify the UI so it can close the open keyboard on paths it can't
+    // observe itself (the internal timeout timer, external expire). We read
+    // the render fields off `req` — still intact even though we removed it
+    // from the pending map above. Best-effort: a throwing handler is logged,
+    // never allowed to poison the settle.
+    if (onSettle) {
+      try {
+        const currentQuestion = req.questions[req.currentIndex]
+        onSettle({
+          requestId: req.requestId,
+          toolUseId: req.toolUseId,
+          status: result.status,
+          chatId: req.chatId,
+          telegramMessageId: req.telegramMessageId,
+          currentIndex: req.currentIndex,
+          totalQuestions: req.questions.length,
+          questionText: currentQuestion?.question,
+          reason: result.reason,
+        })
+      } catch (err) {
+        log.error('ask_user_question onSettle handler threw', {
+          request_id: req.requestId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
     }
   }
 
@@ -416,15 +496,15 @@ export function createAskUserQuestionRelay(
     return { requestId, result: promise }
   }
 
-  function answerChoice(requestId: string, questionIndex: number, optionIndex: number): void {
+  function answerChoice(requestId: string, questionIndex: number, optionIndex: number): AskAnswerOutcome {
     // FIX-T2 F4 — call pruneCompleted on every public surface so cached
     // entries don't accumulate after a burst followed by idle time.
     pruneCompleted()
     const req = pending.get(requestId)
-    if (!req) return
-    if (!ensureCurrent(req, questionIndex, 'answerChoice')) return
+    if (!req) return NOOP_OUTCOME
+    if (!ensureCurrent(req, questionIndex, 'answerChoice')) return NOOP_OUTCOME
     const q = req.questions[req.currentIndex]
-    if (!q) return
+    if (!q) return NOOP_OUTCOME
     const opt = q.options[optionIndex]
     if (!opt) {
       log.warn('ask_user_question answerChoice out of range', {
@@ -432,40 +512,46 @@ export function createAskUserQuestionRelay(
         question_index: questionIndex,
         option_index: optionIndex,
       })
-      return
+      return NOOP_OUTCOME
     }
     if (q.multiSelect === true) {
       // For multi-select, a "choice" tap is a toggle. Keep semantics
       // explicit: callers should prefer toggle(); this is the safety
       // net if TASK-2 routes the wrong handler.
       toggleInternal(req, optionIndex)
-      return
+      return { applied: true, advanced: false, final: false }
     }
     recordSingle(req, opt.label)
     advance(req)
+    // `advance` only ever settles as `answered`; ensureCurrent guaranteed
+    // _settled was false on entry, and nothing between here and there
+    // awaits — so `req._settled` now means THIS call answered the final
+    // question. This synchronous read is the whole point of the outcome.
+    return { applied: true, advanced: true, final: req._settled }
   }
 
-  function answerOther(requestId: string, questionIndex: number, otherText: string): void {
+  function answerOther(requestId: string, questionIndex: number, otherText: string): AskAnswerOutcome {
     pruneCompleted() // FIX-T2 F4
     const req = pending.get(requestId)
-    if (!req) return
-    if (!ensureCurrent(req, questionIndex, 'answerOther')) return
+    if (!req) return NOOP_OUTCOME
+    if (!ensureCurrent(req, questionIndex, 'answerOther')) return NOOP_OUTCOME
     const q = req.questions[req.currentIndex]
-    if (!q) return
+    if (!q) return NOOP_OUTCOME
     const text = otherText.trim()
     if (text.length === 0) {
       log.debug('ask_user_question answerOther empty text', {
         request_id: requestId,
         question_index: questionIndex,
       })
-      return
+      return NOOP_OUTCOME
     }
     if (q.multiSelect === true) {
       req.multiSelectInFlight = [...req.multiSelectInFlight, text]
-      return
+      return { applied: true, advanced: false, final: false }
     }
     recordSingle(req, text)
     advance(req)
+    return { applied: true, advanced: true, final: req._settled }
   }
 
   function toggleInternal(req: PendingAskRequest, optionIndex: number): void {
@@ -493,18 +579,18 @@ export function createAskUserQuestionRelay(
     toggleInternal(req, optionIndex)
   }
 
-  function done(requestId: string, questionIndex: number): void {
+  function done(requestId: string, questionIndex: number): AskAnswerOutcome {
     pruneCompleted() // FIX-T2 F4
     const req = pending.get(requestId)
-    if (!req) return
-    if (!ensureCurrent(req, questionIndex, 'done')) return
+    if (!req) return NOOP_OUTCOME
+    if (!ensureCurrent(req, questionIndex, 'done')) return NOOP_OUTCOME
     const q = req.questions[req.currentIndex]
     if (!q || q.multiSelect !== true) {
       log.debug('ask_user_question done on non-multiselect ignored', {
         request_id: requestId,
         question_index: questionIndex,
       })
-      return
+      return NOOP_OUTCOME
     }
     if (req.multiSelectInFlight.length === 0) {
       // Defensive: TASK-2 should disable Done until at least one item is
@@ -513,10 +599,11 @@ export function createAskUserQuestionRelay(
         request_id: requestId,
         question_index: questionIndex,
       })
-      return
+      return NOOP_OUTCOME
     }
     recordMulti(req, req.multiSelectInFlight)
     advance(req)
+    return { applied: true, advanced: true, final: req._settled }
   }
 
   function expire(requestId: string, reason?: string): void {

@@ -619,9 +619,19 @@ const callbackDeps = {
 // reads `askUserQuestionRelay` to submit new requests; TASK-2's UI is
 // invoked from the callback_query handler below and the text-reply
 // path in handlers.ts (Other follow-up).
+// Late-bound UI ref: the relay's onSettle notifier must reach the UI, but the
+// UI is constructed AFTER the relay (it depends on it). The closure below only
+// fires on a terminal settle — long after both are assigned — so capturing the
+// `let` is safe. This is the seam through which the UI learns about the relay's
+// internal timeout (no callback path runs there) and closes the open keyboard.
+let askUserQuestionUiRef: AskUserQuestionUi | undefined
 const askUserQuestionRelay = createAskUserQuestionRelay({
   log,
   defaultTimeoutMs: config.ask_user_question.timeout_ms,
+  onSettle: (event) => {
+    // Fire-and-forget: handleSettle is best-effort and never throws.
+    void askUserQuestionUiRef?.handleSettle(event)
+  },
 })
 const askUserQuestionUi: AskUserQuestionUi = createAskUserQuestionUi({
   config,
@@ -629,6 +639,7 @@ const askUserQuestionUi: AskUserQuestionUi = createAskUserQuestionUi({
   telegramApi,
   relay: askUserQuestionRelay,
 })
+askUserQuestionUiRef = askUserQuestionUi
 // Permission gate (2026-06-09): interactive Allow/Deny confirm relay for the
 // bypassPermissions DM session. The PreToolUse hook POSTs confirm-tier calls
 // to /hooks/permission/request (webhook layer reads `permissionGateRelay`);
