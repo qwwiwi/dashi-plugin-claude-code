@@ -82,6 +82,9 @@ function makeStubApi(): {
         throw err
       }
     },
+    async answerGuestQuery() {
+      /* not exercised by mirror tests */
+    },
     async deleteMessage(chatId, messageId) {
       ops.push({ method: 'deleteMessage', chatId, messageId })
     },

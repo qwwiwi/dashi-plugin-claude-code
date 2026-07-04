@@ -307,6 +307,29 @@ export const AppConfigSchema = z.object({
     timeout_ms: z.number().int().positive().default(120_000),
     allowed_user_ids: z.array(z.number().int().positive()).optional(),
   }).default({}),
+  // Guest Mode (Bot API 10.0, 2026-07-04) — @-mention the bot in ANY chat
+  // (including chats the bot is not a member of); Telegram delivers a
+  // one-shot `guest_message` update and the bot answers exactly once via
+  // answerGuestQuery. Requires the owner to flip the Guest Mode toggle in
+  // BotFather (getMe.supports_guest_queries turns true).
+  //
+  // Default OFF: the handler is only registered when enabled, so existing
+  // deployments see zero behaviour change until the operator opts in.
+  //
+  // `allowed_user_ids` omitted → inherit the top-level `allowed_user_ids`
+  // (the owner DM allowlist) via resolveGuestModeAllowedUserIds — same
+  // single-source-of-truth pattern as permission_relay inheritance. The
+  // gate is fail-closed on `guest_bot_caller_user.id`: mentions from
+  // anyone else are silently dropped (no answerGuestQuery spent).
+  //
+  // The whole block is OPTIONAL (no `.default({})`) — same trick as `hud`
+  // below — so the many pre-guest test config literals stay valid without
+  // adding the field. `resolveGuestModeEnabled` applies the off-by-default
+  // fallback in one place.
+  guest_mode: z.object({
+    enabled: z.boolean().default(false),
+    allowed_user_ids: z.array(z.number().int().positive()).optional(),
+  }).optional(),
   // Context HUD (wave 3B) — a single pinned Telegram message in the owner's
   // chat that shows context-window usage (bar + percentage) plus two action
   // buttons (Сжать / Новый диалог), refreshed after each turn (SessionStart /
@@ -701,6 +724,35 @@ export function resolvePermissionGateAllowedUserIds(
   }
   const inherited = config.permission_relay.allowed_user_ids
   if (log) log.info('permission_gate: allowed_user_ids unset, inheriting from permission_relay', { count: inherited.length, fallback: true })
+  return inherited
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveGuestModeAllowedUserIds — single source of truth for who may
+// summon the bot via a guest @-mention. Explicit `guest_mode
+// .allowed_user_ids` wins; otherwise inherit the top-level
+// `allowed_user_ids` (the owner DM allowlist). Callers MUST go through
+// this helper so the fallback lives in exactly one place.
+// ─────────────────────────────────────────────────────────────────────
+
+// resolveGuestModeEnabled — whether Guest Mode handling is active. The
+// `guest_mode` block is optional; a missing block means OFF (unlike `hud`,
+// which defaults ON — guest handling must be a deliberate opt-in).
+export function resolveGuestModeEnabled(config: AppConfig): boolean {
+  return config.guest_mode?.enabled ?? false
+}
+
+export function resolveGuestModeAllowedUserIds(
+  config: AppConfig,
+  log?: AllowedUserIdsLogger,
+): readonly number[] {
+  const explicit = config.guest_mode?.allowed_user_ids
+  if (explicit !== undefined) {
+    if (log) log.info('guest_mode: using explicit allowed_user_ids', { count: explicit.length, fallback: false })
+    return explicit
+  }
+  const inherited = config.allowed_user_ids
+  if (log) log.info('guest_mode: allowed_user_ids unset, inheriting from allowed_user_ids', { count: inherited.length, fallback: true })
   return inherited
 }
 

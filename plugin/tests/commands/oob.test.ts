@@ -88,6 +88,7 @@ function makeTelegramApi(): TelegramApi {
     sendPhoto: fail('sendPhoto') as TelegramApi['sendPhoto'],
     downloadFile: fail('downloadFile') as TelegramApi['downloadFile'],
     deleteMessage: fail('deleteMessage') as TelegramApi['deleteMessage'],
+    answerGuestQuery: fail('answerGuestQuery') as TelegramApi['answerGuestQuery'],
   }
 }
 
