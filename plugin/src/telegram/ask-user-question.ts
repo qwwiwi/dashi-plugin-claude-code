@@ -46,6 +46,8 @@ import type { Logger } from '../log.js'
 import type { AppConfig } from '../config.js'
 import { resolveAskUserQuestionAllowedUserIds } from '../config.js'
 import type {
+  AskAnswerOutcome,
+  AskSettleEvent,
   AskUserQuestionRelay,
   PendingAskRequest,
 } from '../channel/ask-user-question.js'
@@ -91,6 +93,44 @@ const MAX_OPTION_DESCRIPTION_CHARS = 500
 // Marker appended when the assembled body would overflow MAX_BODY_CHARS.
 // Self-contained HTML — no open tags, never sliced.
 const OVERFLOW_MARKER = '\n<i>… (обрезано)</i>'
+
+// ── Card-close copy (2026-07-02, warchief UX feedback) ────────────────
+// When a question is answered / times out we STRIP the keyboard and edit
+// the message so it no longer looks tappable, keeping the question text
+// for context and appending a one-line outcome. Tone matches the
+// permission relay's «✅ Allowed / ❌ Denied» verdict-edit convention.
+
+// Raw cap for the chosen-answer echo. «Другое» free-text can be long —
+// truncate so the closed card stays compact.
+const MAX_ANSWER_CHARS = 100
+// Outcome line shown once the warchief has answered a question.
+function formatChosenLine(rawAnswer: string): string {
+  return `✅ Ответ: <b>${escapeHtml(clipRaw(rawAnswer, MAX_ANSWER_CHARS))}</b>`
+}
+// Outcome line shown when the request times out (or is externally expired)
+// with the card still open. Static, HTML-safe literal.
+const TIMEOUT_OUTCOME_LINE = '⏰ Время истекло — спрошу заново'
+// One-shot completion message sent after the LAST question is answered.
+const COMPLETION_TEXT = 'Ответы принял, продолжаю ✅'
+
+/**
+ * Render a CLOSED question card: header + original question text + a single
+ * outcome line, no keyboard. Used both when a question is answered (outcome
+ * = the chosen answer) and on timeout (outcome = the «время истекло» note).
+ * `outcomeLineHtml` is trusted HTML — callers build it via `formatChosenLine`
+ * (escapes user content) or a static safe literal. Header + question are
+ * escaped here. Exported for tests.
+ */
+export function renderClosedQuestionBody(
+  questionRaw: string,
+  currentIndex: number,
+  totalQuestions: number,
+  outcomeLineHtml: string,
+): string {
+  const header = clipRaw(`Вопрос ${currentIndex + 1}/${totalQuestions}`, MAX_HEADER_CHARS)
+  const question = escapeHtml(clipRaw(questionRaw, MAX_QUESTION_CHARS))
+  return `<b>${escapeHtml(header)}</b>\n${question}\n\n${outcomeLineHtml}`
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Public types
@@ -146,6 +186,16 @@ export interface AskUserQuestionUi {
     text: string
     replyToMessageId?: number
   }): Promise<boolean>
+
+  /**
+   * React to a terminal settle the UI did NOT drive itself — chiefly the
+   * relay's internal timeout, where no callback path runs to close the open
+   * keyboard. Wired to the relay's `onSettle` in server.ts. Best-effort:
+   * closes the currently-open question card (strips keyboard, appends the
+   * timeout note) and never throws. A no-op for `answered` (the driven
+   * callback path already closed the card + sent the completion message).
+   */
+  handleSettle(event: AskSettleEvent): Promise<void>
 
   /** Test/inspection — pending «Other» prompts. */
   awaitingOtherCount(): number
@@ -759,27 +809,116 @@ export function createAskUserQuestionUi(
     }
   }
 
-  async function advanceAfterAnswer(requestId: string, prevMessageId: number | undefined, prevChatId: string | undefined): Promise<void> {
-    const stillPending = relay.getPending(requestId)
-    if (stillPending) {
-      // Clear the previous keyboard so the warchief can't double-answer
-      // the question we just consumed, then render the next.
-      if (prevChatId !== undefined && prevMessageId !== undefined) {
-        await clearKeyboard(requestId, prevChatId, prevMessageId, '<i>Ответ принят. Следующий вопрос…</i>')
-      }
-      // FIX-T2 F1: if clearKeyboard hit `forbidden` it already expired
-      // the relay; do NOT proceed to startQuestion on a settled request
-      // (would just no-op since getPending returns undefined, but the
-      // explicit check avoids a stray log line at debug).
-      if (relay.getPending(requestId) === undefined) return
-      await startQuestion(requestId)
+  // Snapshot of the just-answered question, captured in the callback handler
+  // BEFORE the relay mutation (which advances currentIndex / clears the
+  // in-flight list / drops the anchor). Carries everything needed to close
+  // the card with the chosen answer.
+  interface AnswerSnapshot {
+    requestId: string
+    chatId: string | undefined
+    messageId: number | undefined
+    questionIndex: number
+    questionText: string
+    totalQuestions: number
+    // Pre-built, HTML-safe outcome line («✅ Ответ: <label>»).
+    outcomeLineHtml: string
+  }
+
+  // One-shot «Ответы приняты» confirmation after the final question. New
+  // message (not an edit) so the warchief's device pings. Best-effort.
+  async function sendCompletion(chatId: string): Promise<void> {
+    try {
+      await telegramApi.sendMessage(chatId, COMPLETION_TEXT, { parse_mode: 'HTML' })
+    } catch (err) {
+      const cls = classifyEditError(err)
+      log.debug('ask_user_question completion send failed', {
+        chat_id: chatId,
+        kind: cls.kind,
+      })
+    }
+  }
+
+  // Codex HIGH (2026-07-02): the follow-up rendering path is decided by the
+  // relay's SYNCHRONOUS mutation outcome, NOT by re-inferring state from
+  // `getPending()` after an await. The pre-fix code awaited the callback ack
+  // between the mutation and this function; if the internal timeout settled
+  // the request during that await, a NON-final answer saw
+  // `getPending() === undefined` and took the «answered final» branch —
+  // closing the card + sending «Ответы принял…» although the request settled
+  // as timeout. `outcome.final` is computed at mutation time and immune.
+  async function advanceAfterAnswer(snap: AnswerSnapshot, outcome: AskAnswerOutcome): Promise<void> {
+    // Relay refused the mutation (stale/duplicate/out-of-range/empty text)
+    // — nothing changed, nothing to render.
+    if (!outcome.applied) return
+
+    // multiSelect accumulation: an «Другое» free-text entry (or a stray tap)
+    // added to the in-flight list WITHOUT advancing. The card stays open —
+    // just re-render it so the current state shows. No close, no completion.
+    if (!outcome.advanced) {
+      await rerenderCurrent(snap.requestId)
       return
     }
-    // Resolved — drop the keyboard and confirm.
-    if (prevChatId !== undefined && prevMessageId !== undefined) {
-      // No requestId — the relay already settled, so even if clearKeyboard
-      // sees forbidden there's nothing to expire.
-      await clearKeyboard(undefined, prevChatId, prevMessageId, '<b>Ответ принят.</b>')
+
+    // Close the answered card: keep the question text, append the chosen
+    // answer, strip the keyboard so it no longer looks tappable.
+    const closedBody = renderClosedQuestionBody(
+      snap.questionText,
+      snap.questionIndex,
+      snap.totalQuestions,
+      snap.outcomeLineHtml,
+    )
+
+    if (!outcome.final) {
+      // Advanced to the next question. Close the answered card, then render
+      // the next. clearKeyboard is best-effort + classifier-aware (a
+      // `forbidden` there expires the relay), so re-check before rendering.
+      if (snap.chatId !== undefined && snap.messageId !== undefined) {
+        await clearKeyboard(snap.requestId, snap.chatId, snap.messageId, closedBody)
+      }
+      // FIX-T2 F1 + timeout race: if clearKeyboard hit `forbidden` it already
+      // expired the relay, and the internal timeout may have settled it during
+      // the edit await — either way do NOT render a next question on a settled
+      // request. (handleSettle owns the timeout note; anchor was cleared by
+      // advance() so there is no double-edit of this card.)
+      if (relay.getPending(snap.requestId) === undefined) return
+      await startQuestion(snap.requestId)
+      return
+    }
+
+    // outcome.final — THIS answer settled the request as `answered`. Close
+    // the final card, then send ONE completion message. No requestId to
+    // clearKeyboard: the relay already settled, so a `forbidden` there has
+    // nothing left to expire.
+    if (snap.chatId !== undefined && snap.messageId !== undefined) {
+      await clearKeyboard(undefined, snap.chatId, snap.messageId, closedBody)
+    }
+    if (snap.chatId !== undefined) {
+      await sendCompletion(snap.chatId)
+    }
+  }
+
+  // Close the currently-open question card on a settle the UI did NOT drive
+  // (internal timeout / external expire). Best-effort — never throws.
+  async function handleSettle(event: AskSettleEvent): Promise<void> {
+    try {
+      // `answered` is fully handled by the driven callback path (per-question
+      // close + completion message); acting here would double-post. Only the
+      // timeout/expire family leaves a card open with a live keyboard.
+      if (event.status !== 'timeout') return
+      if (!event.chatId || event.telegramMessageId === undefined) return
+      const body = renderClosedQuestionBody(
+        event.questionText ?? '',
+        event.currentIndex,
+        event.totalQuestions,
+        TIMEOUT_OUTCOME_LINE,
+      )
+      // requestId undefined: relay already settled — nothing left to expire.
+      await clearKeyboard(undefined, event.chatId, event.telegramMessageId, body)
+    } catch (err) {
+      log.debug('ask_user_question handleSettle failed', {
+        request_id: event.requestId,
+        error: err instanceof Error ? err.message : String(err),
+      })
     }
   }
 
@@ -864,12 +1003,29 @@ export function createAskUserQuestionUi(
 
     const prevMessageId = pendingBefore.telegramMessageId
     const prevChatId = pendingBefore.chatId
+    const currentQuestion = pendingBefore.questions[pendingBefore.currentIndex]
+    const totalQuestions = pendingBefore.questions.length
 
     try {
       if (parsed.kind === 'choose') {
-        relay.answerChoice(parsed.requestId, parsed.questionIndex, parsed.optionIndex)
+        // Capture the chosen label BEFORE the relay advances past this
+        // question — afterwards currentIndex points at the next one.
+        const chosenLabel = currentQuestion?.options[parsed.optionIndex]?.label ?? ''
+        const snap: AnswerSnapshot = {
+          requestId: parsed.requestId,
+          chatId: prevChatId,
+          messageId: prevMessageId,
+          questionIndex: pendingBefore.currentIndex,
+          questionText: currentQuestion?.question ?? '',
+          totalQuestions,
+          outcomeLineHtml: formatChosenLine(chosenLabel),
+        }
+        const outcome = relay.answerChoice(parsed.requestId, parsed.questionIndex, parsed.optionIndex)
+        // Render BEFORE acking the spinner: the ack is cosmetic and can
+        // trail, while any await placed between the mutation and the
+        // follow-up render widens the timeout race window (Codex HIGH).
+        await advanceAfterAnswer(snap, outcome)
         await ctx.answerCallbackQuery().catch(() => {})
-        await advanceAfterAnswer(parsed.requestId, prevMessageId, prevChatId)
         return
       }
       if (parsed.kind === 'toggle') {
@@ -879,9 +1035,22 @@ export function createAskUserQuestionUi(
         return
       }
       if (parsed.kind === 'done') {
-        relay.done(parsed.requestId, parsed.questionIndex)
+        // Snapshot the committed multi-select labels BEFORE `done()` clears
+        // the in-flight list (advance resets it to []).
+        const committedLabels = [...pendingBefore.multiSelectInFlight]
+        const snap: AnswerSnapshot = {
+          requestId: parsed.requestId,
+          chatId: prevChatId,
+          messageId: prevMessageId,
+          questionIndex: pendingBefore.currentIndex,
+          questionText: currentQuestion?.question ?? '',
+          totalQuestions,
+          outcomeLineHtml: formatChosenLine(committedLabels.join(', ')),
+        }
+        const outcome = relay.done(parsed.requestId, parsed.questionIndex)
+        // Same ordering rationale as `choose`: render first, ack after.
+        await advanceAfterAnswer(snap, outcome)
         await ctx.answerCallbackQuery().catch(() => {})
-        await advanceAfterAnswer(parsed.requestId, prevMessageId, prevChatId)
         return
       }
       // kind === 'other'
@@ -993,11 +1162,20 @@ export function createAskUserQuestionUi(
     // logs at debug). We still clear the awaiting marker so the user
     // is not silently swallowed forever.
     const pendingBefore = relay.getPending(entry.requestId)
-    const prevMessageId = pendingBefore?.telegramMessageId
-    const prevChatId = pendingBefore?.chatId
+    const currentQuestion = pendingBefore?.questions[pendingBefore.currentIndex]
+    const snap: AnswerSnapshot = {
+      requestId: entry.requestId,
+      chatId: pendingBefore?.chatId,
+      messageId: pendingBefore?.telegramMessageId,
+      questionIndex: pendingBefore?.currentIndex ?? entry.questionIndex,
+      questionText: currentQuestion?.question ?? '',
+      totalQuestions: pendingBefore?.questions.length ?? 0,
+      // «Другое» free-text is the chosen answer (truncated in the echo).
+      outcomeLineHtml: formatChosenLine(input.text.trim()),
+    }
     awaitingOther.delete(input.chatId)
-    relay.answerOther(entry.requestId, entry.questionIndex, input.text)
-    await advanceAfterAnswer(entry.requestId, prevMessageId, prevChatId)
+    const outcome = relay.answerOther(entry.requestId, entry.questionIndex, input.text)
+    await advanceAfterAnswer(snap, outcome)
     return true
   }
 
@@ -1010,6 +1188,7 @@ export function createAskUserQuestionUi(
     startQuestion,
     handleAskCallback,
     tryHandleOtherText,
+    handleSettle,
     awaitingOtherCount,
   }
 }

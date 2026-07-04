@@ -20,6 +20,7 @@
 
 import type { Logger } from '../log.js'
 import type {
+  AnswerGuestQueryOpts,
   ChatAction,
   DownloadResult,
   EditOpts,
@@ -266,6 +267,24 @@ export function createSafeTelegramApi(
 
     async deleteMessage(chatId: string, messageId: number): Promise<void> {
       return raw.deleteMessage(chatId, messageId)
+    },
+
+    async answerGuestQuery(
+      guestQueryId: string,
+      text: string,
+      opts: AnswerGuestQueryOpts,
+    ): Promise<void> {
+      // Guest answers land in a PUBLIC foreign chat — redaction here is the
+      // last line of defence, exactly like sendMessage. HTML downgrade
+      // follows the same rule: invalid Telegram HTML ships as plain text.
+      const { text: safeText, parseMode } = sanitize(text, opts.parse_mode)
+      const safeOpts: AnswerGuestQueryOpts = { ...opts }
+      if (parseMode === undefined) {
+        delete safeOpts.parse_mode
+      } else {
+        safeOpts.parse_mode = parseMode
+      }
+      return raw.answerGuestQuery(guestQueryId, safeText, safeOpts)
     },
   }
 }

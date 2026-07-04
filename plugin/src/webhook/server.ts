@@ -38,7 +38,11 @@ import {
 import { resolvePermissionGateAllowedUserIds } from '../config.js'
 import type { PermissionGateRelay } from '../channel/permission-gate-relay.js'
 import { sendChannelNotification, normalizeMeta } from '../channel/notify.js'
-import { toActivityEvent, toTodoWriteEvent } from '../hooks/claude-events.js'
+import {
+  toActivityEvent,
+  toTodoWriteEvent,
+  type TaskMirrorEvent,
+} from '../hooks/claude-events.js'
 import type {
   AskUserQuestionRelay,
   AskUserQuestionResult,
@@ -155,6 +159,49 @@ export interface StatusManagerForWebhook {
   ): Promise<void>
 }
 
+// Structural surface for the SessionInfoStore. Every claude_hook carries
+// transcript_path + session_id; SessionStart also carries model. We record the
+// latest so /status (and the context HUD) can read them. Write-only here.
+export interface SessionInfoRecorder {
+  record(
+    chatId: string | undefined,
+    info: {
+      transcriptPath?: string
+      sessionId?: string
+      model?: string
+      permissionMode?: string
+    },
+  ): void
+}
+
+// Structural surface for the context HUD (wave 3B). SessionStart (re)pins +
+// refreshes the pinned HUD message; Stop refreshes its percentage. Both entry
+// points are best-effort inside the HUD (they swallow + log, never throw), so
+// the webhook fires them fire-and-forget and never blocks the 200. Optional —
+// when absent the hook path is unchanged (no HUD).
+//
+// Status-pin wave (2026-07-04): `onTodoEvent` feeds the HUD's «Задачи»
+// section from the SAME TaskMirrorEvent stream TaskMirror consumes. Optional
+// on the interface so older stubs/tests remain valid.
+export interface ContextHudForWebhook {
+  onSessionStart(chatId: string): Promise<void> | void
+  onStop(chatId: string): Promise<void> | void
+  onTodoEvent?(chatId: string, event: TaskMirrorEvent): Promise<void> | void
+}
+
+// Fire a HUD entry point without EVER letting it disturb the hook 200 path.
+// `Promise.resolve(fn()).catch()` alone is not enough: fn() runs before the
+// wrap, so a synchronous throw would escape (codex review 2026-07-04, HIGH #2).
+function fireHud(log: Logger, fn: () => Promise<void> | void): void {
+  try {
+    void Promise.resolve(fn()).catch(() => {})
+  } catch (err) {
+    log.warn('context hud dispatch threw synchronously (ignored)', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+}
+
 // Structural surface for the AskUserQuestion Telegram UI handler (TASK-2).
 // We accept any object exposing `startQuestion(requestId)` so the webhook
 // layer is decoupled from the concrete implementation in
@@ -174,6 +221,15 @@ export interface WebhookDeps {
   // status update happens. The 200 path stays open so Claude hooks never
   // back-pressure on visibility outages.
   statusManager?: StatusManagerForWebhook
+  // Session facts store (task: context HUD). Records transcript_path + model
+  // from every claude_hook so /status can show context usage. Optional — when
+  // absent the hook path is unchanged (no capture). Pure in-memory, never
+  // throws, so the record call needs no error wrapping.
+  sessionInfo?: SessionInfoRecorder
+  // Context HUD (wave 3B): the pinned context-usage indicator. SessionStart /
+  // Stop hooks drive it. Optional — when absent no HUD is rendered. Fired
+  // fire-and-forget so a HUD failure never back-pressures the 200.
+  contextHud?: ContextHudForWebhook
   // Phase 8: optional memory writer. Receives a sibling dispatch of every
   // hook payload (UserPromptSubmit buffers, Stop writes recent.md +
   // verbose.jsonl). Throws are caught and logged — never block the 200.
@@ -500,6 +556,54 @@ async function handleRequest(
   // Branch on payload variant. Discriminator was set by the Zod transform
   // so we don't have to re-sniff fields here.
   if (payload.kind === 'claude_hook') {
+    // Capture the latest session facts (transcript_path + model) so /status and
+    // the context HUD can read them. transcript_path + session_id ride on every
+    // hook; model is present only on SessionStart. Pure in-memory record.
+    if (deps.sessionInfo) {
+      const info: {
+        transcriptPath?: string
+        sessionId?: string
+        model?: string
+        permissionMode?: string
+      } = {
+        transcriptPath: payload.transcript_path,
+        sessionId: payload.session_id,
+      }
+      if (
+        payload.hook_event_name === 'SessionStart'
+        && typeof payload.model === 'string'
+        && payload.model.length > 0
+      ) {
+        info.model = payload.model
+      }
+      // permission_mode rides on any hook that carries it (schema-optional).
+      // The status pin renders «план» / «выполнение» from the latest value.
+      if (
+        typeof payload.permission_mode === 'string'
+        && payload.permission_mode.length > 0
+      ) {
+        info.permissionMode = payload.permission_mode
+      }
+      deps.sessionInfo.record(payload.chatId, info)
+    }
+
+    // Context HUD (wave 3B): drive the pinned indicator on the session
+    // lifecycle. SessionStart (re)pins + refreshes; Stop refreshes the
+    // percentage after a turn. COMPLETELY isolated from the 200 path: the HUD
+    // methods swallow + log internally. fireHud additionally guards against a
+    // SYNCHRONOUS throw — `Promise.resolve(fn()).catch()` alone evaluates
+    // fn() BEFORE the wrap, so a sync throw would 500 the hook response
+    // (codex review 2026-07-04, HIGH #2). The HUD gates on the owner chat
+    // internally, so a non-owner chatId is a safe no-op.
+    if (deps.contextHud) {
+      const hud = deps.contextHud
+      if (payload.hook_event_name === 'SessionStart') {
+        fireHud(log, () => hud.onSessionStart(payload.chatId))
+      } else if (payload.hook_event_name === 'Stop') {
+        fireHud(log, () => hud.onStop(payload.chatId))
+      }
+    }
+
     // Phase 8: dispatch to memory writer first, BEFORE the status branch,
     // so memory persistence runs regardless of status.enabled. Errors are
     // logged and swallowed — memory must never back-pressure the 200.
@@ -559,17 +663,25 @@ async function handleRequest(
     // PR-A2 (2026-05-20): TaskMirror handles TodoWrite + Stop hooks. The
     // mapper returns null for every other event, so the cost when no
     // TodoWrite is in flight is one schema test per hook — negligible.
-    if (taskMirror) {
+    // Status-pin wave (2026-07-04): the SAME mapped event also feeds the
+    // context HUD's «Задачи» section — fire-and-forget, never blocks the 200.
+    if (taskMirror || deps.contextHud?.onTodoEvent) {
       const todoEvent = toTodoWriteEvent(payload, log)
       if (todoEvent !== null) {
-        try {
-          await taskMirror.recordEvent(payload.chatId, todoEvent)
-        } catch (err) {
-          log.warn('hook event task mirror update failed (ignored)', {
-            chat_id: payload.chatId,
-            hook: payload.hook_event_name,
-            error: err instanceof Error ? err.message : String(err),
-          })
+        if (taskMirror) {
+          try {
+            await taskMirror.recordEvent(payload.chatId, todoEvent)
+          } catch (err) {
+            log.warn('hook event task mirror update failed (ignored)', {
+              chat_id: payload.chatId,
+              hook: payload.hook_event_name,
+              error: err instanceof Error ? err.message : String(err),
+            })
+          }
+        }
+        if (deps.contextHud?.onTodoEvent) {
+          const hud = deps.contextHud
+          fireHud(log, () => hud.onTodoEvent?.(payload.chatId, todoEvent))
         }
       }
     }

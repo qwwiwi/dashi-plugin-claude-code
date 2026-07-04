@@ -44,7 +44,19 @@ export const AppConfigSchema = z.object({
   dm_only: z.boolean().default(true),
   allowed_user_ids: z.array(z.number().int().positive()).min(1).default([164795011]),
   allowed_chat_ids: z.array(z.union([z.number(), z.string()])).default([164795011]),
+  // Owner DM chat ids for OWNER-ONLY surfaces (the pinned context HUD + the
+  // owner command menu). Distinct from `allowed_chat_ids`, which in multichat
+  // ALSO lists group/supergroup ids — a HUD with destructive buttons or the
+  // command menu must NEVER be pinned in a public group (FIX-8). Optional: when
+  // omitted, `resolveOwnerChatIds` falls back to `allowed_user_ids` (in a DM the
+  // chat id equals the positive user id). Positive ids only.
+  owner_chat_ids: z.array(z.number().int().positive()).optional(),
   workspace_root: z.string().optional(),
+  // Model context-window size in tokens, used by /status (context usage) and
+  // the context HUD. Optional — resolved via `resolveContextWindowTokens`,
+  // which applies the 200k default so the field stays absent-friendly for the
+  // many test config literals that predate it.
+  context_window_tokens: z.number().int().positive().optional(),
   // 2026-06-09 duplicate-windows fix: StatusManager and ProgressReporter
   // both defaulted ON, so a fresh install with hooks registered rendered two
   // hook-driven «working/running» Telegram windows next to the tmux mirror.
@@ -295,6 +307,41 @@ export const AppConfigSchema = z.object({
     timeout_ms: z.number().int().positive().default(120_000),
     allowed_user_ids: z.array(z.number().int().positive()).optional(),
   }).default({}),
+  // Guest Mode (Bot API 10.0, 2026-07-04) — @-mention the bot in ANY chat
+  // (including chats the bot is not a member of); Telegram delivers a
+  // one-shot `guest_message` update and the bot answers exactly once via
+  // answerGuestQuery. Requires the owner to flip the Guest Mode toggle in
+  // BotFather (getMe.supports_guest_queries turns true).
+  //
+  // Default OFF: the handler is only registered when enabled, so existing
+  // deployments see zero behaviour change until the operator opts in.
+  //
+  // `allowed_user_ids` omitted → inherit the top-level `allowed_user_ids`
+  // (the owner DM allowlist) via resolveGuestModeAllowedUserIds — same
+  // single-source-of-truth pattern as permission_relay inheritance. The
+  // gate is fail-closed on `guest_bot_caller_user.id`: mentions from
+  // anyone else are silently dropped (no answerGuestQuery spent).
+  //
+  // The whole block is OPTIONAL (no `.default({})`) — same trick as `hud`
+  // below — so the many pre-guest test config literals stay valid without
+  // adding the field. `resolveGuestModeEnabled` applies the off-by-default
+  // fallback in one place.
+  guest_mode: z.object({
+    enabled: z.boolean().default(false),
+    allowed_user_ids: z.array(z.number().int().positive()).optional(),
+  }).optional(),
+  // Context HUD (wave 3B) — a single pinned Telegram message in the owner's
+  // chat that shows context-window usage (bar + percentage) plus the «Сжать»
+  // action button, refreshed after each turn (SessionStart / Stop hooks).
+  // Default ON.
+  //
+  // The whole block is OPTIONAL (no `.default({})`) so `hud` reads as
+  // `hud?: { enabled: boolean }` on the inferred type — existing full-config
+  // test literals that predate this field stay valid without adding it.
+  // `resolveHudEnabled` applies the enabled-by-default fallback in one place.
+  hud: z.object({
+    enabled: z.boolean().default(true),
+  }).optional(),
   // Rich Messages (M1, Bot API 10.1, 2026-06-14). When enabled, a DM reply
   // whose body fits 32768 bytes ships as a single RAW-markdown rich message
   // (Telegram renders tables/math/headings/task-lists/<details>/footnotes)
@@ -725,4 +772,79 @@ export function resolvePermissionGateAllowedUserIds(
   const inherited = config.permission_relay.allowed_user_ids
   if (log) log.info('permission_gate: allowed_user_ids unset, inheriting from permission_relay', { count: inherited.length, fallback: true })
   return inherited
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveGuestModeAllowedUserIds — single source of truth for who may
+// summon the bot via a guest @-mention. Explicit `guest_mode
+// .allowed_user_ids` wins; otherwise inherit the top-level
+// `allowed_user_ids` (the owner DM allowlist). Callers MUST go through
+// this helper so the fallback lives in exactly one place.
+// ─────────────────────────────────────────────────────────────────────
+
+// resolveGuestModeEnabled — whether Guest Mode handling is active. The
+// `guest_mode` block is optional; a missing block means OFF (unlike `hud`,
+// which defaults ON — guest handling must be a deliberate opt-in).
+export function resolveGuestModeEnabled(config: AppConfig): boolean {
+  return config.guest_mode?.enabled ?? false
+}
+
+export function resolveGuestModeAllowedUserIds(
+  config: AppConfig,
+  log?: AllowedUserIdsLogger,
+): readonly number[] {
+  const explicit = config.guest_mode?.allowed_user_ids
+  if (explicit !== undefined) {
+    if (log) log.info('guest_mode: using explicit allowed_user_ids', { count: explicit.length, fallback: false })
+    return explicit
+  }
+  const inherited = config.allowed_user_ids
+  if (log) log.info('guest_mode: allowed_user_ids unset, inheriting from allowed_user_ids', { count: inherited.length, fallback: true })
+  return inherited
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveContextWindowTokens — the model context-window size used by
+// /status (context usage) and the context HUD. Callers MUST go through this
+// helper rather than reading the raw field so the 200k default is applied in
+// exactly one place. Default matches the Claude 200k-token window.
+// ─────────────────────────────────────────────────────────────────────
+
+export const DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
+
+export function resolveContextWindowTokens(config: AppConfig): number {
+  return config.context_window_tokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveHudEnabled — whether the pinned context HUD (wave 3B) is active.
+// The `hud` config block is optional, so callers MUST go through this
+// helper rather than reading `config.hud?.enabled` directly: the
+// enabled-by-default fallback lives in exactly one place. A missing block
+// (older config.json / test literal) and an explicit `{ enabled: true }`
+// both resolve to true; only an explicit `{ enabled: false }` disables it.
+// ─────────────────────────────────────────────────────────────────────
+
+export function resolveHudEnabled(config: AppConfig): boolean {
+  return config.hud?.enabled ?? true
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveOwnerChatIds — the OWNER DM chat ids for owner-only surfaces (the
+// pinned context HUD + the owner command menu). FIX-8 (both reviews): these
+// MUST come from the owner's DM ids, NEVER from `allowed_chat_ids` (which in
+// multichat also lists group ids — a HUD with destructive buttons or the
+// command menu pinned in a public group is a serious leak). Explicit
+// `owner_chat_ids` wins; otherwise we fall back to `allowed_user_ids` (in a DM
+// the chat id equals the positive user id). Positive ids only — a group id can
+// never be an owner DM.
+// ─────────────────────────────────────────────────────────────────────
+
+export function resolveOwnerChatIds(config: AppConfig): readonly number[] {
+  const explicit = config.owner_chat_ids
+  if (explicit !== undefined && explicit.length > 0) {
+    const positive = explicit.filter((n) => Number.isInteger(n) && n > 0)
+    if (positive.length > 0) return positive
+  }
+  return config.allowed_user_ids
 }

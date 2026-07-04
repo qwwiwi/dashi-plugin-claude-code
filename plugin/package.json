@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "grammy": "^1.21.0",
+    "grammy": "1.44.0",
     "js-yaml": "^4.1.0",
     "zod": "^3.23.0"
   },

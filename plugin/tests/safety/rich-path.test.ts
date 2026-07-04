@@ -73,6 +73,9 @@ function makeInnerApi(
       return { path: join(destDir, 'x.bin'), size: 0 }
     },
     async deleteMessage(_chatId, _messageId) {},
+    async answerGuestQuery(_guestQueryId, _text, _opts) {
+      throw new Error('unexpected answerGuestQuery in rich-path test')
+    },
   }
 }
 

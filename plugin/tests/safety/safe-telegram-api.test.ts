@@ -16,7 +16,7 @@ import type { Logger } from '../../src/log.js'
 import { createSafeTelegramApi } from '../../src/safety/safe-telegram-api.js'
 
 interface SentCall {
-  method: 'sendMessage' | 'editMessageText'
+  method: 'sendMessage' | 'editMessageText' | 'answerGuestQuery'
   chatId: string
   messageId?: number
   text: string
@@ -48,6 +48,9 @@ function makeStubApi(): { api: TelegramApi; calls: SentCall[] } {
       return { path: '/tmp/fake' }
     },
     async deleteMessage(_chatId, _messageId) {},
+    async answerGuestQuery(guestQueryId, text, opts) {
+      calls.push({ method: 'answerGuestQuery', chatId: guestQueryId, text, opts })
+    },
   }
   return { api, calls }
 }
@@ -193,6 +196,34 @@ describe('createSafeTelegramApi — pass-through methods', () => {
     const { log } = makeLog()
     const safe = createSafeTelegramApi(api, log)
     await safe.deleteMessage('1', 2)
+  })
+
+  // Guest answers land in a PUBLIC foreign chat — redaction + HTML
+  // validation must apply exactly like sendMessage.
+  test('answerGuestQuery: secrets are redacted before transport', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log, ['MY_EXTRA_SECRET'])
+    await safe.answerGuestQuery('gq', 'token: MY_EXTRA_SECRET end', {})
+    expect(calls[0]!.method).toBe('answerGuestQuery')
+    expect(calls[0]!.text).not.toContain('MY_EXTRA_SECRET')
+  })
+
+  test('answerGuestQuery: invalid HTML downgrades to plain text', async () => {
+    const { api, calls } = makeStubApi()
+    const { log, entries } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    await safe.answerGuestQuery('gq', '<script>x</script>', { parse_mode: 'HTML' })
+    expect((calls[0]!.opts as SendMessageOpts).parse_mode).toBeUndefined()
+    expect(entries.some((e) => e.msg === 'telegram html downgrade')).toBe(true)
+  })
+
+  test('answerGuestQuery: valid HTML keeps parse_mode', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    await safe.answerGuestQuery('gq', '<b>ok</b>', { parse_mode: 'HTML' })
+    expect((calls[0]!.opts as SendMessageOpts).parse_mode).toBe('HTML')
   })
 })
 

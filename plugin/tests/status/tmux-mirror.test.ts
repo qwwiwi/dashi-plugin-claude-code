@@ -67,6 +67,9 @@ function makeStubApi(initialMessageId = 100): {
       }
       ops.push({ method: 'editMessageText', chatId, messageId, text })
     },
+    async answerGuestQuery() {
+      /* not exercised by mirror tests */
+    },
     async deleteMessage(chatId, messageId) {
       ops.push({ method: 'deleteMessage', chatId, messageId })
     },

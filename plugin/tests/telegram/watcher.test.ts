@@ -102,6 +102,7 @@ function makeFakeApi(): FakeApi {
     sendPhoto: noop as unknown as TelegramApi['sendPhoto'],
     downloadFile: noop as unknown as TelegramApi['downloadFile'],
     deleteMessage: noop as unknown as TelegramApi['deleteMessage'],
+    answerGuestQuery: noop as unknown as TelegramApi['answerGuestQuery'],
   }
   return state
 }

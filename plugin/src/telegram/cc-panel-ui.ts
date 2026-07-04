@@ -21,12 +21,31 @@
 // FROZEN whitelist — there is no way to type arbitrary text into the pane, so
 // a pane that dropped to a shell can't be driven to run a shell command.
 
-import { sendSlashCommand, type KeysExec, type TmuxKeysTarget } from '../commands/keys.js'
+import {
+  capturePane,
+  classifyPane,
+  sendControlCommand,
+  sendSlashCommand,
+  type ControlCommandOpts,
+  type KeysCaptureExec,
+  type KeysExec,
+  type TmuxKeysTarget,
+} from '../commands/keys.js'
+import { buildNewConfirmCard } from './newq-confirm-ui.js'
 import type { InlineKeyboardLike } from '../channel/tools.js'
 import type { Logger } from '../log.js'
 
 // The callback prefix. Distinct from kkey:/pgate:/ask:/perm: by construction.
 export const CCMD_PREFIX = 'ccmd:'
+
+// `compact` needs to interrupt a busy pane first, so it is routed through the
+// state-aware `sendControlCommand` (probe → interrupt-if-busy → send → confirm)
+// — but it is non-destructive, so it stays one-tap. `clear` is DESTRUCTIVE
+// (wipes the context) so FIX-7 routes it through the SAME /new confirm card as
+// /new and hud:new — never a one-tap clear from the panel. Every other panel
+// command is safe to type into the composer via `sendSlashCommand` (e.g.
+// `model` opens a picker, `context`/`cost`/`status` are read-only).
+const RELIABLE_CCMD: ReadonlySet<string> = new Set(['compact'])
 
 // Closed, frozen whitelist of the popular Claude Code slash commands the panel
 // exposes. name = the command typed (no leading slash, no args); label = the
@@ -97,6 +116,10 @@ export const CC_PANEL_HEADER =
 export interface CcmdCallbackContext {
   callbackQuery: { data: string }
   from?: { id?: number | undefined }
+  // The chat the tap came from — where the /new confirm card is posted for the
+  // destructive `clear` button (FIX-7). Optional for source-compat with older
+  // test stubs.
+  chatId?: string
   answerCallbackQuery(arg: { text: string }): Promise<void>
 }
 
@@ -105,6 +128,14 @@ export interface CcmdCallbackDeps {
   tmuxKeysTarget?: TmuxKeysTarget
   log: Logger
   exec?: KeysExec
+  // Capture-pane exec + sleep — used only by the reliable path (compact).
+  // Injected for tests; default to the real tmux exec / real timer.
+  captureExec?: KeysCaptureExec
+  sleep?: (ms: number) => Promise<void>
+  // FIX-7: post the /new confirm card (buildNewConfirmCard) as a FRESH message
+  // for the destructive `clear` button. Wired in server.ts to the safe-wrapped
+  // api. When absent, `clear` refuses (fail-closed — never a one-tap clear).
+  sendConfirmCard?: (chatId: string, text: string, keyboard: InlineKeyboardLike) => Promise<void>
 }
 
 // Dispatch a `ccmd:*` callback. Always answers the callback query and returns
@@ -132,8 +163,60 @@ export async function handleCcmdCallback(
     await ctx.answerCallbackQuery({ text: 'неизвестная команда' })
     return true
   }
+  // FIX-7: `clear` is destructive → route through the SAME /new confirm card as
+  // /new and hud:new. Never a one-tap clear from the panel. Handled BEFORE the
+  // pane check because posting a card needs no pane.
+  if (name === 'clear') {
+    if (deps.sendConfirmCard === undefined || ctx.chatId === undefined || ctx.chatId.length === 0) {
+      // Fail-closed: without a way to post the confirm card we refuse rather
+      // than fall back to a one-tap destructive clear.
+      await ctx.answerCallbackQuery({ text: 'недоступно' })
+      return true
+    }
+    const card = buildNewConfirmCard()
+    try {
+      await deps.sendConfirmCard(ctx.chatId, card.text, card.inlineKeyboard)
+    } catch (err) {
+      deps.log.warn('ccmd clear confirm-card send failed', {
+        chat_id: ctx.chatId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      // L12: the card never posted → do NOT claim «подтвердите очистку» (that
+      // would tell the warchief to look for a card that isn't there). Report the
+      // failure instead.
+      await ctx.answerCallbackQuery({ text: 'не удалось показать подтверждение' })
+      return true
+    }
+    await ctx.answerCallbackQuery({ text: 'подтвердите очистку' })
+    return true
+  }
   if (deps.tmuxKeysTarget === undefined) {
     await ctx.answerCallbackQuery({ text: 'pane недоступен' })
+    return true
+  }
+  // compact → reliable state-aware injection (probe, interrupt-if-busy,
+  // confirm-fire) so a busy pane or an open dialog can never eat the command.
+  if (RELIABLE_CCMD.has(name)) {
+    const opts: ControlCommandOpts = { interruptIfBusy: true }
+    if (deps.exec) opts.exec = deps.exec
+    if (deps.captureExec) opts.captureExec = deps.captureExec
+    if (deps.sleep) opts.sleep = deps.sleep
+    const res = await sendControlCommand(deps.tmuxKeysTarget, name, opts)
+    if (res.ok) {
+      await ctx.answerCallbackQuery({ text: `выполнено: /${name}` })
+    } else {
+      await ctx.answerCallbackQuery({ text: `не выполнено: ${res.reason}` })
+    }
+    return true
+  }
+  // IT2-1: the read-only / picker commands (context/cost/status/model/resume/
+  // export) previously blind-fired via sendSlashCommand — but a trailing Enter
+  // into an OPEN dialog APPROVES it, and into a BUSY pane the command is queued.
+  // Gate on a POSITIVE idle exactly like the /cc TEXT path (FIX-6): probe the
+  // pane, refuse with a toast when it is not idle, send only when idle.
+  const state = classifyPane(await capturePane(deps.tmuxKeysTarget, deps.captureExec))
+  if (state !== 'idle') {
+    await ctx.answerCallbackQuery({ text: `сессия не готова (${state})` })
     return true
   }
   // rest is always '' — the panel runs argless commands only.

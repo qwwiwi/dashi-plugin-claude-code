@@ -147,6 +147,7 @@ function makeTelegramApi(): TelegramApi {
     sendPhoto: noop as unknown as TelegramApi['sendPhoto'],
     downloadFile: noop as unknown as TelegramApi['downloadFile'],
     deleteMessage: noop as unknown as TelegramApi['deleteMessage'],
+    answerGuestQuery: noop as unknown as TelegramApi['answerGuestQuery'],
   }
 }
 

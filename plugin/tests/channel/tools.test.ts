@@ -6,6 +6,7 @@ import { join } from 'path'
 import {
   callTool,
   listTools,
+  type AnswerGuestQueryOpts,
   type CallToolRequest,
   type DownloadResult,
   type EditOpts,
@@ -42,6 +43,9 @@ function makeStubApi(overrides: Partial<TelegramApi> = {}): TelegramApi {
       size: 0,
     }),
     deleteMessage: async (_chatId: string, _messageId: number) => {
+      /* noop */
+    },
+    answerGuestQuery: async (_guestQueryId: string, _text: string, _opts: AnswerGuestQueryOpts) => {
       /* noop */
     },
     ...overrides,

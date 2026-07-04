@@ -30,6 +30,13 @@ export const ReplyArgsSchema = z.object({
   // HTML fallback. The explicit 'rich' value is reserved for forcing the rich
   // attempt; behaviourally it joins the same auto-upgrade gate as 'html'.
   format: z.enum(['text', 'markdownv2', 'html', 'rich']).default('html'),
+  // Guest Mode: when the inbound <channel> meta carried guest_query_id,
+  // pass it back here — the reply is delivered via answerGuestQuery into
+  // the chat where the bot was @-mentioned (the bot is NOT a member of
+  // that chat, so chat_id-based sendMessage cannot reach it). One-shot:
+  // Telegram accepts exactly one answer per guest query. Attachments and
+  // reply_to are unsupported on this path and rejected loudly.
+  guest_query_id: z.string().min(1).optional(),
 })
 export type ReplyArgs = z.infer<typeof ReplyArgsSchema>
 
@@ -318,6 +325,10 @@ export const TelegramUpdateSchema = z
     channel_post: z.unknown().optional(),
     edited_channel_post: z.unknown().optional(),
     callback_query: z.unknown().optional(),
+    // Guest Mode (Bot API 10.0): one-shot @-mention from a chat the bot is
+    // not a member of. Payload is a Message with guest_query_id +
+    // guest_bot_caller_user/chat; handler validates the fields it reads.
+    guest_message: z.unknown().optional(),
   })
   .passthrough()
 export type TelegramUpdate = z.infer<typeof TelegramUpdateSchema>
