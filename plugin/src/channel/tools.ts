@@ -402,23 +402,24 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           if (args.reply_to !== undefined) {
             return toolError(name, 'guest replies do not support reply_to — the answer always lands in-place')
           }
-          const claim = deps.guestQueries.claim(args.guest_query_id)
-          if (claim.kind !== 'ok') {
-            return toolError(
-              name,
-              `guest query ${claim.kind} — guest answers are one-shot and expire after 15 minutes`,
-            )
-          }
 
-          // Render once, then hard-cap at ONE Telegram message: there is no
-          // second answerGuestQuery, so chunking cannot apply. splitMessage
-          // keeps HTML tags balanced per chunk — we ship chunk[0] and flag
-          // the truncation in the tool result so the agent knows.
+          // Render BEFORE claiming (Fable #4): a renderer throw after
+          // claim() would strand the one-shot entry inflight until TTL.
+          // Hard-cap at ONE Telegram message: there is no second
+          // answerGuestQuery, so chunking cannot apply — ship chunk[0] and
+          // flag the truncation in the tool result so the agent knows.
           const body =
             args.format === 'html' ? markdownToTelegramHtml(args.text) : args.text
           const chunks = splitMessage(body)
-          const single = chunks[0] as string
+          const single = chunks[0]
+          if (single === undefined) {
+            return toolError(name, 'guest reply rendered to an empty message — nothing to send')
+          }
           const truncated = chunks.length > 1
+          // Plain-text fallback body: the PRE-render text (Fable #3) — a
+          // parse failure means our markup was bad, and raw <b> tag soup in
+          // a public foreign chat reads worse than unrendered markdown.
+          const plainBody = splitMessage(args.text)[0] ?? single
           const guestOpts: AnswerGuestQueryOpts =
             args.format === 'html'
               ? { parse_mode: 'HTML' }
@@ -426,17 +427,45 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
                 ? { parse_mode: 'MarkdownV2' }
                 : {}
 
+          const claim = deps.guestQueries.claim(args.guest_query_id)
+          if (claim.kind !== 'ok') {
+            return toolError(
+              name,
+              `guest query ${claim.kind} — guest answers are one-shot and expire after 15 minutes`,
+            )
+          }
+          // Cheap LLM-mixup guard (Fable #5): with two pending guest
+          // queries in different foreign chats, a swapped (chat_id,
+          // guest_query_id) pair would deliver chat A's answer into chat B
+          // — both public. The registry knows the true origin; refuse loud.
+          if (
+            claim.entry.callerChatId !== undefined &&
+            claim.entry.callerChatId !== args.chat_id
+          ) {
+            deps.guestQueries.release(args.guest_query_id)
+            return toolError(
+              name,
+              `guest query ${args.guest_query_id} originated in chat ${claim.entry.callerChatId}, not ${args.chat_id} — pass the chat_id from the SAME inbound <channel> meta`,
+            )
+          }
+
           try {
             await telegramApi.answerGuestQuery(args.guest_query_id, single, guestOpts)
           } catch (err) {
-            if (args.format === 'html' && isTelegramHtmlParseError(err)) {
-              // Telegram rejected the HTML — the query is NOT consumed by a
-              // failed call, so retry the same body as plain text.
-              log.warn('guest answer HTML parse failed, retrying as plain text', {
+            // Entity-parse failures are format-agnostic (Fable #2):
+            // Telegram raises the same «can't parse entities» family for
+            // HTML and MarkdownV2 bodies — and a chunked MarkdownV2 body
+            // can be INVALID by construction (splitMessage balances only
+            // HTML tags), so without this retry a long markdownv2 guest
+            // reply would burn the query's TTL on identical failures.
+            // A failed call does not consume the query on Telegram's side.
+            if (guestOpts.parse_mode !== undefined && isTelegramHtmlParseError(err)) {
+              log.warn('guest answer entity parse failed, retrying as plain text', {
+                format: args.format,
                 error: err instanceof Error ? err.message : String(err),
               })
               try {
-                await telegramApi.answerGuestQuery(args.guest_query_id, single, {})
+                await telegramApi.answerGuestQuery(args.guest_query_id, plainBody, {})
               } catch (err2) {
                 deps.guestQueries.release(args.guest_query_id)
                 return toolError(name, err2 instanceof Error ? err2.message : String(err2))
@@ -446,6 +475,10 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
               return toolError(name, err instanceof Error ? err.message : String(err))
             }
           }
+
+          // Send succeeded — freeze the entry as answered so a repeat
+          // reply reads 'consumed' and cap-eviction may reclaim the slot.
+          deps.guestQueries.confirm(args.guest_query_id)
 
           return {
             content: [{

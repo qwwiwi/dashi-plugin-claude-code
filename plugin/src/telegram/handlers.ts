@@ -686,12 +686,23 @@ export async function handleGuestMessage(ctx: Context, deps: HandlerDeps): Promi
   }
 
   const chatIdStr = msg.chat?.id !== undefined ? String(msg.chat.id) : undefined
-  deps.guestQueries.register({
+  const admitted = deps.guestQueries.register({
     guestQueryId,
     callerUserId: String(caller.id),
     ...(chatIdStr !== undefined ? { callerChatId: chatIdStr } : {}),
     messageText: text,
   })
+  if (!admitted) {
+    // Registry at cap with every entry inflight — pathological (needs 64
+    // concurrent unanswered claims). Dropping is safer than evicting an
+    // inflight entry and stranding its post-failure retry (dual review
+    // 2026-07-04, Codex #2).
+    deps.log.warn('guest_message dropped — registry at capacity, all entries inflight', {
+      caller_id: caller.id,
+      chat_id: chatIdStr,
+    })
+    return
+  }
 
   const content = buildChannelContent({
     text,

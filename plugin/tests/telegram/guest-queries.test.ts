@@ -3,8 +3,10 @@
 // The registry is the authorization primitive for guest replies: only
 // allowlisted callers' queries are ever registered, and claim() is the
 // one-shot gate the reply tool relies on. These tests pin the fail-closed
-// contract: unknown / consumed / expired all refuse, release() re-arms
-// after a failed send, and the entry cap drops the oldest.
+// contract refined by the 2026-07-04 dual review: duplicate register is a
+// NO-OP (Codex #1), cap eviction never touches inflight entries and
+// prefers answered tombstones (Codex #2 / Fable #1), release() re-arms
+// only inflight entries, confirm() freezes them.
 
 import { describe, expect, test } from 'bun:test'
 
@@ -29,7 +31,7 @@ const ENTRY = {
 describe('GuestQueryRegistry', () => {
   test('claim on a registered query succeeds exactly once', () => {
     const { registry } = makeRegistry()
-    registry.register(ENTRY)
+    expect(registry.register(ENTRY)).toBe(true)
 
     const first = registry.claim('q1')
     expect(first.kind).toBe('ok')
@@ -56,12 +58,28 @@ describe('GuestQueryRegistry', () => {
     expect(registry.claim('q1').kind).toBe('unknown')
   })
 
-  test('release re-arms a consumed entry (failed-send retry path)', () => {
+  test('claim exactly AT the TTL boundary is still valid', () => {
+    const { registry, clock } = makeRegistry(1000)
+    registry.register(ENTRY)
+    clock.t += 1000
+    expect(registry.claim('q1').kind).toBe('ok')
+  })
+
+  test('release re-arms an inflight entry (failed-send retry path)', () => {
     const { registry } = makeRegistry()
     registry.register(ENTRY)
     expect(registry.claim('q1').kind).toBe('ok')
     registry.release('q1')
     expect(registry.claim('q1').kind).toBe('ok')
+  })
+
+  test('confirm freezes the entry — release can no longer re-open it', () => {
+    const { registry } = makeRegistry()
+    registry.register(ENTRY)
+    expect(registry.claim('q1').kind).toBe('ok')
+    registry.confirm('q1')
+    registry.release('q1')
+    expect(registry.claim('q1').kind).toBe('consumed')
   })
 
   test('release on unknown id is a no-op', () => {
@@ -70,26 +88,71 @@ describe('GuestQueryRegistry', () => {
     expect(registry.claim('ghost').kind).toBe('unknown')
   })
 
-  test('re-register of the same id resets the consumed tombstone', () => {
+  test('duplicate register is a NO-OP — a consumed query is never resurrected', () => {
     const { registry } = makeRegistry()
     registry.register(ENTRY)
     expect(registry.claim('q1').kind).toBe('ok')
-    // Telegram never reuses guest_query_id in practice, but the map must
-    // not wedge if it did — a fresh register wins.
+    registry.confirm('q1')
+    // Telegram redelivery of the same update must not re-open the query.
+    expect(registry.register({ ...ENTRY, messageText: 'redelivered' })).toBe(true)
+    const claim = registry.claim('q1')
+    expect(claim.kind).toBe('consumed')
+  })
+
+  test('duplicate register preserves the original entry content', () => {
+    const { registry } = makeRegistry()
+    registry.register(ENTRY)
     registry.register({ ...ENTRY, messageText: 'second' })
     const claim = registry.claim('q1')
     expect(claim.kind).toBe('ok')
-    if (claim.kind === 'ok') expect(claim.entry.messageText).toBe('second')
+    if (claim.kind === 'ok') expect(claim.entry.messageText).toBe('что это за ошибка?')
   })
 
-  test('entry cap drops the oldest registration', () => {
+  test('entry cap evicts the oldest pending registration', () => {
     const { registry } = makeRegistry()
     for (let i = 0; i < 65; i++) {
-      registry.register({ ...ENTRY, guestQueryId: `q${i}` })
+      expect(registry.register({ ...ENTRY, guestQueryId: `q${i}` })).toBe(true)
     }
     // q0 was evicted by the 65th insert; the newest survives.
     expect(registry.claim('q0').kind).toBe('unknown')
     expect(registry.claim('q64').kind).toBe('ok')
+  })
+
+  test('duplicate register at cap does not evict anyone', () => {
+    const { registry } = makeRegistry()
+    for (let i = 0; i < 64; i++) {
+      registry.register({ ...ENTRY, guestQueryId: `q${i}` })
+    }
+    // Re-register an existing id while the map is full — nothing changes.
+    expect(registry.register({ ...ENTRY, guestQueryId: 'q3' })).toBe(true)
+    expect(registry.claim('q0').kind).toBe('ok')
+    expect(registry.claim('q63').kind).toBe('ok')
+  })
+
+  test('cap eviction prefers answered tombstones over pending entries', () => {
+    const { registry } = makeRegistry()
+    for (let i = 0; i < 64; i++) {
+      registry.register({ ...ENTRY, guestQueryId: `q${i}` })
+    }
+    // Answer a mid-list entry — it becomes the eviction victim, not q0.
+    expect(registry.claim('q10').kind).toBe('ok')
+    registry.confirm('q10')
+    expect(registry.register({ ...ENTRY, guestQueryId: 'fresh' })).toBe(true)
+    expect(registry.claim('q0').kind).toBe('ok')
+    expect(registry.claim('q10').kind).toBe('unknown')
+    expect(registry.claim('fresh').kind).toBe('ok')
+  })
+
+  test('cap eviction never touches inflight entries; all-inflight refuses registration', () => {
+    const { registry } = makeRegistry()
+    for (let i = 0; i < 64; i++) {
+      registry.register({ ...ENTRY, guestQueryId: `q${i}` })
+      expect(registry.claim(`q${i}`).kind).toBe('ok') // all inflight now
+    }
+    expect(registry.register({ ...ENTRY, guestQueryId: 'overflow' })).toBe(false)
+    // Every inflight entry survived — release still works on all of them.
+    registry.release('q0')
+    expect(registry.claim('q0').kind).toBe('ok')
   })
 
   test('pendingCount tracks unconsumed live entries', () => {

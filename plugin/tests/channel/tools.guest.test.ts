@@ -222,9 +222,9 @@ describe('reply tool — guest path', () => {
     registered(registry, 'gq-2')
     const deps = makeDeps({ api: stub.api, registry })
 
-    await callTool(replyReq({ chat_id: '-1', guest_query_id: 'gq-2', text: 'a' }), deps)
+    await callTool(replyReq({ chat_id: '-100987', guest_query_id: 'gq-2', text: 'a' }), deps)
     const second = await callTool(
-      replyReq({ chat_id: '-1', guest_query_id: 'gq-2', text: 'b' }),
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-2', text: 'b' }),
       deps,
     )
     expect(second.isError).toBe(true)
@@ -240,7 +240,7 @@ describe('reply tool — guest path', () => {
 
     const result = await callTool(
       replyReq({
-        chat_id: '-1',
+        chat_id: '-100987',
         guest_query_id: 'gq-3',
         text: 'x',
         files: ['/tmp/pic.png'],
@@ -260,7 +260,7 @@ describe('reply tool — guest path', () => {
     const deps = makeDeps({ api: stub.api, registry })
 
     const result = await callTool(
-      replyReq({ chat_id: '-1', guest_query_id: 'gq-4', text: 'x', reply_to: '5' }),
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-4', text: 'x', reply_to: '5' }),
       deps,
     )
     expect(result.isError).toBe(true)
@@ -275,7 +275,7 @@ describe('reply tool — guest path', () => {
 
     const long = 'а'.repeat(9000)
     const result = await callTool(
-      replyReq({ chat_id: '-1', guest_query_id: 'gq-5', text: long }),
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-5', text: long }),
       deps,
     )
     expect(result.isError).toBeUndefined()
@@ -291,7 +291,7 @@ describe('reply tool — guest path', () => {
     const deps = makeDeps({ api: stub.api, registry })
 
     const result = await callTool(
-      replyReq({ chat_id: '-1', guest_query_id: 'gq-6', text: 'ответ' }),
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-6', text: 'ответ' }),
       deps,
     )
     expect(result.isError).toBeUndefined()
@@ -306,13 +306,13 @@ describe('reply tool — guest path', () => {
     const deps = makeDeps({ api: stub.api, registry })
 
     const result = await callTool(
-      replyReq({ chat_id: '-1', guest_query_id: 'gq-7', text: 'x' }),
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-7', text: 'x' }),
       deps,
     )
     expect(result.isError).toBe(true)
     // release() re-armed the claim — a retry succeeds.
     const retry = await callTool(
-      replyReq({ chat_id: '-1', guest_query_id: 'gq-7', text: 'x' }),
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-7', text: 'x' }),
       deps,
     )
     expect(retry.isError).toBeUndefined()
@@ -323,10 +323,103 @@ describe('reply tool — guest path', () => {
     const stub = makeStubApi()
     const deps = makeDeps({ api: stub.api })
     const result = await callTool(
-      replyReq({ chat_id: '-1', guest_query_id: 'gq-8', text: 'x' }),
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-8', text: 'x' }),
       deps,
     )
     expect(result.isError).toBe(true)
     expect(result.content[0]!.text).toContain('guest_mode is not enabled')
+  })
+
+  test('markdownv2 entity-parse error also retries as plain text (Fable #2)', async () => {
+    const stub = makeStubApi({ failures: [htmlParseError()] })
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'gq-9')
+    const deps = makeDeps({ api: stub.api, registry })
+
+    const result = await callTool(
+      replyReq({
+        chat_id: '-100987',
+        guest_query_id: 'gq-9',
+        text: '*broken _markdown',
+        format: 'markdownv2',
+      }),
+      deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(stub.guestCalls.length).toBe(1)
+    expect(stub.guestCalls[0]!.opts.parse_mode).toBeUndefined()
+  })
+
+  test('plain-text fallback ships the PRE-render body, not HTML tag soup (Fable #3)', async () => {
+    const stub = makeStubApi({ failures: [htmlParseError()] })
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'gq-10')
+    const deps = makeDeps({ api: stub.api, registry })
+
+    await callTool(
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-10', text: '**жирный** текст' }),
+      deps,
+    )
+    expect(stub.guestCalls.length).toBe(1)
+    expect(stub.guestCalls[0]!.text).toBe('**жирный** текст')
+    expect(stub.guestCalls[0]!.text).not.toContain('<b>')
+  })
+
+  test('double failure (parse error, then hard error) releases the claim', async () => {
+    const stub = makeStubApi({ failures: [htmlParseError(), new Error('network down')] })
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'gq-11')
+    const deps = makeDeps({ api: stub.api, registry })
+
+    const result = await callTool(
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-11', text: 'x' }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('network down')
+    // Claim re-armed — a retry succeeds.
+    const retry = await callTool(
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-11', text: 'x' }),
+      deps,
+    )
+    expect(retry.isError).toBeUndefined()
+  })
+
+  test('chat_id mismatch with the query origin refuses and re-arms (Fable #5)', async () => {
+    const stub = makeStubApi()
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'gq-12') // callerChatId: -100987
+    const deps = makeDeps({ api: stub.api, registry })
+
+    const result = await callTool(
+      replyReq({ chat_id: '-100555', guest_query_id: 'gq-12', text: 'x' }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('-100987')
+    expect(stub.guestCalls.length).toBe(0)
+    // Claim was released — the correct pair still works.
+    const correct = await callTool(
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-12', text: 'x' }),
+      deps,
+    )
+    expect(correct.isError).toBeUndefined()
+  })
+
+  test('successful answer is frozen — release cannot re-open it (confirm path)', async () => {
+    const stub = makeStubApi()
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'gq-13')
+    const deps = makeDeps({ api: stub.api, registry })
+
+    await callTool(replyReq({ chat_id: '-100987', guest_query_id: 'gq-13', text: 'a' }), deps)
+    registry.release('gq-13') // hostile/buggy release after success
+    const again = await callTool(
+      replyReq({ chat_id: '-100987', guest_query_id: 'gq-13', text: 'b' }),
+      deps,
+    )
+    expect(again.isError).toBe(true)
+    expect(again.content[0]!.text).toContain('consumed')
+    expect(stub.guestCalls.length).toBe(1)
   })
 })

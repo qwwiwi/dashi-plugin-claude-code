@@ -144,10 +144,12 @@ function makeDeps(opts: {
 // ctx.update.guest_message.
 function makeGuestCtx(opts: {
   text?: string
+  caption?: string
   fromId?: number
   callerId?: number
   guestQueryId?: string
   chatId?: number
+  replyTo?: { message_id: number; date: number; text: string; from: { id: number; is_bot: boolean } }
 }): Context {
   const from =
     opts.fromId !== undefined
@@ -168,6 +170,8 @@ function makeGuestCtx(opts: {
         ...(caller !== undefined ? { guest_bot_caller_user: caller } : {}),
         ...(opts.guestQueryId !== undefined ? { guest_query_id: opts.guestQueryId } : {}),
         ...(opts.text !== undefined ? { text: opts.text } : {}),
+        ...(opts.caption !== undefined ? { caption: opts.caption } : {}),
+        ...(opts.replyTo !== undefined ? { reply_to_message: opts.replyTo } : {}),
       },
     },
   } as unknown as Context
@@ -276,6 +280,38 @@ describe('handleGuestMessage', () => {
       deps,
     )
     expect(serverSpy.calls.length).toBe(0)
+  })
+
+  test('caption-only guest message (media mention) is delivered', async () => {
+    const { deps, serverSpy } = makeDeps()
+    await handleGuestMessage(
+      makeGuestCtx({ caption: 'что на этом скрине?', fromId: 164795011, guestQueryId: 'gq-cap' }),
+      deps,
+    )
+    expect(serverSpy.calls.length).toBe(1)
+    expect(serverSpy.calls[0]!.params.content).toContain('что на этом скрине?')
+  })
+
+  test('guest reply_to context is wrapped as untrusted_metadata (anti-spoof parity)', async () => {
+    const { deps, serverSpy } = makeDeps()
+    await handleGuestMessage(
+      makeGuestCtx({
+        text: 'объясни ошибку выше',
+        fromId: 164795011,
+        guestQueryId: 'gq-rt',
+        replyTo: {
+          message_id: 500,
+          date: 1700000000,
+          text: 'Traceback: boom',
+          from: { id: 999, is_bot: false },
+        },
+      }),
+      deps,
+    )
+    expect(serverSpy.calls.length).toBe(1)
+    const content = serverSpy.calls[0]!.params.content ?? ''
+    expect(content).toContain('<untrusted_metadata')
+    expect(content).toContain('Traceback: boom')
   })
 
   test('notify transport failure throws so the poller dead-letters', async () => {
