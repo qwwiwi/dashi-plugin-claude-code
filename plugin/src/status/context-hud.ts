@@ -1,7 +1,7 @@
 // Context HUD (wave 3B) — a single PINNED Telegram message in the owner's chat
 // that shows how full the model's context window is (a 10-segment unicode bar +
-// percentage) plus two action buttons: «Сжать» (/compact) and «Новый диалог»
-// (confirm-then-/clear). It is the KAI-style always-visible indicator, refreshed
+// percentage) plus one action button: «Сжать» (/compact). It is the
+// KAI-style always-visible indicator, refreshed
 // after every turn from the SessionStart / Stop hook events — there are NO
 // timers or polling; the HUD only moves when a hook fires.
 //
@@ -58,11 +58,14 @@ function escapeHtml(s: string): string {
 
 // Build the HUD's inline keyboard. Static (never changes) so the edit path can
 // re-send the same markup on every refresh and let Telegram no-op it.
+// «Новый диалог» removed per prince directive 2026-07-04 — clearing context is
+// too destructive for a one-tap pinned button; /new stays as the command path.
+// The hud:new callback handler is kept so a stale pinned card (pre-removal
+// markup) still resolves to the confirm flow instead of a dead tap.
 export function buildHudKeyboard(): InlineKeyboardLike {
   return {
     inline_keyboard: [
       [{ text: '🗜 Сжать', callback_data: `${HUD_PREFIX}compact` }],
-      [{ text: '🧹 Новый диалог', callback_data: `${HUD_PREFIX}new` }],
     ],
   }
 }

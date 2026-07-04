@@ -212,15 +212,16 @@ describe('renderHud', () => {
     expect(escaped).toContain('<i>a&lt;b&gt;&amp;c</i>')
   })
 
-  test('keyboard shape: Сжать / Новый диалог with hud: callbacks', () => {
+  test('keyboard shape: single Сжать row, no Новый диалог button', () => {
     const { keyboard } = renderHud({ usedTokens: 0 }, WINDOW)
     expect(keyboard).toEqual(buildHudKeyboard())
     const rows = keyboard.inline_keyboard
-    expect(rows.length).toBe(2)
+    expect(rows.length).toBe(1)
     expect(rows[0]![0]!.callback_data).toBe(`${HUD_PREFIX}compact`)
-    expect(rows[1]![0]!.callback_data).toBe(`${HUD_PREFIX}new`)
     expect(rows[0]![0]!.text).toContain('Сжать')
-    expect(rows[1]![0]!.text).toContain('Новый диалог')
+    const flat = JSON.stringify(keyboard)
+    expect(flat).not.toContain('Новый диалог')
+    expect(flat).not.toContain(`${HUD_PREFIX}new`)
   })
 })
 

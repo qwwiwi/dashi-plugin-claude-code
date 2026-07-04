@@ -489,7 +489,7 @@ const statusManager = new StatusManager({
 const sessionInfoStore = new SessionInfoStore()
 
 // Context HUD (wave 3B) — the single pinned Telegram message in the owner's
-// chat showing context-window usage + Сжать / Новый диалог buttons. Driven by
+// chat showing context-window usage + the «Сжать» button. Driven by
 // the SessionStart / Stop hooks (wired through the webhook deps below) and the
 // `hud:` callback branch further down. Owner chats: allowed_chat_ids, falling
 // back to allowed_user_ids (in a DM the chat id equals the user id). The HUD

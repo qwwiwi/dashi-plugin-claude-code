@@ -331,9 +331,9 @@ export const AppConfigSchema = z.object({
     allowed_user_ids: z.array(z.number().int().positive()).optional(),
   }).optional(),
   // Context HUD (wave 3B) — a single pinned Telegram message in the owner's
-  // chat that shows context-window usage (bar + percentage) plus two action
-  // buttons (Сжать / Новый диалог), refreshed after each turn (SessionStart /
-  // Stop hooks). Default ON.
+  // chat that shows context-window usage (bar + percentage) plus the «Сжать»
+  // action button, refreshed after each turn (SessionStart / Stop hooks).
+  // Default ON.
   //
   // The whole block is OPTIONAL (no `.default({})`) so `hud` reads as
   // `hud?: { enabled: boolean }` on the inferred type — existing full-config
