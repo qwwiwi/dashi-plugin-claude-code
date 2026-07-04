@@ -128,24 +128,27 @@ describe('parseOobCommand', () => {
     expect(r!.name).toBe('status')
   })
 
-  test('parses /reset force with hasForceFlag=true', () => {
-    const r = parseOobCommand('/reset force')
+  test('parses /compact (now an intentional command)', () => {
+    const r = parseOobCommand('/compact')
     expect(r).not.toBeNull()
-    expect(r!.name).toBe('reset')
-    expect(r!.args).toBe('force')
-    expect(r!.hasForceFlag).toBe(true)
+    expect(r!.name).toBe('compact')
+    expect(r!.args).toBe('')
   })
 
-  test('parses /new without force has hasForceFlag=false', () => {
+  test('parses /new', () => {
     const r = parseOobCommand('/new')
     expect(r).not.toBeNull()
     expect(r!.name).toBe('new')
-    expect(r!.hasForceFlag).toBe(false)
   })
 
-  test('parses unknown /foo as null', () => {
+  test('/reset is no longer a known command', () => {
+    expect(parseOobCommand('/reset')).toBeNull()
+    expect(parseOobCommand('/reset force')).toBeNull()
+  })
+
+  test('parses unknown /foo as null; /halt still absent', () => {
     expect(parseOobCommand('/foo')).toBeNull()
-    expect(parseOobCommand('/compact')).toBeNull()
+    // /halt remains intentionally unimplemented.
     expect(parseOobCommand('/halt')).toBeNull()
   })
 
@@ -170,14 +173,14 @@ describe('handleOobCommand', () => {
     expect(result.replyToTelegram).toBeDefined()
     const text = result.replyToTelegram!.text
     expect(result.replyToTelegram!.parseMode).toBe('HTML')
-    // Lists all 5 Scope A commands.
+    // Lists the current control commands.
     expect(text).toContain('/help')
     expect(text).toContain('/status')
     expect(text).toContain('/stop')
-    expect(text).toContain('/reset')
+    expect(text).toContain('/compact')
     expect(text).toContain('/new')
-    // Scope B commands explicitly absent.
-    expect(text).not.toContain('/compact')
+    // /reset was removed; /halt remains intentionally absent.
+    expect(text).not.toContain('/reset')
     expect(text).not.toContain('/halt')
   })
 
@@ -229,37 +232,168 @@ describe('handleOobCommand', () => {
     expect(result.replyToTelegram).toBeDefined()
   })
 
-  test('/reset force emits channel notification meta.command=reset', async () => {
-    const parsed = parseOobCommand('/reset force')!
-    const result = await handleOobCommand(parsed, makeCtx())
-    expect(result.command).toBe('reset')
-    expect(result.notifyChannel).toBeDefined()
-    expect(result.notifyChannel!.meta.command).toBe('reset')
-    expect(result.replyToTelegram!.text).toContain('сброшена')
-  })
-
-  test('/reset (no force) returns reply asking for force flag, no channel notify', async () => {
-    const parsed = parseOobCommand('/reset')!
-    const result = await handleOobCommand(parsed, makeCtx())
-    expect(result.command).toBe('reset')
-    expect(result.notifyChannel).toBeUndefined()
-    expect(result.replyToTelegram).toBeDefined()
-    expect(result.replyToTelegram!.text).toContain('force')
-  })
-
-  test('/new force emits channel notification meta.command=new', async () => {
-    const parsed = parseOobCommand('/new force')!
-    const result = await handleOobCommand(parsed, makeCtx())
-    expect(result.command).toBe('new')
-    expect(result.notifyChannel).toBeDefined()
-    expect(result.notifyChannel!.meta.command).toBe('new')
-  })
-
-  test('/new (no force) returns reply asking for force flag, no channel notify', async () => {
+  test('/new renders a confirm card (buttons, no channel notify, no pane touched)', async () => {
     const parsed = parseOobCommand('/new')!
     const result = await handleOobCommand(parsed, makeCtx())
+    expect(result.command).toBe('new')
     expect(result.notifyChannel).toBeUndefined()
-    expect(result.replyToTelegram!.text).toContain('force')
+    expect(result.replyToTelegram).toBeDefined()
+    expect(result.replyToTelegram!.text).toContain('Новый диалог')
+    // Confirm keyboard with newq:confirm(:nonce) / newq:cancel buttons.
+    const kb = result.replyToTelegram!.inlineKeyboard
+    expect(kb).toBeDefined()
+    const datas = kb!.inline_keyboard.flat().map((b) => b.callback_data)
+    expect(datas.some((d) => d !== undefined && d.startsWith('newq:confirm'))).toBe(true)
+    expect(datas).toContain('newq:cancel')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// /compact — reliable control-command injection via sendControlCommand.
+// We drive it with a scripted capture-pane + send-keys fake (same shapes as
+// keys-control.test.ts) and assert the REAL-result → message mapping.
+// ─────────────────────────────────────────────────────────────────────
+
+const IDLE_PANE = [
+  '╭────────────────────────────────╮',
+  '│ >                              │',
+  '╰────────────────────────────────╯',
+  '  ? for shortcuts',
+].join('\n')
+
+const BUSY_PANE = [
+  '✳ Working… (esc to interrupt)',
+  '╭────────────────────────────────╮',
+  '│ >                              │',
+  '╰────────────────────────────────╯',
+].join('\n')
+
+const DIALOG_PANE = [
+  '│ Do you want to proceed?        │',
+  '│ ❯ 1. Yes                       │',
+  '│   2. No                        │',
+].join('\n')
+
+const COMPACTING_PANE = [
+  '❯ /compact',
+  'Compacting conversation…',
+  '╭────────────────────────────────╮',
+  '│ >                              │',
+  '╰────────────────────────────────╯',
+].join('\n')
+
+const NOT_SUBMITTED_PANE = [
+  '╭────────────────────────────────╮',
+  '│ > /compact                     │',
+  '╰────────────────────────────────╯',
+  '  ? for shortcuts',
+].join('\n')
+
+// Idle pane with a typed '/cmd' draft — the pre-Enter TOCTOU snapshot (FIX-3).
+function typedPane(cmd: string): string {
+  return [
+    '╭────────────────────────────────╮',
+    `│ > /${cmd}                        │`,
+    '╰────────────────────────────────╯',
+    '  ? for shortcuts',
+  ].join('\n')
+}
+
+const noSleep = async (_ms: number): Promise<void> => {}
+
+function compactCtx(panes: string[]): OobContext {
+  let i = 0
+  return makeCtx({
+    tmuxKeys: {
+      target: { paneTarget: '%1', socketPath: '/tmp/s' },
+      exec: async () => ({ exitCode: 0, stderr: '' }),
+      captureExec: async () => {
+        const out = i < panes.length ? panes[i]! : (panes[panes.length - 1] ?? '')
+        i++
+        return { exitCode: 0, stdout: out, stderr: '' }
+      },
+      sleep: noSleep,
+    },
+  })
+}
+
+describe('/compact', () => {
+  test('no tmux pane → «недоступно»', async () => {
+    const parsed = parseOobCommand('/compact')!
+    const result = await handleOobCommand(parsed, makeCtx())
+    expect(result.command).toBe('compact')
+    expect(result.replyToTelegram!.text).toContain('недоступно')
+    expect(result.notifyChannel).toBeUndefined()
+  })
+
+  test('ok → «контекст сжимается»', async () => {
+    const parsed = parseOobCommand('/compact')!
+    const result = await handleOobCommand(
+      parsed,
+      compactCtx([IDLE_PANE, typedPane('compact'), COMPACTING_PANE]),
+    )
+    expect(result.replyToTelegram!.text).toContain('контекст сжимается')
+  })
+
+  test('busy (stays busy after interrupt) → busy message', async () => {
+    const parsed = parseOobCommand('/compact')!
+    const result = await handleOobCommand(parsed, compactCtx([BUSY_PANE, BUSY_PANE]))
+    expect(result.replyToTelegram!.text).toContain('агент занят')
+  })
+
+  test('dialog → «ждёт ответа в диалоге»', async () => {
+    const parsed = parseOobCommand('/compact')!
+    const result = await handleOobCommand(parsed, compactCtx([DIALOG_PANE]))
+    expect(result.replyToTelegram!.text).toContain('ждёт ответа в диалоге')
+  })
+
+  test('not-submitted → «не удалось отправить»', async () => {
+    const parsed = parseOobCommand('/compact')!
+    const result = await handleOobCommand(
+      parsed,
+      compactCtx([IDLE_PANE, NOT_SUBMITTED_PANE, NOT_SUBMITTED_PANE, NOT_SUBMITTED_PANE]),
+    )
+    expect(result.replyToTelegram!.text).toContain('не удалось отправить')
+    expect(result.replyToTelegram!.text).toContain('not-submitted')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// /status — context-usage line (task 5). Fake transcript on disk + config
+// window tokens; assert the formatted line and the «—» fallback.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('/status context line', () => {
+  test('renders «контекст: X/Y (Z%)» from a transcript', async () => {
+    const { writeFileSync, mkdtempSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const { tmpdir } = await import('node:os')
+    const dir = mkdtempSync(join(tmpdir(), 'oob-status-'))
+    const transcript = join(dir, 's.jsonl')
+    // One main-thread assistant turn: input 100000 + cache_read 10000 = 110000.
+    writeFileSync(
+      transcript,
+      JSON.stringify({
+        isSidechain: false,
+        message: { role: 'assistant', usage: { input_tokens: 100000, cache_read_input_tokens: 10000 } },
+      }) + '\n',
+    )
+    const parsed = parseOobCommand('/status')!
+    const result = await handleOobCommand(
+      parsed,
+      makeCtx({ transcriptPath: transcript, contextWindowTokens: 200000, modelName: 'opus' }),
+    )
+    const text = result.replyToTelegram!.text
+    expect(text).toContain('контекст:')
+    expect(text).toContain('110k / 200k (55%)')
+    expect(text).toContain('model:')
+    expect(text).toContain('opus')
+  })
+
+  test('no transcript path → «контекст: —»', async () => {
+    const parsed = parseOobCommand('/status')!
+    const result = await handleOobCommand(parsed, makeCtx())
+    expect(result.replyToTelegram!.text).toContain('контекст: <code>—</code>')
   })
 })
 
@@ -417,7 +551,66 @@ describe('/cc panel', () => {
     expect(res.notifyChannel).toBeUndefined()
   })
 
-  test('/cc <command> still types the command into the pane', async () => {
+  // IT2-6: typed `/cc clear` is destructive → posts the /new confirm card (with
+  // newq:* buttons) and types NOTHING into the pane. Never a one-tap clear.
+  test('/cc clear posts the confirm card, types NOTHING into the pane', async () => {
+    const parsed = parseOobCommand('/cc clear')
+    if (!parsed) throw new Error('parse failed')
+    const calls: string[][] = []
+    const ctx = makeCtx()
+    ctx.tmuxKeys = {
+      target: { paneTarget: '%1', socketPath: '/tmp/s' },
+      exec: async (args) => {
+        calls.push([...args])
+        return { exitCode: 0, stderr: '' }
+      },
+      captureExec: async () => ({ exitCode: 0, stdout: IDLE_PANE, stderr: '' }),
+      sleep: noSleep,
+    }
+    const res = await handleOobCommand(parsed, ctx)
+    expect(res.command).toBe('cc')
+    // A confirm card was returned (buttons), not a keystroke.
+    expect(res.replyToTelegram!.text).toContain('Новый диалог')
+    const kb = res.replyToTelegram!.inlineKeyboard
+    expect(kb).toBeDefined()
+    const datas = kb!.inline_keyboard.flat().map((b) => b.callback_data)
+    expect(datas.some((d) => d !== undefined && d.startsWith('newq:confirm'))).toBe(true)
+    expect(datas).toContain('newq:cancel')
+    // Nothing typed into the pane at command time.
+    expect(calls.length).toBe(0)
+  })
+
+  // FIX-6: typed `/cc compact` (argless control) routes through the RELIABLE
+  // state-aware sender (probe → confirm), exactly like the ccmd: button.
+  test('/cc compact routes through the reliable sender (probe + confirm)', async () => {
+    const parsed = parseOobCommand('/cc compact')
+    if (!parsed) throw new Error('parse failed')
+    const calls: string[][] = []
+    let i = 0
+    const panes = [IDLE_PANE, typedPane('compact'), COMPACTING_PANE]
+    const ctx = makeCtx()
+    ctx.tmuxKeys = {
+      target: { paneTarget: '%1', socketPath: '/tmp/s' },
+      exec: async (args) => {
+        calls.push([...args])
+        return { exitCode: 0, stderr: '' }
+      },
+      captureExec: async () => {
+        const out = i < panes.length ? panes[i]! : (panes[panes.length - 1] ?? '')
+        i++
+        return { exitCode: 0, stdout: out, stderr: '' }
+      },
+      sleep: noSleep,
+    }
+    const res = await handleOobCommand(parsed, ctx)
+    expect(res.command).toBe('cc')
+    expect(calls.some((c) => c.includes('/compact'))).toBe(true)
+    expect(res.replyToTelegram!.text).toContain('отправлено в сессию')
+  })
+
+  // FIX-6: typed `/cc compact` into a DIALOG pane must NOT blind-fire — the
+  // reliable sender refuses (a trailing Enter would approve the dialog).
+  test('/cc compact into a dialog pane refuses, types NOTHING', async () => {
     const parsed = parseOobCommand('/cc compact')
     if (!parsed) throw new Error('parse failed')
     const calls: string[][] = []
@@ -428,9 +621,52 @@ describe('/cc panel', () => {
         calls.push([...args])
         return { exitCode: 0, stderr: '' }
       },
+      captureExec: async () => ({ exitCode: 0, stdout: DIALOG_PANE, stderr: '' }),
+      sleep: noSleep,
     }
     const res = await handleOobCommand(parsed, ctx)
-    expect(res.command).toBe('cc')
-    expect(calls.some((c) => c.includes('/compact'))).toBe(true)
+    expect(calls.length).toBe(0) // never typed into an open dialog
+    expect(res.replyToTelegram!.text).toContain('ждёт ответа в диалоге')
+  })
+
+  // FIX-6: an ARGFUL `/cc <cmd>` (e.g. `model opus`) probes the pane and refuses
+  // when it is not idle, before the blind sendSlashCommand.
+  test('/cc model opus into a busy pane refuses (probe-before-send)', async () => {
+    const parsed = parseOobCommand('/cc model opus')
+    if (!parsed) throw new Error('parse failed')
+    const calls: string[][] = []
+    const ctx = makeCtx()
+    ctx.tmuxKeys = {
+      target: { paneTarget: '%1', socketPath: '/tmp/s' },
+      exec: async (args) => {
+        calls.push([...args])
+        return { exitCode: 0, stderr: '' }
+      },
+      captureExec: async () => ({ exitCode: 0, stdout: BUSY_PANE, stderr: '' }),
+      sleep: noSleep,
+    }
+    const res = await handleOobCommand(parsed, ctx)
+    expect(calls.length).toBe(0) // did not blind-send into a busy pane
+    expect(res.replyToTelegram!.text).toContain('сессия не готова')
+  })
+
+  // FIX-6: an argful `/cc <cmd>` into an IDLE pane still sends (probe passed).
+  test('/cc model opus into an idle pane sends the command', async () => {
+    const parsed = parseOobCommand('/cc model opus')
+    if (!parsed) throw new Error('parse failed')
+    const calls: string[][] = []
+    const ctx = makeCtx()
+    ctx.tmuxKeys = {
+      target: { paneTarget: '%1', socketPath: '/tmp/s' },
+      exec: async (args) => {
+        calls.push([...args])
+        return { exitCode: 0, stderr: '' }
+      },
+      captureExec: async () => ({ exitCode: 0, stdout: IDLE_PANE, stderr: '' }),
+      sleep: noSleep,
+    }
+    const res = await handleOobCommand(parsed, ctx)
+    expect(calls.some((c) => c.includes('/model opus'))).toBe(true)
+    expect(res.replyToTelegram!.text).toContain('отправлено в сессию')
   })
 })
