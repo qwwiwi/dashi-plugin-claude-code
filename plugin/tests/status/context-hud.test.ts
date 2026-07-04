@@ -637,6 +637,23 @@ describe('renderStatusTasks', () => {
   })
 })
 
+describe('renderStatusTasks budget', () => {
+  test('total budget: a flood of long in-progress items stays bounded', () => {
+    const todos = Array.from({ length: 40 }, (_, i) =>
+      todo(String(i), 'in_progress', `<${'очень длинная задача с разметкой & сущностями '.repeat(2)}${i}>`))
+    const text = renderStatusTasks(todos)
+    expect(text.length).toBeLessThan(1700)
+    expect(text).toContain('строк скрыто')
+  })
+
+  test('truncation never splits a surrogate pair', () => {
+    const raw = '𝕏'.repeat(100) // astral-plane chars (2 UTF-16 units each)
+    const text = renderStatusTasks([todo('1', 'pending', raw)])
+    expect(text).not.toContain('\uFFFD')
+    expect(text).toContain('…')
+  })
+})
+
 describe('renderHud work view', () => {
   test('permissionMode plan → «режим: план»; other → «выполнение»; absent → no line', () => {
     const plan = renderHud({ usedTokens: 0 }, WINDOW, 'm', { todos: [], permissionMode: 'plan' })

@@ -1183,6 +1183,21 @@ const handlerDeps: HandlerDeps = {
   askUserQuestionUi,
 }
 
+// Status pin (2026-07-04, review HIGH #1): every HUD bump re-pins the fresh
+// card, and each pin drops a permanent «закрепил сообщение» service bubble
+// into the chat (disable_notification mutes only the push). Delete OUR OWN
+// pin service messages immediately — gated on the sender being THIS bot, so
+// the warchief's manual pins are never touched. Best-effort: a failed delete
+// just leaves one bubble behind.
+bot.on('message:pinned_message', ctx => {
+  if (botIdentity.id === 0 || ctx.message.from?.id !== botIdentity.id) return
+  void ctx.deleteMessage().catch((err: unknown) => {
+    log.warn('pin service-message delete failed (ignored)', {
+      chat_id: String(ctx.chat.id),
+      error: err instanceof Error ? err.message : String(err),
+    })
+  })
+})
 bot.on('message:text', ctx => handleInboundText(ctx, handlerDeps))
 bot.on('message:photo', ctx => handleInboundPhoto(ctx, handlerDeps))
 bot.on('message:document', ctx => handleInboundDocument(ctx, handlerDeps))

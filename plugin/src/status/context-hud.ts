@@ -80,6 +80,11 @@ export interface HudWorkView {
 const TASKS_MAX_PENDING = 5
 const TASKS_MAX_DONE = 2
 const TASK_LINE_CHARS = 80
+// Total section budget (post-escape chars). Keeps the card far under the
+// 4096 sendMessage cap even with many in-progress items and markup-heavy
+// subjects (escaping expands & → &amp; AFTER the per-line cut) — review
+// 2026-07-04 LOW #3.
+const TASKS_MAX_CHARS = 1500
 
 const TASK_ICONS = {
   in_progress: '◐',
@@ -91,7 +96,10 @@ function taskLine(todo: TodoItem): string {
   const raw = todo.status === 'in_progress' && todo.activeForm
     ? todo.activeForm
     : todo.content
-  const cut = raw.length > TASK_LINE_CHARS ? `${raw.slice(0, TASK_LINE_CHARS - 1)}…` : raw
+  // Truncate on CODE POINTS (Array.from), not UTF-16 units — a .slice cut
+  // can split a surrogate pair and render U+FFFD (review 2026-07-04 LOW #4).
+  const cps = Array.from(raw)
+  const cut = cps.length > TASK_LINE_CHARS ? `${cps.slice(0, TASK_LINE_CHARS - 1).join('')}…` : raw
   return `${TASK_ICONS[todo.status]} ${escapeHtml(cut)}`
 }
 
@@ -122,7 +130,23 @@ export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
   const hiddenDone = completed.length - visibleDone.length
   if (hiddenDone > 0) lines.push(`<i>+${hiddenDone} завершено ранее</i>`)
   for (const t of visibleDone) lines.push(taskLine(t))
-  return lines.join('\n')
+
+  // Total-budget pass: the per-category caps bound pending/completed but not
+  // in-progress, and escaping expands after the per-line cut. Keep the header
+  // always; drop overflowing lines and mark the cut with a tail.
+  const out: string[] = []
+  let used = 0
+  let dropped = 0
+  for (const line of lines) {
+    if (out.length === 0 || used + 1 + line.length <= TASKS_MAX_CHARS) {
+      out.push(line)
+      used += (out.length === 1 ? 0 : 1) + line.length
+    } else {
+      dropped++
+    }
+  }
+  if (dropped > 0) out.push(`<i>+${dropped} строк скрыто</i>`)
+  return out.join('\n')
 }
 
 // «план» is the only mode worth naming; every other Claude Code permission
