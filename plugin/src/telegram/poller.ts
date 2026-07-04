@@ -108,6 +108,10 @@ const ALLOWED_UPDATES: ReadonlyArray<Exclude<keyof Update, 'update_id'>> = [
   'channel_post',
   'edited_channel_post',
   'callback_query',
+  // Guest Mode (Bot API 10.0): requesting the update type is harmless when
+  // the BotFather toggle is off — Telegram simply never emits it. The
+  // handler itself is only registered when config.guest_mode.enabled.
+  'guest_message',
 ]
 
 // ─────────────────────────────────────────────────────────────────────

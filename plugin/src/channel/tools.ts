@@ -28,6 +28,7 @@ import {
   StatusArgsSchema,
 } from '../schemas.js'
 import { assertAllowedChat } from '../telegram/gate.js'
+import type { GuestQueryRegistry } from '../telegram/guest-queries.js'
 import {
   isTelegramHtmlParseError,
   markdownToTelegramHtml,
@@ -120,6 +121,11 @@ export type ChatAction =
   | 'record_video_note'
   | 'upload_video_note'
 
+// Options for the one-shot guest answer (Guest Mode, Bot API 10.0).
+export interface AnswerGuestQueryOpts {
+  parse_mode?: 'MarkdownV2' | 'HTML'
+}
+
 export interface TelegramApi {
   sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<{ message_id: number }>
   editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void>
@@ -129,6 +135,10 @@ export interface TelegramApi {
   sendPhoto(chatId: string, filePath: string, opts: SendDocumentOpts): Promise<{ message_id: number }>
   downloadFile(fileId: string, destDir: string): Promise<DownloadResult>
   deleteMessage(chatId: string, messageId: number): Promise<void>
+  // Guest Mode: answer a guest @-mention exactly once. Telegram's contract
+  // takes an InlineQueryResult; we constrain the surface to a text article
+  // — the only shape the reply tool emits — so stubs stay trivial.
+  answerGuestQuery(guestQueryId: string, text: string, opts: AnswerGuestQueryOpts): Promise<void>
 }
 
 // Thin wrapper around grammY bot.api. Keeps the rest of the system free of
@@ -199,6 +209,20 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       writeFileSync(path, buf)
       return { path, size: buf.length }
     },
+    async answerGuestQuery(guestQueryId, text, opts) {
+      // answerGuestQuery takes an InlineQueryResult; a text answer is an
+      // article with InputTextMessageContent. `id` is scoped to the query
+      // (one result per answer), so a constant is fine.
+      await bot.api.answerGuestQuery(guestQueryId, {
+        type: 'article',
+        id: 'answer',
+        title: 'Ответ',
+        input_message_content: {
+          message_text: text,
+          ...(opts.parse_mode !== undefined ? { parse_mode: opts.parse_mode } : {}),
+        },
+      })
+    },
   }
 }
 
@@ -211,12 +235,17 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'reply',
     description:
-      'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+      'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents. GUEST MODE: when the inbound <channel> meta carries guest_query_id (guest="1"), pass that guest_query_id here too — the answer is delivered into the foreign chat via answerGuestQuery. Guest answers are ONE-SHOT (exactly one reply, no attachments, no reply_to, single message ≤4096 chars — be concise).',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string' },
         text: { type: 'string' },
+        guest_query_id: {
+          type: 'string',
+          description:
+            'Guest Mode only: the guest_query_id from the inbound <channel> meta. When set, the reply goes through answerGuestQuery (one-shot) instead of sendMessage.',
+        },
         reply_to: {
           type: 'string',
           description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
@@ -329,6 +358,11 @@ export interface ToolDeps {
   // H4 fix (2026-05-23): when multichat is enabled, the policy is the
   // authoritative outbound allowlist. Omitted in legacy DM-only mode.
   policy?: MultichatPolicy
+  // Guest Mode (2026-07-04): pending one-shot guest queries. Authorization
+  // for a guest reply is registry membership — only allowlisted callers'
+  // queries are ever registered (handleGuestMessage gates first), so the
+  // chat allowlist is deliberately NOT consulted on this path.
+  guestQueries?: GuestQueryRegistry
 }
 
 function toolError(name: string, message: string): CallToolResult {
@@ -353,6 +387,76 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         const parsed = ReplyArgsSchema.safeParse(rawArgs)
         if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
         const args = parsed.data
+
+        // Guest Mode path (2026-07-04). Authorization = registry membership
+        // (only allowlisted callers' queries get registered), NOT the chat
+        // allowlist — the originating chat is one the bot is not a member
+        // of, so assertAllowedChat would always (correctly) refuse it.
+        if (args.guest_query_id !== undefined) {
+          if (deps.guestQueries === undefined) {
+            return toolError(name, 'guest replies unavailable — guest_mode is not enabled in config')
+          }
+          if ((args.files ?? []).length > 0) {
+            return toolError(name, 'guest replies cannot carry attachments — answerGuestQuery is text-only')
+          }
+          if (args.reply_to !== undefined) {
+            return toolError(name, 'guest replies do not support reply_to — the answer always lands in-place')
+          }
+          const claim = deps.guestQueries.claim(args.guest_query_id)
+          if (claim.kind !== 'ok') {
+            return toolError(
+              name,
+              `guest query ${claim.kind} — guest answers are one-shot and expire after 15 minutes`,
+            )
+          }
+
+          // Render once, then hard-cap at ONE Telegram message: there is no
+          // second answerGuestQuery, so chunking cannot apply. splitMessage
+          // keeps HTML tags balanced per chunk — we ship chunk[0] and flag
+          // the truncation in the tool result so the agent knows.
+          const body =
+            args.format === 'html' ? markdownToTelegramHtml(args.text) : args.text
+          const chunks = splitMessage(body)
+          const single = chunks[0] as string
+          const truncated = chunks.length > 1
+          const guestOpts: AnswerGuestQueryOpts =
+            args.format === 'html'
+              ? { parse_mode: 'HTML' }
+              : args.format === 'markdownv2'
+                ? { parse_mode: 'MarkdownV2' }
+                : {}
+
+          try {
+            await telegramApi.answerGuestQuery(args.guest_query_id, single, guestOpts)
+          } catch (err) {
+            if (args.format === 'html' && isTelegramHtmlParseError(err)) {
+              // Telegram rejected the HTML — the query is NOT consumed by a
+              // failed call, so retry the same body as plain text.
+              log.warn('guest answer HTML parse failed, retrying as plain text', {
+                error: err instanceof Error ? err.message : String(err),
+              })
+              try {
+                await telegramApi.answerGuestQuery(args.guest_query_id, single, {})
+              } catch (err2) {
+                deps.guestQueries.release(args.guest_query_id)
+                return toolError(name, err2 instanceof Error ? err2.message : String(err2))
+              }
+            } else {
+              deps.guestQueries.release(args.guest_query_id)
+              return toolError(name, err instanceof Error ? err.message : String(err))
+            }
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: truncated
+                ? 'guest answer sent (TRUNCATED to one message — guest replies are one-shot; keep them short)'
+                : 'guest answer sent',
+            }],
+          }
+        }
+
         try {
           assertAllowedChat(args.chat_id, config, deps.policy)
         } catch (err) {

@@ -28,6 +28,7 @@
 
 import type { Logger } from '../log.js'
 import type {
+  AnswerGuestQueryOpts,
   ChatAction,
   DownloadResult,
   EditOpts,
@@ -285,6 +286,20 @@ export function createRateLimitedTelegramApi(
 
     async deleteMessage(chatId: string, messageId: number): Promise<void> {
       return withRetry('deleteMessage', () => raw.deleteMessage(chatId, messageId))
+    },
+
+    async answerGuestQuery(
+      guestQueryId: string,
+      text: string,
+      guestOpts: AnswerGuestQueryOpts,
+    ): Promise<void> {
+      // No per-chat FIFO: guest queries have no allowlisted chat id and are
+      // one-shot by contract — there is never a second send to order after.
+      // The 429-retry wrapper still applies (a retry of a FAILED call does
+      // not double-answer; Telegram only consumes the query on success).
+      return withRetry('answerGuestQuery', () =>
+        raw.answerGuestQuery(guestQueryId, text, guestOpts),
+      )
     },
   }
 }

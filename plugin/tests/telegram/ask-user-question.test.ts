@@ -90,6 +90,9 @@ function fakeTelegram(state: FakeTelegramSends, opts?: { editThrows?: boolean })
     async downloadFile(_fileId: string, _destDir: string): Promise<DownloadResult> {
       return { path: '/tmp/x' }
     },
+    async answerGuestQuery(): Promise<void> {
+      /* not exercised */
+    },
     async deleteMessage(_chatId: string, _messageId: number): Promise<void> {
       /* no-op */
     },
@@ -1286,6 +1289,7 @@ function scriptedTelegram(state: FakeTelegramSends, sendErrors: Array<Error | nu
     async sendPhoto(_c, _f, _o) { return { message_id: 0 } },
     async downloadFile(_f, _d): Promise<DownloadResult> { return { path: '/tmp/x' } },
     async deleteMessage(_c, _m) { /* no-op */ },
+    async answerGuestQuery() { /* no-op */ },
   }
 }
 
