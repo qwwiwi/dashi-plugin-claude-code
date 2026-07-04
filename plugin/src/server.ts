@@ -507,6 +507,11 @@ const hudApi: HudTelegramApi = {
     telegramApi.editMessageText(chatId, messageId, text, opts),
   pinChatMessage: (chatId, messageId, opts) =>
     bot.api.pinChatMessage(chatId, messageId, opts).then(() => undefined),
+  // bump() legs (status pin): delete goes through the safe wrapper (rate
+  // limiting); unpin carries no user text and is adapted from grammY like pin.
+  deleteMessage: (chatId, messageId) => telegramApi.deleteMessage(chatId, messageId),
+  unpinChatMessage: (chatId, messageId) =>
+    bot.api.unpinChatMessage(chatId, messageId).then(() => undefined),
 }
 const contextHud = new ContextHud({
   api: hudApi,
@@ -1160,6 +1165,9 @@ const handlerDeps: HandlerDeps = {
   watcher: inboundWatcher,
   // Optional /mirror control surface — undefined when tmux_mirror.enabled=false.
   ...(tmuxMirror !== null ? { tmuxMirror } : {}),
+  // Status pin (2026-07-04): re-anchor the pinned card on every inbound owner
+  // message, sequenced before the tmux-mirror bump inside handlers.ts.
+  contextHud,
   // /keys — deterministic keystrokes into the agent pane (DM allowlist only).
   ...(tmuxKeysTarget !== undefined ? { tmuxKeys: { target: tmuxKeysTarget } } : {}),
   // Session facts (transcript_path + model) for /status context usage.

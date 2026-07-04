@@ -1044,3 +1044,66 @@ describe('POST /hooks/agent — memoryWriter branch (Phase 8 T7)', () => {
     expect(mcp.calls.length).toBe(1)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Status pin (2026-07-04): permission_mode capture + HUD todo dispatch
+// ─────────────────────────────────────────────────────────────────────
+
+describe('POST /hooks/agent — status-pin wiring', () => {
+  test('permission_mode is recorded; TodoWrite reaches contextHud.onTodoEvent', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const recorded: Array<{ chatId: string | undefined; info: Record<string, unknown> }> = []
+    const todoEvents: Array<{ chatId: string; event: { kind: string } }> = []
+    const h = await startWebhookServer(enabledConfig(), {
+      mcpServer: mcp.server,
+      config: enabledConfig(),
+      statePaths: paths,
+      log: createLogger('test'),
+      sessionInfo: {
+        record: (chatId, info) => {
+          recorded.push({ chatId, info: info as Record<string, unknown> })
+        },
+      },
+      contextHud: {
+        onSessionStart: () => {},
+        onStop: () => {},
+        onTodoEvent: (chatId, event) => {
+          todoEvents.push({ chatId, event })
+        },
+      },
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'PostToolUse',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+        permission_mode: 'plan',
+        tool_name: 'TodoWrite',
+        tool_use_id: 'u1',
+        tool_input: {
+          todos: [{ content: 'шаг', status: 'in_progress', activeForm: 'делаю шаг' }],
+        },
+        tool_result: 'ok',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(recorded.length).toBe(1)
+    expect(recorded[0]!.info.permissionMode).toBe('plan')
+    // fire-and-forget dispatch — give the microtask queue one tick
+    await new Promise((r) => setTimeout(r, 10))
+    expect(todoEvents.length).toBe(1)
+    expect(todoEvents[0]!.chatId).toBe('164795011')
+    expect(todoEvents[0]!.event.kind).toBe('todo_write')
+  })
+})
