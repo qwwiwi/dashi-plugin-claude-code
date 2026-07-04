@@ -489,7 +489,7 @@ const statusManager = new StatusManager({
 const sessionInfoStore = new SessionInfoStore()
 
 // Context HUD (wave 3B) — the single pinned Telegram message in the owner's
-// chat showing context-window usage + Сжать / Новый диалог buttons. Driven by
+// chat showing context-window usage + the «Сжать» button. Driven by
 // the SessionStart / Stop hooks (wired through the webhook deps below) and the
 // `hud:` callback branch further down. Owner chats: allowed_chat_ids, falling
 // back to allowed_user_ids (in a DM the chat id equals the user id). The HUD
@@ -503,8 +503,8 @@ const sessionInfoStore = new SessionInfoStore()
 // message delivery.
 // FIX-8 (both reviews): owner chats come from resolveOwnerChatIds (owner_chat_ids
 // / allowed_user_ids = positive DM ids), NEVER allowed_chat_ids — which in
-// multichat also lists group ids. A HUD with destructive buttons must never be
-// pinned in a public group, and its control callbacks drive the single global
+// multichat also lists group ids. A HUD with session-driving controls must
+// never be pinned in a public group, and its callbacks drive the single global
 // DM pane.
 const hudOwnerChatIds: ReadonlyArray<number | string> = resolveOwnerChatIds(config)
 const hudApi: HudTelegramApi = {
@@ -910,7 +910,8 @@ bot.on('callback_query:data', async ctx => {
     }
     return
   }
-  // Context HUD panel (hud:*) — the two buttons on the pinned HUD message.
+  // Context HUD panel (hud:*) — callbacks of the pinned HUD message («Сжать»
+  // plus legacy hud:new from stale pre-removal markup).
   // Same fail-closed allowlist auth as kkey:/ccmd:/newq: (config
   // .allowed_user_ids). `hud:compact` drives the reliable /compact injection;
   // `hud:new` posts the SAME /new confirm card whose newq:* buttons the branch
