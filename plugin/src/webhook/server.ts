@@ -189,6 +189,19 @@ export interface ContextHudForWebhook {
   onTodoEvent?(chatId: string, event: TaskMirrorEvent): Promise<void> | void
 }
 
+// Fire a HUD entry point without EVER letting it disturb the hook 200 path.
+// `Promise.resolve(fn()).catch()` alone is not enough: fn() runs before the
+// wrap, so a synchronous throw would escape (codex review 2026-07-04, HIGH #2).
+function fireHud(log: Logger, fn: () => Promise<void> | void): void {
+  try {
+    void Promise.resolve(fn()).catch(() => {})
+  } catch (err) {
+    log.warn('context hud dispatch threw synchronously (ignored)', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+}
+
 // Structural surface for the AskUserQuestion Telegram UI handler (TASK-2).
 // We accept any object exposing `startQuestion(requestId)` so the webhook
 // layer is decoupled from the concrete implementation in
@@ -577,15 +590,17 @@ async function handleRequest(
     // Context HUD (wave 3B): drive the pinned indicator on the session
     // lifecycle. SessionStart (re)pins + refreshes; Stop refreshes the
     // percentage after a turn. COMPLETELY isolated from the 200 path: the HUD
-    // methods swallow + log internally, and we still `void`+`.catch` here so a
-    // synchronous throw (defensive) can never escape into the hook response.
-    // The HUD gates on the owner chat internally, so a non-owner chatId is a
-    // safe no-op.
+    // methods swallow + log internally. fireHud additionally guards against a
+    // SYNCHRONOUS throw — `Promise.resolve(fn()).catch()` alone evaluates
+    // fn() BEFORE the wrap, so a sync throw would 500 the hook response
+    // (codex review 2026-07-04, HIGH #2). The HUD gates on the owner chat
+    // internally, so a non-owner chatId is a safe no-op.
     if (deps.contextHud) {
+      const hud = deps.contextHud
       if (payload.hook_event_name === 'SessionStart') {
-        void Promise.resolve(deps.contextHud.onSessionStart(payload.chatId)).catch(() => {})
+        fireHud(log, () => hud.onSessionStart(payload.chatId))
       } else if (payload.hook_event_name === 'Stop') {
-        void Promise.resolve(deps.contextHud.onStop(payload.chatId)).catch(() => {})
+        fireHud(log, () => hud.onStop(payload.chatId))
       }
     }
 
@@ -665,9 +680,8 @@ async function handleRequest(
           }
         }
         if (deps.contextHud?.onTodoEvent) {
-          void Promise.resolve(
-            deps.contextHud.onTodoEvent(payload.chatId, todoEvent),
-          ).catch(() => {})
+          const hud = deps.contextHud
+          fireHud(log, () => hud.onTodoEvent?.(payload.chatId, todoEvent))
         }
       }
     }

@@ -691,6 +691,22 @@ describe('ContextHud bump', () => {
     expect(api.sent.length).toBe(2)
   })
 
+  test('delete AND unpin both fail → bump aborts, old card kept (one-pin invariant)', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER)
+    const oldId = api.sent[0]!.message_id
+    api.deleteError = new Error('400: message can\'t be deleted')
+    api.unpinError = new Error('network')
+
+    await hud.bump(OWNER)
+    expect(api.sent.length).toBe(1) // NO replacement sent — two pins impossible
+    // The old id survives: a later refresh edits the SAME card.
+    await hud.updateNow(OWNER)
+    const lastEdit = api.edited[api.edited.length - 1]!
+    expect(lastEdit.messageId).toBe(oldId)
+  })
+
   test('debounce: a second bump within the window is a no-op', async () => {
     const api = new FakeApi()
     const hud = makeHud(api)

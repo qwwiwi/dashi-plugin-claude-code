@@ -21,7 +21,7 @@
 // that message instead of spamming a fresh one; if the user deleted it we
 // recreate it exactly once.
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { classifyEditError } from '../safety/telegram-edit-classifier.js'
@@ -389,10 +389,18 @@ export class ContextHud {
         const old = this.messageIds.get(chatId) ?? this.loadPersisted(chatId)
         if (old !== undefined) {
           this.messageIds.delete(chatId)
-          let deleted = false
+          // `retired` = the old card can no longer hold a pin (deleted, or
+          // unpinned in place). Only a retired old card may be replaced —
+          // otherwise sending a fresh pinned card could yield TWO pins
+          // (codex review 2026-07-04, HIGH #1).
+          let retired = false
           try {
             await this.api.deleteMessage(chatId, old)
-            deleted = true
+            retired = true
+            // Deliberate persistence cleanup (codex MED #3): the persisted id
+            // now points at a deleted message. Drop it so a crash between
+            // here and sendFresh can't resurrect the stale id later.
+            this.clearPersisted(chatId)
           } catch (err) {
             this.log.warn('context hud bump delete failed (will unpin instead)', {
               chat_id: chatId,
@@ -400,9 +408,10 @@ export class ContextHud {
               error: err instanceof Error ? err.message : String(err),
             })
           }
-          if (!deleted) {
+          if (!retired) {
             try {
               await this.api.unpinChatMessage(chatId, old)
+              retired = true
             } catch (err) {
               this.log.warn('context hud bump unpin failed (ignored)', {
                 chat_id: chatId,
@@ -410,6 +419,14 @@ export class ContextHud {
                 error: err instanceof Error ? err.message : String(err),
               })
             }
+          }
+          if (!retired) {
+            // BOTH legs failed — the old card may still be pinned somewhere.
+            // Bail out and keep pointing at it: a stale position beats a
+            // second pinned card (the one-pin invariant is the warchief's
+            // hard requirement). The next bump retries the whole sequence.
+            this.messageIds.set(chatId, old)
+            return
           }
         }
         // sendFresh persists the new id (overwriting the stale one) and pins.
@@ -573,6 +590,19 @@ export class ContextHud {
     // defensively so a surprising value can never escape the state dir.
     const safe = chatId.replace(/[^0-9A-Za-z_-]/g, '_')
     return join(this.stateDir, `context-hud-${safe}.json`)
+  }
+
+  // Remove the persisted id after a successful delete — a file pointing at a
+  // deleted message is worse than no file (bump/updateNow would edit a ghost).
+  private clearPersisted(chatId: string): void {
+    try {
+      rmSync(this.persistPath(chatId), { force: true })
+    } catch (err) {
+      this.log.warn('context hud clearPersisted failed (ignored)', {
+        chat_id: chatId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
   }
 
   private loadPersisted(chatId: string): number | undefined {

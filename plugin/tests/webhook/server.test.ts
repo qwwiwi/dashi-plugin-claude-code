@@ -1050,6 +1050,55 @@ describe('POST /hooks/agent — memoryWriter branch (Phase 8 T7)', () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe('POST /hooks/agent — status-pin wiring', () => {
+  test('a synchronously-throwing HUD never breaks the 200 path', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const h = await startWebhookServer(enabledConfig(), {
+      mcpServer: mcp.server,
+      config: enabledConfig(),
+      statePaths: paths,
+      log: createLogger('test'),
+      contextHud: {
+        onSessionStart: () => {
+          throw new Error('sync boom')
+        },
+        onStop: () => {
+          throw new Error('sync boom')
+        },
+        onTodoEvent: () => {
+          throw new Error('sync boom')
+        },
+      },
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+
+    for (const body of [
+      { hook_event_name: 'SessionStart', model: 'fable', source: 'startup' },
+      {
+        hook_event_name: 'PostToolUse', tool_name: 'TodoWrite', tool_use_id: 'u1',
+        tool_input: { todos: [{ content: 'x', status: 'pending' }] }, tool_result: 'ok',
+      },
+      { hook_event_name: 'Stop' },
+    ]) {
+      const resp = await fetch(url(h, '/hooks/agent'), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          chatId: 164795011,
+          session_id: 's1',
+          transcript_path: '/tmp/t.jsonl',
+          cwd: '/tmp',
+          ...body,
+        }),
+      })
+      expect(resp.status).toBe(200)
+    }
+  })
+
   test('permission_mode is recorded; TodoWrite reaches contextHud.onTodoEvent', async () => {
     process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
     const mcp = makeMcpStub()
