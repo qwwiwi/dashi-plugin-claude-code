@@ -217,6 +217,7 @@ describe('renderHud', () => {
     expect(keyboard).toEqual(buildHudKeyboard())
     const rows = keyboard.inline_keyboard
     expect(rows.length).toBe(1)
+    expect(rows[0]).toHaveLength(1)
     expect(rows[0]![0]!.callback_data).toBe(`${HUD_PREFIX}compact`)
     expect(rows[0]![0]!.text).toContain('Сжать')
     const flat = JSON.stringify(keyboard)

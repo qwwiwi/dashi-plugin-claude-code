@@ -32,7 +32,8 @@ import type { TodoItem } from '../schemas.js'
 import type { EditOpts, InlineKeyboardLike, SendMessageOpts } from '../channel/tools.js'
 import type { Logger } from '../log.js'
 
-// The callback prefix for the HUD's two buttons. Distinct from kkey:/ccmd:/
+// The callback prefix for the HUD's callbacks (compact button + legacy new
+// from stale pre-removal markup). Distinct from kkey:/ccmd:/
 // newq:/pgate:/ask: by construction so it never collides in the shared
 // bot.on('callback_query:data') router.
 export const HUD_PREFIX = 'hud:'
@@ -662,7 +663,8 @@ export class ContextHud {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Callback handler for the HUD's two buttons (hud:compact / hud:new).
+// Callback handler for the HUD's callbacks (hud:compact — the card's only
+// button — plus legacy hud:new from stale pre-removal markup).
 //
 // Fail-closed auth FIRST (config.allowed_user_ids — the SAME allowlist that
 // guards every other session-driving control), then parse, then act:
