@@ -1,0 +1,10 @@
+{
+  "name": "dashi-channel",
+  "displayName": "Dashi Channel — Telegram bridge for Claude Code",
+  "version": "1.1.0",
+  "description": "Telegram channel plugin for Claude Code: personal DM bridge + public multichat, permission relay, confirm-panel keys, context HUD with a single pinned status card, rich messages (Bot API 10.1), Guest Mode, voice transcription, terminal mirror, secret redaction.",
+  "author": { "name": "qwwiwi" },
+  "repository": "https://github.com/qwwiwi/dashi-plugin-claude-code",
+  "license": "Apache-2.0",
+  "keywords": ["telegram", "channel", "mcp", "bridge", "bot"]
+}

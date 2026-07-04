@@ -20,6 +20,8 @@ import { execSync } from 'child_process'
 import { homedir } from 'os'
 import { isAbsolute, join, resolve as resolvePath } from 'path'
 
+import pkg from '../package.json'
+
 import {
   RuntimeEnvSchema,
   getStatePaths,
@@ -452,7 +454,9 @@ const richLatch = createRichLatch()
 const telegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSecrets, richLatch)
 
 const mcp = new Server(
-  { name: 'dashi-channel', version: '1.0.0' },
+  // Single version source: package.json (kept in lockstep with the repo-root
+  // .claude-plugin/plugin.json by tests/version-sync.test.ts).
+  { name: 'dashi-channel', version: pkg.version },
   {
     capabilities: {
       tools: {},
