@@ -11,7 +11,7 @@
 // the real createSafeTelegramApi so redaction + classification run for real.
 
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -378,16 +378,22 @@ describe("callTool('reply') rich gate", () => {
   })
 
   test('files present → rich skipped (text+attachment goes legacy path)', async () => {
-    // No workspace_root → attachment resolution rejects, but the point is that
-    // rich is never attempted when files are present. Assert no rich call.
-    const h = makeHarness({})
-    await callTool(
-      replyReq({ chat_id: PRINCE_DM, text: 'with file', files: ['/etc/hosts'] }),
+    // A VALID workspace file, so the reply runs the full send path instead of
+    // dying in attachment validation — proving the rich gate itself skips on
+    // files.length > 0 (Codex review 2026-07-04: the old /etc/hosts variant
+    // returned before ever reaching the gate).
+    const workspace = mkdtempSync(join(tmpdir(), 'dashi-rich-files-ws-'))
+    writeFileSync(join(workspace, 'report.txt'), 'attachment body')
+    const h = makeHarness({ config: { workspace_root: workspace } })
+    const result = await callTool(
+      replyReq({ chat_id: PRINCE_DM, text: 'with file', files: [join(workspace, 'report.txt')] }),
       h.deps,
     )
-    // Reply errors on the unresolved file (no workspace_root) — that's fine;
-    // the invariant under test is that the rich path was NOT taken.
+    expect(result.isError).toBeUndefined()
     expect(h.recorder.sendRich).toHaveLength(0)
+    // Text shipped through the legacy HTML chunk path.
+    expect(h.recorder.sendMessage).toHaveLength(1)
+    rmSync(workspace, { recursive: true, force: true })
     h.cleanup()
   })
 

@@ -160,19 +160,21 @@ export function createSafeTelegramApi(
       rawMarkdown: string,
       opts: SendRichMessageOpts,
     ): Promise<SendRichMessageResult> {
-      // Redact FIRST — secrets must be stripped from the raw markdown before
-      // it leaves the process, exactly like the sendMessage path. We do NOT
-      // run validateTelegramHtml here: the body is markdown, not HTML, and
-      // the validator would corrupt it. Telegram's server-side parser is the
-      // safety net — a bad body comes back as a 400 we classify and fall
-      // back from.
-      const redacted = redactSecrets(rawMarkdown, extraSecrets)
-
       // Latch already tripped (or no latch wired) → don't even attempt the
       // send; report fallback so the caller uses the validated HTML path.
+      // Checked before redaction: a latched-off session would otherwise pay
+      // a full redaction pass on up-to-32KB text for every skipped call.
       if (richLatch === undefined || richLatch.sendDisabled) {
         return { fallback: true }
       }
+
+      // Redact BEFORE the raw call — secrets must be stripped from the raw
+      // markdown before it leaves the process, exactly like the sendMessage
+      // path. We do NOT run validateTelegramHtml here: the body is markdown,
+      // not HTML, and the validator would corrupt it. Telegram's server-side
+      // parser is the safety net — a bad body comes back as a 400 we
+      // classify and fall back from.
+      const redacted = redactSecrets(rawMarkdown, extraSecrets)
 
       try {
         return await raw.sendRichMessage(chatId, redacted, opts)
