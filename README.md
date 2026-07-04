@@ -20,7 +20,7 @@ It replaces the deprecated `claude -p` gateway pattern (a Python daemon that spa
 
 One plugin process = one Telegram bot = one agent. By default it serves **a single DM chat** (legacy single-session mode). With `multichat.enabled` turned on, the same bot fans incoming messages out across several per-chat tmux sessions of one identity — see section [3](#3-multichat--how-it-works-and-why).
 
-> **Status:** under active development. Latest merged PR — **#34** (the Stop hook writes the multichat reply to the outbox). Poller auto-reconnect — **#30**. Full list: `gh pr list --state merged --limit 15`. CI: `bun test` + `bun run typecheck` must pass clean before merge.
+> **Status:** in production across a multi-agent fleet. Current release — **[v1.1.0](CHANGELOG.md)** (2026-07-04): rich messages, Guest Mode, context HUD + pinned status card — see section [15](#15-whats-new-in-v110--rich-messages-guest-mode-context-hud--status-pin). Versioning and release process: [CHANGELOG.md](CHANGELOG.md) · [docs/RELEASING.md](docs/RELEASING.md). CI: `bun test` + `bun run typecheck` must pass clean before merge.
 
 ---
 
@@ -40,6 +40,7 @@ One plugin process = one Telegram bot = one agent. By default it serves **a sing
 12. [Quick start and documentation](#12-quick-start-and-documentation)
 13. [Why migrate — the 2026-06-15 deadline](#13-why-migrate--the-2026-06-15-deadline)
 14. [Multi-agent — a fleet of agents under one subscription](#14-multi-agent--a-fleet-of-agents-under-one-subscription)
+15. [What's new in v1.1.0 — rich messages, Guest Mode, context HUD + status pin](#15-whats-new-in-v110--rich-messages-guest-mode-context-hud--status-pin)
 
 ---
 
@@ -793,6 +794,36 @@ bun skills/doctor-dashi-plugin/scripts/doctor.ts \
 ```
 
 For migration context see `docs/04-migration-from-gateway.md` and section 13.
+
+---
+
+## 15. What's new in v1.1.0 — rich messages, Guest Mode, context HUD + status pin
+
+Everything shipped in early July 2026 (PRs #86, #94–#97). Full history: [CHANGELOG.md](CHANGELOG.md); how releases are cut: [docs/RELEASING.md](docs/RELEASING.md).
+
+### Rich messages (Bot API 10.1)
+
+DM replies auto-upgrade to `sendRichMessage`: Telegram renders **raw markdown server-side** — native headings, tables, task-lists, math, `<details>` collapsibles, footnotes — and the body cap is **32 768 bytes** (vs 4 096 for a normal message), so a long structured answer ships as ONE message instead of being chunked and lossily HTML-converted.
+
+- **Zero-config.** Nothing to enable: an eligible reply (a DM, no attachments, fits 32 KB) tries the rich path first.
+- **Transparent fallback — you never lose a message.** If Telegram (or the local grammY build) doesn't know the method, a session-scoped capability latch turns rich off and everything flows through the classic HTML path. A markdown parse rejection (400) falls back one-off without latching; an oversize body falls back to HTML chunking.
+- **Safety unchanged.** The rich path goes through the same secret-redaction and rate-limit wrappers as every other send — it is a new method on the same layered Telegram API.
+- **Controls:** kill switch — env `TELEGRAM_RICH_MESSAGES=0` or config `richMessages.enabled=false`; per-chat opt-out — config `richMessages.perChatOptOut` or env `TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT` (CSV of chat ids).
+- **Scope:** DMs only for now. Group/multichat replies and Guest Mode answers keep the HTML path.
+
+### Guest Mode (one-shot @-mentions)
+
+@-mention the bot in **any chat it is NOT a member of** and the agent receives a one-shot query: the inbound message carries `guest="1"` and a `guest_query_id`, and the answer is delivered into that foreign chat via `answerGuestQuery` — visible to everyone there.
+
+- **Fail-closed:** only allowlisted user ids can summon the bot; anyone else is dropped before a handler runs.
+- **One-shot contract:** exactly one answer per query, ≤4096 chars, no attachments, no threading; the query expires ~15 minutes after arrival.
+- **Enabling requires both switches:** the Guest Mode toggle in BotFather AND `guest_mode.enabled=true` in config (a missing block means OFF).
+
+### Context HUD + a single pinned status card
+
+The owner's DM keeps exactly **one pinned service message**: context-window %, session mode, and current tasks, re-anchored above the terminal mirror on every inbound message. Service bubbles are auto-deleted; the command menu is owner-scoped; `/compact`, `/new`, `/status` are state-aware (driven through the live TUI). `AskUserQuestion` dialogs are relayed as Telegram **inline buttons** — answer the agent's multiple-choice questions with one tap.
+
+Config: `hud.enabled` (optional block; a missing block means ON). Owner chats come from the owner allowlist — the HUD and its buttons never appear in groups.
 
 ---
 
