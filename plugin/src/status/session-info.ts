@@ -20,6 +20,10 @@ export interface SessionInfo {
   transcriptPath?: string
   sessionId?: string
   model?: string
+  // Claude Code permission mode from the latest hook payload that carried one
+  // ('default' | 'plan' | 'acceptEdits' | 'bypassPermissions'). The status pin
+  // renders «план» vs «выполнение» from it.
+  permissionMode?: string
 }
 
 export class SessionInfoStore {
@@ -36,6 +40,7 @@ export class SessionInfoStore {
     if (info.transcriptPath) next.transcriptPath = info.transcriptPath
     if (info.sessionId) next.sessionId = info.sessionId
     if (info.model) next.model = info.model
+    if (info.permissionMode) next.permissionMode = info.permissionMode
     if (key !== undefined) this.byChat.set(key, next)
     // `latest` always tracks the most recent event so a single-session caller
     // (no chatId passed to get()) still sees the freshest transcript/model.

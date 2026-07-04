@@ -21,11 +21,14 @@
 // that message instead of spamming a fresh one; if the user deleted it we
 // recreate it exactly once.
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { classifyEditError } from '../safety/telegram-edit-classifier.js'
 import { readContextUsage as realReadContextUsage, type ContextUsage } from './context-usage.js'
+import { applyTaskCreateToMap, applyTaskUpdateToMap } from './task-mirror.js'
+import type { TaskMirrorEvent } from '../hooks/claude-events.js'
+import type { TodoItem } from '../schemas.js'
 import type { EditOpts, InlineKeyboardLike, SendMessageOpts } from '../channel/tools.js'
 import type { Logger } from '../log.js'
 
@@ -41,6 +44,10 @@ export const HUD_PREFIX = 'hud:'
 const BAR_SEGMENTS = 10
 const BAR_FILLED = '▰'
 const BAR_EMPTY = '▱'
+
+// bump() debounce window — collapses inbound-message bursts (multi-part voice,
+// albums) into a single delete+resend. Mirrors TmuxMirror.BUMP_DEBOUNCE_MS.
+const HUD_BUMP_DEBOUNCE_MS = 1500
 
 // Escape the model string for HTML parse mode. Model ids ("claude-opus-4-8")
 // carry no markup, but escape defensively so a surprising value can never break
@@ -60,6 +67,94 @@ export function buildHudKeyboard(): InlineKeyboardLike {
   }
 }
 
+// Work-status view rendered under the context line (status-pin wave, 2026-07-04).
+export interface HudWorkView {
+  todos: ReadonlyArray<TodoItem>
+  permissionMode?: string
+}
+
+// Caps for the tasks section. The HUD is a compact pinned card, not the full
+// TaskMirror body: all in-progress items, a handful of pending, the last
+// couple of completed. Item text is truncated on the RAW string BEFORE
+// escaping so an entity can never be sliced in half.
+const TASKS_MAX_PENDING = 5
+const TASKS_MAX_DONE = 2
+const TASK_LINE_CHARS = 80
+// Total section budget (post-escape chars). Keeps the card far under the
+// 4096 sendMessage cap even with many in-progress items and markup-heavy
+// subjects (escaping expands & → &amp; AFTER the per-line cut) — review
+// 2026-07-04 LOW #3.
+const TASKS_MAX_CHARS = 1500
+
+const TASK_ICONS = {
+  in_progress: '◐',
+  pending: '◻',
+  completed: '☑',
+} as const
+
+function taskLine(todo: TodoItem): string {
+  const raw = todo.status === 'in_progress' && todo.activeForm
+    ? todo.activeForm
+    : todo.content
+  // Truncate on CODE POINTS (Array.from), not UTF-16 units — a .slice cut
+  // can split a surrogate pair and render U+FFFD (review 2026-07-04 LOW #4).
+  const cps = Array.from(raw)
+  const cut = cps.length > TASK_LINE_CHARS ? `${cps.slice(0, TASK_LINE_CHARS - 1).join('')}…` : raw
+  return `${TASK_ICONS[todo.status]} ${escapeHtml(cut)}`
+}
+
+/**
+ * Render the compact «Задачи» section for the status pin: a 10-segment
+ * done/total bar + in-progress / pending / last-completed lines.
+ * Empty todos → empty string (the HUD omits the section entirely).
+ * PURE — exported for unit tests.
+ */
+export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
+  if (todos.length === 0) return ''
+  const inProgress = todos.filter((t) => t.status === 'in_progress')
+  const pending = todos.filter((t) => t.status === 'pending')
+  const completed = todos.filter((t) => t.status === 'completed')
+  const total = todos.length
+  const done = completed.length
+
+  const filled = Math.max(0, Math.min(BAR_SEGMENTS, Math.round((done / total) * BAR_SEGMENTS)))
+  const bar = BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(BAR_SEGMENTS - filled)
+
+  const lines: string[] = [`<b>Задачи</b> ${bar} ${done}/${total}`]
+  for (const t of inProgress) lines.push(taskLine(t))
+  for (const t of pending.slice(0, TASKS_MAX_PENDING)) lines.push(taskLine(t))
+  if (pending.length > TASKS_MAX_PENDING) {
+    lines.push(`<i>+${pending.length - TASKS_MAX_PENDING} ещё…</i>`)
+  }
+  const visibleDone = completed.slice(-TASKS_MAX_DONE)
+  const hiddenDone = completed.length - visibleDone.length
+  if (hiddenDone > 0) lines.push(`<i>+${hiddenDone} завершено ранее</i>`)
+  for (const t of visibleDone) lines.push(taskLine(t))
+
+  // Total-budget pass: the per-category caps bound pending/completed but not
+  // in-progress, and escaping expands after the per-line cut. Keep the header
+  // always; drop overflowing lines and mark the cut with a tail.
+  const out: string[] = []
+  let used = 0
+  let dropped = 0
+  for (const line of lines) {
+    if (out.length === 0 || used + 1 + line.length <= TASKS_MAX_CHARS) {
+      out.push(line)
+      used += (out.length === 1 ? 0 : 1) + line.length
+    } else {
+      dropped++
+    }
+  }
+  if (dropped > 0) out.push(`<i>+${dropped} строк скрыто</i>`)
+  return out.join('\n')
+}
+
+// «план» is the only mode worth naming; every other Claude Code permission
+// mode (default / acceptEdits / bypassPermissions) is just «выполнение».
+function modeLabel(permissionMode: string): string {
+  return permissionMode === 'plan' ? 'план' : 'выполнение'
+}
+
 /**
  * Render the HUD text + keyboard from a context-usage reading.
  *
@@ -68,18 +163,31 @@ export function buildHudKeyboard(): InlineKeyboardLike {
  * clamped percentage. An optional second line shows the model when known.
  * A null usage (no transcript / no usable turn yet) renders `🧠 <b>Контекст</b>: —`.
  *
+ * With a `work` view the card grows a mode line («режим: план» /
+ * «выполнение», only when the permission mode is known) and a compact
+ * «Задачи» section (renderStatusTasks) — the combined status pin the
+ * warchief asked for on 2026-07-04: ONE pinned message = context + work.
+ *
  * PURE — no I/O, no clock — so it is trivially unit-testable against fixed inputs.
  */
 export function renderHud(
   usage: { usedTokens: number } | null,
   windowTokens: number,
   model?: string,
+  work?: HudWorkView,
 ): { text: string; keyboard: InlineKeyboardLike } {
   const keyboard = buildHudKeyboard()
   const modelLine = model !== undefined && model.length > 0 ? `\n<i>${escapeHtml(model)}</i>` : ''
+  const modeLine =
+    work?.permissionMode !== undefined && work.permissionMode.length > 0
+      ? `\n<i>режим: ${modeLabel(work.permissionMode)}</i>`
+      : ''
+  const tasksBlock = work !== undefined ? renderStatusTasks(work.todos) : ''
+  const tasksSection = tasksBlock.length > 0 ? `\n\n${tasksBlock}` : ''
+  const tail = `${modelLine}${modeLine}${tasksSection}`
 
   if (usage === null) {
-    return { text: `🧠 <b>Контекст</b>: —${modelLine}`, keyboard }
+    return { text: `🧠 <b>Контекст</b>: —${tail}`, keyboard }
   }
 
   const windowK = Math.round(windowTokens / 1000)
@@ -91,7 +199,7 @@ export function renderHud(
   const filled = Math.max(0, Math.min(BAR_SEGMENTS, Math.round(pct / 10)))
   const bar = BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(BAR_SEGMENTS - filled)
 
-  const text = `🧠 <b>Контекст</b>: ${bar} ${pct}% (${usedK}k / ${windowK}k)${modelLine}`
+  const text = `🧠 <b>Контекст</b>: ${bar} ${pct}% (${usedK}k / ${windowK}k)${tail}`
   return { text, keyboard }
 }
 
@@ -109,12 +217,23 @@ export interface HudTelegramApi {
   sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<{ message_id: number }>
   editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void>
   pinChatMessage(chatId: string, messageId: number, opts: { disable_notification?: boolean }): Promise<void>
+  // bump() re-anchoring (status-pin wave): delete the old card (deleting a
+  // pinned message also removes its pin), unpin as the fallback when delete
+  // is refused (bots cannot delete own messages older than 48h). Both carry
+  // no user text — adapted from grammY at the composition root like pin.
+  deleteMessage(chatId: string, messageId: number): Promise<void>
+  unpinChatMessage(chatId: string, messageId: number): Promise<void>
 }
 
 // Read-only view of the SessionInfoStore the HUD consumes. Satisfied by
 // `SessionInfoStore.get`.
 export interface SessionInfoReader {
-  get(chatId?: string): { transcriptPath?: string; sessionId?: string; model?: string }
+  get(chatId?: string): {
+    transcriptPath?: string
+    sessionId?: string
+    model?: string
+    permissionMode?: string
+  }
 }
 
 // Injectable transcript reader — defaults to the real `readContextUsage`. Tests
@@ -156,6 +275,14 @@ export class ContextHud {
   private readonly readUsage: ReadContextUsageFn
   // In-memory message-id cache per chat (mirrors the on-disk persistence).
   private readonly messageIds = new Map<string, number>()
+  // Latest work-status view per chat (todos synthesised from TodoWrite /
+  // TaskCreate / TaskUpdate hook events). Kept ACROSS turns — a Stop hook
+  // does not clear it, so the pinned card keeps showing «что сделали» until
+  // the next task replaces the snapshot.
+  private readonly work = new Map<string, { todos: ReadonlyArray<TodoItem>; taskMap: Map<string, TodoItem> }>()
+  // bump() debounce per chat — a burst of inbound messages collapses to one
+  // delete+resend (same rationale as TmuxMirror.BUMP_DEBOUNCE_MS).
+  private readonly lastBumpAt = new Map<string, number>()
   // FIX-9 (both reviews): per-chat serialization. A concurrent SessionStart +
   // Stop (both firing before the first send persists an id) would each see an
   // empty cache and sendFresh → TWO pinned HUDs. Chaining every HUD operation
@@ -236,6 +363,107 @@ export class ContextHud {
     await this.updateNow(chatId)
   }
 
+  // Todo events (TodoWrite / TaskCreate / TaskUpdate, mapped by
+  // toTodoWriteEvent in the webhook) — update the work view and refresh the
+  // card in place. `todo_session_stop` deliberately does NOT clear the view:
+  // the pinned card keeps the last milestones visible across turns.
+  onTodoEvent(chatId: string, event: TaskMirrorEvent): Promise<void> {
+    if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
+    if (event.kind === 'todo_session_stop') return Promise.resolve()
+    let state = this.work.get(chatId)
+    if (state === undefined) {
+      state = { todos: [], taskMap: new Map<string, TodoItem>() }
+      this.work.set(chatId, state)
+    }
+    switch (event.kind) {
+      case 'todo_write':
+        // TodoWrite payloads ARE the full list — replace wholesale and drop
+        // the incremental map so a mid-session tool switch starts clean.
+        state.taskMap.clear()
+        state.todos = event.todos
+        break
+      case 'task_create':
+        applyTaskCreateToMap(state.taskMap, event)
+        state.todos = Array.from(state.taskMap.values())
+        break
+      case 'task_update':
+        applyTaskUpdateToMap(state.taskMap, event)
+        state.todos = Array.from(state.taskMap.values())
+        break
+    }
+    return this.updateNow(chatId)
+  }
+
+  // Re-anchor the pinned card at the BOTTOM of the chat (just above the tmux
+  // mirror — the handlers fire this BEFORE TmuxMirror.bump on every inbound
+  // owner message). Deletes the old message — which also removes its pin, so
+  // the one-pin invariant holds — and sends+pins a fresh one. When Telegram
+  // refuses the delete (bots cannot delete own messages older than 48h) we
+  // fall back to unpinChatMessage so two pins can never coexist. Debounced
+  // and serialized per chat; best-effort like every other HUD op.
+  bump(chatId: string): Promise<void> {
+    if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
+    const now = Date.now()
+    const last = this.lastBumpAt.get(chatId)
+    if (last !== undefined && now - last < HUD_BUMP_DEBOUNCE_MS) return Promise.resolve()
+    this.lastBumpAt.set(chatId, now)
+    return this.runSerialized(chatId, async () => {
+      try {
+        const { text, keyboard } = await this.renderCurrent(chatId)
+        const old = this.messageIds.get(chatId) ?? this.loadPersisted(chatId)
+        if (old !== undefined) {
+          this.messageIds.delete(chatId)
+          // `retired` = the old card can no longer hold a pin (deleted, or
+          // unpinned in place). Only a retired old card may be replaced —
+          // otherwise sending a fresh pinned card could yield TWO pins
+          // (codex review 2026-07-04, HIGH #1).
+          let retired = false
+          try {
+            await this.api.deleteMessage(chatId, old)
+            retired = true
+            // Deliberate persistence cleanup (codex MED #3): the persisted id
+            // now points at a deleted message. Drop it so a crash between
+            // here and sendFresh can't resurrect the stale id later.
+            this.clearPersisted(chatId)
+          } catch (err) {
+            this.log.warn('context hud bump delete failed (will unpin instead)', {
+              chat_id: chatId,
+              message_id: old,
+              error: err instanceof Error ? err.message : String(err),
+            })
+          }
+          if (!retired) {
+            try {
+              await this.api.unpinChatMessage(chatId, old)
+              retired = true
+            } catch (err) {
+              this.log.warn('context hud bump unpin failed (ignored)', {
+                chat_id: chatId,
+                message_id: old,
+                error: err instanceof Error ? err.message : String(err),
+              })
+            }
+          }
+          if (!retired) {
+            // BOTH legs failed — the old card may still be pinned somewhere.
+            // Bail out and keep pointing at it: a stale position beats a
+            // second pinned card (the one-pin invariant is the warchief's
+            // hard requirement). The next bump retries the whole sequence.
+            this.messageIds.set(chatId, old)
+            return
+          }
+        }
+        // sendFresh persists the new id (overwriting the stale one) and pins.
+        await this.sendFresh(chatId, text, keyboard)
+      } catch (err) {
+        this.log.warn('context hud bump failed (ignored)', {
+          chat_id: chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    })
+  }
+
   // Read the latest usage and reconcile the HUD message. Best-effort: never
   // throws. Creates the message if none exists yet (e.g. Stop before any
   // SessionStart), otherwise edits it in place. Serialized per chat.
@@ -274,7 +502,13 @@ export class ContextHud {
         usage = null
       }
     }
-    return renderHud(usage, this.windowTokens, info.model)
+    const work: HudWorkView = {
+      todos: this.work.get(chatId)?.todos ?? [],
+      ...(info.permissionMode !== undefined && info.permissionMode.length > 0
+        ? { permissionMode: info.permissionMode }
+        : {}),
+    }
+    return renderHud(usage, this.windowTokens, info.model, work)
   }
 
   // Resolve the HUD message id for a chat: in-memory cache → persisted file →
@@ -380,6 +614,19 @@ export class ContextHud {
     // defensively so a surprising value can never escape the state dir.
     const safe = chatId.replace(/[^0-9A-Za-z_-]/g, '_')
     return join(this.stateDir, `context-hud-${safe}.json`)
+  }
+
+  // Remove the persisted id after a successful delete — a file pointing at a
+  // deleted message is worse than no file (bump/updateNow would edit a ghost).
+  private clearPersisted(chatId: string): void {
+    try {
+      rmSync(this.persistPath(chatId), { force: true })
+    } catch (err) {
+      this.log.warn('context hud clearPersisted failed (ignored)', {
+        chat_id: chatId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
   }
 
   private loadPersisted(chatId: string): number | undefined {

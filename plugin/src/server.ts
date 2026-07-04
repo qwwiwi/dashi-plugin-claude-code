@@ -507,6 +507,11 @@ const hudApi: HudTelegramApi = {
     telegramApi.editMessageText(chatId, messageId, text, opts),
   pinChatMessage: (chatId, messageId, opts) =>
     bot.api.pinChatMessage(chatId, messageId, opts).then(() => undefined),
+  // bump() legs (status pin): delete goes through the safe wrapper (rate
+  // limiting); unpin carries no user text and is adapted from grammY like pin.
+  deleteMessage: (chatId, messageId) => telegramApi.deleteMessage(chatId, messageId),
+  unpinChatMessage: (chatId, messageId) =>
+    bot.api.unpinChatMessage(chatId, messageId).then(() => undefined),
 }
 const contextHud = new ContextHud({
   api: hudApi,
@@ -1160,6 +1165,9 @@ const handlerDeps: HandlerDeps = {
   watcher: inboundWatcher,
   // Optional /mirror control surface — undefined when tmux_mirror.enabled=false.
   ...(tmuxMirror !== null ? { tmuxMirror } : {}),
+  // Status pin (2026-07-04): re-anchor the pinned card on every inbound owner
+  // message, sequenced before the tmux-mirror bump inside handlers.ts.
+  contextHud,
   // /keys — deterministic keystrokes into the agent pane (DM allowlist only).
   ...(tmuxKeysTarget !== undefined ? { tmuxKeys: { target: tmuxKeysTarget } } : {}),
   // Session facts (transcript_path + model) for /status context usage.
@@ -1175,6 +1183,21 @@ const handlerDeps: HandlerDeps = {
   askUserQuestionUi,
 }
 
+// Status pin (2026-07-04, review HIGH #1): every HUD bump re-pins the fresh
+// card, and each pin drops a permanent «закрепил сообщение» service bubble
+// into the chat (disable_notification mutes only the push). Delete OUR OWN
+// pin service messages immediately — gated on the sender being THIS bot, so
+// the warchief's manual pins are never touched. Best-effort: a failed delete
+// just leaves one bubble behind.
+bot.on('message:pinned_message', ctx => {
+  if (botIdentity.id === 0 || ctx.message.from?.id !== botIdentity.id) return
+  void ctx.deleteMessage().catch((err: unknown) => {
+    log.warn('pin service-message delete failed (ignored)', {
+      chat_id: String(ctx.chat.id),
+      error: err instanceof Error ? err.message : String(err),
+    })
+  })
+})
 bot.on('message:text', ctx => handleInboundText(ctx, handlerDeps))
 bot.on('message:photo', ctx => handleInboundPhoto(ctx, handlerDeps))
 bot.on('message:document', ctx => handleInboundDocument(ctx, handlerDeps))

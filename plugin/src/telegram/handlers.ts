@@ -149,6 +149,11 @@ export interface HandlerDeps {
   // when tmux_mirror.enabled=false at startup the mirror instance is
   // never created and the OOB handler replies «disabled in config».
   tmuxMirror?: TmuxMirrorControl
+  // Context HUD / status pin (2026-07-04): bump() re-anchors the pinned
+  // status card at the bottom of the chat on every inbound owner message —
+  // sequenced BEFORE tmuxMirror.bump so the card lands ABOVE the mirror.
+  // Optional so older tests compile; the HUD gates on owner internally.
+  contextHud?: { bump(chatId: string): Promise<void> }
   // /keys target — resolved tmux pane of the agent session (server.ts wiring).
   tmuxKeys?: { target: TmuxKeysTarget }
   // Session facts (transcript_path + model) learned from Claude hook events,
@@ -291,16 +296,39 @@ function maybeTriggerWatcher(ctx: Context, deps: HandlerDeps): void {
 // Bug #3 (TASK-4): use `isSideEffectAllowed` so a non-addressed group
 // message never re-anchors the mirror.
 function maybeBumpMirror(ctx: Context, deps: HandlerDeps): void {
-  if (!deps.tmuxMirror?.bump) return
+  const hasMirror = deps.tmuxMirror?.bump !== undefined
+  const hasHud = deps.contextHud !== undefined
+  if (!hasMirror && !hasHud) return
   if (!isSideEffectAllowed(ctx, deps.config, deps.policy)) return
   const chatNum = ctx.chat?.id
   if (chatNum === undefined) return
-  void deps.tmuxMirror.bump().catch((err) => {
-    deps.log.warn('tmux mirror bump error (ignored)', {
-      chat_id: String(chatNum),
-      error: err instanceof Error ? err.message : String(err),
-    })
-  })
+  const chatId = String(chatNum)
+  // Sequence matters (status-pin wave, 2026-07-04): the pinned status card
+  // re-anchors FIRST, the tmux mirror second, so the chat bottom always reads
+  // «status card above, mirror below». Each leg is best-effort — a HUD
+  // failure must never rob the mirror of its bump, and vice versa.
+  void (async () => {
+    if (hasHud) {
+      try {
+        await deps.contextHud!.bump(chatId)
+      } catch (err) {
+        deps.log.warn('context hud bump error (ignored)', {
+          chat_id: chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+    if (hasMirror) {
+      try {
+        await deps.tmuxMirror!.bump!()
+      } catch (err) {
+        deps.log.warn('tmux mirror bump error (ignored)', {
+          chat_id: chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+  })()
 }
 
 // FIX-D M1 (2026-05-27): chat-type detection from a stringified Telegram

@@ -95,6 +95,69 @@ function parseCreatedTaskId(toolResult: unknown): string | null {
   return match ? (match[1] ?? null) : null
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Pure task-map appliers — shared by TaskMirror and the ContextHud work
+// section so both surfaces synthesise IDENTICAL todo snapshots from the
+// same TaskCreate/TaskUpdate event stream. Exported for reuse + tests.
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Apply a `task_create` event to a task map (see TaskMirror.applyTaskCreate
+ * docs for the provisional-id → harness-id reconciliation contract).
+ */
+export function applyTaskCreateToMap(
+  taskMap: Map<string, TodoItem>,
+  event: Extract<TaskMirrorEvent, { kind: 'task_create' }>,
+): void {
+  const realId =
+    event.toolResult !== undefined ? parseCreatedTaskId(event.toolResult) : null
+  const provisionalId = event.toolUseId
+  const provisional = taskMap.get(provisionalId)
+  const item: TodoItem = {
+    id: realId ?? provisional?.id ?? provisionalId,
+    content: event.input.subject,
+    status: provisional?.status ?? 'pending',
+    ...(event.input.activeForm !== undefined
+      ? { activeForm: event.input.activeForm }
+      : provisional?.activeForm !== undefined
+        ? { activeForm: provisional.activeForm }
+        : {}),
+  }
+  taskMap.delete(provisionalId)
+  if (realId !== null && realId !== provisionalId) {
+    taskMap.delete(realId)
+  }
+  taskMap.set(item.id ?? provisionalId, item)
+}
+
+/**
+ * Apply a `task_update` event to a task map. `status: 'deleted'` removes the
+ * entry; a missing target synthesises a minimal placeholder (webhook drops).
+ */
+export function applyTaskUpdateToMap(
+  taskMap: Map<string, TodoItem>,
+  event: Extract<TaskMirrorEvent, { kind: 'task_update' }>,
+): void {
+  const id = event.input.taskId
+  if (event.input.status === 'deleted') {
+    taskMap.delete(id)
+    return
+  }
+  const existing = taskMap.get(id)
+  const status = event.input.status ?? existing?.status ?? 'pending'
+  const next: TodoItem = {
+    id,
+    content: event.input.subject ?? existing?.content ?? `task ${id}`,
+    status,
+    ...(event.input.activeForm !== undefined
+      ? { activeForm: event.input.activeForm }
+      : existing?.activeForm !== undefined
+        ? { activeForm: existing.activeForm }
+        : {}),
+  }
+  taskMap.set(id, next)
+}
+
 export class TaskMirror {
   private readonly telegramApi: TelegramApiForProgress
   private readonly config: AppConfig
@@ -180,29 +243,9 @@ export class TaskMirror {
     entry: ChatTaskEntry,
     event: Extract<TaskMirrorEvent, { kind: 'task_create' }>,
   ): void {
-    const realId =
-      event.toolResult !== undefined ? parseCreatedTaskId(event.toolResult) : null
-    const provisionalId = event.toolUseId
-    const provisional = entry.taskMap.get(provisionalId)
-    const item: TodoItem = {
-      id: realId ?? provisional?.id ?? provisionalId,
-      content: event.input.subject,
-      status: provisional?.status ?? 'pending',
-      ...(event.input.activeForm !== undefined
-        ? { activeForm: event.input.activeForm }
-        : provisional?.activeForm !== undefined
-          ? { activeForm: provisional.activeForm }
-          : {}),
-    }
-    // Drop the provisional entry, insert under the canonical id. This re-keys
-    // the Map without dropping anything else; insertion-order semantics mean
-    // the task moves to the tail on reconciliation, which is the right place
-    // visually (most recently activated).
-    entry.taskMap.delete(provisionalId)
-    if (realId !== null && realId !== provisionalId) {
-      entry.taskMap.delete(realId)
-    }
-    entry.taskMap.set(item.id ?? provisionalId, item)
+    // Re-keying (provisional → canonical id) moves the task to the Map tail on
+    // reconciliation — the right place visually (most recently activated).
+    applyTaskCreateToMap(entry.taskMap, event)
   }
 
   /**
@@ -215,27 +258,7 @@ export class TaskMirror {
     entry: ChatTaskEntry,
     event: Extract<TaskMirrorEvent, { kind: 'task_update' }>,
   ): void {
-    const id = event.input.taskId
-    // Drop 'deleted' before constructing the TodoItem -- the rendered TodoItem
-    // type accepts only pending/in_progress/completed, and the schema-coerced
-    // 'deleted' value would not narrow correctly otherwise.
-    if (event.input.status === 'deleted') {
-      entry.taskMap.delete(id)
-      return
-    }
-    const existing = entry.taskMap.get(id)
-    const status = event.input.status ?? existing?.status ?? 'pending'
-    const next: TodoItem = {
-      id,
-      content: event.input.subject ?? existing?.content ?? `task ${id}`,
-      status,
-      ...(event.input.activeForm !== undefined
-        ? { activeForm: event.input.activeForm }
-        : existing?.activeForm !== undefined
-          ? { activeForm: existing.activeForm }
-          : {}),
-    }
-    entry.taskMap.set(id, next)
+    applyTaskUpdateToMap(entry.taskMap, event)
   }
 
   /**

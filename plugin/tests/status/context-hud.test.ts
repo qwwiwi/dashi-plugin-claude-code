@@ -10,11 +10,14 @@ import {
   handleHudCallback,
   parseHudCallback,
   renderHud,
+  renderStatusTasks,
   type HudCallbackContext,
   type HudCallbackDeps,
   type HudTelegramApi,
   type SessionInfoReader,
 } from '../../src/status/context-hud.js'
+import type { TaskMirrorEvent } from '../../src/hooks/claude-events.js'
+import type { TodoItem } from '../../src/schemas.js'
 import type { ControlCommandResult } from '../../src/commands/keys.js'
 import type { ControlSender } from '../../src/telegram/newq-confirm-ui.js'
 import type { EditOpts, InlineKeyboardLike, SendMessageOpts } from '../../src/channel/tools.js'
@@ -69,10 +72,14 @@ class FakeApi implements HudTelegramApi {
   sent: SendRecord[] = []
   edited: EditRecord[] = []
   pinned: PinRecord[] = []
+  deleted: Array<{ chatId: string; messageId: number }> = []
+  unpinned: Array<{ chatId: string; messageId: number }> = []
   nextId = 100
   sendError: unknown
   editError: unknown
   pinError: unknown
+  deleteError: unknown
+  unpinError: unknown
 
   async sendMessage(
     chatId: string,
@@ -103,11 +110,22 @@ class FakeApi implements HudTelegramApi {
     this.pinned.push({ chatId, messageId, opts })
     if (this.pinError) throw this.pinError
   }
+
+  async deleteMessage(chatId: string, messageId: number): Promise<void> {
+    if (this.deleteError) throw this.deleteError
+    this.deleted.push({ chatId, messageId })
+  }
+
+  async unpinChatMessage(chatId: string, messageId: number): Promise<void> {
+    if (this.unpinError) throw this.unpinError
+    this.unpinned.push({ chatId, messageId })
+  }
 }
 
 function fakeSession(info: {
   transcriptPath?: string
   model?: string
+  permissionMode?: string
 }): SessionInfoReader {
   return { get: () => info }
 }
@@ -557,5 +575,228 @@ describe('handleHudCallback', () => {
     expect(calls.length).toBe(0)
     expect(cards.length).toBe(0)
     expect(answers[0]).toContain('недоступно')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Status pin (2026-07-04): renderStatusTasks + work view + bump + todos
+// ─────────────────────────────────────────────────────────────────────
+
+function todo(id: string, status: TodoItem['status'], content: string, activeForm?: string): TodoItem {
+  return { id, status, content, ...(activeForm !== undefined ? { activeForm } : {}) }
+}
+
+describe('renderStatusTasks', () => {
+  test('empty list → empty string (section omitted)', () => {
+    expect(renderStatusTasks([])).toBe('')
+  })
+
+  test('bar reflects done/total and header carries the count', () => {
+    const todos = [
+      todo('1', 'completed', 'a'),
+      todo('2', 'completed', 'b'),
+      todo('3', 'completed', 'c'),
+      todo('4', 'in_progress', 'd'),
+      todo('5', 'pending', 'e'),
+    ]
+    const text = renderStatusTasks(todos)
+    expect(text).toContain('<b>Задачи</b>')
+    expect(text).toContain('3/5')
+    expect((text.match(/▰/g) ?? []).length).toBe(6) // round(3/5*10)
+    expect((text.match(/▱/g) ?? []).length).toBe(4)
+  })
+
+  test('in-progress uses activeForm; content is escaped and truncated', () => {
+    const long = 'x'.repeat(120)
+    const text = renderStatusTasks([
+      todo('1', 'in_progress', 'raw', 'Working <on> & stuff'),
+      todo('2', 'pending', long),
+    ])
+    expect(text).toContain('◐ Working &lt;on&gt; &amp; stuff')
+    expect(text).toContain('…')
+    expect(text).not.toContain(long)
+  })
+
+  test('pending capped at 5 with a «+N ещё…» tail', () => {
+    const todos = Array.from({ length: 7 }, (_, i) => todo(String(i), 'pending', `p${i}`))
+    const text = renderStatusTasks(todos)
+    expect((text.match(/◻/g) ?? []).length).toBe(5)
+    expect(text).toContain('<i>+2 ещё…</i>')
+  })
+
+  test('completed shows the last 2 with a hidden-count line', () => {
+    const todos = [
+      ...Array.from({ length: 4 }, (_, i) => todo(String(i), 'completed', `d${i}`)),
+      todo('x', 'in_progress', 'now'),
+    ]
+    const text = renderStatusTasks(todos)
+    expect((text.match(/☑/g) ?? []).length).toBe(2)
+    expect(text).toContain('☑ d2')
+    expect(text).toContain('☑ d3')
+    expect(text).toContain('<i>+2 завершено ранее</i>')
+  })
+})
+
+describe('renderStatusTasks budget', () => {
+  test('total budget: a flood of long in-progress items stays bounded', () => {
+    const todos = Array.from({ length: 40 }, (_, i) =>
+      todo(String(i), 'in_progress', `<${'очень длинная задача с разметкой & сущностями '.repeat(2)}${i}>`))
+    const text = renderStatusTasks(todos)
+    expect(text.length).toBeLessThan(1700)
+    expect(text).toContain('строк скрыто')
+  })
+
+  test('truncation never splits a surrogate pair', () => {
+    const raw = '𝕏'.repeat(100) // astral-plane chars (2 UTF-16 units each)
+    const text = renderStatusTasks([todo('1', 'pending', raw)])
+    expect(text).not.toContain('\uFFFD')
+    expect(text).toContain('…')
+  })
+})
+
+describe('renderHud work view', () => {
+  test('permissionMode plan → «режим: план»; other → «выполнение»; absent → no line', () => {
+    const plan = renderHud({ usedTokens: 0 }, WINDOW, 'm', { todos: [], permissionMode: 'plan' })
+    expect(plan.text).toContain('<i>режим: план</i>')
+    const exec = renderHud({ usedTokens: 0 }, WINDOW, 'm', { todos: [], permissionMode: 'acceptEdits' })
+    expect(exec.text).toContain('<i>режим: выполнение</i>')
+    const none = renderHud({ usedTokens: 0 }, WINDOW, 'm', { todos: [] })
+    expect(none.text).not.toContain('режим:')
+  })
+
+  test('todos append a «Задачи» section; empty todos omit it', () => {
+    const withTasks = renderHud({ usedTokens: 0 }, WINDOW, undefined, {
+      todos: [todo('1', 'in_progress', 'работаю')],
+    })
+    expect(withTasks.text).toContain('\n\n<b>Задачи</b>')
+    expect(withTasks.text).toContain('◐ работаю')
+    const without = renderHud({ usedTokens: 0 }, WINDOW)
+    expect(without.text).not.toContain('Задачи')
+  })
+})
+
+describe('ContextHud bump', () => {
+  test('existing message: delete old → send fresh → pin; persisted id updated', async () => {
+    const api = new FakeApi()
+    const dir = stateDir()
+    const hud = makeHud(api, { dir })
+    await hud.onSessionStart(OWNER)
+    const oldId = api.sent[0]!.message_id
+
+    await hud.bump(OWNER)
+    expect(api.deleted).toEqual([{ chatId: OWNER, messageId: oldId }])
+    expect(api.unpinned.length).toBe(0)
+    expect(api.sent.length).toBe(2)
+    const newId = api.sent[1]!.message_id
+    expect(newId).not.toBe(oldId)
+    expect(api.pinned.map((p) => p.messageId)).toContain(newId)
+    const persisted = JSON.parse(
+      readFileSync(join(dir, `context-hud-${OWNER}.json`), 'utf8'),
+    ) as { message_id: number }
+    expect(persisted.message_id).toBe(newId)
+  })
+
+  test('delete refused (older than 48h) → unpin fallback, fresh message still sent', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER)
+    const oldId = api.sent[0]!.message_id
+    api.deleteError = new Error('400: message can\'t be deleted')
+
+    await hud.bump(OWNER)
+    expect(api.unpinned).toEqual([{ chatId: OWNER, messageId: oldId }])
+    expect(api.sent.length).toBe(2)
+  })
+
+  test('delete AND unpin both fail → bump aborts, old card kept (one-pin invariant)', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER)
+    const oldId = api.sent[0]!.message_id
+    api.deleteError = new Error('400: message can\'t be deleted')
+    api.unpinError = new Error('network')
+
+    await hud.bump(OWNER)
+    expect(api.sent.length).toBe(1) // NO replacement sent — two pins impossible
+    // The old id survives: a later refresh edits the SAME card.
+    await hud.updateNow(OWNER)
+    const lastEdit = api.edited[api.edited.length - 1]!
+    expect(lastEdit.messageId).toBe(oldId)
+  })
+
+  test('debounce: a second bump within the window is a no-op', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER)
+    await hud.bump(OWNER)
+    await hud.bump(OWNER)
+    expect(api.deleted.length).toBe(1)
+    expect(api.sent.length).toBe(2)
+  })
+
+  test('no prior message → just sends + pins (no delete/unpin)', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.bump(OWNER)
+    expect(api.deleted.length).toBe(0)
+    expect(api.unpinned.length).toBe(0)
+    expect(api.sent.length).toBe(1)
+    expect(api.pinned.length).toBe(1)
+  })
+
+  test('non-owner chat → complete no-op', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.bump('-1001234567890')
+    await hud.bump('99999')
+    expect(api.sent.length).toBe(0)
+  })
+})
+
+describe('ContextHud onTodoEvent', () => {
+  test('todo_write refreshes the card with a tasks section', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER)
+
+    const event: TaskMirrorEvent = {
+      kind: 'todo_write',
+      todos: [todo('1', 'in_progress', 'шаг один'), todo('2', 'pending', 'шаг два')],
+    }
+    await hud.onTodoEvent(OWNER, event)
+    const last = api.edited[api.edited.length - 1]!
+    expect(last.text).toContain('<b>Задачи</b>')
+    expect(last.text).toContain('◐ шаг один')
+    expect(last.text).toContain('◻ шаг два')
+    expect(last.text).toContain('0/2')
+  })
+
+  test('task_create + task_update accumulate; todo_session_stop keeps the view', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER)
+
+    await hud.onTodoEvent(OWNER, {
+      kind: 'task_create',
+      toolUseId: 'tu1',
+      input: { subject: 'собрать фичу' },
+      toolResult: 'Task #7 created successfully',
+    })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'task_update',
+      toolUseId: 'tu2',
+      input: { taskId: '7', status: 'completed' },
+    })
+    let last = api.edited[api.edited.length - 1]!
+    expect(last.text).toContain('☑ собрать фичу')
+    expect(last.text).toContain('1/1')
+
+    const editsBefore = api.edited.length
+    await hud.onTodoEvent(OWNER, { kind: 'todo_session_stop' })
+    expect(api.edited.length).toBe(editsBefore) // stop never clears/re-renders
+    // A later refresh still carries the last snapshot.
+    await hud.updateNow(OWNER)
+    last = api.edited[api.edited.length - 1] ?? last
+    expect(last.text).toContain('☑ собрать фичу')
   })
 })
