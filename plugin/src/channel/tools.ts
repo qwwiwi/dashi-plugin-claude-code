@@ -35,6 +35,11 @@ import {
 } from '../format/html.js'
 import { splitMessage } from '../format/chunk.js'
 import { assertSendableFile, isPhotoExtension } from '../security/paths.js'
+import {
+  buildRichMessagePayload,
+  contentFitsRichLimits,
+} from '../format/rich.js'
+import type { RichLatch } from '../safety/rich-latch.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // MCP request/response types we touch. We narrow rather than import deep
@@ -102,6 +107,18 @@ export interface SendDocumentOpts {
   caption?: string
 }
 
+// Options for the rich-message send. Threading only for M1; M3/M4 extend.
+export interface SendRichMessageOpts {
+  reply_to_message_id?: number
+}
+
+// Result of a rich send. Either Telegram accepted it (we got a message_id)
+// or the layered wrapper decided to fall back to the HTML path. `fallback`
+// is the signal the reply tool reads to decide whether to also run the HTML
+// chunk path — exactly one of the two ships, so a message is never lost or
+// duplicated.
+export type SendRichMessageResult = { message_id: number } | { fallback: true }
+
 export interface DownloadResult {
   path: string
   mime?: string
@@ -128,6 +145,17 @@ export interface AnswerGuestQueryOpts {
 
 export interface TelegramApi {
   sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<{ message_id: number }>
+  // Telegram Bot API 10.1 Rich Messages: ship RAW markdown that Telegram
+  // renders server-side (tables/math/headings/task-lists/<details>/footnotes,
+  // up to 32768 bytes). The result is either a message_id (sent) or
+  // { fallback: true } (caller must use the HTML path instead). Implemented
+  // via grammY's raw escape hatch; redaction runs in the safe wrapper BEFORE
+  // the raw send — never call this from outside the layered chain.
+  sendRichMessage(
+    chatId: string,
+    rawMarkdown: string,
+    opts: SendRichMessageOpts,
+  ): Promise<SendRichMessageResult>
   editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void>
   setMessageReaction(chatId: string, messageId: number, emoji: string): Promise<void>
   sendChatAction(chatId: string, action: ChatAction): Promise<void>
@@ -140,6 +168,20 @@ export interface TelegramApi {
   // — the only shape the reply tool emits — so stubs stay trivial.
   answerGuestQuery(guestQueryId: string, text: string, opts: AnswerGuestQueryOpts): Promise<void>
 }
+
+// grammY ^1.21.0 has no typed `sendRichMessage` on its RawApi (the method is
+// newer than the bundled types). We reach it through the raw escape hatch
+// `bot.api.raw`, narrowed to a typed function rather than `any`: the body is
+// the RichMessageBody buildRichMessagePayload produces, and the response is
+// the small shape we read message_id from (defensively — Telegram nests it
+// under `result`, grammY usually unwraps to the top level).
+interface RawSendRichResponse {
+  message_id?: number
+  result?: { message_id?: number }
+}
+type RawSendRichMessageFn = (
+  body: Record<string, unknown>,
+) => Promise<RawSendRichResponse>
 
 // Thin wrapper around grammY bot.api. Keeps the rest of the system free of
 // grammy-specific quirks (reply_parameters vs reply_to_message_id, etc).
@@ -158,6 +200,29 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       }
       const sent = await bot.api.sendMessage(chatId, text, other)
       return { message_id: sent.message_id }
+    },
+    async sendRichMessage(chatId, rawMarkdown, opts) {
+      // Build the raw-api body (chat_id + markdown + reply_parameters) and
+      // dispatch through grammY's untyped raw escape hatch. The safe wrapper
+      // already redacted `rawMarkdown`; this layer only transports it.
+      const body = buildRichMessagePayload(rawMarkdown, {
+        chat_id: chatId,
+        ...(opts.reply_to_message_id !== undefined
+          ? { reply_to_message_id: opts.reply_to_message_id }
+          : {}),
+      })
+      // `bot.api.raw` is typed to known methods only; cast through unknown to
+      // a typed function for the (still-untyped-in-grammY) sendRichMessage.
+      const rawApi = bot.api.raw as unknown as Record<string, unknown>
+      const sendRich = rawApi.sendRichMessage as RawSendRichMessageFn
+      const res = await sendRich(body as unknown as Record<string, unknown>)
+      // Parse message_id defensively: top-level (grammY-unwrapped) first,
+      // then nested under `result` (raw Bot API envelope).
+      const messageId = res.message_id ?? res.result?.message_id
+      if (typeof messageId !== 'number') {
+        throw new Error('sendRichMessage returned no message_id')
+      }
+      return { message_id: messageId }
     },
     async editMessageText(chatId, messageId, text, opts) {
       const other: Record<string, unknown> = {}
@@ -258,10 +323,10 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         },
         format: {
           type: 'string',
-          enum: ['text', 'markdownv2', 'html'],
+          enum: ['text', 'markdownv2', 'html', 'rich'],
           default: 'html',
           description:
-            "Rendering mode. Default: 'html' — markdown (**bold**, *italic*, `code`, ```fenced```, [text](url), tables, # headings) is auto-converted to Telegram's HTML subset and auto-chunked at 4000 chars. Plain `<`, `>`, `&` in regular text are safe — they get auto-escaped before sending. On parse error the chunk re-sends as plain text so the reply still ships. Use 'text' only to bypass markdown conversion entirely (e.g. sending pre-built Telegram entity strings verbatim). 'markdownv2' passes raw — caller escapes per Telegram rules.",
+            "Rendering mode. Default: 'html' — markdown (**bold**, *italic*, `code`, ```fenced```, [text](url), tables, # headings) is auto-converted to Telegram's HTML subset and auto-chunked at 4000 chars. Plain `<`, `>`, `&` in regular text are safe — they get auto-escaped before sending. On parse error the chunk re-sends as plain text so the reply still ships. Use 'text' only to bypass markdown conversion entirely (e.g. sending pre-built Telegram entity strings verbatim). 'markdownv2' passes raw — caller escapes per Telegram rules. 'rich' is never required: DM replies auto-upgrade to Telegram's native markdown rendering when available; the explicit value just forces the same gate.",
         },
       },
       required: ['chat_id', 'text'],
@@ -363,6 +428,20 @@ export interface ToolDeps {
   // queries are ever registered (handleGuestMessage gates first), so the
   // chat allowlist is deliberately NOT consulted on this path.
   guestQueries?: GuestQueryRegistry
+  // M1 rich messages (2026-06-14): session-scoped capability latch shared
+  // with the safe-telegram-api wrapper. The reply handler reads
+  // `sendDisabled` to skip rich attempts cheaply once a capability error has
+  // latched it off. Optional so existing test fixtures that omit it keep the
+  // legacy HTML-only behaviour (rich is then never attempted).
+  richLatch?: RichLatch
+}
+
+// DM detection: a Telegram DM chat.id equals the user's id and is positive.
+// Groups/supergroups/channels are negative. M1 ships rich messages to DMs
+// only (groups are M4). Non-numeric / NaN ids fail closed (not a DM).
+export function isDmChat(chatId: string): boolean {
+  const n = Number(chatId)
+  return Number.isFinite(n) && n > 0
 }
 
 function toolError(name: string, message: string): CallToolResult {
@@ -408,8 +487,12 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           // Hard-cap at ONE Telegram message: there is no second
           // answerGuestQuery, so chunking cannot apply — ship chunk[0] and
           // flag the truncation in the tool result so the agent knows.
+          // 'rich' degrades to the HTML rendering here: answerGuestQuery has
+          // no rich_message payload, and raw markdown in a public foreign
+          // chat reads worse than our rendered HTML subset.
+          const guestFormat = args.format === 'rich' ? 'html' : args.format
           const body =
-            args.format === 'html' ? markdownToTelegramHtml(args.text) : args.text
+            guestFormat === 'html' ? markdownToTelegramHtml(args.text) : args.text
           const chunks = splitMessage(body)
           const single = chunks[0]
           if (single === undefined) {
@@ -421,9 +504,9 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           // a public foreign chat reads worse than unrendered markdown.
           const plainBody = splitMessage(args.text)[0] ?? single
           const guestOpts: AnswerGuestQueryOpts =
-            args.format === 'html'
+            guestFormat === 'html'
               ? { parse_mode: 'HTML' }
-              : args.format === 'markdownv2'
+              : guestFormat === 'markdownv2'
                 ? { parse_mode: 'MarkdownV2' }
                 : {}
 
@@ -514,7 +597,46 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
 
         const sentIds: number[] = []
 
-        if (args.format === 'html') {
+        // ── M1 Rich Messages (Bot API 10.1) ─────────────────────────────
+        // Attempt a single RAW-markdown rich send when ALL conditions hold.
+        // On success we push the id and SKIP the HTML/text+chunk path. On a
+        // transparent `{ fallback: true }` we fall through to the existing
+        // HTML path UNCHANGED — exactly one path ships, so the reply is
+        // never lost or duplicated. A `transient` error re-throws from the
+        // safe wrapper (caught by the outer try) so we never silently
+        // swallow then resend.
+        const richLatch = deps.richLatch
+        const richEligible =
+          config.richMessages.enabled &&
+          args.format !== 'text' &&
+          args.format !== 'markdownv2' &&
+          richLatch !== undefined &&
+          !richLatch.sendDisabled &&
+          !config.richMessages.perChatOptOut.includes(args.chat_id) &&
+          files.length === 0 &&
+          contentFitsRichLimits(args.text) &&
+          isDmChat(args.chat_id)
+
+        let richSent = false
+        if (richEligible) {
+          const richOpts: SendRichMessageOpts = {}
+          if (replyToId !== undefined) richOpts.reply_to_message_id = replyToId
+          const res = await telegramApi.sendRichMessage(args.chat_id, args.text, richOpts)
+          if ('message_id' in res) {
+            sentIds.push(res.message_id)
+            richSent = true
+          }
+          // else res.fallback === true → fall through to the HTML path below.
+        }
+
+        if (richSent) {
+          // Rich shipped the whole body — nothing else to send for text.
+          // (Attachments are impossible here: richEligible required
+          // files.length === 0.)
+        } else if (args.format === 'html' || args.format === 'rich') {
+          // HTML path (also the fallback for 'rich'): when rich was skipped
+          // (disabled / non-DM / oversize / opted-out / has files) or fell
+          // back transparently, render markdown → validated Telegram HTML.
           // Convert markdown → Telegram HTML, then chunk at 4000 chars so we
           // never exceed Telegram's 4096 sendMessage cap. reply_to applies
           // only to the first chunk so a long answer doesn't quote-spam the

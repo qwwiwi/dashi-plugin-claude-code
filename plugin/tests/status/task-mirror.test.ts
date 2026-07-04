@@ -75,6 +75,7 @@ function makeConfig(overrides: Partial<AppConfig['task_mirror']> = {}): AppConfi
     multichat: { enabled: false },
     ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
     permission_gate: { enabled: false, timeout_ms: 120_000 },
+    richMessages: { enabled: false, perChatOptOut: [] },
   }
 }
 

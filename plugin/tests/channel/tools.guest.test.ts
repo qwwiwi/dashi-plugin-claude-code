@@ -61,6 +61,8 @@ function makeConfig(): AppConfig {
     ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
     permission_gate: { enabled: false, timeout_ms: 120_000 },
     guest_mode: { enabled: true },
+    // Rich disabled: guest replies must exercise answerGuestQuery only.
+    richMessages: { enabled: false, perChatOptOut: [] },
   }
 }
 
@@ -111,6 +113,8 @@ function makeStubApi(opts: { failures?: Error[] } = {}): {
       counters.sendMessage += 1
       return { message_id: 1 }
     },
+    // Guest replies must never take the rich path — throw loudly if they do.
+    sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
     editMessageText: noop as unknown as TelegramApi['editMessageText'],
     setMessageReaction: noop as unknown as TelegramApi['setMessageReaction'],
     sendChatAction: async () => {},
@@ -202,6 +206,32 @@ describe('reply tool — guest path', () => {
     expect(stub.sendMessageCalls).toBe(0)
     // One-shot: the claim is spent.
     expect(registry.claim('gq-1').kind).toBe('consumed')
+  })
+
+  test("format 'rich' degrades to HTML rendering — answerGuestQuery gets rendered body, never sendRichMessage", async () => {
+    const stub = makeStubApi()
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'gq-rich')
+    const deps = makeDeps({ api: stub.api, registry })
+
+    // answerGuestQuery has no rich_message payload: 'rich' must render the
+    // same HTML subset as the default path (sendRichMessage stub throws, so
+    // any rich attempt fails this test loudly).
+    const result = await callTool(
+      replyReq({
+        chat_id: '-100987',
+        guest_query_id: 'gq-rich',
+        text: '**жирный** ответ',
+        format: 'rich',
+      }),
+      deps,
+    )
+
+    expect(result.isError).toBeUndefined()
+    expect(stub.guestCalls.length).toBe(1)
+    expect(stub.guestCalls[0]!.text).toContain('<b>жирный</b>')
+    expect(stub.guestCalls[0]!.opts.parse_mode).toBe('HTML')
+    expect(stub.sendMessageCalls).toBe(0)
   })
 
   test('unknown guest query → tool error, no API call', async () => {

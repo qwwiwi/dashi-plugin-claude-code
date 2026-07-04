@@ -49,6 +49,9 @@ function makeStubApi(initialMessageId = 100): {
       const id = nextMessageId++
       return { message_id: id }
     },
+    async sendRichMessage(_chatId, _rawMarkdown, _opts) {
+      return { fallback: true as const }
+    },
     async editMessageText(chatId, messageId, text, _opts: EditOpts) {
       if (editErrorQueue.length > 0) {
         const err = editErrorQueue.shift()

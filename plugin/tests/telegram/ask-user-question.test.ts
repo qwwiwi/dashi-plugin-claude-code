@@ -71,6 +71,9 @@ function fakeTelegram(state: FakeTelegramSends, opts?: { editThrows?: boolean })
       state.nextMessageId += 1
       return { message_id: id }
     },
+    async sendRichMessage(_chatId, _rawMarkdown, _opts) {
+      return { fallback: true as const }
+    },
     async editMessageText(chatId, messageId, text, editOpts) {
       state.editCalls.push({ chatId, messageId, text, opts: editOpts })
       if (opts?.editThrows) throw new Error('edit refused for test')
@@ -1283,6 +1286,7 @@ function scriptedTelegram(state: FakeTelegramSends, sendErrors: Array<Error | nu
       const err = editErrors.shift() ?? null
       if (err) throw err
     },
+    async sendRichMessage(_c, _r, _o) { return { fallback: true as const } },
     async setMessageReaction(_c, _m, _e) { /* no-op */ },
     async sendChatAction(_c, _a) { /* no-op */ },
     async sendDocument(_c, _f, _o) { return { message_id: 0 } },

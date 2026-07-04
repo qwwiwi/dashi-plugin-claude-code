@@ -110,6 +110,12 @@ function makeStubApi(clock: FakeClock): StubApi {
       calls.push({ method: 'sendMessage', chatId, text, opts, ts: clock.now() })
       return { message_id: calls.length }
     },
+    async sendRichMessage(_chatId, _rawMarkdown, _opts) {
+      // Pass-through stub; the rich path's own coverage lives in
+      // tests/safety/rich-path.test.ts. Routes through the same enqueue here.
+      maybeThrow('sendMessage')
+      return { message_id: calls.length + 1 }
+    },
     async editMessageText(chatId, messageId, text, opts) {
       maybeThrow('editMessageText')
       calls.push({ method: 'editMessageText', chatId, messageId, text, opts, ts: clock.now() })

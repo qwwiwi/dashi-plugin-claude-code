@@ -58,6 +58,7 @@ function makeConfig(overrides: Partial<AppConfig['watcher']> = {}): AppConfig {
     multichat: { enabled: false },
     ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
     permission_gate: { enabled: false, timeout_ms: 120_000 },
+    richMessages: { enabled: false, perChatOptOut: [] },
   }
 }
 
@@ -93,6 +94,7 @@ function makeFakeApi(): FakeApi {
       state.calls.push(entry)
       return { message_id: 999 }
     },
+    sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
     editMessageText: noop as unknown as TelegramApi['editMessageText'],
     setMessageReaction: noop as unknown as TelegramApi['setMessageReaction'],
     sendChatAction: noop as unknown as TelegramApi['sendChatAction'],

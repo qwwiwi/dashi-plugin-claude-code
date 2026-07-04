@@ -53,6 +53,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
     permission_gate: { enabled: false, timeout_ms: 120_000 },
     guest_mode: { enabled: true },
+    richMessages: { enabled: false, perChatOptOut: [] },
     ...overrides,
   }
 }
@@ -106,6 +107,7 @@ function makeTelegramApi(): TelegramApi {
   }
   return {
     sendMessage: noop as unknown as TelegramApi['sendMessage'],
+    sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
     editMessageText: noop as unknown as TelegramApi['editMessageText'],
     setMessageReaction: noop as unknown as TelegramApi['setMessageReaction'],
     sendChatAction: async () => {},

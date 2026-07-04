@@ -342,6 +342,24 @@ export const AppConfigSchema = z.object({
   hud: z.object({
     enabled: z.boolean().default(true),
   }).optional(),
+  // Rich Messages (M1, Bot API 10.1, 2026-06-14). When enabled, a DM reply
+  // whose body fits 32768 bytes ships as a single RAW-markdown rich message
+  // (Telegram renders tables/math/headings/task-lists/<details>/footnotes)
+  // with a TRANSPARENT fallback to the HTML path on any rejection. Default
+  // ON: the fallback makes it safe to enable everywhere — a build without the
+  // method latches off after one call and behaves exactly like before.
+  //
+  // `perChatOptOut` holds chat_ids (as strings, matching the inbound
+  // <channel chat_id="…">) that should NEVER receive rich messages — they
+  // always take the HTML path. Use it to pin a specific chat to the legacy
+  // rendering while the feature rolls out.
+  //
+  // Kill switch: set env TELEGRAM_RICH_MESSAGES to a falsy value (0/false/
+  // no/off) to force enabled=false fleet-wide without editing config.json.
+  richMessages: z.object({
+    enabled: z.boolean().default(true),
+    perChatOptOut: z.array(z.string()).default([]),
+  }).default({}),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
 
@@ -413,6 +431,19 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_ASK_USER_QUESTION_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
   TELEGRAM_ASK_USER_QUESTION_ALLOWED_USER_IDS: z.string().optional(), // CSV
   TELEGRAM_ASK_USER_QUESTION_MAX_PREVIEW_CHARS: z.coerce.number().int().positive().optional(),
+  // Rich Messages (M1, 2026-06-14). Kill switch: a falsy value
+  // (0/false/no/off, case-insensitive) forces richMessages.enabled=false;
+  // anything else (1/true/yes/on …) forces it true. Unset = config.json /
+  // schema default (true). Parsed to a boolean here; layered onto the
+  // richMessages block in loadConfig.
+  TELEGRAM_RICH_MESSAGES: z
+    .string()
+    .transform((v) => !/^(0|false|no|off)$/i.test(v.trim()))
+    .optional(),
+  // CSV of chat_ids that always take the HTML path (never rich). Mirrors the
+  // CSV chat-id parsing used for the allowlist; stored as strings to match
+  // the inbound <channel chat_id="…"> form the reply tool compares against.
+  TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT: z.string().optional(), // CSV
 })
 export type RuntimeEnv = z.infer<typeof RuntimeEnvSchema>
 
@@ -585,6 +616,22 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     askUserQuestion.max_preview_chars = parsedEnv.TELEGRAM_ASK_USER_QUESTION_MAX_PREVIEW_CHARS
   }
   if (Object.keys(askUserQuestion).length > 0) merged.ask_user_question = askUserQuestion
+
+  // Rich Messages env overrides (M1, 2026-06-14). Same layering pattern: take
+  // the config.json sub-object if present, layer env on top, emit only when
+  // something is set so Zod applies schema defaults cleanly otherwise.
+  const richMessages = (merged.richMessages && typeof merged.richMessages === 'object'
+    ? merged.richMessages
+    : {}) as Record<string, unknown>
+  if (parsedEnv.TELEGRAM_RICH_MESSAGES !== undefined) {
+    richMessages.enabled = parsedEnv.TELEGRAM_RICH_MESSAGES
+  }
+  if (parsedEnv.TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT !== undefined) {
+    // Chat ids stay as strings (matching the inbound <channel chat_id="…">).
+    // Reuse parseCsvChatIds for validation, then stringify each entry.
+    richMessages.perChatOptOut = parseCsvChatIds(parsedEnv.TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT).map(String)
+  }
+  if (Object.keys(richMessages).length > 0) merged.richMessages = richMessages
 
   try {
     return AppConfigSchema.parse(merged)

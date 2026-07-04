@@ -176,6 +176,7 @@ function makeTelegramApi(): {
   }
   const api: TelegramApi = {
     sendMessage: (async () => ({ message_id: 1 })) as unknown as TelegramApi['sendMessage'],
+    sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
     editMessageText: noop as unknown as TelegramApi['editMessageText'],
     setMessageReaction: async (chatId, messageId, emoji) => {
       reactions.push({ chatId, messageId, emoji })

@@ -22,7 +22,14 @@ export const ReplyArgsSchema = z.object({
   // text without markdown markers passes through unchanged. Pass 'text'
   // explicitly only when the caller needs a literal `<` / `>` / `&` in
   // the body (rare). Inspired by openclaw/extensions/telegram (MIT).
-  format: z.enum(['text', 'markdownv2', 'html']).default('html'),
+  //
+  // 'rich' (M1, Bot API 10.1): ship RAW markdown that Telegram renders
+  // server-side (tables/math/headings/task-lists/<details>/footnotes). It is
+  // NOT required to request it — when `richMessages.enabled` is on, an 'html'
+  // (the default) reply to a DM is auto-upgraded to rich with a transparent
+  // HTML fallback. The explicit 'rich' value is reserved for forcing the rich
+  // attempt; behaviourally it joins the same auto-upgrade gate as 'html'.
+  format: z.enum(['text', 'markdownv2', 'html', 'rich']).default('html'),
   // Guest Mode: when the inbound <channel> meta carried guest_query_id,
   // pass it back here — the reply is delivered via answerGuestQuery into
   // the chat where the bot was @-mentioned (the bot is NOT a member of
