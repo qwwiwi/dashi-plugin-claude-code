@@ -155,6 +155,26 @@ export interface StatusManagerForWebhook {
   ): Promise<void>
 }
 
+// Structural surface for the SessionInfoStore. Every claude_hook carries
+// transcript_path + session_id; SessionStart also carries model. We record the
+// latest so /status (and the context HUD) can read them. Write-only here.
+export interface SessionInfoRecorder {
+  record(
+    chatId: string | undefined,
+    info: { transcriptPath?: string; sessionId?: string; model?: string },
+  ): void
+}
+
+// Structural surface for the context HUD (wave 3B). SessionStart (re)pins +
+// refreshes the pinned HUD message; Stop refreshes its percentage. Both entry
+// points are best-effort inside the HUD (they swallow + log, never throw), so
+// the webhook fires them fire-and-forget and never blocks the 200. Optional —
+// when absent the hook path is unchanged (no HUD).
+export interface ContextHudForWebhook {
+  onSessionStart(chatId: string): Promise<void> | void
+  onStop(chatId: string): Promise<void> | void
+}
+
 // Structural surface for the AskUserQuestion Telegram UI handler (TASK-2).
 // We accept any object exposing `startQuestion(requestId)` so the webhook
 // layer is decoupled from the concrete implementation in
@@ -174,6 +194,15 @@ export interface WebhookDeps {
   // status update happens. The 200 path stays open so Claude hooks never
   // back-pressure on visibility outages.
   statusManager?: StatusManagerForWebhook
+  // Session facts store (task: context HUD). Records transcript_path + model
+  // from every claude_hook so /status can show context usage. Optional — when
+  // absent the hook path is unchanged (no capture). Pure in-memory, never
+  // throws, so the record call needs no error wrapping.
+  sessionInfo?: SessionInfoRecorder
+  // Context HUD (wave 3B): the pinned context-usage indicator. SessionStart /
+  // Stop hooks drive it. Optional — when absent no HUD is rendered. Fired
+  // fire-and-forget so a HUD failure never back-pressures the 200.
+  contextHud?: ContextHudForWebhook
   // Phase 8: optional memory writer. Receives a sibling dispatch of every
   // hook payload (UserPromptSubmit buffers, Stop writes recent.md +
   // verbose.jsonl). Throws are caught and logged — never block the 200.
@@ -500,6 +529,39 @@ async function handleRequest(
   // Branch on payload variant. Discriminator was set by the Zod transform
   // so we don't have to re-sniff fields here.
   if (payload.kind === 'claude_hook') {
+    // Capture the latest session facts (transcript_path + model) so /status and
+    // the context HUD can read them. transcript_path + session_id ride on every
+    // hook; model is present only on SessionStart. Pure in-memory record.
+    if (deps.sessionInfo) {
+      const info: { transcriptPath?: string; sessionId?: string; model?: string } = {
+        transcriptPath: payload.transcript_path,
+        sessionId: payload.session_id,
+      }
+      if (
+        payload.hook_event_name === 'SessionStart'
+        && typeof payload.model === 'string'
+        && payload.model.length > 0
+      ) {
+        info.model = payload.model
+      }
+      deps.sessionInfo.record(payload.chatId, info)
+    }
+
+    // Context HUD (wave 3B): drive the pinned indicator on the session
+    // lifecycle. SessionStart (re)pins + refreshes; Stop refreshes the
+    // percentage after a turn. COMPLETELY isolated from the 200 path: the HUD
+    // methods swallow + log internally, and we still `void`+`.catch` here so a
+    // synchronous throw (defensive) can never escape into the hook response.
+    // The HUD gates on the owner chat internally, so a non-owner chatId is a
+    // safe no-op.
+    if (deps.contextHud) {
+      if (payload.hook_event_name === 'SessionStart') {
+        void Promise.resolve(deps.contextHud.onSessionStart(payload.chatId)).catch(() => {})
+      } else if (payload.hook_event_name === 'Stop') {
+        void Promise.resolve(deps.contextHud.onStop(payload.chatId)).catch(() => {})
+      }
+    }
+
     // Phase 8: dispatch to memory writer first, BEFORE the status branch,
     // so memory persistence runs regardless of status.enabled. Errors are
     // logged and swallowed — memory must never back-pressure the 200.

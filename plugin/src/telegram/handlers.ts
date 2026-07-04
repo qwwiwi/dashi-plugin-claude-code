@@ -18,6 +18,7 @@ import type { Context } from 'grammy'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 
 import type { AppConfig, StatePaths } from '../config.js'
+import { resolveContextWindowTokens } from '../config.js'
 import type { Logger } from '../log.js'
 import type { TelegramApi } from '../channel/tools.js'
 import type { StatusManager } from '../status/status-manager.js'
@@ -150,6 +151,11 @@ export interface HandlerDeps {
   tmuxMirror?: TmuxMirrorControl
   // /keys target — resolved tmux pane of the agent session (server.ts wiring).
   tmuxKeys?: { target: TmuxKeysTarget }
+  // Session facts (transcript_path + model) learned from Claude hook events,
+  // surfaced by /status (context usage). Structural getter so handlers stay
+  // decoupled from the concrete SessionInfoStore. Optional — absent in legacy
+  // wiring / tests, in which case /status shows «контекст: —».
+  sessionInfo?: { get(chatId?: string): { transcriptPath?: string; model?: string } }
   // Multichat router. When present together with `policy`, all gated
   // inbound traffic is dispatched to the per-chat tmux session via
   // `router.dispatch(InboundMessage)` instead of the legacy
@@ -1111,6 +1117,10 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
     const allowedChatSet = new Set(deps.config.allowed_chat_ids.map((v) => String(v)))
     const allowedChat = chatNum !== undefined && allowedChatSet.has(String(chatNum))
     if (chatType === 'private' && chatId && senderId && allowedSender && allowedChat) {
+      // Session facts for /status context usage: transcript_path + model
+      // learned from hook events (per chat when multichat). Snapshot at
+      // command time — /status is itself a snapshot.
+      const session = deps.sessionInfo?.get(chatId)
       const oobCtx: OobContext = {
         chatId,
         senderId,
@@ -1119,6 +1129,10 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
         log: deps.log,
         botId: deps.bot.id,
         stateDir: deps.statePaths.root,
+        contextWindowTokens: resolveContextWindowTokens(deps.config),
+        uptimeSeconds: process.uptime(),
+        ...(session?.transcriptPath ? { transcriptPath: session.transcriptPath } : {}),
+        ...(session?.model ? { modelName: session.model } : {}),
         ...(deps.statusManager
           ? {
               statusManager: {
