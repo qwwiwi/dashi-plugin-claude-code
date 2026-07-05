@@ -57,6 +57,11 @@ describe('validateTelegramHtml — valid passes', () => {
     const r = validateTelegramHtml('<blockquote>quote</blockquote>')
     expect(r.downgraded).toBe(false)
   })
+
+  test('passes <blockquote expandable> (collapsible-quote attribute)', () => {
+    const r = validateTelegramHtml('<blockquote expandable>quote</blockquote>')
+    expect(r.downgraded).toBe(false)
+  })
 })
 
 describe('validateTelegramHtml — invalid downgrades', () => {

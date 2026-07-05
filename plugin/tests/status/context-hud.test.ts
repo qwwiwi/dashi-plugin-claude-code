@@ -637,6 +637,24 @@ describe('renderStatusTasks', () => {
     expect(text).toContain('☑ d3')
     expect(text).toContain('<i>+2 завершено ранее</i>')
   })
+
+  test('detail lives in an expandable blockquote; header stays outside', () => {
+    const text = renderStatusTasks([
+      todo('1', 'completed', 'done-a'),
+      todo('2', 'in_progress', 'now', 'Doing X'),
+      todo('3', 'pending', 'later'),
+    ])
+    const qi = text.indexOf('<blockquote expandable>')
+    expect(qi).toBeGreaterThan(-1)
+    // header (bar + count) is before the quote, not inside it
+    expect(text.slice(0, qi)).toContain('<b>Задачи</b>')
+    expect(text.endsWith('</blockquote>')).toBe(true)
+    // per-task detail is inside the collapsible quote
+    const inside = text.slice(qi)
+    expect(inside).toContain('◐ Doing X')
+    expect(inside).toContain('◻ later')
+    expect(inside).toContain('☑ done-a')
+  })
 })
 
 describe('renderStatusTasks budget', () => {

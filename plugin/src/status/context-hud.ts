@@ -124,33 +124,40 @@ export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
   const filled = Math.max(0, Math.min(BAR_SEGMENTS, Math.round((done / total) * BAR_SEGMENTS)))
   const bar = BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(BAR_SEGMENTS - filled)
 
-  const lines: string[] = [`<b>Задачи</b> ${bar} ${done}/${total}`]
-  for (const t of inProgress) lines.push(taskLine(t))
-  for (const t of pending.slice(0, TASKS_MAX_PENDING)) lines.push(taskLine(t))
+  // The header (bar + count) stays OUTSIDE the collapsible quote so progress is
+  // always visible when collapsed; the per-task detail goes INSIDE an
+  // <blockquote expandable>, so the pin reads «progress — tap to expand the list».
+  const header = `<b>Задачи</b> ${bar} ${done}/${total}`
+
+  const detail: string[] = []
+  for (const t of inProgress) detail.push(taskLine(t))
+  for (const t of pending.slice(0, TASKS_MAX_PENDING)) detail.push(taskLine(t))
   if (pending.length > TASKS_MAX_PENDING) {
-    lines.push(`<i>+${pending.length - TASKS_MAX_PENDING} ещё…</i>`)
+    detail.push(`<i>+${pending.length - TASKS_MAX_PENDING} ещё…</i>`)
   }
   const visibleDone = completed.slice(-TASKS_MAX_DONE)
   const hiddenDone = completed.length - visibleDone.length
-  if (hiddenDone > 0) lines.push(`<i>+${hiddenDone} завершено ранее</i>`)
-  for (const t of visibleDone) lines.push(taskLine(t))
+  if (hiddenDone > 0) detail.push(`<i>+${hiddenDone} завершено ранее</i>`)
+  for (const t of visibleDone) detail.push(taskLine(t))
 
   // Total-budget pass: the per-category caps bound pending/completed but not
-  // in-progress, and escaping expands after the per-line cut. Keep the header
-  // always; drop overflowing lines and mark the cut with a tail.
+  // in-progress, and escaping expands after the per-line cut. The header is
+  // always kept (counted first); drop overflowing detail lines, mark the cut.
   const out: string[] = []
-  let used = 0
+  let used = header.length
   let dropped = 0
-  for (const line of lines) {
-    if (out.length === 0 || used + 1 + line.length <= TASKS_MAX_CHARS) {
+  for (const line of detail) {
+    if (used + 1 + line.length <= TASKS_MAX_CHARS) {
       out.push(line)
-      used += (out.length === 1 ? 0 : 1) + line.length
+      used += 1 + line.length
     } else {
       dropped++
     }
   }
   if (dropped > 0) out.push(`<i>+${dropped} строк скрыто</i>`)
-  return out.join('\n')
+
+  if (out.length === 0) return header
+  return `${header}\n<blockquote expandable>${out.join('\n')}</blockquote>`
 }
 
 // «план» is the only mode worth naming; every other Claude Code permission
@@ -341,6 +348,11 @@ export class ContextHud {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
     return this.runSerialized(chatId, async () => {
       try {
+        // A new session starts with a clean task list: drop any snapshot left
+        // over from a prior session so the pin never shows stale milestones
+        // (renderStatusTasks returns '' for an empty list → the section is
+        // omitted until the agent emits fresh TodoWrite/TaskCreate events).
+        this.work.delete(chatId)
         const { text, keyboard } = await this.renderCurrent(chatId)
         const ensured = await this.ensureMessage(chatId, text, keyboard)
         if (ensured === undefined) return

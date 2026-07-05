@@ -67,7 +67,10 @@ const TAG_ATTR_ALLOWLIST: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ['code', new Set(['class'])],
   ['pre', new Set<string>()],
   ['tg-spoiler', new Set<string>()],
-  ['blockquote', new Set<string>()],
+  // `expandable` is Telegram's collapsible-quote flag (Bot API 7.9+); it is a
+  // valueless boolean attribute, not a styling/URL vector, so whitelisting it
+  // on the already-allowed <blockquote> does not widen the XSS surface.
+  ['blockquote', new Set(['expandable'])],
   ['b', new Set<string>()],
   ['strong', new Set<string>()],
   ['i', new Set<string>()],
