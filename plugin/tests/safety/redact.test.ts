@@ -440,4 +440,22 @@ describe('redactSecrets — Zoom join links (public passcode exemption)', () => 
     expect(out).toContain(join)
     expect(out).not.toContain(token)
   })
+
+  test('zoom-shaped URL smuggling a non-allowlisted param is NOT exempted', () => {
+    const smuggle =
+      'https://us02web.zoom.us/j/83269385955?pwd=x&access_token=REALSECRETVALUE12345'
+    const out = redactSecrets(smuggle)
+    expect(out).not.toContain('REALSECRETVALUE12345')
+    expect(out).toContain('[REDACTED]')
+  })
+
+  test('crafted placeholder in input cannot index into zoomLinks', () => {
+    const nul = String.fromCharCode(0)
+    const crafted = `${nul}ZOOMJOIN0${nul} and a real link ${join}`
+    const out = redactSecrets(crafted)
+    // raw NULs from input are stripped, so the crafted marker is inert text
+    expect(out).toContain('ZOOMJOIN0 and a real link')
+    expect(out).toContain(join)
+    expect(out).not.toContain(nul)
+  })
 })

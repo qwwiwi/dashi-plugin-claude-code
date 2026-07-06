@@ -82,10 +82,28 @@ const URL_USERINFO_RE = /(https?:\/\/[^/\s:@]+:)[^@/\s]+(@)/gi
 const ZOOM_JOIN_URL_RE =
   /https:\/\/[a-z0-9-]+\.zoom\.us\/[jw]\/\d{8,12}\?[^\s"'<>]*\bpwd=[^\s"'<>]+/gi
 
-// Placeholder wrapper for swapped-out Zoom links. NUL bytes cannot appear
-// in inbound Telegram text or model output, so round-tripping is safe and
-// the placeholder can never collide with real content.
+// Placeholder wrapper for swapped-out Zoom links. Raw NUL bytes are
+// stripped from the input before the swap runs (see redactSecrets), so a
+// placeholder in the output can only be one WE inserted - no collision or
+// index-injection from crafted input.
 const ZOOM_PLACEHOLDER_RE = /\u0000ZOOMJOIN(\d+)\u0000/g
+
+// Query params allowed to ride inside an exempted Zoom join link. Anything
+// else (token=, access_token=, ...) means the URL is NOT a plain join link -
+// the exemption is refused and the normal rules mask it (fail closed).
+// pwd = join passcode, uname = prefill display name, omn = one-meeting id.
+const ZOOM_ALLOWED_PARAMS = new Set(['pwd', 'uname', 'omn'])
+
+// True iff every query param name in the matched join URL is allowlisted.
+function isCleanZoomJoinUrl(url: string): boolean {
+  const qIdx = url.indexOf('?')
+  if (qIdx < 0) return false
+  for (const pair of url.slice(qIdx + 1).split('&')) {
+    const name = pair.split('=', 1)[0]?.toLowerCase() ?? ''
+    if (!ZOOM_ALLOWED_PARAMS.has(name)) return false
+  }
+  return true
+}
 
 // JWT anywhere (path, query, fragment, prose): three dot-separated
 // base64url segments, the first two starting with `eyJ` (= `{"`). The
@@ -250,12 +268,18 @@ export function redactSecrets(
   text: string,
   extras?: ReadonlyArray<string>,
 ): string {
-  let out = text
+  // Strip raw NUL bytes first: they never appear in legitimate Telegram
+  // text or model output, and this guarantees any ZOOM placeholder in the
+  // string below is one we inserted ourselves (no index injection).
+  let out = text.replace(/\u0000/g, '')
   // Zoom join links are swapped out FIRST and restored LAST: their pwd=
   // param is a public join passcode, not a secret, and must survive every
-  // rule (incl. QUERY_TOKEN_RE) byte-identical. See ZOOM_JOIN_URL_RE.
+  // rule (incl. QUERY_TOKEN_RE) byte-identical. Only links whose query
+  // params are ALL allowlisted qualify - a zoom-shaped URL carrying e.g.
+  // &token=... is left to the normal rules. See ZOOM_JOIN_URL_RE.
   const zoomLinks: string[] = []
   out = out.replace(ZOOM_JOIN_URL_RE, (m) => {
+    if (!isCleanZoomJoinUrl(m)) return m
     zoomLinks.push(m)
     return `\u0000ZOOMJOIN${zoomLinks.length - 1}\u0000`
   })
