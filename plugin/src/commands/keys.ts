@@ -425,7 +425,15 @@ export function classifyPane(text: string): PaneState {
   ) {
     return 'dialog'
   }
-  if (chrome.includes('esc to interrupt')) {
+  // v2.1.200 busy footer printed "esc to interrupt". v2.1.201 replaced it with a
+  // spinner line "✢ … (Nm Ns · ↓ Nk tokens)" that no longer prints that phrase,
+  // so a busy pane classified as 'unknown' and compact refused (regression
+  // 2026-07-06, foreshadowed by the radar's claude-code v2.1.201 bump). Detect
+  // BOTH markers; the spinner's "· ↓/↑ … tokens)" tail never appears idle/dialog.
+  if (
+    chrome.includes('esc to interrupt') ||
+    /·\s*[↓↑][\s\d.,]*k?\s*tokens?\)/i.test(chrome)
+  ) {
     return 'busy'
   }
   if (

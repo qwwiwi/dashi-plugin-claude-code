@@ -141,6 +141,17 @@ describe('classifyPane', () => {
     expect(classifyPane('')).toBe('unknown')
   })
 
+  // v2.1.201 (regression 2026-07-06): the busy footer dropped "esc to interrupt"
+  // in favour of a spinner line "✢ … (Nm Ns · ↓ Nk tokens)". Without matching it
+  // a busy pane classified as 'unknown' and the compact button refused.
+  test('v2.1.201 spinner (no "esc to interrupt") is still busy', () => {
+    expect(classifyPane('✢ Триггерю… (6m 7s · ↓ 14.5k tokens)')).toBe('busy')
+    expect(classifyPane('✶ Working… (12s · ↓ 800 tokens)')).toBe('busy')
+    expect(classifyPane('· Cogitating… (1m 3s · ↑ 2.1k tokens)')).toBe('busy')
+    // the spinner tail must NOT make a plain idle/bypass footer read as busy
+    expect(classifyPane('⏵⏵ bypass permissions on (shift+tab to cycle)')).toBe('idle')
+  })
+
   // FIX-5 (Fable M3): markers are anchored to the BOTTOM UI chrome, so the
   // agent's own transcript quoting "Do you want to proceed?" / "esc to
   // interrupt" (this very plugin discusses these strings) far above the
