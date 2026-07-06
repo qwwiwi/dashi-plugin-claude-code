@@ -400,3 +400,44 @@ describe('redactSecrets — HTML-neutral marker', () => {
     expect(out).not.toContain('<redacted>')
   })
 })
+
+describe('redactSecrets — Zoom join links (public passcode exemption)', () => {
+  const join =
+    'https://us02web.zoom.us/j/83269385955?pwd=ylrXDjig1u7We2mblEbWHsAzl8dsbU.1'
+
+  test('zoom join URL survives byte-identical, placeholder fully removed', () => {
+    const out = redactSecrets(`Ссылка: ${join} — жми`)
+    expect(out).toContain(join)
+    expect(out).not.toContain('[REDACTED]')
+    expect(out).not.toContain(String.fromCharCode(0))
+  })
+
+  test('idempotent: double pass keeps the link intact', () => {
+    const once = redactSecrets(join)
+    expect(redactSecrets(once)).toBe(once)
+  })
+
+  test('subdomain /w/ webinar link survives; bare-host link fails closed', () => {
+    const sub =
+      'https://us02web.zoom.us/w/98765432101?pwd=AbCdEf123456.7&uname=x'
+    expect(redactSecrets(sub)).toContain(sub)
+    // bare zoom.us has no subdomain — outside the tight host shape, so the
+    // passcode is still masked (fail closed for unexpected shapes)
+    const bare = 'https://zoom.us/w/98765432101?pwd=AbCdEf123456.7'
+    expect(redactSecrets(bare)).toContain('pwd=[REDACTED]')
+  })
+
+  test('pwd on non-zoom URLs is still masked', () => {
+    const other = 'https://evil.example.com/j/83269385955?pwd=supersecret123'
+    const out = redactSecrets(other)
+    expect(out).toContain('pwd=[REDACTED]')
+    expect(out).not.toContain('supersecret123')
+  })
+
+  test('secrets NEXT TO a zoom link are still masked', () => {
+    const token = '1234567890:AAHdqTcvbXHK4-KpB7avjkkwcHM4dJq0Fx8'
+    const out = redactSecrets(`join ${join} and the bot token ${token}`)
+    expect(out).toContain(join)
+    expect(out).not.toContain(token)
+  })
+})

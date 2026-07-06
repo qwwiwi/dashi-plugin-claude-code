@@ -73,6 +73,20 @@ const QUERY_TOKEN_RE =
 // would carry basic-auth credentials verbatim.
 const URL_USERINFO_RE = /(https?:\/\/[^/\s:@]+:)[^@/\s]+(@)/gi
 
+// Zoom join links: the `pwd=` query param on a zoom.us `/j/<id>` (meeting)
+// or `/w/<id>` (webinar) join URL is a PUBLIC join passcode — the link
+// exists to be shared with attendees, and QUERY_TOKEN_RE would mask the
+// passcode and break it (prince directive 2026-07-06). These URLs are
+// swapped out before the rules run and restored verbatim afterwards.
+// Tight shape: real zoom.us subdomain host, numeric meeting id, pwd param.
+const ZOOM_JOIN_URL_RE =
+  /https:\/\/[a-z0-9-]+\.zoom\.us\/[jw]\/\d{8,12}\?[^\s"'<>]*\bpwd=[^\s"'<>]+/gi
+
+// Placeholder wrapper for swapped-out Zoom links. NUL bytes cannot appear
+// in inbound Telegram text or model output, so round-tripping is safe and
+// the placeholder can never collide with real content.
+const ZOOM_PLACEHOLDER_RE = /\u0000ZOOMJOIN(\d+)\u0000/g
+
 // JWT anywhere (path, query, fragment, prose): three dot-separated
 // base64url segments, the first two starting with `eyJ` (= `{"`). The
 // generic rule never caught these reliably (dots break the char class),
@@ -237,6 +251,14 @@ export function redactSecrets(
   extras?: ReadonlyArray<string>,
 ): string {
   let out = text
+  // Zoom join links are swapped out FIRST and restored LAST: their pwd=
+  // param is a public join passcode, not a secret, and must survive every
+  // rule (incl. QUERY_TOKEN_RE) byte-identical. See ZOOM_JOIN_URL_RE.
+  const zoomLinks: string[] = []
+  out = out.replace(ZOOM_JOIN_URL_RE, (m) => {
+    zoomLinks.push(m)
+    return `\u0000ZOOMJOIN${zoomLinks.length - 1}\u0000`
+  })
   // Extras BEFORE patterns: caller-supplied exact substrings (e.g. webhook
   // tokens with no public shape) get masked first so the downstream generic
   // long-token rule doesn't partially eat them and leave a recoverable
@@ -265,5 +287,13 @@ export function redactSecrets(
   // final post-specific-rules text to compute URL ranges (offsets shift
   // as earlier rules rewrite the string).
   out = maskLongTokensOutsideUrls(out)
+  // Restore the swapped-out Zoom join links byte-identical. Runs after
+  // every rule so nothing can touch the passcode inside.
+  if (zoomLinks.length > 0) {
+    out = out.replace(
+      ZOOM_PLACEHOLDER_RE,
+      (whole, idx: string) => zoomLinks[Number(idx)] ?? whole,
+    )
+  }
   return out
 }
