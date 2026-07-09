@@ -857,3 +857,596 @@ describe('git-exec-surface round 3 — any git -c confirms (Codex High r3)', () 
     expect(classify('Bash', { command: 'git commit -m fix' }, OVR).tier).toBe('allow')
   })
 })
+
+describe('git-exec-surface `-c` is POSITIONAL — subcommand -c is benign, global -c confirms (option B, 2026-07-08)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // ── MUST NOT confirm: -c belongs to the subcommand, not to git ──────────
+  test('git switch -c (create branch) does not confirm', () => {
+    expect(surfaced('git switch -c feature/x')).toBe(false)
+    expect(classify('Bash', { command: 'git switch -c feature/x' }, VARIANT1).tier).toBe('allow')
+  })
+  test('git commit -c HEAD (reuse message) does not confirm', () => {
+    expect(surfaced('git commit -c HEAD --amend')).toBe(false)
+  })
+  test('git branch -c oldname newname (copy branch) does not confirm', () => {
+    expect(surfaced('git branch -c oldname newname')).toBe(false)
+  })
+  test('git -C dir switch -c topic — subcommand -c after global -C dir is benign', () => {
+    expect(surfaced('git -C /repo switch -c topic')).toBe(false)
+    expect(classify('Bash', { command: 'git -C /repo switch -c topic' }, VARIANT1).tier).toBe('allow')
+  })
+  test('git -C /some/dir status — case-sensitivity preserved (uppercase -C is not -c)', () => {
+    expect(surfaced('git -C /some/dir status')).toBe(false)
+    expect(classify('Bash', { command: 'git -C /some/dir status' }, VARIANT1).tier).toBe('allow')
+  })
+  test('non-git command whose -c belongs to python; "git" only inside a string', () => {
+    expect(surfaced('echo "\'git-exec-surface\'"; python3 -c "import yaml; print(1)"')).toBe(false)
+  })
+  test('git in seg 1, python -c in seg 2 — the -c is not attributed to git', () => {
+    expect(surfaced('git show HEAD:file | python3 -c "import sys"')).toBe(false)
+  })
+
+  // ── MUST STILL confirm: real global config/exec surfaces ────────────────
+  test('git -c core.sshCommand=evil push (global config) still confirms', () => {
+    expect(surfaced('git -c core.sshCommand=evil push')).toBe(true)
+  })
+  test('git -c credential.helper=... fetch still confirms', () => {
+    expect(surfaced('git -c credential.helper=/tmp/x fetch')).toBe(true)
+  })
+  test('git -C /repo -c core.hooksPath=/tmp push — global -c after -C dir still confirms', () => {
+    expect(surfaced('git -C /repo -c core.hooksPath=/tmp push')).toBe(true)
+  })
+  test('git --config-env=core.sshCommand=X push (long form) still confirms', () => {
+    expect(surfaced('git --config-env=core.sshCommand=X push')).toBe(true)
+  })
+  test('GIT_SSH_COMMAND=/tmp/evil git push (env indirection) still confirms', () => {
+    expect(classify('Bash', { command: 'GIT_SSH_COMMAND=/tmp/evil git push' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('git clone --upload-pack=/tmp/evil (transport exec) still confirms', () => {
+    expect(surfaced('git clone --upload-pack=/tmp/evil host:repo')).toBe(true)
+  })
+  test('wrapper-fn indirection ($ present → fail-closed whole-command scan) still confirms', () => {
+    expect(surfaced('g(){ git "$@"; }; g -c core.sshCommand=evil fetch')).toBe(true)
+  })
+  test('unbalanced quotes around git -c → fail-closed confirm', () => {
+    expect(surfaced('git -c core.sshCommand=evil "unterminated push')).toBe(true)
+  })
+})
+
+describe('git-exec-surface fix-loop — command-prefix wrappers, line-continuation, quoted -c under indirection (Codex+Fable review 2026-07-09)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // FINDING 1 — a global `-c` behind ANY command-prefix wrapper still confirms
+  // (positional scan must find the git token, not anchor on the first token).
+  test('command git -c … push confirms', () => {
+    expect(surfaced('command git -c core.sshCommand=evil push')).toBe(true)
+  })
+  test('exec git -c … push confirms', () => {
+    expect(surfaced('exec git -c core.sshCommand=evil push')).toBe(true)
+  })
+  test('env git -c … push confirms', () => {
+    expect(surfaced('env git -c core.sshCommand=evil push')).toBe(true)
+  })
+  test('env X=1 git -c … push confirms', () => {
+    expect(surfaced('env X=1 git -c core.sshCommand=evil push')).toBe(true)
+  })
+  test('sudo git -c … push confirms (via the sudo builtin, which fires first — still not a silent allow)', () => {
+    // The `sudo ` builtin confirm masks git-exec-surface here; what matters is
+    // it confirms rather than silently allowing.
+    expect(classify('Bash', { command: 'sudo git -c core.sshCommand=evil push' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('nice git -c … push confirms', () => {
+    expect(surfaced('nice git -c core.sshCommand=evil push')).toBe(true)
+  })
+  test('nohup git -c … push confirms', () => {
+    expect(surfaced('nohup git -c core.sshCommand=evil push')).toBe(true)
+  })
+  test('stdbuf -o0 git -c … push confirms', () => {
+    expect(surfaced('stdbuf -o0 git -c core.sshCommand=evil push')).toBe(true)
+  })
+  test('xargs git -c … confirms', () => {
+    expect(surfaced('xargs git -c core.sshCommand=evil')).toBe(true)
+  })
+  test('wrapper with global -C dir then -c still confirms (value-flag consumption anchored on git token)', () => {
+    expect(surfaced('command git -C /r -c core.sshCommand=evil push')).toBe(true)
+  })
+  test('but a wrapper prefix does NOT over-confirm a benign subcommand -c', () => {
+    expect(surfaced('command git switch -c feature/x')).toBe(false)
+    expect(surfaced('env X=1 git commit -c HEAD --amend')).toBe(false)
+  })
+
+  // FINDING 2 — backslash-newline line continuation splitting `-c`.
+  test('git -\\<newline>c … push (bash joins to git -c) confirms', () => {
+    expect(surfaced('git -\\\nc core.sshCommand=evil push')).toBe(true)
+  })
+  test('line continuation does not break a benign subcommand -c', () => {
+    // `git switch -\<nl>c br` joins to `git switch -c br` — still benign.
+    expect(surfaced('git switch -\\\nc feature/x')).toBe(false)
+  })
+
+  // FINDING 3 — quoted `-c` under $/backtick indirection must not slip.
+  test("g(){ git \"$@\"; }; g '-c' … fetch (quoted -c under indirection) confirms", () => {
+    expect(surfaced('g(){ git "$@"; }; g \'-c\' core.sshCommand=evil fetch')).toBe(true)
+  })
+  test('unquoted -c under indirection still confirms (unchanged)', () => {
+    expect(surfaced('g(){ git "$@"; }; g -c core.sshCommand=evil fetch')).toBe(true)
+  })
+  test('indirection with git in $(…) and a real -c still confirms', () => {
+    expect(surfaced('$(git -c core.sshCommand=evil push)')).toBe(true)
+  })
+  test('benign $() with git and no -c does not confirm', () => {
+    expect(classify('Bash', { command: 'B=$(git rev-parse --abbrev-ref HEAD); echo $B' }, VARIANT1).tier).toBe('allow')
+  })
+})
+
+describe('git-exec-surface round-3 tightening — ANSI-C quoting + quote-aware line continuation (Codex Sol r3)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // CLOSE #1 — ANSI-C quoting decodes to a real `-c`; presence in a git command
+  // fails closed (the $ path can't decode `$'…'`).
+  test("git $'-c' user.name=x status (ANSI-C quoted -c) confirms", () => {
+    expect(surfaced("git $'-c' user.name=x status")).toBe(true)
+  })
+  test("git $'\\x2d\\x63' user.name=x status (hex ANSI-C -c) confirms", () => {
+    expect(surfaced("git $'\\x2d\\x63' user.name=x status")).toBe(true)
+  })
+
+  // CLOSE #2 — backslash-newline stripping is quote-aware: single-quoted content
+  // is preserved (bash does no continuation removal inside single quotes), so a
+  // single-quoted `-\<nl>c` stays literal and is NOT a global -c.
+  test("git '-\\<newline>c' … (single-quoted) is NOT transformed into -c → benign", () => {
+    expect(surfaced("git '-\\\nc' feature/x")).toBe(false)
+  })
+  test('git -\\<newline>c … (unquoted) still joins to -c → confirms', () => {
+    expect(surfaced('git -\\\nc user.name=x status')).toBe(true)
+  })
+})
+
+describe('git-exec-surface round-4 — git glued in command substitution / assignment under indirection (Codex Sol r4)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // HIGH — git glued as `x=$(git …`: the token is `x=$(git`, not `git`, so the
+  // old token-dequote git-presence test missed it. The broad `\bgit\b` + marker
+  // fail-closed now catches the whole class.
+  test("x=$(git '-c' …) (quoted -c inside command substitution) confirms", () => {
+    expect(surfaced("x=$(git '-c' core.sshCommand=/tmp/evil fetch origin)")).toBe(true)
+  })
+  test("x=$(git $'-c' …) (ANSI-C -c inside command substitution) confirms", () => {
+    expect(surfaced("x=$(git $'-c' core.sshCommand=/tmp/evil fetch origin)")).toBe(true)
+  })
+  test('`git -c … push` in backticks confirms', () => {
+    expect(surfaced('`git -c core.sshCommand=x push`')).toBe(true)
+  })
+  test('accepted safe-side: x=$(git switch -c "$b") confirms under indirection (unresolvable argv)', () => {
+    expect(surfaced('x=$(git switch -c "$b")')).toBe(true)
+  })
+  test('but a substitution with git and NO config marker stays allow', () => {
+    expect(classify('Bash', { command: 'x=$(git rev-parse HEAD); echo $x' }, VARIANT1).tier).toBe('allow')
+  })
+})
+
+describe('git-exec-surface round-5 — value-flag completeness + indirection fragment concatenation (Codex Sol r5)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // FINDING A — separate-value globals that precede a real `-c` must be
+  // consumed on the CLEAN positional path, else the value reads as the
+  // subcommand and the following global `-c` is missed.
+  test('git --attr-source HEAD -c … fetch (attr-source consumes HEAD) confirms', () => {
+    expect(surfaced('git --attr-source HEAD -c core.sshCommand=/tmp/evil fetch origin')).toBe(true)
+  })
+  test('git --shallow-file /tmp/shallow -c … fetch confirms', () => {
+    expect(surfaced('git --shallow-file /tmp/shallow -c core.sshCommand=/tmp/evil fetch origin')).toBe(true)
+  })
+  test('and those flags alone (no -c) do NOT over-confirm on the clean path', () => {
+    expect(surfaced('git --attr-source HEAD log --oneline -1')).toBe(false)
+  })
+
+  // FINDING B — bash fragment concatenation under indirection ($/backtick).
+  test("x=$(git -'c' …) — split -'c' rejoins to -c → confirms", () => {
+    expect(surfaced("x=$(git -'c' core.sshCommand=/tmp/evil fetch origin)")).toBe(true)
+  })
+  test('x=$(git -\\c …) — backslash-split -\\c rejoins to -c → confirms', () => {
+    expect(surfaced('x=$(git -\\c core.sshCommand=/tmp/evil fetch origin)')).toBe(true)
+  })
+  test("x=$(git clone --upload'-pack'=… ) — split long flag rejoins → confirms", () => {
+    expect(surfaced("x=$(git clone --upload'-pack'=/tmp/evil ssh://host/repo)")).toBe(true)
+  })
+  test("x=$('g'it -c … ) — split command word 'g'it rejoins to git → confirms", () => {
+    expect(surfaced("x=$('g'it -c core.sshCommand=/tmp/evil fetch origin)")).toBe(true)
+  })
+})
+
+describe('git-exec-surface round-6 — fragmented long-form (clean) + ANSI-C command word (indirection) (Codex Sol r6)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // FINDING 1 — CLEAN path: a fragmented LONG-form config/exec flag dequotes to
+  // a real global exec surface before the subcommand.
+  test("git --config'-env'=… ls-remote (fragmented --config-env, RCE) confirms", () => {
+    expect(surfaced("X=id git --config'-env'=core.sshCommand=X ls-remote ssh://example.invalid/repo")).toBe(true)
+  })
+  test("git --up'load'-pack=/x clone host:r (fragmented --upload-pack) confirms", () => {
+    expect(surfaced("git --up'load'-pack=/x clone host:r")).toBe(true)
+  })
+  test("git --con'fig'-env=… fetch (fragmented --config-env) confirms", () => {
+    expect(surfaced("git --con'fig'-env=core.sshCommand=X fetch origin")).toBe(true)
+  })
+  test('benign long options that are NOT exec surfaces do not confirm on the clean path', () => {
+    expect(surfaced('git --no-pager log --oneline -1')).toBe(false)
+    expect(surfaced('git --paginate diff')).toBe(false)
+  })
+
+  // FINDING 2 — indirection: ANSI-C-encoded command word / flag.
+  test("$'\\x67\\x69\\x74' -c … (hex ANSI-C git) under indirection confirms", () => {
+    expect(surfaced("X=id $'\\x67\\x69\\x74' -c core.sshCommand=X ls-remote ssh://example.invalid/repo")).toBe(true)
+  })
+  test("$'\\147\\151\\164' -c … (octal ANSI-C git) under indirection confirms", () => {
+    expect(surfaced("X=id $'\\147\\151\\164' -c core.sshCommand=X ls-remote ssh://example.invalid/repo")).toBe(true)
+  })
+  test("x=$($'\\x67\\x69\\x74' -c … ) inside command substitution confirms", () => {
+    expect(surfaced("x=$($'\\x67\\x69\\x74' -c core.sshCommand=/tmp/evil fetch origin)")).toBe(true)
+  })
+  test('benign ANSI-C with no git and no config marker (printf $\\n) does not confirm', () => {
+    expect(classify('Bash', { command: "printf $'\\n'" }, VARIANT1).tier).toBe('allow')
+  })
+})
+
+describe('git-exec-surface round-7 — position-independent value-shape model (Codex Sol r7, terminal for clean path)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // FINDING 1 — `-c` config AFTER the subcommand (git clone -c … sets pre-fetch
+  // config → RCE). The old "global before subcommand" walk missed it.
+  test('git clone -c core.sshCommand=x repo (subcommand -c config) confirms', () => {
+    expect(surfaced('git clone -c core.sshCommand=/tmp/evil ssh://host/repo')).toBe(true)
+  })
+  // FINDING 2 — fragmented long transport flag AFTER the subcommand. `git push`
+  // is itself a builtin confirm, so to prove the surface fires INDEPENDENTLY we
+  // downgrade `git push` and require git-exec-surface to still stand.
+  const OVR_PUSH: PermissionPolicy = { default_tier: 'allow', confirm_overrides: { builtin_rules: ['git push'] } }
+  test("git push --receive'-pack'=/x origin (fragmented, after subcommand) still confirms even when git push is downgraded", () => {
+    const v = classify('Bash', { command: "git push --receive'-pack'=/tmp/evil origin main" }, OVR_PUSH)
+    expect(v.tier).toBe('confirm')
+    expect(v.matchedRule).toContain('git-exec-surface')
+  })
+  test('git push --receive-pack=/x origin (plain, after subcommand) still confirms when git push is downgraded', () => {
+    const v = classify('Bash', { command: 'git push --receive-pack=/tmp/evil origin' }, OVR_PUSH)
+    expect(v.tier).toBe('confirm')
+    expect(v.matchedRule).toContain('git-exec-surface')
+  })
+  test('git clone --upload-pack=/x host:r (after subcommand) confirms', () => {
+    expect(surfaced('git clone --upload-pack=/tmp/evil host:r')).toBe(true)
+  })
+
+  // Prior global/pre-subcommand cases still confirm under the new model.
+  test('git -c k=v push (global -c) confirms', () => {
+    expect(surfaced('git -c core.sshCommand=/tmp/evil push')).toBe(true)
+  })
+  test('git --attr-source HEAD -c core.sshCommand=x fetch confirms', () => {
+    expect(surfaced('git --attr-source HEAD -c core.sshCommand=/tmp/evil fetch origin')).toBe(true)
+  })
+  test('command git -c k=v push (wrapper prefix) confirms', () => {
+    expect(surfaced('command git -c core.sshCommand=/tmp/evil push')).toBe(true)
+  })
+
+  // FINDING 3 — variable-held `-c` with a literal dotted config-key payload.
+  test("c=-c; git \"$c\" alias.pwn='!id' pwn (variable -c, dotted-key config) confirms", () => {
+    expect(surfaced("c=-c; git \"$c\" alias.pwn='!/usr/bin/id' pwn")).toBe(true)
+  })
+
+  // MUST-NOT — the value-shape model keeps every clean-path FP fix intact.
+  test('subcommand -c with a non-config value stays benign', () => {
+    expect(surfaced('git switch -c feature/x')).toBe(false)
+    expect(surfaced('git commit -c HEAD')).toBe(false)
+    expect(surfaced('git commit -c HEAD --amend')).toBe(false)
+    expect(surfaced('git branch -c old new')).toBe(false)
+    expect(surfaced('git log -c')).toBe(false)
+    expect(surfaced('git show -c HEAD')).toBe(false)
+  })
+  test('non-config git invocations stay benign', () => {
+    expect(surfaced('git -C /path status')).toBe(false)
+    expect(surfaced('git --no-pager log')).toBe(false)
+    expect(surfaced('git --paginate diff')).toBe(false)
+    expect(surfaced('echo "\'git-exec-surface\'"; python3 -c "import yaml"')).toBe(false)
+  })
+  test('benign indirection without a dotted-key config assignment stays allow', () => {
+    expect(classify('Bash', { command: 'git checkout "$branch"' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'git log --author="$me"' }, VARIANT1).tier).toBe('allow')
+  })
+})
+
+describe('git-exec-surface round-8 — transport-exec aliases & long-prefix abbreviations (Codex Sol r8, final)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // FIX 1 — unambiguous long-option prefix abbreviations of the exec surfaces.
+  test('git clone --upload=/x host:r (--upload == --upload-pack) confirms', () => {
+    expect(surfaced('git clone --upload=/tmp/evil host:r')).toBe(true)
+  })
+  test('git clone --upl=/x host:r (--upl abbreviation) confirms', () => {
+    expect(surfaced('git clone --upl=/tmp/evil host:r')).toBe(true)
+  })
+  test('git fetch --rec=/x origin (--rec == --receive-pack family prefix) confirms', () => {
+    expect(surfaced('git fetch --rec=/tmp/evil origin')).toBe(true)
+  })
+  test('git --conf=... fetch (non-clone --config) is git-rejected → benign under the r13 position model', () => {
+    // git has NO global `--config` (only `-c`/`--config-env`); `--config` sets
+    // config ONLY for `clone`. On `fetch` it is an unknown option → git errors,
+    // nothing runs (Codex Sol r13 — precise subcommand model). The real clone
+    // surface `git clone --conf core.sshCommand=x` is covered in round-13.
+    expect(surfaced('git --conf=core.sshCommand=/tmp/evil fetch origin')).toBe(false)
+  })
+
+  // FIX 2 — `-u` is --upload-pack ONLY for fetch-family subcommands.
+  test('git clone -u /x ssh://host/repo (fetch-family -u) confirms', () => {
+    expect(surfaced('git clone -u /tmp/evil ssh://host/repo')).toBe(true)
+  })
+  test('git fetch -u /x origin (fetch-family -u) confirms', () => {
+    expect(surfaced('git fetch -u /tmp/evil origin')).toBe(true)
+  })
+  test('git pull -u /x origin (fetch-family -u) confirms', () => {
+    expect(surfaced('git pull -u /tmp/evil origin')).toBe(true)
+  })
+
+  // CRITICAL MUST-NOT — `-u` on non-fetch subcommands is a totally different,
+  // extremely common flag and must NOT confirm.
+  test('git push -u origin main does NOT confirm (set-upstream, not upload-pack)', () => {
+    expect(surfaced('git push -u origin main')).toBe(false)
+    expect(classify('Bash', { command: 'git push -u origin main' }, VARIANT1).matchedRule ?? '').not.toContain('git-exec-surface')
+  })
+  test('git push -u origin HEAD does NOT confirm', () => {
+    expect(surfaced('git push -u origin HEAD')).toBe(false)
+  })
+  test('git add -u / git add -u . does NOT confirm', () => {
+    expect(classify('Bash', { command: 'git add -u' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'git add -u .' }, VARIANT1).tier).toBe('allow')
+  })
+  test('git branch -u origin/main does NOT confirm (set-upstream)', () => {
+    expect(classify('Bash', { command: 'git branch -u origin/main' }, VARIANT1).tier).toBe('allow')
+  })
+  test('long-prefix matcher does not trip benign long options', () => {
+    expect(surfaced('git --no-pager log')).toBe(false)
+    expect(surfaced('git --paginate diff')).toBe(false)
+    expect(surfaced('git log --oneline -5')).toBe(false)
+    expect(classify('Bash', { command: 'git log --author=me' }, VARIANT1).tier).toBe('allow')
+    expect(surfaced('git commit --amend --all')).toBe(false)
+    expect(surfaced('git clone --recurse-submodules host:r')).toBe(false)
+    expect(surfaced('git clone --reference /x host:r')).toBe(false)
+  })
+
+  // Indirection: long-prefix abbreviation runs on the flattened+decoded text.
+  test('x=$(git clone --upl=/x host:r) under indirection confirms', () => {
+    expect(surfaced('x=$(git clone --upl=/tmp/evil host:r)')).toBe(true)
+  })
+})
+
+describe('git-exec-surface round-9 — dotted-key discriminator + stuck -u + 2-char prefix (Codex Sol r9, definitively final)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // FIX 1 (CRITICAL) — a `-c` value with `=` but NO dot is a benign branch name,
+  // not a config key. This kills the round-7 false positive.
+  test('git switch -c feature=x (branch name with =) does NOT confirm', () => {
+    expect(surfaced('git switch -c feature=x')).toBe(false)
+    expect(classify('Bash', { command: 'git switch -c feature=x' }, VARIANT1).tier).toBe('allow')
+  })
+  test('git branch -c old=name copied (branch name with =) does NOT confirm', () => {
+    expect(surfaced('git branch -c old=name copied')).toBe(false)
+  })
+  test('git commit -c HEAD / git switch -c feature/x stay benign', () => {
+    expect(surfaced('git commit -c HEAD')).toBe(false)
+    expect(surfaced('git switch -c feature/x')).toBe(false)
+  })
+  test('real DOTTED -c config still confirms', () => {
+    expect(surfaced('git -c core.sshCommand=/tmp/evil push')).toBe(true)
+    expect(surfaced('git clone -c core.sshCommand=/tmp/evil repo')).toBe(true)
+    expect(surfaced('git -c credential.helper=/tmp/x fetch')).toBe(true)
+  })
+
+  // FIX 2 — stuck short `-u<value>` for fetch-family.
+  test('git clone -u/tmp/evil ssh://host/repo (stuck -u) confirms', () => {
+    expect(surfaced('git clone -u/tmp/evil ssh://host/repo')).toBe(true)
+  })
+  test('git fetch -u/x origin (stuck -u) confirms', () => {
+    expect(surfaced('git fetch -u/tmp/evil origin')).toBe(true)
+  })
+  test('stuck -u regression guard: push/add/branch stay benign', () => {
+    expect(surfaced('git push -u origin main')).toBe(false)
+    expect(classify('Bash', { command: 'git add -u' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'git add -u .' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'git branch -u origin/main' }, VARIANT1).tier).toBe('allow')
+  })
+
+  // FIX 3 — 2-char long-option prefix.
+  test('git clone --up=/x ssh://host/repo (--up == --upload-pack) confirms', () => {
+    expect(surfaced('git clone --up=/tmp/evil ssh://host/repo')).toBe(true)
+  })
+  test('threshold-2 does not newly trip the benign long-option set', () => {
+    expect(surfaced('git --no-pager log')).toBe(false)
+    expect(surfaced('git --paginate diff')).toBe(false)
+    expect(surfaced('git log --oneline -5')).toBe(false)
+    expect(classify('Bash', { command: 'git log --author=me' }, VARIANT1).tier).toBe('allow')
+    expect(surfaced('git commit --amend --all')).toBe(false)
+    expect(surfaced('git clone --recurse-submodules host:r')).toBe(false)
+    expect(surfaced('git clone --reference /x host:r')).toBe(false)
+  })
+})
+
+describe('git-exec-surface round-10 — --exec-path=<path> + global -c dotted key without = (Codex Sol r10, final)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // FIX 1 — --exec-path with a value is RCE; bare --exec-path is benign.
+  test('git --exec-path=/tmp/evil pwn confirms', () => {
+    expect(surfaced('git --exec-path=/tmp/evil pwn')).toBe(true)
+  })
+  test('bare git --exec-path does NOT confirm', () => {
+    expect(surfaced('git --exec-path')).toBe(false)
+    expect(classify('Bash', { command: 'git --exec-path' }, VARIANT1).tier).toBe('allow')
+  })
+  test('--exec-path=<path> under indirection confirms', () => {
+    expect(surfaced('x=$(git --exec-path=/tmp/evil pwn)')).toBe(true)
+  })
+
+  // FIX 2 — a GLOBAL (pre-subcommand) -c with a dotted key confirms even WITHOUT
+  // `=` (git sets it boolean-true); post-subcommand -c stays `=`-required.
+  test('git -c core.hooksPath commit (global dotted -c, no =) confirms', () => {
+    expect(surfaced('git -c core.hooksPath commit')).toBe(true)
+  })
+  test('git -c core.sshCommand fetch (global dotted -c, no =) confirms', () => {
+    expect(surfaced('git -c core.sshCommand fetch')).toBe(true)
+  })
+  test('git -c core.sshCommand=x push (global dotted -c, with =) still confirms', () => {
+    expect(surfaced('git -c core.sshCommand=/tmp/evil push')).toBe(true)
+  })
+  test('MUST STAY BENIGN: branch-name -c cases (post-subcommand, no dotted-key=)', () => {
+    expect(classify('Bash', { command: 'git switch -c feature' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'git switch -c feature=x' }, VARIANT1).tier).toBe('allow')
+    expect(surfaced('git commit -c HEAD')).toBe(false)
+    expect(surfaced('git branch -c old new')).toBe(false)
+    expect(surfaced('git branch -c old=name copied')).toBe(false)
+  })
+})
+
+describe('git-exec-surface round-11 — --config is value-gated like -c (Codex Sol r11, FP fix)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // FP FIX — `git help --config` lists config variables, benign. `--config`
+  // (and its `config`-resolving prefixes) is the long form of `-c` and needs a
+  // dotted config value to be a surface.
+  test('git help --config does NOT confirm', () => {
+    expect(surfaced('git help --config')).toBe(false)
+    expect(classify('Bash', { command: 'git help --config' }, VARIANT1).tier).toBe('allow')
+  })
+  test('git help --config (trailing space) does NOT confirm', () => {
+    expect(classify('Bash', { command: 'git help --config ' }, VARIANT1).tier).toBe('allow')
+  })
+  test('git help --conf / git help --co do NOT confirm', () => {
+    expect(surfaced('git help --conf')).toBe(false)
+    expect(surfaced('git help --co')).toBe(false)
+  })
+
+  // MUST-CONFIRM — real --config config injection surfaces.
+  test('git clone --config core.sshCommand=x repo (separate value) confirms', () => {
+    expect(surfaced('git clone --config core.sshCommand=/tmp/evil repo')).toBe(true)
+  })
+  test('git clone --config=core.sshCommand=x repo (glued value) confirms', () => {
+    expect(surfaced('git clone --config=core.sshCommand=/tmp/evil repo')).toBe(true)
+  })
+  test('git clone --conf core.sshCommand=x repo (prefix + value) confirms', () => {
+    expect(surfaced('git clone --conf core.sshCommand=/tmp/evil repo')).toBe(true)
+  })
+
+  // Always-surface long forms remain unconditional.
+  test('git --config-env=core.sshCommand=X push still confirms (always-surface)', () => {
+    expect(surfaced('git --config-env=core.sshCommand=X push')).toBe(true)
+  })
+  test('git clone --up=/x host:r still confirms (transport program)', () => {
+    expect(surfaced('git clone --up=/tmp/evil host:r')).toBe(true)
+  })
+  test('git push --receive-pack=/x origin still confirms even when git push is downgraded', () => {
+    const OVR_PUSH: PermissionPolicy = { default_tier: 'allow', confirm_overrides: { builtin_rules: ['git push'] } }
+    const v = classify('Bash', { command: 'git push --receive-pack=/tmp/evil origin' }, OVR_PUSH)
+    expect(v.tier).toBe('confirm')
+    expect(v.matchedRule).toContain('git-exec-surface')
+  })
+
+  // Prior benign guards intact under the new split.
+  test('prior benign cases still do not confirm', () => {
+    expect(classify('Bash', { command: 'git switch -c feature=x' }, VARIANT1).tier).toBe('allow')
+    expect(surfaced('git commit -c HEAD')).toBe(false)
+    expect(surfaced('git -C /path status')).toBe(false)
+    expect(surfaced('git push -u origin main')).toBe(false)
+    expect(classify('Bash', { command: 'git add -u' }, VARIANT1).tier).toBe('allow')
+    expect(surfaced('git --exec-path')).toBe(false)
+    expect(surfaced('git --no-pager log')).toBe(false)
+    expect(surfaced('git log --oneline -5')).toBe(false)
+  })
+})
+
+describe('git-exec-surface round-12 — global -c is unconditional (URL-scoped config-key RCE) (Codex Sol r12, final)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // FINDING — URL-scoped config key (`credential.<URL>.helper=!cmd`) is RCE; its
+  // `:`/`/` chars fail the dotted-key regex, so a GLOBAL `-c` must not require it.
+  test('git -c credential.https://host.helper=!id fetch (URL-scoped key) confirms', () => {
+    expect(surfaced("git -c 'credential.https://github.com.helper=!id' fetch https://github.com/private/repo")).toBe(true)
+  })
+  test('global -c with any nonempty value confirms (no benign global -c exists)', () => {
+    expect(surfaced('git -c core.sshCommand=/tmp/evil push')).toBe(true)
+    expect(surfaced('git -c core.hooksPath commit')).toBe(true)
+    expect(surfaced('git -c foo=bar push')).toBe(true) // git-rejected but safe-side
+  })
+
+  // MUST-STAY-BENIGN — post-subcommand `-c` rule unchanged (branch names etc.).
+  test('post-subcommand -c (branch names / message reuse) stays benign', () => {
+    expect(classify('Bash', { command: 'git switch -c feature=x' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'git switch -c feature' }, VARIANT1).tier).toBe('allow')
+    expect(surfaced('git commit -c HEAD')).toBe(false)
+    expect(surfaced('git commit -c HEAD --amend')).toBe(false)
+    expect(surfaced('git branch -c old new')).toBe(false)
+    expect(surfaced('git branch -c old=name copied')).toBe(false)
+    expect(surfaced('git log -c')).toBe(false)
+    expect(surfaced('git show -c HEAD')).toBe(false)
+    expect(surfaced('git -C /path status')).toBe(false)
+    expect(surfaced('git help --config')).toBe(false)
+  })
+})
+
+describe('git-exec-surface round-13 — config family is POSITION/SUBCOMMAND gated, not value-shape (Codex Sol r13, terminal)', () => {
+  const surfaced = (cmd: string) =>
+    (classify('Bash', { command: cmd }, VARIANT1).matchedRule ?? '').includes('git-exec-surface')
+
+  // MUST-CONFIRM — long-form `--config` under clone with a URL-scoped key.
+  test("git clone --config='credential.https://host.helper=!id' url (URL-scoped, long) confirms", () => {
+    expect(surfaced("git clone --config='credential.https://github.com.helper=!id' https://github.com/private/repo")).toBe(true)
+  })
+  test('git clone --config=core.sshCommand=x r (glued) confirms', () => {
+    expect(surfaced('git clone --config=core.sshCommand=/tmp/evil r')).toBe(true)
+  })
+  test('git clone --config core.sshCommand=x r (separate) confirms', () => {
+    expect(surfaced('git clone --config core.sshCommand=/tmp/evil r')).toBe(true)
+  })
+  test("git clone -c 'credential.https://host.helper=!id' url (URL-scoped, short) confirms", () => {
+    expect(surfaced("git clone -c 'credential.https://github.com.helper=!id' https://github.com/private/repo")).toBe(true)
+  })
+  test('git clone -c core.sshCommand=x r confirms', () => {
+    expect(surfaced('git clone -c core.sshCommand=/tmp/evil r')).toBe(true)
+  })
+  test("git -c 'credential.https://h.helper=!id' fetch url (global, URL-scoped) confirms", () => {
+    expect(surfaced("git -c 'credential.https://h.helper=!id' fetch https://h/r")).toBe(true)
+  })
+  test('other always-surfaces intact', () => {
+    expect(surfaced('git -c core.sshCommand=/tmp/evil push')).toBe(true)
+    expect(surfaced('git --config-env=core.sshCommand=X push')).toBe(true)
+    expect(surfaced('git --exec-path=/tmp/evil pwn')).toBe(true)
+    expect(surfaced('git clone -u/tmp/evil ssh://host/repo')).toBe(true)
+  })
+
+  // MUST-STAY-BENIGN — non-clone `-c`/`--config` and everyday commands.
+  test('non-clone -c and --config plus everyday commands stay benign', () => {
+    expect(classify('Bash', { command: 'git switch -c feature=x' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'git switch -c feature' }, VARIANT1).tier).toBe('allow')
+    expect(surfaced('git commit -c HEAD')).toBe(false)
+    expect(surfaced('git commit -c HEAD --amend')).toBe(false)
+    expect(surfaced('git branch -c old new')).toBe(false)
+    expect(surfaced('git branch -c old=name copied')).toBe(false)
+    expect(classify('Bash', { command: 'git checkout -b x' }, VARIANT1).tier).toBe('allow')
+    expect(surfaced('git log -c')).toBe(false)
+    expect(surfaced('git show -c HEAD')).toBe(false)
+    expect(surfaced('git help --config')).toBe(false)
+    expect(classify('Bash', { command: 'git help --config ' }, VARIANT1).tier).toBe('allow')
+    expect(surfaced('git -C /path status')).toBe(false)
+    expect(surfaced('git push -u origin main')).toBe(false)
+    expect(classify('Bash', { command: 'git add -u' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'git config user.name x' }, VARIANT1).tier).toBe('allow')
+  })
+})

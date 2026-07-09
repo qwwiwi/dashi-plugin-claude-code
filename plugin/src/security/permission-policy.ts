@@ -399,24 +399,34 @@ function bashReferencesSecret(command: string): boolean {
 // visible command is still just "git push". These ALWAYS confirm and can
 // never appear in confirm_overrides (separate matcher, not in the built-in
 // substring list).
-// ANY `git -c <...>` (or its long form `--config`/`--config-env`) confirms:
-// quoting and include.path indirection make per-key matching leaky, and the
-// owner has accepted that only a clean `git push` auto-allows (Codex High
-// round 3 — tokenizing the shell is overkill; confirm-on-any-`-c` is the
-// minimal safe patch).
+// Short `-c` is git's GLOBAL config option ONLY when it precedes the
+// subcommand token (`git -c name=value <cmd>`). A `-c` AFTER the subcommand is
+// that subcommand's own flag and is benign — `git switch -c branch` (create),
+// `git commit -c HEAD` (reuse message), `git branch -c old new`, `git notes
+// add -c <obj>`. The old whole-command `-c` regex could not tell these apart
+// (it matched `-c` anywhere after the substring "git") and carded the owner on
+// every one, plus on non-git commands whose `-c` belongs to another program
+// while "git" only appears inside a string (`echo "git-exec-surface"; python3
+// -c …`). The detection is now POSITIONAL and command-anchored: split the
+// pipeline into segments, tokenize each git-bearing segment quote-aware, and a
+// global `-c` seen before the first non-option token is the surface (option B,
+// warchief 2026-07-08). The long forms (`--config`/`--config-env`,
+// `--upload-pack`/`--receive-pack`/`--exec`) never collide with benign
+// subcommand flags, so they keep their original position-independent semantics.
 //
 // `-c` is matched CASE-SENSITIVELY (lowercase only). git's `-C <dir>` (change
 // working directory) is a completely safe, extremely common flag that differs
-// from `-c <cfg>` (config injection) ONLY by case. The classifier lowercases
-// the command for substring matching, which collapsed `-C`→`-c` and raised a
-// confirm card on every `git -C …` — the single biggest false-positive in the
-// gate (2026-06-10). So gitExecSurface takes the RAW command and the `-c`
-// regex below has NO `/i` flag; `git` itself stays case-insensitive via the
-// explicit char classes, and the long forms keep `/i` (they are lowercase).
+// from `-c <cfg>` (config injection) ONLY by case. gitExecSurface takes the RAW
+// (case-preserved) command so `-C` never collapses onto `-c`; the long forms
+// keep `/i` (they are lowercase). GIT_DASH_C_RE survives only as the
+// conservative whole-command fallback for shell-indirection cases (see below).
 const GIT_DASH_C_RE = /[Gg][Ii][Tt]\b[^\n]*?\s-c(\s|=|["'])/
-const GIT_CONFIG_LONG_RE = /\bgit\b[^\n]*?--config(\s|=|-env)/i
+// `--exec` (transport exec alias) matches ONLY as the whole option — a trailing
+// `[\w-]` (i.e. `--exec-path`) is excluded: bare `--exec-path` merely PRINTS
+// git's exec path and is benign; `--exec-path=<path>` is handled as an explicit
+// surface in isLongExecSurfaceToken (Codex Sol r10).
 const GIT_FLAG_RE =
-  /\bgit\b[^\n]*?(--config-env|--upload-pack|--receive-pack|--exec)\b/i
+  /\bgit\b[^\n]*?(--config-env\b|--upload-pack\b|--receive-pack\b|--exec(?![\w-]))/i
 const GIT_HOOKS_WRITE_RE = /(\.git\/hooks\/|core\.hookspath)/i
 // Git config/exec indirection via environment variables — these reroute how
 // git push authenticates or which local program it runs, so a downgraded
@@ -478,38 +488,425 @@ export function segmentBashQuoteAware(command: string): string[] | null {
   return segs.map((s) => s.trim()).filter((s) => s.length > 0)
 }
 
-/** Any git config/exec flag in a segment. `-c` is case-sensitive (see RE); the
- *  long forms are case-insensitive. Operates on the RAW (case-preserved) text. */
-function gitFlagPresent(s: string): boolean {
-  return GIT_DASH_C_RE.test(s) || GIT_CONFIG_LONG_RE.test(s) || GIT_FLAG_RE.test(s)
+/** Position-independent ALWAYS-surface long forms: `--config-env`, the
+ *  transport-exec flags (`--upload-pack`/`--receive-pack`/`--exec`). NOTE: bare
+ *  `--config` is NOT here — it is the long form of `-c` and is dangerous only
+ *  WITH a config-assignment value (`git help --config` merely lists variables),
+ *  so config-family is value-gated in segmentGitExecSurface, not matched raw
+ *  (Codex Sol r11). Case-insensitive (the flags are lowercase). */
+function gitLongFormPresent(s: string): boolean {
+  return GIT_FLAG_RE.test(s)
+}
+
+/** True if a git-bearing segment carries a long-form config/exec flag. Keeps
+ *  the original segment/indirection semantics: pipeline neighbours can't be
+ *  blamed for git's flags, but shell indirection falls back to the whole-command
+ *  scan (fail-closed). */
+function gitLongFormSurface(rawCommand: string): boolean {
+  if (!gitLongFormPresent(rawCommand)) return false
+  // Indirection ($var/$(…)/`…`/wrapper fns) can route argv INTO git from
+  // elsewhere → conservative whole-command scan (a flag is already present).
+  if (/[$`]/.test(rawCommand)) return true
+  const segs = segmentBashQuoteAware(rawCommand)
+  if (segs === null) return true // unbalanced quotes → fail-closed
+  return segs.some((s) => /\bgit\b/i.test(s) && gitLongFormPresent(s))
+}
+
+/**
+ * Quote-aware argv tokenizer for ONE pipeline segment (top-level operators are
+ * already split by segmentBashQuoteAware). Splits on unquoted whitespace and
+ * returns each token's DEQUOTED value (surrounding quotes removed, `\` unescaped
+ * outside single quotes). The dequoted form lets the scan tell a real `git`
+ * command word from a quoted string literal such as `"'git-exec-surface'"`.
+ * Returns null on unbalanced quoting so the caller can fail closed.
+ */
+function tokenizeQuoteAware(segment: string): string[] | null {
+  const tokens: string[] = []
+  let deq = ''
+  let has = false // token exists (even if it dequotes to empty, e.g. "")
+  let quote: "'" | '"' | null = null
+  const flush = () => {
+    if (has) tokens.push(deq)
+    deq = ''
+    has = false
+  }
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i] as string
+    if (quote === "'") {
+      if (ch === "'") { quote = null; continue }
+      deq += ch; has = true; continue
+    }
+    if (quote === '"') {
+      if (ch === '\\') {
+        const nx = segment[i + 1]
+        if (nx !== undefined) { deq += nx; has = true; i++; continue }
+        deq += ch; has = true; continue
+      }
+      if (ch === '"') { quote = null; continue }
+      deq += ch; has = true; continue
+    }
+    if (ch === "'" || ch === '"') { quote = ch; has = true; continue }
+    if (ch === '\\') {
+      const nx = segment[i + 1]
+      if (nx !== undefined) { deq += nx; has = true; i++; continue }
+      continue
+    }
+    if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') { flush(); continue }
+    deq += ch; has = true
+  }
+  if (quote !== null) return null
+  flush()
+  return tokens
+}
+
+// git resolves an UNAMBIGUOUS long-option PREFIX to the full option, so
+// `--upl`/`--upload` == `--upload-pack`, `--rec`/`--receive` == `--receive-pack`.
+// ALWAYS-surface targets: they name a program to run / are the exec-env config
+// form, so they are a surface regardless of value (no benign
+// `git help --upload-pack`-style collision). `config` (the plain long form of
+// `-c`) is deliberately EXCLUDED here — it is value-gated (see config-family).
+const LONG_EXEC_PREFIX_TARGETS = ['upload-pack', 'receive-pack']
+
+/** A DEQUOTED token that is an ALWAYS-surface long exec flag (regardless of
+ *  value): `--exec` (run program, exact — `--exec-path` bare is NOT it),
+ *  `--exec-path=<nonempty>` (reroutes git's exec search path → RCE),
+ *  `--config-env` and its `--config-e…` prefixes (exec-env config), and the
+ *  `--upload-pack`/`--receive-pack` transport programs (down to 2-char
+ *  prefixes). Prefix abbreviations & fragment-rejoined forms are handled since
+ *  we match on the DEQUOTED name (Codex Sol r8/r10/r11). */
+function isAlwaysLongExecSurface(tok: string): boolean {
+  if (!tok.startsWith('--')) return false
+  // `--exec-path=<nonempty>` reroutes git's executable search path (RCE); bare
+  // `--exec-path` (no value, just prints) stays benign.
+  if (/^--exec-path=.+/.test(tok)) return true
+  const name = (tok.slice(2).split('=')[0] as string).toLowerCase()
+  if (name === 'exec') return true
+  // `--config-env` and its prefixes PAST "config" (`config-`, `config-e`, …);
+  // these resolve unambiguously to config-env (exec-env), always a surface.
+  if (name.length >= 7 && 'config-env'.startsWith(name)) return true
+  // Minimum 2 chars for the transport programs: git resolves `--up`==upload-pack
+  // etc.; no benign git long option is a 2-char prefix of these (verified vs
+  // --no-pager/--paginate/--oneline/--author/--amend/--all/--recurse-submodules/
+  // --reference). ACCEPTED RESIDUAL (documented): 1-char prefixes (`--u`) and
+  // deeper per-subcommand abbreviation ambiguity need git's full parse-options
+  // tables — infeasible in a heuristic.
+  if (name.length < 2) return false
+  return LONG_EXEC_PREFIX_TARGETS.some((t) => t.startsWith(name))
+}
+
+/** A DEQUOTED token that is the CONFIG-FAMILY long form of `-c`: `--config` and
+ *  its prefixes that resolve to `config` (`--c`/`--co`/`--con`/`--conf`/
+ *  `--confi`/`--config`) — NOT `--config-env`/`--config-e…` (those are
+ *  always-surface). Config-family sets git config only for `git clone`; it is a
+ *  surface there with any nonempty value, benign elsewhere (Codex Sol r13). */
+function isConfigFamilyToken(tok: string): boolean {
+  if (!tok.startsWith('--')) return false
+  const name = (tok.slice(2).split('=')[0] as string).toLowerCase()
+  return name.length >= 1 && 'config'.startsWith(name)
+}
+
+/** The value carried by a `-c`/`--config`-family token: the glued `=<value>`
+ *  tail if present, else the NEXT token. Returns undefined when there is no
+ *  value (bare flag at end of argv). */
+function consumedFlagValue(tok: string, next: string | undefined): string | undefined {
+  const eq = tok.indexOf('=')
+  if (eq >= 0) return tok.slice(eq + 1)
+  return next
+}
+
+/**
+ * SHORT `-c` config surface, POSITION/SUBCOMMAND model (Codex Sol r13 — replaces
+ * the leaky value-shape heuristic; git accepts URL-scoped / exotic config keys
+ * that no value regex can enumerate). There is NO benign config-set `-c`, so a
+ * `-c` with any nonempty consumed value is a surface exactly in the two
+ * config-setting positions:
+ *   - GLOBAL `-c` (before the subcommand): always config injection —
+ *     `git -c <key>=<value> <sub>`.
+ *   - `-c` when the SUBCOMMAND is `clone` (`git clone -c <key>=<value>`): sets
+ *     config pre-fetch.
+ * Any OTHER subcommand's `-c` is that subcommand's own flag (create branch,
+ * reuse message, combined diff) → benign: `git switch -c feature[=x]`,
+ * `git commit -c HEAD`, `git branch -c old[=name]`, `git log -c`,
+ * `git show -c HEAD`. `-C` (uppercase, change-dir) is never `-c`.
+ */
+function shortDashCConfig(tok: string, next: string | undefined, isGlobal: boolean, isCloneSub: boolean): boolean {
+  let val: string | undefined
+  if (tok === '-c') val = next
+  else if (tok.length > 2 && tok[0] === '-' && tok[1] === 'c') val = tok.slice(2)
+  if (val === undefined || val.length === 0) return false
+  return isGlobal || isCloneSub
+}
+
+/** True if a token is a real `git` command word (bare or path-qualified),
+ *  not a substring like `git-exec-surface` nor a quoted string literal. */
+function isGitToken(tok: string): boolean {
+  return tok === 'git' || /(?:^|\/)git$/.test(tok)
+}
+
+// git top-level options that consume the NEXT token as a SEPARATE value. Used
+// ONLY to skip over an option's value when locating the subcommand (so
+// `git -C /r clone …` reads `clone`, not `/r`, as the subcommand).
+const GIT_VALUE_GLOBAL_FLAGS = new Set([
+  '-C', '--git-dir', '--work-tree', '--namespace', '--super-prefix',
+  '--attr-source', '--shallow-file',
+])
+
+// Subcommands for which bare `-u` is the short alias of `--upload-pack` (selects
+// the executed transport program). For push/add/branch/… `-u` means something
+// else entirely (set-upstream, update), so the `-u` surface is scoped to these.
+const GIT_UPLOAD_PACK_U_SUBCOMMANDS = new Set(['clone', 'fetch', 'ls-remote', 'pull'])
+
+/** Index of the subcommand token in a git invocation: the first token after the
+ *  git token that is not an option and is not a value consumed by a preceding
+ *  separate-value global. Returns toks.length if none (bare `git` / only
+ *  options). A `-c` seen at index < this is a GLOBAL `-c`. */
+function gitSubcommandIndex(toks: string[], gitAt: number): number {
+  let i = gitAt + 1
+  while (i < toks.length) {
+    const tok = toks[i] as string
+    if (tok.length === 0) { i++; continue }
+    if (tok[0] !== '-') return i
+    if (tok === '-c' || GIT_VALUE_GLOBAL_FLAGS.has(tok)) { i += 2; continue }
+    i++
+  }
+  return toks.length
+}
+
+/**
+ * True if a git-bearing segment carries a git exec surface, using a
+ * POSITION-INDEPENDENT value-shape model (Codex Sol r7 — `git clone -c k=v`
+ * sets config AFTER the subcommand, and long transport flags come after it too,
+ * so the old "global before subcommand" boundary leaked). We require a real
+ * `git` token (dequoted exactly `git`/`.../git`) so a quoted string
+ * (`"git-exec-surface"`) is ignored and prefix wrappers (`env`, `sudo`, `xargs`,
+ * `command`, …) are still handled, then scan EVERY token after it for:
+ *   - a SHORT `-c` config surface — dotted key, `=` optional when GLOBAL
+ *     (pre-subcommand), `=` required when post-subcommand (see shortDashCConfig), or
+ *   - a LONG exec-surface flag (`--config`/`--config-env`, `--upload-pack`,
+ *     `--receive-pack`, `--exec`, incl. prefix abbreviations / fragment-rejoined
+ *     ones) anywhere, before OR after the subcommand, or
+ *   - a bare `-u` (`--upload-pack` alias) when the subcommand is fetch-family
+ *     (clone/fetch/ls-remote/pull) — scoped so `git push -u` / `git add -u`
+ *     stay benign (Codex Sol r8).
+ */
+function segmentGitExecSurface(segment: string): boolean {
+  const toks = tokenizeQuoteAware(segment)
+  if (toks === null) return true // weird quoting we can't tokenize → fail-closed
+  // ACCEPTED RESIDUAL (Codex Sol r3, deliberately not fixed): this scans for a
+  // `git` token in ANY position, not only the command position. So a `git` that
+  // is DATA to another command (`printf '%s\n' git -c user.name=x`) is treated
+  // as a command word and over-cards (confirms) even though git never runs.
+  // Fully closing it needs shell command-position parsing (rabbit hole); the
+  // over-card is harmless (safe-side false positive), so it stays.
+  let gitAt = -1
+  for (let g = 0; g < toks.length; g++) {
+    if (isGitToken(toks[g] as string)) { gitAt = g; break }
+  }
+  if (gitAt < 0) return false
+  const subIdx = gitSubcommandIndex(toks, gitAt)
+  const subcommand = subIdx < toks.length ? (toks[subIdx] as string) : ''
+  const fetchFamily = GIT_UPLOAD_PACK_U_SUBCOMMANDS.has(subcommand)
+  const isCloneSub = subcommand === 'clone'
+  for (let i = gitAt + 1; i < toks.length; i++) {
+    const tok = toks[i] as string
+    // Short `-c`: config surface when GLOBAL (pre-subcommand) or under `clone`.
+    if (shortDashCConfig(tok, toks[i + 1], i < subIdx, isCloneSub)) return true
+    if (isAlwaysLongExecSurface(tok)) return true
+    // Long config-family (`--config`/`--conf`/…) sets config ONLY for `clone`;
+    // any nonempty value there → surface, regardless of key shape (URL-scoped
+    // keys included). `git help --config` (not clone) stays benign.
+    if (isCloneSub && isConfigFamilyToken(tok)) {
+      const val = consumedFlagValue(tok, toks[i + 1])
+      if (val !== undefined && val.length > 0) return true
+    }
+    // `-u` == --upload-pack for fetch-family, separate (`-u /x`) OR stuck
+    // (`-u/x`). push/add/branch are not fetch-family, so their `-u` is benign.
+    if (fetchFamily && (tok === '-u' || (tok.startsWith('-u') && tok.length > 2))) return true
+  }
+  return false
+}
+
+const ANSI_C_SIMPLE: Record<string, string> = {
+  n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', f: '\f', v: '\v',
+  e: '\x1b', E: '\x1b', '\\': '\\', "'": "'", '"': '"', '?': '?',
+}
+
+/**
+ * Decode a bash ANSI-C `$'…'` body starting at `start` (just past the opening
+ * `'`). Handles `\xHH` hex, `\NNN` octal (1–3 digits), `\uHHHH`/`\UHHHHHHHH`
+ * and the standard escapes. Returns [decodedBytes, indexAfterClosingQuote,
+ * closed]. `closed=false` means the `'` was never found (unterminated).
+ */
+function decodeAnsiCBody(s: string, start: number): [string, number, boolean] {
+  let out = ''
+  let i = start
+  while (i < s.length) {
+    const c = s[i] as string
+    if (c === "'") return [out, i + 1, true]
+    if (c === '\\') {
+      const e = s[i + 1]
+      if (e === undefined) { out += '\\'; i++; continue }
+      if (e === 'x') {
+        const m = /^[0-9a-fA-F]{1,2}/.exec(s.slice(i + 2))
+        if (m) { out += String.fromCharCode(parseInt(m[0], 16)); i += 2 + m[0].length; continue }
+        out += 'x'; i += 2; continue
+      }
+      if (e === 'u' || e === 'U') {
+        const width = e === 'u' ? 4 : 8
+        const m = new RegExp(`^[0-9a-fA-F]{1,${width}}`).exec(s.slice(i + 2))
+        if (m) { out += String.fromCodePoint(parseInt(m[0], 16)); i += 2 + m[0].length; continue }
+        out += e; i += 2; continue
+      }
+      if (e >= '0' && e <= '7') {
+        const m = /^[0-7]{1,3}/.exec(s.slice(i + 1))
+        if (m) { out += String.fromCharCode(parseInt(m[0], 8) & 0xff); i += 1 + m[0].length; continue }
+      }
+      if (e in ANSI_C_SIMPLE) { out += ANSI_C_SIMPLE[e]; i += 2; continue }
+      out += e; i += 2; continue // unknown escape → keep the char
+    }
+    out += c; i++
+  }
+  return [out, i, false] // unterminated
+}
+
+/**
+ * Collapse bash quote/backslash concatenation AND ANSI-C encoding for the
+ * fail-closed indirection branch, so an encoded/fragmented `git`/`-c`/long-flag
+ * surfaces: `$'\x67\x69\x74'`→`git`, `-'c'`→`-c`, `-\c`→`-c`, `'g'it`→`git`,
+ * `--upload'-pack'`→`--upload-pack`. `$'…'` is decoded first (its escapes are
+ * special); an UNTERMINATED `$'…` is left verbatim so the caller can fail
+ * closed on the surviving `$'` marker. Not a full shell parse — just enough to
+ * defeat fragment splitting and ANSI-C encoding of the markers.
+ */
+function flattenIndirection(s: string): string {
+  let out = ''
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i] as string
+    if (ch === '$' && s[i + 1] === "'") {
+      const [decoded, next, closed] = decodeAnsiCBody(s, i + 2)
+      if (!closed) { out += s.slice(i); break } // unterminated → keep $' marker
+      out += decoded
+      i = next - 1 // for-loop ++ lands on the char after the closing quote
+      continue
+    }
+    if (ch === '\\') {
+      const nx = s[i + 1]
+      if (nx !== undefined) { out += nx; i++; continue }
+      continue // trailing backslash dropped
+    }
+    if (ch === "'" || ch === '"') continue // drop quote chars → fragments join
+    out += ch
+  }
+  return out
+}
+
+/** git config/exec surface: value-shape `-c name=value` + long exec flags on the
+ *  clean path (position-independent per segment), broad fail-closed under
+ *  shell indirection. */
+function gitGlobalDashCSurface(command: string): boolean {
+  // Shell indirection ($var/$(…)/`…`/wrapper fns) can route argv into git from
+  // another segment, and git may be GLUED inside a substitution/assignment
+  // (`x=$(git …`, `` `git …` ``) so it isn't even a clean token — positional
+  // tokenization is untrustworthy here. This branch runs ONLY when `$`/backtick
+  // is present, i.e. argv genuinely cannot be resolved, so we broadly FAIL
+  // CLOSED (Codex Sol HIGH r4): if a `git` word appears anywhere AND any config/
+  // exec-surface marker is present in the raw text, confirm. Over-confirming is
+  // accepted on the safe side — a benign `x=$(git switch -c "$b")` also confirms
+  // under indirection; we deliberately do not try to exempt it.
+  if (/[$`]/.test(command)) {
+    // bash reconstructs a token by concatenating adjacent quoted/unquoted/
+    // backslash fragments (`-'c'`→`-c`, `-\c`→`-c`, `'g'it`→`git`,
+    // `--upload'-pack'`→`--upload-pack`), which the RAW regexes miss. Build a
+    // FLATTENED view that drops quote chars and backslash-escapes so those
+    // fragments join, then run the git-word + marker checks on it (Codex Sol
+    // HIGH r5). This is the fail-closed indirection branch, so the resulting
+    // over-confirm (e.g. a benign `grep -c git` inside `$(…)`) is ACCEPTED on
+    // the safe side — we do not try to exempt it.
+    const flat = flattenIndirection(command)
+    const lc = flat.toLowerCase()
+    const flatToks = tokenizeQuoteAware(flat) ?? []
+    const marker =
+      GIT_DASH_C_RE.test(flat) || // `git … -c`
+      /-c(?:\s|=|$)/.test(flat) || // any short `-c` config marker (quotes dropped)
+      gitLongFormPresent(flat) || // --config-env / --upload-pack / --receive-pack
+      flatToks.some(isAlwaysLongExecSurface) || // + prefix abbreviations (`--upl=…`)
+      // Config-family (`--config …`/`--conf=…`) WITH a value → fail-closed under
+      // indirection (can't resolve the subcommand; safe-side, Codex Sol r13).
+      flatToks.some((t, idx) => {
+        if (!isConfigFamilyToken(t)) return false
+        const v = consumedFlagValue(t, flatToks[idx + 1])
+        return v !== undefined && v.length > 0
+      }) ||
+      // A dotted config-key assignment (`alias.pwn=`, `core.sshCommand=`,
+      // `user.name=`) — catches a variable-held `-c` whose flag we can't see but
+      // whose config payload is literal (`c=-c; git "$c" alias.pwn='!id' pwn`).
+      // Deliberately narrow: a DOTTED key + `=`, so `--author=`, `FOO=bar`, and
+      // `git checkout "$b"` (no dotted-key=) do NOT trip it (Codex Sol r7).
+      /\b[A-Za-z][\w-]*\.[\w.-]*=/.test(flat) ||
+      GIT_ENV_INDIRECTION_RE.test(lc) ||
+      GIT_HOOKS_WRITE_RE.test(lc)
+    if (!marker) return false
+    // A config/exec marker is present. Confirm if a git word appears in the
+    // decoded+flattened text, OR if an un-resolved ANSI-C `$'…'` remains (it
+    // could encode `git`/`-c` we couldn't fully decode) — fail closed, do NOT
+    // return false past it. This over-confirms a benign marker+`$'` with no git
+    // (accepted safe-side for the unresolvable indirection branch).
+    return /\bgit\b/.test(flat) || /\$'/.test(command)
+  }
+  const segs = segmentBashQuoteAware(command)
+  if (segs === null) return true // unbalanced quotes → fail-closed
+  return segs.some(segmentGitExecSurface)
+}
+
+/**
+ * Remove backslash-newline line continuations QUOTE-AWARE, mirroring bash:
+ * bash joins `\<newline>` OUTSIDE quotes and INSIDE double quotes, but PRESERVES
+ * it inside single quotes (no processing there). An escaped backslash (`\\`)
+ * consumes both backslashes so a following newline stays literal (parity).
+ */
+function stripLineContinuations(command: string): string {
+  let out = ''
+  let quote: "'" | '"' | null = null
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i] as string
+    if (quote === "'") {
+      out += ch
+      if (ch === "'") quote = null
+      continue
+    }
+    if (ch === "'" && quote === null) { quote = "'"; out += ch; continue }
+    if (ch === '"') { quote = quote === '"' ? null : '"'; out += ch; continue }
+    if (ch === '\\') {
+      const nx = command[i + 1]
+      // `\<newline>` (outside quotes or in double quotes) → line continuation.
+      if (nx === '\n') { i++; continue }
+      if (nx === '\r' && command[i + 2] === '\n') { i += 2; continue }
+      // Any other escaped char (incl. escaped backslash / escaped quote) — keep
+      // both so parity and quote state stay correct.
+      if (nx !== undefined) { out += ch + nx; i++; continue }
+      out += ch
+      continue
+    }
+    out += ch
+  }
+  return out
 }
 
 function gitExecSurface(rawCommand: string): boolean {
-  const lower = rawCommand.toLowerCase()
+  // bash removes backslash-newline line continuations before word splitting, so
+  // `git -\<newline>c …` is really `git -c …`. Strip them FIRST so
+  // segmentation/tokenization see the joined argv (Codex edge: the split `-`+`c`
+  // otherwise slips the positional scan). Quote-aware: single-quoted content is
+  // left untouched (bash preserves `\<newline>` inside single quotes).
+  const command = stripLineContinuations(rawCommand)
+  const lower = command.toLowerCase()
   // Hook-path writes and env indirection are segment-independent and
   // case-insensitive (GIT_SSH_COMMAND= etc. are uppercase env vars).
   if (GIT_HOOKS_WRITE_RE.test(lower) || GIT_ENV_INDIRECTION_RE.test(lower)) return true
-  // Fast path: if no config/exec flag appears ANYWHERE, no segmentation can
-  // create one (segments are substrings) — definitively safe. Match on the RAW
-  // command so `-c` keeps its case (`git -C` change-dir must NOT trip here).
-  if (!gitFlagPresent(rawCommand)) return false
-  // A flag matched somewhere. We only narrow to per-segment scanning (to
-  // suppress a pipeline neighbour's flag, e.g. `git show X | grep -c Y`) when
-  // there is NO shell indirection. Indirection ($var, $(...), `...`, arrays,
-  // wrapper functions) can route argv INTO git from another segment (Codex
-  // Critical: `g(){ git "$@"; }; g -c core.sshCommand=evil fetch`), so we fall
-  // back to the whole-command scan — at least as strict as the pre-segment
-  // behaviour. (Residual, pre-existing in that behaviour too: a flag that
-  // appears textually BEFORE git via a variable — `c='-c …'; git $c` — is not
-  // caught here; closing that needs real argv resolution, out of scope.)
-  if (/[$`]/.test(rawCommand)) {
-    return gitFlagPresent(rawCommand)
-  }
-  const segs = segmentBashQuoteAware(rawCommand)
-  if (segs === null) return true // unbalanced quotes → fail-closed
-  // Indirection-free, balanced: the flag can only belong to git if a
-  // git-bearing segment literally carries it.
-  return segs.some((s) => /\bgit\b/i.test(s) && gitFlagPresent(s))
+  // Position-independent long forms keep their original semantics.
+  if (gitLongFormSurface(command)) return true
+  // Short `-c` is git's global config option ONLY before the subcommand.
+  return gitGlobalDashCSurface(command)
 }
 
 // ── systemctl: verb-aware confirm (live FPs 2026-06-10) ─────────────────
