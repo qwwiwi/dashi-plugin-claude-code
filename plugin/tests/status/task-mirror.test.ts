@@ -780,3 +780,77 @@ describe('TaskMirror', () => {
     expect(opens).toBe(closes)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// M3 reality mirror — applyReconciledView (freshness + dedup/bucket-cross)
+// ─────────────────────────────────────────────────────────────────────
+
+describe('applyReconciledView', () => {
+  const rvTodos: TodoItem[] = [
+    { id: '1', content: 'Alpha', status: 'in_progress' },
+    { id: '2', content: 'Beta', status: 'pending' },
+  ]
+
+  test('renders the freshness header and sends once', async () => {
+    const { mirror, api } = makeMirror()
+    await mirror.applyReconciledView('chat-1', {
+      sessionId: SID,
+      todos: rvTodos,
+      freshness: { kind: 'fresh', reconciledAgeMs: 5_000 },
+    })
+    await mirror._idleForTests('chat-1')
+    expect(api.calls.filter((c) => c.kind === 'send')).toHaveLength(1)
+    expect(api.calls[0]!.text).toContain('<b>Задачи</b> · <i>сверено меньше минуты назад</i>')
+  })
+
+  test('same content + same minute bucket ⇒ no follow-up edit (dedup)', async () => {
+    const { mirror, api, clock } = makeMirror()
+    await mirror.applyReconciledView('chat-1', {
+      sessionId: SID,
+      todos: rvTodos,
+      freshness: { kind: 'fresh', reconciledAgeMs: 5_000 },
+    })
+    await mirror._idleForTests('chat-1')
+    const editsAfterFirst = api.calls.filter((c) => c.kind === 'edit').length
+
+    clock.advance(3000) // clear the throttle window
+    await mirror.applyReconciledView('chat-1', {
+      sessionId: SID,
+      todos: rvTodos,
+      freshness: { kind: 'fresh', reconciledAgeMs: 40_000 }, // still «меньше минуты»
+    })
+    await mirror._idleForTests('chat-1')
+    expect(api.calls.filter((c) => c.kind === 'edit').length).toBe(editsAfterFirst)
+  })
+
+  test('crossing a minute bucket ⇒ one edit', async () => {
+    const { mirror, api, clock } = makeMirror()
+    await mirror.applyReconciledView('chat-1', {
+      sessionId: SID,
+      todos: rvTodos,
+      freshness: { kind: 'fresh', reconciledAgeMs: 5_000 },
+    })
+    await mirror._idleForTests('chat-1')
+    const before = api.calls.filter((c) => c.kind === 'edit').length
+
+    clock.advance(3000)
+    await mirror.applyReconciledView('chat-1', {
+      sessionId: SID,
+      todos: rvTodos,
+      freshness: { kind: 'fresh', reconciledAgeMs: 65_000 }, // now «1 мин»
+    })
+    await mirror._idleForTests('chat-1')
+    expect(api.calls.filter((c) => c.kind === 'edit').length).toBe(before + 1)
+  })
+
+  test('empty list before any message is NOT materialised', async () => {
+    const { mirror, api } = makeMirror()
+    await mirror.applyReconciledView('chat-1', {
+      sessionId: SID,
+      todos: [],
+      freshness: { kind: 'unverified' },
+    })
+    await mirror._idleForTests('chat-1')
+    expect(api.calls).toHaveLength(0)
+  })
+})

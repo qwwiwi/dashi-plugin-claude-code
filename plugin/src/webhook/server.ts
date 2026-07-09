@@ -220,6 +220,17 @@ export interface AskUserQuestionUi {
   startQuestion(requestId: string): Promise<void> | void
 }
 
+// M3 reality mirror surface. All methods are synchronous best-effort (they
+// catch internally); the webhook calls them fire-and-forget so a reconciler
+// fault never touches the 200 path.
+export interface TaskRealityMirrorForWebhook {
+  onSessionStart(chatId: string, opts: { sessionId: string; cwd?: string }): void
+  onUserPromptSubmit(chatId: string, opts: { sessionId: string; cwd?: string }): void
+  onStop(chatId: string): void
+  onSessionEnd(chatId: string, opts: { sessionId: string }): void
+  onTaskEvent(chatId: string, event: TaskMirrorEvent, opts?: { cwd?: string }): void
+}
+
 export interface WebhookDeps {
   mcpServer: McpServer
   config: AppConfig
@@ -253,6 +264,14 @@ export interface WebhookDeps {
   // logged and swallowed; we still defensively wrap in try/catch here
   // to match the statusManager / progressReporter pattern.
   taskMirror?: TaskMirror
+  // M3 reality mirror (2026-07-09): reconciles the tool-event stream with the
+  // real task list Claude Code renders in the tmux pane. When present it is the
+  // SOLE driver of the two task surfaces (context HUD «Задачи» + TaskMirror) —
+  // the raw taskMirror.recordEvent / contextHud.onTodoEvent mutation dispatch
+  // below is bypassed so the reconciled (freshness-tagged) view is authoritative.
+  // Its methods are sync + best-effort (they catch internally). Optional —
+  // absent = legacy event-only path.
+  taskRealityMirror?: TaskRealityMirrorForWebhook
   // PR-A3 (M3 fix): InboundWatcher — on session_stop the webhook clears
   // the per-chat debounce marker so a fresh session can auto-reply on its
   // very first inbound message without waiting for the previous session's
@@ -426,6 +445,7 @@ async function handleRequest(
     memoryWriter,
     progressReporter,
     taskMirror,
+    taskRealityMirror,
     watcher,
   } = deps
   const method = req.method ?? 'GET'
@@ -620,6 +640,32 @@ async function handleRequest(
       }
     }
 
+    // M3 reality mirror: drive the pane-vs-events reconciliation on the session
+    // lifecycle. SessionStart binds + captures; UserPromptSubmit opens the turn
+    // window + captures; Stop captures then closes the window; SessionEnd
+    // freezes. All calls are sync best-effort (the mirror catches internally),
+    // fired fire-and-forget so the reconciler never touches the 200 path.
+    if (taskRealityMirror) {
+      const rm = taskRealityMirror
+      const cwd = payload.cwd
+      fireHud(log, () => {
+        switch (payload.hook_event_name) {
+          case 'SessionStart':
+            rm.onSessionStart(payload.chatId, { sessionId: payload.session_id, cwd })
+            break
+          case 'UserPromptSubmit':
+            rm.onUserPromptSubmit(payload.chatId, { sessionId: payload.session_id, cwd })
+            break
+          case 'Stop':
+            rm.onStop(payload.chatId)
+            break
+          case 'SessionEnd':
+            rm.onSessionEnd(payload.chatId, { sessionId: payload.session_id })
+            break
+        }
+      })
+    }
+
     // Phase 8: dispatch to memory writer first, BEFORE the status branch,
     // so memory persistence runs regardless of status.enabled. Errors are
     // logged and swallowed — memory must never back-pressure the 200.
@@ -685,7 +731,20 @@ async function handleRequest(
     // session change and finalizes on SessionEnd). The HUD's onTodoEvent
     // consumes ONLY mutations — its session lifecycle is driven by the
     // dedicated onSessionStart / onSessionEnd calls above.
-    if (taskMirror || deps.contextHud?.onTodoEvent) {
+    //
+    // M3: when the reality mirror is wired it is the SOLE driver of the task
+    // surfaces — mutation events feed it (it reconciles them against the pane
+    // and pushes a freshness-tagged view into both surfaces). The legacy direct
+    // taskMirror.recordEvent + contextHud.onTodoEvent path runs ONLY when the
+    // reconciler is absent, so the two never double-render.
+    if (taskRealityMirror) {
+      const todoEvent = toTodoWriteEvent(payload, log)
+      if (todoEvent !== null && isTaskMutationEvent(todoEvent)) {
+        const rm = taskRealityMirror
+        const cwd = payload.cwd
+        fireHud(log, () => rm.onTaskEvent(payload.chatId, todoEvent, { cwd }))
+      }
+    } else if (taskMirror || deps.contextHud?.onTodoEvent) {
       const todoEvent = toTodoWriteEvent(payload, log)
       if (todoEvent !== null) {
         if (taskMirror) {

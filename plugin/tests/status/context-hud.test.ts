@@ -875,3 +875,49 @@ describe('ContextHud onTodoEvent', () => {
     expect(last.text).not.toContain('старое')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// M3 reality mirror — applyReconciledView
+// ─────────────────────────────────────────────────────────────────────
+
+describe('applyReconciledView', () => {
+  test('renders the reconciled list + freshness label into the pinned card', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.applyReconciledView(OWNER, {
+      sessionId: 's1',
+      todos: [
+        { id: '1', content: 'живая задача', status: 'in_progress' },
+        { id: '2', content: 'ещё одна', status: 'pending' },
+      ],
+      freshness: { kind: 'fresh', reconciledAgeMs: 5_000 },
+    })
+    const text = api.sent.length > 0 ? api.sent[0]!.text : api.edited[api.edited.length - 1]!.text
+    expect(text).toContain('<b>Задачи</b> · <i>сверено меньше минуты назад</i>')
+    expect(text).toContain('живая задача')
+  })
+
+  test('non-owner chat is a no-op', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.applyReconciledView('-100999', {
+      sessionId: 's1',
+      todos: [{ id: '1', content: 'x', status: 'pending' }],
+      freshness: { kind: 'unverified' },
+    })
+    expect(api.sent.length).toBe(0)
+  })
+
+  test('«НЕ СВЕРЕНО» when the view is unverified', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.applyReconciledView(OWNER, {
+      sessionId: 's1',
+      todos: [{ id: '1', content: 'только событие', status: 'pending' }],
+      freshness: { kind: 'unverified' },
+    })
+    const text = api.sent[0]!.text
+    expect(text).toContain('<b>Задачи — НЕ СВЕРЕНО</b>')
+    expect(text).toContain('Показаны только события инструментов')
+  })
+})

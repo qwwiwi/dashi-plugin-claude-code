@@ -29,9 +29,7 @@
 //   • Voice transcription / screenshots.
 //   • Multiple panes per session.
 
-import { execFile } from 'child_process'
 import { createHash } from 'crypto'
-import { promisify } from 'util'
 
 import type { Logger } from '../log.js'
 import type { TelegramApi } from '../channel/tools.js'
@@ -47,6 +45,17 @@ import {
   type RenderMode,
   type SegmentType,
 } from './tmux-pane-filter.js'
+// The capture-pane exec seams + ANSI strip live in the shared pane-capture
+// module so TmuxMirror and TaskRealityMirror never duplicate the capture code
+// path. Re-exported below for backward-compat (tests import them from here).
+import {
+  defaultTmuxExec,
+  stripAnsi,
+  type TmuxExec,
+  type TmuxExecResult,
+} from './pane-capture.js'
+
+export type { TmuxExec, TmuxExecResult }
 
 /**
  * @deprecated Use {@link shouldMirrorTmuxForChat} from
@@ -71,16 +80,6 @@ export function shouldEnableMirror(
 ): boolean {
   return shouldMirrorTmuxForChat(policy ?? null, chatId)
 }
-
-export interface TmuxExecResult {
-  stdout: string
-  stderr: string
-  exitCode: number
-}
-
-// Test seam: the production wrapper calls `tmux capture-pane`; tests
-// inject a deterministic stub. Args are exactly the argv after the binary.
-export type TmuxExec = (args: readonly string[]) => Promise<TmuxExecResult>
 
 export interface TmuxMirrorOptions {
   api: TelegramApi
@@ -169,24 +168,8 @@ const BUMP_DEBOUNCE_MS = 1500
 const BUMP_WAIT_MAX_MS = 2000
 const BUMP_WAIT_TICK_MS = 25
 
-// Strip ANSI / vt control sequences and bare control characters. Keep
-// newlines + tabs. Patterns:
-//   • CSI:  ESC [ ... terminator-letter
-//   • OSC:  ESC ] ... BEL  OR  ESC ] ... ST (ESC \)
-//   • DCS/PM/APC/SOS: ESC (P|^|_|X) ... ST
-//   • two-byte: ESC + single char in @-Z, \, -, _
-// Stripping happens BEFORE htmlEscape so leftover characters can't blow up
-// Telegram's HTML parser. ST is `ESC \`; we accept both BEL and ST as
-// terminators for OSC since real terminals emit either.
-const ANSI_RE =
-  // eslint-disable-next-line no-control-regex
-  /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][\s\S]*?(?:\x07|\x1b\\)|[P^_X][\s\S]*?\x1b\\|[@-Z\\\-_])/g
-// eslint-disable-next-line no-control-regex
-const CTRL_RE = /[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g
-
-function stripAnsi(text: string): string {
-  return text.replace(ANSI_RE, '').replace(CTRL_RE, '')
-}
+// ANSI / control stripping is provided by the shared pane-capture module
+// (imported above as `stripAnsi`) so the capture code path is single-sourced.
 
 // Claude Code's pane decorates output with glyphs that iOS Telegram renders
 // with EMOJI presentation (⏺ U+23FA tool bullet, ⚠ U+26A0 warning). The
@@ -216,27 +199,8 @@ function hash(text: string): string {
   return createHash('sha256').update(text).digest('hex').slice(0, 16)
 }
 
-// Default exec: spawn tmux and capture stdout/stderr. We never throw on
-// non-zero exit so the caller can render the failure state instead of
-// crashing the polling loop.
-const execFileAsync = promisify(execFile)
-async function defaultTmuxExec(args: readonly string[]): Promise<TmuxExecResult> {
-  try {
-    const { stdout, stderr } = await execFileAsync('tmux', args as string[], {
-      maxBuffer: 4 * 1024 * 1024,
-      encoding: 'utf8',
-      timeout: 5000,
-    })
-    return { stdout, stderr, exitCode: 0 }
-  } catch (err) {
-    const e = err as { stdout?: string; stderr?: string; code?: number; message?: string }
-    return {
-      stdout: e.stdout ?? '',
-      stderr: e.stderr ?? e.message ?? 'tmux exec failed',
-      exitCode: typeof e.code === 'number' ? e.code : 1,
-    }
-  }
-}
+// Default exec lives in pane-capture (shared with TaskRealityMirror), imported
+// above as `defaultTmuxExec`.
 
 // Render the body. Wraps content in a `<pre>` block and enforces the body
 // cap by trimming from the TOP (oldest lines) — the warchief almost always

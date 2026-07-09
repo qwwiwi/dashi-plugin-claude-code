@@ -27,6 +27,7 @@ import { join } from 'node:path'
 import { classifyEditError } from '../safety/telegram-edit-classifier.js'
 import { readContextUsage as realReadContextUsage, type ContextUsage } from './context-usage.js'
 import { applyTaskCreateToMap, applyTaskUpdateToMap } from './task-mirror.js'
+import { renderFreshnessHeader, type TaskFreshness } from './task-freshness.js'
 import type { TaskMirrorEvent } from '../hooks/claude-events.js'
 import type { TodoItem } from '../schemas.js'
 import type { EditOpts, InlineKeyboardLike, SendMessageOpts } from '../channel/tools.js'
@@ -75,6 +76,9 @@ export function buildHudKeyboard(): InlineKeyboardLike {
 export interface HudWorkView {
   todos: ReadonlyArray<TodoItem>
   permissionMode?: string
+  // M3 reality mirror: when present, the «Задачи» header carries a freshness
+  // indicator («сверено … / ДАННЫЕ УСТАРЕЛИ / НЕ СВЕРЕНО / сессия завершена»).
+  freshness?: TaskFreshness
 }
 
 // Caps for the tasks section. The HUD is a compact pinned card, not the full
@@ -113,7 +117,10 @@ function taskLine(todo: TodoItem): string {
  * Empty todos → empty string (the HUD omits the section entirely).
  * PURE — exported for unit tests.
  */
-export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
+export function renderStatusTasks(
+  todos: ReadonlyArray<TodoItem>,
+  freshness?: TaskFreshness,
+): string {
   if (todos.length === 0) return ''
   const inProgress = todos.filter((t) => t.status === 'in_progress')
   const pending = todos.filter((t) => t.status === 'pending')
@@ -127,7 +134,12 @@ export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
   // The header (bar + count) stays OUTSIDE the collapsible quote so progress is
   // always visible when collapsed; the per-task detail goes INSIDE an
   // <blockquote expandable>, so the pin reads «progress — tap to expand the list».
-  const header = `<b>Задачи</b> ${bar} ${done}/${total}`
+  // M3: when a freshness indicator is supplied the bold «Задачи» label is
+  // replaced by the freshness label (+ optional subline), so the pin shows how
+  // recently the list was reconciled against the real pane.
+  const fh = freshness !== undefined ? renderFreshnessHeader(freshness) : { label: '<b>Задачи</b>' }
+  const header = `${fh.label} ${bar} ${done}/${total}`
+  const subLine = 'sub' in fh && fh.sub !== undefined ? `\n${fh.sub}` : ''
 
   const detail: string[] = []
   for (const t of inProgress) detail.push(taskLine(t))
@@ -144,7 +156,7 @@ export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
   // in-progress, and escaping expands after the per-line cut. The header is
   // always kept (counted first); drop overflowing detail lines, mark the cut.
   const out: string[] = []
-  let used = header.length
+  let used = header.length + subLine.length
   let dropped = 0
   for (const line of detail) {
     if (used + 1 + line.length <= TASKS_MAX_CHARS) {
@@ -156,8 +168,8 @@ export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
   }
   if (dropped > 0) out.push(`<i>+${dropped} строк скрыто</i>`)
 
-  if (out.length === 0) return header
-  return `${header}\n<blockquote expandable>${out.join('\n')}</blockquote>`
+  if (out.length === 0) return `${header}${subLine}`
+  return `${header}${subLine}\n<blockquote expandable>${out.join('\n')}</blockquote>`
 }
 
 // «план» is the only mode worth naming; every other Claude Code permission
@@ -193,7 +205,7 @@ export function renderHud(
     work?.permissionMode !== undefined && work.permissionMode.length > 0
       ? `\n<i>режим: ${modeLabel(work.permissionMode)}</i>`
       : ''
-  const tasksBlock = work !== undefined ? renderStatusTasks(work.todos) : ''
+  const tasksBlock = work !== undefined ? renderStatusTasks(work.todos, work.freshness) : ''
   const tasksSection = tasksBlock.length > 0 ? `\n\n${tasksBlock}` : ''
   const tail = `${modelLine}${modeLine}${tasksSection}`
 
@@ -291,6 +303,12 @@ export class ContextHud {
   // does not clear it, so the pinned card keeps showing «что сделали» until
   // the next task replaces the snapshot.
   private readonly work = new Map<string, { todos: ReadonlyArray<TodoItem>; taskMap: Map<string, TodoItem> }>()
+  // M3 reality mirror: the reconciled view (real pane-verified list + freshness)
+  // per chat. When present it SUPERSEDES the event-only `work` snapshot in the
+  // render — the pin then reflects the harness's real task list. Fed by
+  // TaskRealityMirror.applyReconciledView; the raw onTodoEvent path is bypassed
+  // when the reconciler is wired (server.ts), so the two never fight.
+  private readonly reconciled = new Map<string, { todos: ReadonlyArray<TodoItem>; freshness: TaskFreshness }>()
   // Per-chat session id, tracked from SessionStart + task events. Used to decide
   // when to CLEAR the task snapshot: a genuine session change clears it; a
   // compact (same id) preserves it. SessionStart fires for startup / resume /
@@ -367,6 +385,9 @@ export class ContextHud {
       // milestones (renderStatusTasks returns '' for an empty list → the
       // section is omitted until fresh TodoWrite/TaskCreate events arrive).
       this.work.delete(chatId)
+      // M3: also drop the reconciled view; TaskRealityMirror re-pushes a fresh
+      // «НЕ СВЕРЕНО» view for the new session immediately after.
+      this.reconciled.delete(chatId)
     }
     // Compact / resume / first-ever start (same or unknown id) preserve the
     // snapshot. Track the latest known id for the next comparison.
@@ -453,6 +474,23 @@ export class ContextHud {
         state.todos = Array.from(state.taskMap.values())
         break
     }
+    return this.updateNow(chatId)
+  }
+
+  // M3 reality mirror: adopt the reconciled (pane-verified) task view + its
+  // freshness indicator and refresh the pin in place. This SUPERSEDES the
+  // event-only `work` snapshot in the render, so the pin reflects the harness's
+  // real task list even when the agent skipped the task tools. Best-effort +
+  // serialized like every other HUD op; gates on owner + enabled.
+  applyReconciledView(
+    chatId: string,
+    view: { sessionId: string; todos: ReadonlyArray<TodoItem>; freshness: TaskFreshness },
+  ): Promise<void> {
+    if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
+    this.reconciled.set(chatId, { todos: view.todos, freshness: view.freshness })
+    // Keep the tracked session id coherent so a later onSessionStart correctly
+    // detects a genuine change.
+    this.sessionIds.set(chatId, view.sessionId)
     return this.updateNow(chatId)
   }
 
@@ -564,12 +602,15 @@ export class ContextHud {
         usage = null
       }
     }
-    const work: HudWorkView = {
-      todos: this.work.get(chatId)?.todos ?? [],
-      ...(info.permissionMode !== undefined && info.permissionMode.length > 0
+    // M3: the reconciled (pane-verified) view wins over the event-only snapshot.
+    const rv = this.reconciled.get(chatId)
+    const permissionMode =
+      info.permissionMode !== undefined && info.permissionMode.length > 0
         ? { permissionMode: info.permissionMode }
-        : {}),
-    }
+        : {}
+    const work: HudWorkView = rv !== undefined
+      ? { todos: rv.todos, freshness: rv.freshness, ...permissionMode }
+      : { todos: this.work.get(chatId)?.todos ?? [], ...permissionMode }
     return renderHud(usage, this.windowTokens, info.model, work)
   }
 

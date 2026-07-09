@@ -51,6 +51,8 @@ import { StatusManager } from './status/status-manager.js'
 import { ProgressReporter } from './status/progress-reporter.js'
 import { TaskMirror } from './status/task-mirror.js'
 import { TmuxMirror } from './status/tmux-mirror.js'
+import { defaultTmuxExec } from './status/pane-capture.js'
+import { TaskRealityMirror } from './status/task-reality-mirror.js'
 import { SessionInfoStore } from './status/session-info.js'
 import {
   ContextHud,
@@ -606,6 +608,48 @@ if (config.tmux_mirror.enabled) {
     process.once('SIGINT', shutdownMirror)
     process.once('SIGTERM', shutdownMirror)
   }
+}
+
+// Env gate for the M3 reconciler (behaviour-changing surface, off by default).
+// Accepts `1` / `true` / `yes` / `on` (case-insensitive).
+function resolveTaskReconcilerEnabled(): boolean {
+  const v = (process.env.JARVIS_TASK_RECONCILER ?? '').trim().toLowerCase()
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on'
+}
+
+// TaskRealityMirror (M3, 2026-07-09) — reconciles the tool-event stream with
+// the REAL task list Claude Code renders in the tmux pane, so the context HUD
+// «Задачи» section and the TaskMirror message reflect reality even when the
+// agent forgets to call the task tools. Default-OFF: opt in with
+// JARVIS_TASK_RECONCILER=1 (behaviour-changing surface, warchief-gated, like
+// tmux_mirror). Reuses the tmux_mirror pane target/socket (the agent's task
+// list renders in that same pane) and captures a wider window (200 lines) so a
+// long list is always in view. Owner-DM-gated; each sink also gates internally.
+let taskRealityMirror: TaskRealityMirror | undefined
+if (resolveTaskReconcilerEnabled()) {
+  const paneTarget = config.tmux_mirror.pane_target || 'channel-thrall:0.0'
+  const ownerSet = new Set(hudOwnerChatIds.map(String))
+  taskRealityMirror = new TaskRealityMirror({
+    exec: defaultTmuxExec,
+    capture: {
+      paneTarget,
+      ...(config.tmux_mirror.socket_name ? { socketName: config.tmux_mirror.socket_name } : {}),
+      lineCount: 200,
+    },
+    log,
+    sinks: [contextHud, taskMirror],
+    // Owner DM only (positive numeric chat id in the owner set) — the pane is
+    // the single global DM session; a group chat must never be reconciled.
+    isOwnerChat: (chatId: string): boolean => {
+      if (!ownerSet.has(chatId)) return false
+      const n = Number(chatId)
+      return Number.isInteger(n) && n > 0
+    },
+  })
+  log.info('task reality mirror configured', { pane_target: paneTarget })
+  const shutdownReality = (): void => taskRealityMirror?.stop()
+  process.once('SIGINT', shutdownReality)
+  process.once('SIGTERM', shutdownReality)
 }
 
 // InboundWatcher (PR-A3, 2026-05-20) — auto-reply «Тралл занят» when the
@@ -1384,6 +1428,7 @@ try {
     contextHud,
     progressReporter,
     taskMirror,
+    ...(taskRealityMirror !== undefined ? { taskRealityMirror } : {}),
     watcher: inboundWatcher,
     ...(memoryWriter !== undefined ? { memoryWriter } : {}),
     // PRX-1 TASK-3 (2026-05-27): AskUserQuestion HTTP relay routes.

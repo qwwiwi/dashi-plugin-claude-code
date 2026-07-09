@@ -39,6 +39,7 @@ import type { TaskMirrorEvent } from '../hooks/claude-events.js'
 import type { TodoItem } from '../schemas.js'
 import type { TelegramApiForProgress } from './telegram-api.js'
 import { escapeHtml } from '../format/html.js'
+import { renderFreshnessHeader, type TaskFreshness } from './task-freshness.js'
 
 // Telegram editMessageText cap (4096 chars). Default render budget below it
 // — the spec asks for ~3500-char headroom (see plan §3 file 4).
@@ -97,6 +98,10 @@ interface ChatTaskEntry {
   // after every mutation so `scheduleFlush` keeps using the existing renderer.
   // Insertion-order Map keeps the visual ordering stable across renders.
   taskMap: Map<string, TodoItem>
+  // M3 reality mirror: freshness indicator for the «Задачи» header. Set by
+  // applyReconciledView; undefined in the legacy event-only path (header stays
+  // the plain «Задачи»).
+  freshness?: TaskFreshness
   // Last text we actually sent / edited. Idempotency gate.
   lastRenderedText?: string
   // Timestamp of the last successful send or edit. Used for throttle.
@@ -296,6 +301,60 @@ export class TaskMirror {
     }
   }
 
+  /**
+   * M3 reality mirror entry point. Publishes a reconciled (pane-verified) task
+   * list + freshness indicator into the rolling message. The reconciled list is
+   * the FULL authoritative list, so it replaces the snapshot wholesale (clears
+   * the incremental taskMap). Serialized per chat like recordEvent; never throws.
+   *
+   * When the reconciler is wired (server.ts), the raw recordEvent path is
+   * bypassed and this is the sole driver — so the two never fight over `todos`.
+   * An empty list before any message exists is NOT materialised (we don't post
+   * an empty «задач нет» card for a fresh session with no tasks yet).
+   */
+  async applyReconciledView(
+    chatId: string,
+    view: { sessionId: string; todos: ReadonlyArray<TodoItem>; freshness: TaskFreshness },
+  ): Promise<void> {
+    if (!this.config.task_mirror.enabled) return
+    await this.runSerialized(chatId, () => this.applyReconciledViewInner(chatId, view))
+  }
+
+  private async applyReconciledViewInner(
+    chatId: string,
+    view: { sessionId: string; todos: ReadonlyArray<TodoItem>; freshness: TaskFreshness },
+  ): Promise<void> {
+    try {
+      await this.ensureSessionForMutation(chatId, view.sessionId)
+      const entry = this.getOrCreate(chatId)
+      if (entry.stopped) return
+      entry.sessionId = view.sessionId
+      entry.lastActivityMs = this.now()
+      // Reconciled list is the full authoritative snapshot.
+      entry.taskMap.clear()
+      entry.todos = view.todos
+      entry.freshness = view.freshness
+      // Don't create an empty card for a fresh session with no tasks yet; wait
+      // until a task actually appears. Once a message exists we keep editing it
+      // (a freshness change on a non-empty list still updates in place).
+      if (entry.messageId === undefined && view.todos.length === 0) return
+      if (entry.messageId !== undefined) this.persistEntry(entry)
+      this.scheduleFlush(entry)
+      if (entry.messageId === undefined && entry.flushPromise !== null) {
+        try {
+          await entry.flushPromise
+        } catch {
+          /* already logged inside executeFlush */
+        }
+      }
+    } catch (err) {
+      this.log.warn('task mirror applyReconciledView failed (ignored)', {
+        chat_id: chatId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
   // Serialize an operation per chat. The returned promise resolves when THIS op
   // completes; the next call for the same chat waits for it. `fn` swallows its
   // own errors (recordEventInner try/catch), so the chain never rejects.
@@ -479,7 +538,7 @@ export class TaskMirror {
    */
   private scheduleFlush(entry: ChatTaskEntry): void {
     if (entry.stopped) return
-    const text = this.safeRender(entry.todos)
+    const text = this.safeRender(entry.todos, entry.freshness)
     if (!text || text === entry.lastRenderedText) return
     entry.desiredText = text
 
@@ -636,14 +695,14 @@ export class TaskMirror {
    * the safety margin renderTodoList reserves.
    */
   private renderFinal(entry: ChatTaskEntry): string {
-    const block = this.safeRender(entry.todos)
+    const block = this.safeRender(entry.todos, entry.freshness)
     if (!block) return ''
     return `${block}\n<i>сессия завершена</i>`
   }
 
-  private safeRender(todos: ReadonlyArray<TodoItem>): string {
+  private safeRender(todos: ReadonlyArray<TodoItem>, freshness?: TaskFreshness): string {
     try {
-      return renderTodoList(todos, this.config.task_mirror.collapse_completed_after)
+      return renderTodoList(todos, this.config.task_mirror.collapse_completed_after, undefined, freshness)
     } catch (err) {
       this.log.warn('task mirror render failed (ignored)', {
         error: err instanceof Error ? err.message : String(err),
@@ -759,9 +818,17 @@ export function renderTodoList(
   todos: ReadonlyArray<TodoItem>,
   collapseCompletedAfter: number,
   maxChars: number = DEFAULT_MAX_CHARS,
+  freshness?: TaskFreshness,
 ): string {
+  // M3: the bold «Задачи» header is replaced by the reconciliation-freshness
+  // label (+ optional subline) when a freshness value is supplied.
+  const fh = freshness !== undefined ? renderFreshnessHeader(freshness) : { label: '<b>Задачи</b>' }
+  const headerLabel = fh.label
+  const headerSub = 'sub' in fh && fh.sub !== undefined ? fh.sub : undefined
+
   if (todos.length === 0) {
-    return '<b>Задачи</b>\n<i>задач нет</i>'
+    const subLine = headerSub !== undefined ? `\n${headerSub}` : ''
+    return `${headerLabel}${subLine}\n<i>задач нет</i>`
   }
 
   let doneCount = 0
@@ -787,7 +854,7 @@ export function renderTodoList(
     }
   }
 
-  const header = '<b>Задачи</b>'
+  const headerLines = headerSub !== undefined ? [headerLabel, headerSub] : [headerLabel]
   const counts = `${doneCount} done / ${inProgressCount} in progress / ${pendingCount} pending`
 
   // Show only the last N completed items; older ones collapse into a tail
@@ -798,7 +865,7 @@ export function renderTodoList(
     : []
   const hiddenCompletedCount = completed.length - visibleCompleted.length
 
-  const lines: string[] = [header, counts, '']
+  const lines: string[] = [...headerLines, counts, '']
   for (const t of inProgress) lines.push(`${ICONS.in_progress} ${escapeTodoLine(t)}`)
   for (const t of pending) lines.push(`${ICONS.pending} ${escapeTodoLine(t)}`)
   if (hiddenCompletedCount > 0) {
@@ -812,8 +879,8 @@ export function renderTodoList(
   // Over budget. Truncation pass: drop trailing pending lines first, then
   // completed. Always keep header + counts + at least the in-progress block.
   const safeBudget = maxChars - TRUNCATE_MARGIN
-  // Header block (header + counts + blank line) is mandatory.
-  const headerBlock = [header, counts, ''].join('\n')
+  // Header block (header + optional freshness subline + counts + blank line) is mandatory.
+  const headerBlock = [...headerLines, counts, ''].join('\n')
   const inProgressBlock = inProgress
     .map((t) => `${ICONS.in_progress} ${escapeTodoLine(t)}`)
     .join('\n')
