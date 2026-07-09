@@ -17,7 +17,10 @@
 //  10. collapse_completed_after: «+M завершено ранее» tail.
 //  11. Long todo lines stay under Telegram's 4096-char cap.
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   TaskMirror,
@@ -159,7 +162,26 @@ function makeFakeApi(): FakeApi {
   return state
 }
 
-function makeMirror(opts: { config?: AppConfig; clock?: FakeClock; api?: FakeApi } = {}): {
+// Track temp dirs for cleanup (persistence tests).
+const tmpDirs: string[] = []
+function stateDir(): string {
+  const d = mkdtempSync(join(tmpdir(), 'task-mirror-'))
+  tmpDirs.push(d)
+  return d
+}
+afterEach(() => {
+  for (const d of tmpDirs.splice(0)) {
+    try {
+      rmSync(d, { recursive: true, force: true })
+    } catch {
+      /* ignore */
+    }
+  }
+})
+
+function makeMirror(
+  opts: { config?: AppConfig; clock?: FakeClock; api?: FakeApi; stateDir?: string } = {},
+): {
   mirror: TaskMirror
   clock: FakeClock
   api: FakeApi
@@ -175,21 +197,27 @@ function makeMirror(opts: { config?: AppConfig; clock?: FakeClock; api?: FakeApi
     now: () => clock.now,
     setTimer: clock.setTimer,
     clearTimer: clock.clearTimer,
+    ...(opts.stateDir !== undefined ? { stateDir: opts.stateDir } : {}),
   })
   return { mirror, clock, api, config }
 }
 
-function todoEvent(todos: TodoItem[]): TaskMirrorEvent {
-  return { kind: 'todo_write', todos }
+// Default session id used by the helpers so existing tests keep a single,
+// stable session unless they explicitly pass a different one.
+const SID = 'sess-A'
+
+function todoEvent(todos: TodoItem[], sessionId: string = SID): TaskMirrorEvent {
+  return { kind: 'todo_write', sessionId, todos }
 }
 
 function taskCreateEvent(
   toolUseId: string,
   subject: string,
-  opts: { activeForm?: string; toolResult?: string } = {},
+  opts: { activeForm?: string; toolResult?: string; sessionId?: string } = {},
 ): TaskMirrorEvent {
   const event: Extract<TaskMirrorEvent, { kind: 'task_create' }> = {
     kind: 'task_create',
+    sessionId: opts.sessionId ?? SID,
     toolUseId,
     input: {
       subject,
@@ -208,9 +236,11 @@ function taskUpdateEvent(
     subject: string
     activeForm: string
   }>,
+  sessionId: string = SID,
 ): TaskMirrorEvent {
   return {
     kind: 'task_update',
+    sessionId,
     toolUseId: `tu-update-${taskId}`,
     input: {
       taskId,
@@ -219,7 +249,13 @@ function taskUpdateEvent(
   }
 }
 
-const STOP: TaskMirrorEvent = { kind: 'todo_session_stop' }
+function sessionStart(sessionId: string, source?: 'startup' | 'resume' | 'clear' | 'compact'): TaskMirrorEvent {
+  return { kind: 'session_start', sessionId, ...(source !== undefined ? { source } : {}) }
+}
+
+function sessionEnd(sessionId: string = SID): TaskMirrorEvent {
+  return { kind: 'session_end', sessionId }
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Tests — recordEvent / lifecycle
@@ -306,7 +342,7 @@ describe('TaskMirror', () => {
     expect(edits[0]!.text).toContain('Step C')
   })
 
-  test('session_stop ships final edit with «сессия завершена» marker and evicts entry', async () => {
+  test('session_end ships final edit with «сессия завершена» marker and evicts entry', async () => {
     const { mirror, clock, api } = makeMirror()
     await mirror.recordEvent('chat-1', todoEvent([
       { content: 'Step A', status: 'in_progress' },
@@ -319,7 +355,7 @@ describe('TaskMirror', () => {
     const editsBeforeStop = api.calls.filter((c) => c.kind === 'edit').length
     expect(editsBeforeStop).toBeGreaterThanOrEqual(1)
 
-    await mirror.recordEvent('chat-1', STOP)
+    await mirror.recordEvent('chat-1', sessionEnd())
     // Final edit contains the «сессия завершена» marker.
     const editsAfterStop = api.calls.filter((c) => c.kind === 'edit')
     const finalEdit = editsAfterStop[editsAfterStop.length - 1]
@@ -336,7 +372,7 @@ describe('TaskMirror', () => {
     expect(sends[1]!.messageId).toBe(201)
   })
 
-  test('session_stop on an unchanged snapshot STILL fires a final edit (marker breaks idempotency)', async () => {
+  test('session_end on an unchanged snapshot STILL fires a final edit (marker breaks idempotency)', async () => {
     const { mirror, clock, api } = makeMirror()
     // One TodoWrite — establishes the message.
     await mirror.recordEvent('chat-1', todoEvent([
@@ -349,13 +385,16 @@ describe('TaskMirror', () => {
 
     // STOP: even though the snapshot is byte-for-byte the same as the initial
     // send, the marker guarantees the final text differs, so an edit fires.
-    await mirror.recordEvent('chat-1', STOP)
+    await mirror.recordEvent('chat-1', sessionEnd())
     const edits = api.calls.filter((c) => c.kind === 'edit')
     expect(edits.length).toBe(1)
     expect(edits[0]!.text).toContain('сессия завершена')
   })
 
-  test('TTL eviction: idle entry past session_ttl_ms starts a fresh thread', async () => {
+  test('TTL does NOT expire an active same-session snapshot (orphan cleanup only)', async () => {
+    // New semantics: the mirror no longer finalizes on Stop, so an idle gap is
+    // normal. A same-session update after a long idle must EDIT the existing
+    // message, never start a fresh thread — the warchief keeps his task list.
     const { mirror, clock, api } = makeMirror({
       config: makeConfig({ session_ttl_ms: 60_000 }),
     })
@@ -364,18 +403,21 @@ describe('TaskMirror', () => {
     ]))
     expect(api.calls.filter((c) => c.kind === 'send').length).toBe(1)
 
-    clock.advance(60_001)
+    clock.advance(60_001) // long idle, but SAME session
     await mirror.recordEvent('chat-1', todoEvent([
+      { content: 'Step A', status: 'completed' },
       { content: 'Step B', status: 'in_progress' },
     ]))
+    await mirror._idleForTests('chat-1')
     const sends = api.calls.filter((c) => c.kind === 'send')
     const edits = api.calls.filter((c) => c.kind === 'edit')
-    expect(sends.length).toBe(2)
-    expect(sends[1]!.messageId).toBe(201)
-    expect(edits.length).toBe(0)
+    expect(sends.length).toBe(1) // no fresh thread
+    expect(edits.length).toBe(1) // same message edited in place
+    expect(edits[0]!.messageId).toBe(200)
+    expect(edits[0]!.text).toContain('Step B')
   })
 
-  test('multi-chat isolation: chat A stop does not affect chat B', async () => {
+  test('multi-chat isolation: chat A session end does not affect chat B', async () => {
     const { mirror, clock, api } = makeMirror()
     await mirror.recordEvent('chat-A', todoEvent([
       { content: 'A1', status: 'in_progress' },
@@ -386,7 +428,7 @@ describe('TaskMirror', () => {
     const sendsAfterInit = api.calls.filter((c) => c.kind === 'send')
     expect(sendsAfterInit.length).toBe(2)
 
-    await mirror.recordEvent('chat-A', STOP)
+    await mirror.recordEvent('chat-A', sessionEnd())
     clock.advance(3001)
     // Chat B still owns its message.
     await mirror.recordEvent('chat-B', todoEvent([
@@ -406,7 +448,7 @@ describe('TaskMirror', () => {
     await mirror.recordEvent('chat-1', todoEvent([
       { content: 'X', status: 'in_progress' },
     ]))
-    await mirror.recordEvent('chat-1', STOP)
+    await mirror.recordEvent('chat-1', sessionEnd())
     expect(api.calls.length).toBe(0)
   })
 
@@ -509,6 +551,154 @@ describe('TaskMirror', () => {
     expect(sends.length).toBe(1)
     expect(sends[0]!.text).toContain('Recovered')
     expect(sends[0]!.text).toContain('1 in progress')
+  })
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Session lifecycle (namespacing) — the reset/finalize semantics
+  // ─────────────────────────────────────────────────────────────────────
+
+  test('three task_create events → canonical ids, correct order, no provisional duplicate', async () => {
+    const { mirror, api, clock } = makeMirror()
+    // Each PostToolUse create carries the harness id via toolResult.
+    await mirror.recordEvent('chat-1', taskCreateEvent('tu-1', 'First', { toolResult: 'Task #1 created' }))
+    clock.advance(3000)
+    await mirror.recordEvent('chat-1', taskCreateEvent('tu-2', 'Second', { toolResult: 'Task #2 created' }))
+    clock.advance(3000)
+    await mirror.recordEvent('chat-1', taskCreateEvent('tu-3', 'Third', { toolResult: 'Task #3 created' }))
+    await mirror._idleForTests('chat-1')
+    const last = [...api.calls].reverse().find((c) => c.kind === 'edit' || c.kind === 'send')!
+    expect(last.text).toContain('3 pending')
+    // Order preserved and no duplicated rows.
+    expect(last.text.indexOf('First')).toBeLessThan(last.text.indexOf('Second'))
+    expect(last.text.indexOf('Second')).toBeLessThan(last.text.indexOf('Third'))
+    expect((last.text.match(/First/g) ?? []).length).toBe(1)
+  })
+
+  test('session_start with the SAME id preserves the snapshot (compact)', async () => {
+    const { mirror, api, clock } = makeMirror()
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Ongoing', status: 'in_progress' }], 'sess-A'))
+    clock.advance(3000)
+    // Compact fires SessionStart with the same id — must NOT reset or send anew.
+    await mirror.recordEvent('chat-1', sessionStart('sess-A', 'compact'))
+    await mirror.recordEvent('chat-1', todoEvent([
+      { content: 'Ongoing', status: 'completed' },
+      { content: 'Next', status: 'in_progress' },
+    ], 'sess-A'))
+    await mirror._idleForTests('chat-1')
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    expect(sends.length).toBe(1) // no fresh thread on compact
+    expect(edits[edits.length - 1]!.text).toContain('Next')
+    // No «сессия завершена» marker — the session did not end.
+    expect(api.calls.every((c) => !c.text.includes('сессия завершена'))).toBe(true)
+  })
+
+  test('session_start with a NEW id finalizes the old snapshot and starts fresh', async () => {
+    const { mirror, api, clock } = makeMirror()
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Old task', status: 'in_progress' }], 'sess-A'))
+    clock.advance(3000)
+    await mirror.recordEvent('chat-1', sessionStart('sess-B', 'startup'))
+    // Old message got a final «сессия завершена» edit.
+    const finalEdit = api.calls.filter((c) => c.kind === 'edit').pop()
+    expect(finalEdit!.text).toContain('сессия завершена')
+    // New session's first task → a brand-new message (msg 201).
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'New task', status: 'in_progress' }], 'sess-B'))
+    await mirror._idleForTests('chat-1')
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(2)
+    expect(sends[1]!.messageId).toBe(201)
+    expect(sends[1]!.text).toContain('New task')
+  })
+
+  test('task event with a new session id resets even without a SessionStart hook', async () => {
+    const { mirror, api, clock } = makeMirror()
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Alpha', status: 'in_progress' }], 'sess-A'))
+    clock.advance(3000)
+    // First event of a new session, SessionStart missed → still resets.
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Beta', status: 'in_progress' }], 'sess-B'))
+    await mirror._idleForTests('chat-1')
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(2) // fresh message for the new session
+    expect(sends[1]!.text).toContain('Beta')
+    expect(sends[1]!.text).not.toContain('Alpha')
+  })
+
+  test('burst updates across a session transition do not overwrite the new session message', async () => {
+    const { mirror, api, clock } = makeMirror()
+    // Session A: a burst of updates, all within the throttle window (deferred).
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'A step 1', status: 'in_progress' }], 'sess-A'))
+    clock.advance(200)
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'A step 2', status: 'in_progress' }], 'sess-A'))
+    clock.advance(200)
+    // Session B begins mid-burst: finalize A (its pending edit is cancelled),
+    // then B sends its own message.
+    await mirror.recordEvent('chat-1', sessionStart('sess-B', 'clear'))
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'B step 1', status: 'in_progress' }], 'sess-B'))
+    await mirror._idleForTests('chat-1')
+    // Drain any stale A timer that might fire late.
+    clock.advance(5000)
+    await mirror._idleForTests('chat-1')
+
+    const bMessageId = api.calls.filter((c) => c.kind === 'send').pop()!.messageId!
+    // No edit to B's message may contain session A content.
+    const bEdits = api.calls.filter((c) => c.kind === 'edit' && c.messageId === bMessageId)
+    for (const e of bEdits) {
+      expect(e.text).not.toContain('A step')
+    }
+    // B's message shows B's task.
+    const bView = [...api.calls].reverse().find((c) => c.messageId === bMessageId)!
+    expect(bView.text).toContain('B step 1')
+  })
+
+  test('persistence: a new instance with the same state dir restores the snapshot', async () => {
+    const dir = stateDir()
+    const api1 = makeFakeApi()
+    const clock = new FakeClock()
+    const first = makeMirror({ api: api1, clock, stateDir: dir })
+    await first.mirror.recordEvent('chat-1', todoEvent([
+      { content: 'Persisted task', status: 'in_progress' },
+    ], 'sess-P'))
+    await first.mirror._idleForTests('chat-1')
+    const sentId = api1.calls.filter((c) => c.kind === 'send')[0]!.messageId!
+    expect(sentId).toBe(200)
+
+    // Simulate a plugin restart: brand-new mirror instance, SAME state dir.
+    const api2 = makeFakeApi()
+    const second = makeMirror({ api: api2, clock, stateDir: dir })
+    // Advance past the throttle window (in production Date.now() is already far
+    // past it; the fake clock starts at 0 so we step it explicitly).
+    clock.advance(3000)
+    // A same-session update must EDIT the restored message (id 200), not send anew.
+    await second.mirror.recordEvent('chat-1', todoEvent([
+      { content: 'Persisted task', status: 'completed' },
+      { content: 'Follow-up', status: 'in_progress' },
+    ], 'sess-P'))
+    await second.mirror._idleForTests('chat-1')
+    const sends2 = api2.calls.filter((c) => c.kind === 'send')
+    const edits2 = api2.calls.filter((c) => c.kind === 'edit')
+    expect(sends2.length).toBe(0) // restored — no fresh message
+    expect(edits2.length).toBe(1)
+    expect(edits2[0]!.messageId).toBe(200)
+    expect(edits2[0]!.text).toContain('Follow-up')
+  })
+
+  test('persistence: a restart in a NEW session finalizes the restored old snapshot', async () => {
+    const dir = stateDir()
+    const api1 = makeFakeApi()
+    const clock = new FakeClock()
+    const first = makeMirror({ api: api1, clock, stateDir: dir })
+    await first.mirror.recordEvent('chat-1', todoEvent([
+      { content: 'Old', status: 'in_progress' },
+    ], 'sess-old'))
+    await first.mirror._idleForTests('chat-1')
+
+    const api2 = makeFakeApi()
+    const second = makeMirror({ api: api2, clock, stateDir: dir })
+    // New session after restart → finalize the restored message, start fresh.
+    await second.mirror.recordEvent('chat-1', sessionStart('sess-new', 'startup'))
+    const finalEdit = api2.calls.filter((c) => c.kind === 'edit').pop()
+    expect(finalEdit!.messageId).toBe(200)
+    expect(finalEdit!.text).toContain('сессия завершена')
   })
 
   // ─────────────────────────────────────────────────────────────────────

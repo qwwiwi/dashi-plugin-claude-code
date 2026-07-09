@@ -291,6 +291,12 @@ export class ContextHud {
   // does not clear it, so the pinned card keeps showing «что сделали» until
   // the next task replaces the snapshot.
   private readonly work = new Map<string, { todos: ReadonlyArray<TodoItem>; taskMap: Map<string, TodoItem> }>()
+  // Per-chat session id, tracked from SessionStart + task events. Used to decide
+  // when to CLEAR the task snapshot: a genuine session change clears it; a
+  // compact (same id) preserves it. SessionStart fires for startup / resume /
+  // clear / compact, so source alone can't tell «new session» from «compacted
+  // same session» — the id does.
+  private readonly sessionIds = new Map<string, string>()
   // bump() debounce per chat — a burst of inbound messages collapses to one
   // delete+resend (same rationale as TmuxMirror.BUMP_DEBOUNCE_MS).
   private readonly lastBumpAt = new Map<string, number>()
@@ -344,15 +350,29 @@ export class ContextHud {
 
   // SessionStart: ensure the HUD message exists and is pinned, then refresh it.
   // The whole method is best-effort — it never throws. Serialized per chat.
-  onSessionStart(chatId: string): Promise<void> {
+  //
+  // Task snapshot handling: SessionStart fires for startup, resume, clear AND
+  // compact. A compact keeps the SAME session id, so clearing the task list on
+  // every SessionStart would wipe the milestones the warchief is watching every
+  // time the context is auto-compacted. We therefore clear ONLY on a genuine
+  // session change (new id) or an explicit `source === 'clear'`; a compact with
+  // the same id preserves the snapshot.
+  onSessionStart(chatId: string, opts: { sessionId?: string; source?: string } = {}): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
+    const { sessionId, source } = opts
+    const prev = this.sessionIds.get(chatId)
+    const sessionChanged = sessionId !== undefined && prev !== undefined && prev !== sessionId
+    if (source === 'clear' || sessionChanged) {
+      // Genuine reset: drop the prior snapshot so the pin never shows stale
+      // milestones (renderStatusTasks returns '' for an empty list → the
+      // section is omitted until fresh TodoWrite/TaskCreate events arrive).
+      this.work.delete(chatId)
+    }
+    // Compact / resume / first-ever start (same or unknown id) preserve the
+    // snapshot. Track the latest known id for the next comparison.
+    if (sessionId !== undefined) this.sessionIds.set(chatId, sessionId)
     return this.runSerialized(chatId, async () => {
       try {
-        // A new session starts with a clean task list: drop any snapshot left
-        // over from a prior session so the pin never shows stale milestones
-        // (renderStatusTasks returns '' for an empty list → the section is
-        // omitted until the agent emits fresh TodoWrite/TaskCreate events).
-        this.work.delete(chatId)
         const { text, keyboard } = await this.renderCurrent(chatId)
         const ensured = await this.ensureMessage(chatId, text, keyboard)
         if (ensured === undefined) return
@@ -373,19 +393,45 @@ export class ContextHud {
     })
   }
 
-  // Stop / end-of-turn: refresh the percentage. No pin (that is SessionStart's
-  // job); updateNow self-heals a deleted message once.
+  // Stop / end-of-turn: refresh the percentage. Stop carries model /
+  // permission_mode for the pinned card but must NOT finalize task state. No
+  // pin (that is SessionStart's job); updateNow self-heals a deleted message.
   async onStop(chatId: string): Promise<void> {
+    await this.updateNow(chatId)
+  }
+
+  // SessionEnd (the REAL session end, unlike Stop): refresh the pinned card.
+  // We keep the last task snapshot visible (the next SessionStart with a new id
+  // clears it) but forget the tracked session id so a brand-new session is
+  // correctly treated as a change. Best-effort, serialized like the others.
+  async onSessionEnd(chatId: string, opts: { sessionId?: string } = {}): Promise<void> {
+    if (!this.enabled || !this.isOwner(chatId)) return
+    const { sessionId } = opts
+    const prev = this.sessionIds.get(chatId)
+    // Ignore a late SessionEnd for a session we've already moved past.
+    if (sessionId !== undefined && prev !== undefined && prev !== sessionId) return
+    this.sessionIds.delete(chatId)
     await this.updateNow(chatId)
   }
 
   // Todo events (TodoWrite / TaskCreate / TaskUpdate, mapped by
   // toTodoWriteEvent in the webhook) — update the work view and refresh the
-  // card in place. `todo_session_stop` deliberately does NOT clear the view:
-  // the pinned card keeps the last milestones visible across turns.
+  // card in place. Session lifecycle events are handled by onSessionStart /
+  // onSessionEnd, not here; if one slips through it is ignored.
+  //
+  // A task event whose sessionId differs from the tracked one signals a new
+  // session (we may have missed SessionStart) — reset the stale snapshot and
+  // adopt the new id so the pin never blends two sessions' task lists.
   onTodoEvent(chatId: string, event: TaskMirrorEvent): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
-    if (event.kind === 'todo_session_stop') return Promise.resolve()
+    if (event.kind === 'session_start' || event.kind === 'session_end') {
+      return Promise.resolve()
+    }
+    const prev = this.sessionIds.get(chatId)
+    if (prev !== undefined && prev !== event.sessionId) {
+      this.work.delete(chatId)
+    }
+    this.sessionIds.set(chatId, event.sessionId)
     let state = this.work.get(chatId)
     if (state === undefined) {
       state = { todos: [], taskMap: new Map<string, TodoItem>() }

@@ -26,6 +26,16 @@
 #     (tmux kill-session -t multichat-<chat_id>; the router respawns on the
 #     next inbound message).
 #
+# Task-feeder note (2026-07-09): child multichat sessions deliberately carry
+# NO context-HUD / task-mirror notification feeders. Those surfaces are
+# owner-DM only (a group/supergroup chat id is negative and never gets a pinned
+# HUD), and the master DM session's feeders are installed separately by
+# scripts/patch-claude-settings.ts — which now uses the NARROW canonical set
+# (SessionStart, UserPromptSubmit, PostToolUse=TaskCreate|TaskUpdate|TodoWrite,
+# SessionEnd, Stop), no `.*` PreToolUse/PostToolUse. The per-chat hooks synced
+# below (persona / policy-gate / outbox / hot-memory) are the ONLY hooks a
+# child workspace runs; do NOT add wide notification feeders here.
+#
 # Usage:
 #   scripts/sync-multichat-hooks.sh [--deploy-dir /abs/path]
 # Default deploy dir: ~/.claude-lab/thrall/.claude/chats/hooks

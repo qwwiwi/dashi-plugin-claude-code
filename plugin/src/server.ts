@@ -555,7 +555,7 @@ const progressReporter = new ProgressReporter({ telegramApi, config, log })
 // showing Claude's TodoWrite milestones. Independent of the two surfaces
 // above; uses the same safe-wrapped telegramApi so every text/edit goes
 // through redact + HTML validation before leaving the process.
-const taskMirror = new TaskMirror({ telegramApi, config, log })
+const taskMirror = new TaskMirror({ telegramApi, config, log, stateDir: statePaths.root })
 
 // TmuxMirror (2026-05-20) — read-only mirror of the agent's terminal pane
 // into ONE rolling Telegram message. Default-OFF in config; the warchief

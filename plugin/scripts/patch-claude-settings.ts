@@ -41,19 +41,42 @@ const REMINDER_MARKER = 'dashi-channel-reminder-hook'
 // the legacy entry in place + append the marked one, firing the hook
 // twice (review §6).
 const HELPER_PATH_FINGERPRINT = 'post-hook.ts'
+
+// All hook events we TOUCH — we filter our own (marker / legacy / gate) entries
+// out of each and rebuild. PreToolUse is iterated so the permission-gate hook
+// still installs there, even though it no longer carries a notification feeder.
 const HOOK_EVENTS = [
   'SessionStart',
   'UserPromptSubmit',
   'PreToolUse',
   'PostToolUse',
+  'SessionEnd',
   'Stop',
 ] as const
 
 type HookEvent = (typeof HOOK_EVENTS)[number]
 
+// NARROW canonical notification-feeder set (2026-07-09). The feeder spawns a
+// `bun` process + HTTP POST for every event it fires on; a `.*` PreToolUse /
+// PostToolUse feeder therefore paid that cost on EVERY tool call — far too much
+// on a 7.8 GB VPS, and the status/progress surfaces that once consumed the
+// per-tool stream are disabled. The surfaces still in use (pinned context HUD +
+// task mirror) need only: session lifecycle (SessionStart / SessionEnd),
+// per-turn context refresh (UserPromptSubmit / Stop), and the task tools
+// (PostToolUse scoped to TaskCreate|TaskUpdate|TodoWrite).
+const FEEDER_EVENTS: ReadonlySet<HookEvent> = new Set<HookEvent>([
+  'SessionStart',
+  'UserPromptSubmit',
+  'PostToolUse',
+  'SessionEnd',
+  'Stop',
+])
+
+// Claude Code hook matchers accept `|`-separated EXACT tool names. Scoping the
+// PostToolUse feeder to the three task tools is what keeps the feeder off the
+// hot path (Bash/Read/Edit/… no longer fire it).
 const MATCHER_BY_EVENT: Partial<Record<HookEvent, string>> = {
-  PreToolUse: '.*',
-  PostToolUse: '.*',
+  PostToolUse: 'TaskCreate|TaskUpdate|TodoWrite',
 }
 
 export interface PatchOptions {
@@ -180,11 +203,12 @@ export function applyPatch(settings: SettingsShape, opts: PatchOptions): Setting
   const hooks: NonNullable<SettingsShape['hooks']> = { ...(settings.hooks ?? {}) }
   const withGate = opts.permissionGateHelperPath !== undefined
   for (const event of HOOK_EVENTS) {
-    const next = buildEntryFor(event, opts)
     const existing = hooks[event] ?? []
     // Drop anything that's clearly ours: notification marker, legacy
     // markerless notification entry, OR the gate marker (re-added below for
-    // PreToolUse). Unrelated entries survive untouched.
+    // PreToolUse). Unrelated entries survive untouched. This also STRIPS a
+    // previously-installed `.*` PreToolUse/PostToolUse feeder (same MARKER), so
+    // re-running the patch migrates an old wide install to the narrow set.
     const filtered = existing.filter(
       (e) =>
         !e ||
@@ -193,9 +217,14 @@ export function applyPatch(settings: SettingsShape, opts: PatchOptions): Setting
           e.marker !== REMINDER_MARKER &&
           !isLegacyDashiEntry(e)),
     )
-    const rebuilt = [...filtered, next]
+    const rebuilt = [...filtered]
+    // The notification feeder is added ONLY for the narrow FEEDER_EVENTS set.
+    // PreToolUse is iterated (for the gate below) but no longer gets a feeder.
+    if (FEEDER_EVENTS.has(event)) {
+      rebuilt.push(buildEntryFor(event, opts))
+    }
     // The gate hook lives on PreToolUse only, and is registered FIRST so its
-    // deny verdict is evaluated before the notification mirror runs.
+    // deny verdict is evaluated before any later hook runs.
     if (event === 'PreToolUse' && withGate) {
       rebuilt.unshift(buildGateEntry(opts))
     }
@@ -205,7 +234,13 @@ export function applyPatch(settings: SettingsShape, opts: PatchOptions): Setting
     if (event === 'UserPromptSubmit' && opts.reminderHelperPath !== undefined) {
       rebuilt.push(buildReminderEntry(opts))
     }
-    hooks[event] = rebuilt
+    // Don't leave an empty array behind (e.g. PreToolUse with no gate): drop
+    // the key so the patched settings stay clean.
+    if (rebuilt.length > 0) {
+      hooks[event] = rebuilt
+    } else {
+      delete hooks[event]
+    }
   }
   return { ...settings, hooks }
 }

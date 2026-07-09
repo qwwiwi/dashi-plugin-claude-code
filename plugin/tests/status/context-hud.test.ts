@@ -781,6 +781,7 @@ describe('ContextHud onTodoEvent', () => {
 
     const event: TaskMirrorEvent = {
       kind: 'todo_write',
+      sessionId: 's1',
       todos: [todo('1', 'in_progress', 'шаг один'), todo('2', 'pending', 'шаг два')],
     }
     await hud.onTodoEvent(OWNER, event)
@@ -791,19 +792,21 @@ describe('ContextHud onTodoEvent', () => {
     expect(last.text).toContain('0/2')
   })
 
-  test('task_create + task_update accumulate; todo_session_stop keeps the view', async () => {
+  test('task_create + task_update accumulate; session_end keeps the view', async () => {
     const api = new FakeApi()
     const hud = makeHud(api)
-    await hud.onSessionStart(OWNER)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
 
     await hud.onTodoEvent(OWNER, {
       kind: 'task_create',
+      sessionId: 's1',
       toolUseId: 'tu1',
       input: { subject: 'собрать фичу' },
       toolResult: 'Task #7 created successfully',
     })
     await hud.onTodoEvent(OWNER, {
       kind: 'task_update',
+      sessionId: 's1',
       toolUseId: 'tu2',
       input: { taskId: '7', status: 'completed' },
     })
@@ -811,12 +814,64 @@ describe('ContextHud onTodoEvent', () => {
     expect(last.text).toContain('☑ собрать фичу')
     expect(last.text).toContain('1/1')
 
-    const editsBefore = api.edited.length
-    await hud.onTodoEvent(OWNER, { kind: 'todo_session_stop' })
-    expect(api.edited.length).toBe(editsBefore) // stop never clears/re-renders
-    // A later refresh still carries the last snapshot.
+    // SessionEnd refreshes but keeps the last snapshot visible.
+    await hud.onSessionEnd(OWNER, { sessionId: 's1' })
     await hud.updateNow(OWNER)
     last = api.edited[api.edited.length - 1] ?? last
     expect(last.text).toContain('☑ собрать фичу')
+  })
+
+  test('compact (same session id) preserves tasks; a new session id clears them', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'живая задача')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('живая задача')
+
+    // Compact: SAME id → tasks preserved.
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'compact' })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('живая задача')
+
+    // New session id → tasks cleared (section omitted).
+    await hud.onSessionStart(OWNER, { sessionId: 's2', source: 'startup' })
+    expect(api.edited[api.edited.length - 1]!.text).not.toContain('живая задача')
+  })
+
+  test('source=clear wipes tasks even on the same session id', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'сотрётся')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('сотрётся')
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'clear' })
+    expect(api.edited[api.edited.length - 1]!.text).not.toContain('сотрётся')
+  })
+
+  test('a task event with a new session id resets the stale snapshot', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'старое'), todo('2', 'pending', 'ещё старое')],
+    })
+    // A task event from a new session (missed SessionStart) — replace, not blend.
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's2',
+      todos: [todo('9', 'in_progress', 'новое')],
+    })
+    const last = api.edited[api.edited.length - 1]!
+    expect(last.text).toContain('новое')
+    expect(last.text).not.toContain('старое')
   })
 })

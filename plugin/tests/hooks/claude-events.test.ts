@@ -128,6 +128,19 @@ describe('WebhookPayloadSchema — Claude hook variant', () => {
     expect(p.model).toBe('claude-sonnet-4-6')
   })
 
+  test('SessionEnd parses with optional reason (real session-end hook)', () => {
+    const p = parse({
+      ...baseCommon,
+      hook_event_name: 'SessionEnd',
+      reason: 'clear',
+    })
+    expect(p.kind).toBe('claude_hook')
+    if (p.kind !== 'claude_hook' || p.hook_event_name !== 'SessionEnd') {
+      throw new Error('unreachable')
+    }
+    expect(p.reason).toBe('clear')
+  })
+
   test('rejects missing chatId on hook payload', () => {
     expect(() =>
       parse({
@@ -240,6 +253,18 @@ describe('toActivityEvent mapping', () => {
     })
     expect(event.kind).toBe('session_start')
   })
+
+  test('SessionEnd → session_stop (closes the transient bubble)', () => {
+    const event = toActivityEvent({
+      chatId: '1',
+      session_id: 's',
+      transcript_path: '/t',
+      cwd: '/',
+      hook_event_name: 'SessionEnd',
+      reason: 'clear',
+    })
+    expect(event.kind).toBe('session_stop')
+  })
 })
 
 describe('toTodoWriteEvent mapping', () => {
@@ -250,7 +275,9 @@ describe('toTodoWriteEvent mapping', () => {
     cwd: '/',
   } as const
 
-  test('PreToolUse TaskCreate → task_create event (no toolResult yet)', () => {
+  test('PreToolUse TaskCreate → null (provisional create is NOT mapped; avoids phantom)', () => {
+    // The PreToolUse create races the permission gate on the same event; a
+    // rejected create would leave a phantom task. Only PostToolUse is mapped.
     const event = toTodoWriteEvent({
       ...common,
       hook_event_name: 'PreToolUse',
@@ -258,15 +285,10 @@ describe('toTodoWriteEvent mapping', () => {
       tool_use_id: 'tu-create-1',
       tool_input: { subject: 'Implement X', description: 'why', activeForm: 'Implementing X' },
     })
-    expect(event?.kind).toBe('task_create')
-    if (event?.kind !== 'task_create') throw new Error('unreachable')
-    expect(event.toolUseId).toBe('tu-create-1')
-    expect(event.input.subject).toBe('Implement X')
-    expect(event.input.activeForm).toBe('Implementing X')
-    expect('toolResult' in event).toBe(false)
+    expect(event).toBeNull()
   })
 
-  test('PostToolUse TaskCreate → task_create event with toolResult', () => {
+  test('PostToolUse TaskCreate → task_create event with toolResult + sessionId', () => {
     const event = toTodoWriteEvent({
       ...common,
       hook_event_name: 'PostToolUse',
@@ -278,9 +300,10 @@ describe('toTodoWriteEvent mapping', () => {
     expect(event?.kind).toBe('task_create')
     if (event?.kind !== 'task_create') throw new Error('unreachable')
     expect(event.toolResult).toBe('Task #7 created successfully')
+    expect(event.sessionId).toBe('s')
   })
 
-  test('PostToolUse TaskUpdate → task_update event with coerced string taskId', () => {
+  test('PostToolUse TaskUpdate → task_update event with coerced string taskId + sessionId', () => {
     const event = toTodoWriteEvent({
       ...common,
       hook_event_name: 'PostToolUse',
@@ -293,6 +316,52 @@ describe('toTodoWriteEvent mapping', () => {
     if (event?.kind !== 'task_update') throw new Error('unreachable')
     expect(event.input.taskId).toBe('7')
     expect(event.input.status).toBe('in_progress')
+    expect(event.sessionId).toBe('s')
+  })
+
+  test('SessionStart → session_start lifecycle event (carries source + sessionId)', () => {
+    const event = toTodoWriteEvent({
+      ...common,
+      hook_event_name: 'SessionStart',
+      source: 'compact',
+    })
+    expect(event?.kind).toBe('session_start')
+    if (event?.kind !== 'session_start') throw new Error('unreachable')
+    expect(event.sessionId).toBe('s')
+    expect(event.source).toBe('compact')
+  })
+
+  test('SessionEnd → session_end lifecycle event', () => {
+    const event = toTodoWriteEvent({
+      ...common,
+      hook_event_name: 'SessionEnd',
+      reason: 'clear',
+    })
+    expect(event?.kind).toBe('session_end')
+    if (event?.kind !== 'session_end') throw new Error('unreachable')
+    expect(event.sessionId).toBe('s')
+    expect(event.reason).toBe('clear')
+  })
+
+  test('Stop → null (turn-end, never finalizes the task surface)', () => {
+    const event = toTodoWriteEvent({
+      ...common,
+      hook_event_name: 'Stop',
+    })
+    expect(event).toBeNull()
+  })
+
+  test('PostToolUse TodoWrite → todo_write carries sessionId', () => {
+    const event = toTodoWriteEvent({
+      ...common,
+      hook_event_name: 'PostToolUse',
+      tool_name: 'TodoWrite',
+      tool_use_id: 'tu-todo',
+      tool_input: { todos: [{ content: 'a', status: 'pending' }] },
+    })
+    expect(event?.kind).toBe('todo_write')
+    if (event?.kind !== 'todo_write') throw new Error('unreachable')
+    expect(event.sessionId).toBe('s')
   })
 
   test('PreToolUse TaskUpdate → null (we only mirror PostToolUse for updates)', () => {

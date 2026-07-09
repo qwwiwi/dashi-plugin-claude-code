@@ -16,10 +16,22 @@
 //   * Throttle via `edit_throttle_ms`. First send bypasses throttle, subsequent
 //     edits within the window defer onto a single timer slot.
 //   * Idempotency: same rendered text → no Telegram round-trip.
-//   * TTL eviction on `session_ttl_ms` of idleness — protects against lost
-//     `session_stop` hooks the way ProgressReporter does.
-//   * `recordEvent` is fire-and-forget; top-level try/catch swallows every
+//   * Session namespacing: the snapshot is keyed on the harness `sessionId`.
+//     A SessionStart with a new id (or a task event carrying one) resets the
+//     mirror; compact / resume of the same id preserve it. The mirror finalizes
+//     ONLY on SessionEnd (the real session end) — NEVER on Stop (turn-end).
+//   * TTL (`session_ttl_ms`) is orphan cleanup ONLY: a same-session snapshot is
+//     never expired for idleness; the TTL merely decides whether a session
+//     change drops the old snapshot silently (stale orphan) or finalizes it
+//     with a marker (fresh handoff).
+//   * Persistence: `{sessionId, messageId, todos}` is written per chat under the
+//     plugin state dir, so a plugin restart restores the rolling message
+//     instead of spamming a fresh one.
+//   * `recordEvent` is serialized per chat and its try/catch swallows every
 //     throw so the webhook 200 path is never blocked.
+
+import { mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import type { AppConfig } from '../config.js'
 import type { Logger } from '../log.js'
@@ -50,6 +62,19 @@ export interface TaskMirrorDeps {
   now?: () => number
   setTimer?: (cb: () => void, ms: number) => NodeJS.Timeout
   clearTimer?: (handle: NodeJS.Timeout) => void
+  // Plugin state dir. When set, the mirror persists `{sessionId, messageId,
+  // todos}` per chat so a plugin restart restores the rolling message instead
+  // of losing the snapshot. Omitted in unit tests that don't exercise restart.
+  stateDir?: string
+}
+
+// On-disk snapshot persisted per chat under `task-mirror-<chatId>.json`. Lets a
+// plugin restart pick up the SAME rolling message (edit in place) and the SAME
+// session namespace, instead of spamming a fresh message on the next event.
+interface PersistedTaskState {
+  sessionId?: string
+  messageId: number
+  todos: ReadonlyArray<TodoItem>
 }
 
 // Per-chat lifecycle entry. Field-for-field parallel to ChatProgressEntry,
@@ -57,8 +82,11 @@ export interface TaskMirrorDeps {
 interface ChatTaskEntry {
   chatId: string
   messageId?: number
+  // Session this snapshot belongs to. Harness task ids restart at #1 every
+  // session, so a mutation whose event.sessionId differs resets the mirror.
+  sessionId?: string
   startedAtMs: number
-  // Updated on every recordEvent. Used by TTL eviction in getOrCreate.
+  // Updated on every recordEvent. Used by TTL orphan cleanup on session change.
   lastActivityMs: number
   // Latest TodoWrite snapshot from Claude. Replaced wholesale on each event
   // — TodoWrite is itself the full list, so we never merge incrementally.
@@ -81,7 +109,8 @@ interface ChatTaskEntry {
   // Single-slot throttle timer. Non-null while waiting for the throttle
   // window to elapse before publishing.
   pendingTimer: NodeJS.Timeout | null
-  // True once todo_session_stop has been processed. Idempotency guard.
+  // True once the entry has been finalized (session end) or dropped (orphan /
+  // session change). Idempotency + orphan guard for late in-flight flushes.
   stopped: boolean
 }
 
@@ -165,7 +194,14 @@ export class TaskMirror {
   private readonly now: () => number
   private readonly setTimer: (cb: () => void, ms: number) => NodeJS.Timeout
   private readonly clearTimer: (handle: NodeJS.Timeout) => void
+  private readonly stateDir: string | undefined
   private readonly chats: Map<string, ChatTaskEntry>
+  // Per-chat serialization. Session transitions (finalize old → start new) and
+  // throttled flushes must not interleave across concurrent webhook requests,
+  // or a late old-session edit could race the new session's snapshot. Every
+  // recordEvent for a chat is chained through this settled (never-rejecting)
+  // promise — mirrors ContextHud.runSerialized.
+  private readonly chatLocks: Map<string, Promise<void>>
 
   constructor(deps: TaskMirrorDeps) {
     this.telegramApi = deps.telegramApi
@@ -174,32 +210,52 @@ export class TaskMirror {
     this.now = deps.now ?? (() => Date.now())
     this.setTimer = deps.setTimer ?? ((cb, ms) => setTimeout(cb, ms))
     this.clearTimer = deps.clearTimer ?? ((h) => clearTimeout(h))
+    this.stateDir = deps.stateDir
     this.chats = new Map()
+    this.chatLocks = new Map()
   }
 
   /**
    * Main entry point. Called by the webhook handler for every Claude hook
-   * that mapped to a TaskMirrorEvent. Never throws — top-level try/catch
-   * swallows any failure so the webhook 200 path stays open.
+   * that mapped to a TaskMirrorEvent. Never throws — the inner handler's
+   * try/catch swallows any failure so the webhook 200 path stays open.
    *
-   * Three input shapes:
-   *   - `todo_write`: full list snapshot (legacy TodoWrite tool). Replaces
-   *     `todos` wholesale AND clears `taskMap` so a mid-session switch from
-   *     TodoWrite to TaskCreate/Update starts cleanly.
-   *   - `task_create` / `task_update`: incremental events from the newer
-   *     TaskCreate/TaskUpdate tools. Mutate `taskMap`, then synthesise the
-   *     `todos` array from it.
-   *   - `todo_session_stop`: terminal signal, handled separately.
+   * Serialized per chat so a session transition and its flushes can't
+   * interleave with a concurrent event for the same chat.
    */
   async recordEvent(chatId: string, event: TaskMirrorEvent): Promise<void> {
     if (!this.config.task_mirror.enabled) return
+    await this.runSerialized(chatId, () => this.recordEventInner(chatId, event))
+  }
+
+  /**
+   * Serialized body. Five input shapes:
+   *   - `session_start`: reset the snapshot when the session id changes
+   *     (genuine new session); preserve it on compact / resume of the same id.
+   *   - `session_end`: finalize the surface (marker + evict). The REAL session
+   *     end — Stop no longer reaches here.
+   *   - `todo_write`: full list snapshot (legacy TodoWrite tool). Replaces
+   *     `todos` wholesale AND clears `taskMap`.
+   *   - `task_create` / `task_update`: incremental events. Mutate `taskMap`,
+   *     then synthesise the `todos` array from it.
+   */
+  private async recordEventInner(chatId: string, event: TaskMirrorEvent): Promise<void> {
     try {
-      if (event.kind === 'todo_session_stop') {
-        await this.handleStop(chatId)
+      if (event.kind === 'session_start') {
+        await this.handleSessionStart(chatId, event.sessionId)
         return
       }
+      if (event.kind === 'session_end') {
+        await this.handleSessionEnd(chatId, event.sessionId)
+        return
+      }
+
+      // Task mutation. Reset the mirror first if this event belongs to a
+      // different session than the current snapshot.
+      await this.ensureSessionForMutation(chatId, event.sessionId)
       const entry = this.getOrCreate(chatId)
       if (entry.stopped) return
+      entry.sessionId = event.sessionId
       entry.lastActivityMs = this.now()
 
       switch (event.kind) {
@@ -217,13 +273,44 @@ export class TaskMirror {
           entry.todos = Array.from(entry.taskMap.values())
           break
       }
+      // Persist eagerly once the message exists so a restart mid-session
+      // restores the latest todos even if the throttled edit hasn't landed.
+      if (entry.messageId !== undefined) this.persistEntry(entry)
       this.scheduleFlush(entry)
+      // Materialise the FIRST send inside the lock so a following serialized
+      // event edits the same message instead of double-sending. Deferred
+      // (throttled) edits keep messageId already set, so we do NOT await them
+      // and throttling is preserved.
+      if (entry.messageId === undefined && entry.flushPromise !== null) {
+        try {
+          await entry.flushPromise
+        } catch {
+          /* already logged inside executeFlush */
+        }
+      }
     } catch (err) {
       this.log.warn('task mirror recordEvent failed (ignored)', {
         chat_id: chatId,
         error: err instanceof Error ? err.message : String(err),
       })
     }
+  }
+
+  // Serialize an operation per chat. The returned promise resolves when THIS op
+  // completes; the next call for the same chat waits for it. `fn` swallows its
+  // own errors (recordEventInner try/catch), so the chain never rejects.
+  private runSerialized(chatId: string, fn: () => Promise<void>): Promise<void> {
+    const prior = this.chatLocks.get(chatId) ?? Promise.resolve()
+    const result = prior.then(fn, fn)
+    const settled: Promise<void> = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    this.chatLocks.set(chatId, settled)
+    void settled.then(() => {
+      if (this.chatLocks.get(chatId) === settled) this.chatLocks.delete(chatId)
+    })
+    return result
   }
 
   /**
@@ -280,20 +367,24 @@ export class TaskMirror {
   // Internals
   // ─────────────────────────────────────────────────────────────────────
 
+  // Return the in-memory entry, restoring it from disk first if the process
+  // just restarted. Unlike the old getOrCreate, this NEVER expires an entry by
+  // TTL — an active same-session snapshot must survive idle gaps (the mirror no
+  // longer finalizes on Stop, so idleness is normal). TTL now bites ONLY as
+  // orphan cleanup on a session change (see ensureSessionForMutation).
+  private hydrate(chatId: string): ChatTaskEntry | undefined {
+    const mem = this.chats.get(chatId)
+    if (mem) return mem
+    const persisted = this.loadPersisted(chatId)
+    if (!persisted) return undefined
+    const entry = this.reconstructEntry(chatId, persisted)
+    this.chats.set(chatId, entry)
+    return entry
+  }
+
   private getOrCreate(chatId: string): ChatTaskEntry {
-    const existing = this.chats.get(chatId)
-    if (existing) {
-      const idle = this.now() - existing.lastActivityMs
-      if (idle > this.config.task_mirror.session_ttl_ms) {
-        this.log.debug('task mirror entry TTL expired, starting fresh thread', {
-          chat_id: chatId,
-          idle_ms: idle,
-        })
-        this.chats.delete(chatId)
-      } else {
-        return existing
-      }
-    }
+    const existing = this.hydrate(chatId)
+    if (existing) return existing
     const entry: ChatTaskEntry = {
       chatId,
       startedAtMs: this.now(),
@@ -307,6 +398,78 @@ export class TaskMirror {
     }
     this.chats.set(chatId, entry)
     return entry
+  }
+
+  // Rebuild an entry from its persisted snapshot. lastRenderedText is set so the
+  // idempotency gate holds (an identical follow-up event is a no-op); lastEditAt
+  // is 0 so the first post-restore edit isn't throttled.
+  private reconstructEntry(chatId: string, persisted: PersistedTaskState): ChatTaskEntry {
+    const taskMap = new Map<string, TodoItem>()
+    persisted.todos.forEach((t, i) => {
+      taskMap.set(t.id ?? `restored-${i}`, t)
+    })
+    return {
+      chatId,
+      messageId: persisted.messageId,
+      ...(persisted.sessionId !== undefined ? { sessionId: persisted.sessionId } : {}),
+      startedAtMs: this.now(),
+      lastActivityMs: this.now(),
+      todos: persisted.todos,
+      taskMap,
+      lastRenderedText: this.safeRender(persisted.todos),
+      lastEditAtMs: 0,
+      flushPromise: null,
+      pendingTimer: null,
+      stopped: false,
+    }
+  }
+
+  // ─── session lifecycle ────────────────────────────────────────────────
+
+  // SessionStart: reset the snapshot on a genuine session change, preserve it
+  // on compact / resume (same id). Fires before any task event of the new
+  // session, so the next mutation starts on a clean entry.
+  private async handleSessionStart(chatId: string, sessionId: string): Promise<void> {
+    const existing = this.hydrate(chatId)
+    if (!existing) return
+    if (existing.sessionId === undefined) {
+      existing.sessionId = sessionId
+      return
+    }
+    if (existing.sessionId === sessionId) return // compact / resume — preserve
+    await this.resetForNewSession(chatId, existing)
+  }
+
+  // SessionEnd (the REAL session end): finalize the surface. A late SessionEnd
+  // that names a session we've already moved past is ignored so it can't kill
+  // the new session's mirror.
+  private async handleSessionEnd(chatId: string, sessionId: string): Promise<void> {
+    const existing = this.hydrate(chatId)
+    if (!existing) return
+    if (existing.sessionId !== undefined && existing.sessionId !== sessionId) return
+    await this.finalize(chatId, existing)
+  }
+
+  // A task mutation arrived: reset if it belongs to a different session than
+  // the current snapshot (e.g. we missed the SessionStart hook).
+  private async ensureSessionForMutation(chatId: string, sessionId: string): Promise<void> {
+    const existing = this.hydrate(chatId)
+    if (!existing) return
+    if (existing.sessionId === undefined) return // adopted by the mutation
+    if (existing.sessionId === sessionId) return
+    await this.resetForNewSession(chatId, existing)
+  }
+
+  // Reset on session change. If the old snapshot is fresh, finalize it
+  // gracefully (final «сессия завершена» edit) so the warchief sees the handoff;
+  // if it is past the TTL it is a stale orphan and dropped silently.
+  private async resetForNewSession(chatId: string, existing: ChatTaskEntry): Promise<void> {
+    const idle = this.now() - existing.lastActivityMs
+    if (idle > this.config.task_mirror.session_ttl_ms) {
+      this.dropOrphan(chatId, existing)
+    } else {
+      await this.finalize(chatId, existing)
+    }
   }
 
   /**
@@ -365,6 +528,7 @@ export class TaskMirror {
           entry.messageId = sent.message_id
           entry.lastRenderedText = text
           entry.lastEditAtMs = this.now()
+          this.persistEntry(entry)
         } else {
           this.log.warn('task mirror send completed after stop (orphan)', {
             chat_id: entry.chatId,
@@ -384,6 +548,7 @@ export class TaskMirror {
       if (!entry.stopped) {
         entry.lastRenderedText = text
         entry.lastEditAtMs = this.now()
+        this.persistEntry(entry)
       }
     } catch (err) {
       this.log.warn('task mirror editMessageText failed (ignored)', {
@@ -395,19 +560,19 @@ export class TaskMirror {
   }
 
   /**
-   * Eviction handler — mirrors ProgressReporter.handleStop. Cancels timers,
-   * awaits any in-flight flush, posts a final edit (if a message exists)
-   * with the latest snapshot AND a «сессия завершена» marker line, then
-   * deletes the entry.
+   * Finalize a session. Cancels timers, awaits any in-flight flush, posts a
+   * final edit (if a message exists) with the latest snapshot AND a «сессия
+   * завершена» marker line, then evicts the entry and clears its persisted
+   * snapshot. Called on SessionEnd and on a fresh session change — NEVER on
+   * Stop (Stop is turn-end, not session-end).
    *
-   * Why the marker: without it, if the last TodoWrite snapshot was already
-   * rendered the idempotency gate (`text === lastRenderedText`) skips the
-   * final edit — the warchief never sees a visual «session ended» signal.
-   * Appending a non-empty marker line guarantees the final text differs.
+   * Why the marker: without it, if the last snapshot was already rendered the
+   * idempotency gate (`text === lastRenderedText`) skips the final edit — the
+   * warchief never sees a visual «session ended» signal. Appending a non-empty
+   * marker line guarantees the final text differs.
    */
-  private async handleStop(chatId: string): Promise<void> {
-    const entry = this.chats.get(chatId)
-    if (!entry || entry.stopped) return
+  private async finalize(chatId: string, entry: ChatTaskEntry): Promise<void> {
+    if (entry.stopped) return
     entry.stopped = true
 
     if (entry.pendingTimer !== null) {
@@ -440,6 +605,26 @@ export class TaskMirror {
     }
 
     this.chats.delete(chatId)
+    this.clearPersisted(chatId)
+  }
+
+  /**
+   * Drop a stale orphan (a snapshot whose session changed AND that is past the
+   * TTL — a long-dead session we never got a clean SessionEnd for). Silent: no
+   * «сессия завершена» edit, since the old message is long stale. Cancels the
+   * throttle timer and marks the entry stopped so any in-flight flush no-ops.
+   */
+  private dropOrphan(chatId: string, entry: ChatTaskEntry): void {
+    entry.stopped = true
+    if (entry.pendingTimer !== null) {
+      this.clearTimer(entry.pendingTimer)
+      entry.pendingTimer = null
+    }
+    this.log.debug('task mirror orphan dropped on session change (TTL elapsed)', {
+      chat_id: chatId,
+    })
+    this.chats.delete(chatId)
+    this.clearPersisted(chatId)
   }
 
   /**
@@ -464,6 +649,88 @@ export class TaskMirror {
         error: err instanceof Error ? err.message : String(err),
       })
       return ''
+    }
+  }
+
+  // ─── persistence ──────────────────────────────────────────────────────
+  // Best-effort, same pattern as ContextHud: a persistence failure NEVER
+  // disturbs the surface (the mirror keeps working from memory). Files are
+  // written atomically (temp + rename in the same dir) so a partial write can't
+  // corrupt the snapshot. No-op when no state dir was configured.
+
+  private persistPath(chatId: string): string {
+    const safe = chatId.replace(/[^0-9A-Za-z_-]/g, '_')
+    return join(this.stateDir as string, `task-mirror-${safe}.json`)
+  }
+
+  private persistEntry(entry: ChatTaskEntry): void {
+    if (this.stateDir === undefined) return
+    if (entry.messageId === undefined) return
+    const snapshot: PersistedTaskState = {
+      ...(entry.sessionId !== undefined ? { sessionId: entry.sessionId } : {}),
+      messageId: entry.messageId,
+      todos: entry.todos,
+    }
+    try {
+      mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
+      const path = this.persistPath(entry.chatId)
+      const tmp = `${path}.tmp.${process.pid}.${Date.now()}`
+      writeFileSync(tmp, JSON.stringify(snapshot), { mode: 0o600 })
+      try {
+        renameSync(tmp, path)
+      } catch (err) {
+        try {
+          unlinkSync(tmp)
+        } catch {
+          /* ignore */
+        }
+        throw err
+      }
+    } catch (err) {
+      this.log.warn('task mirror persist failed (ignored)', {
+        chat_id: entry.chatId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  private loadPersisted(chatId: string): PersistedTaskState | undefined {
+    if (this.stateDir === undefined) return undefined
+    let raw: string
+    try {
+      raw = readFileSync(this.persistPath(chatId), 'utf8')
+    } catch {
+      return undefined // missing file → no persisted snapshot
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+      const obj = parsed as Record<string, unknown>
+      const messageId = obj.messageId
+      if (typeof messageId !== 'number' || !Number.isInteger(messageId) || messageId <= 0) {
+        return undefined
+      }
+      const todos = Array.isArray(obj.todos) ? (obj.todos as ReadonlyArray<TodoItem>) : []
+      const sessionId = typeof obj.sessionId === 'string' ? obj.sessionId : undefined
+      return {
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        messageId,
+        todos,
+      }
+    } catch {
+      return undefined // malformed JSON → treat as no snapshot
+    }
+  }
+
+  private clearPersisted(chatId: string): void {
+    if (this.stateDir === undefined) return
+    try {
+      rmSync(this.persistPath(chatId), { force: true })
+    } catch (err) {
+      this.log.warn('task mirror clearPersisted failed (ignored)', {
+        chat_id: chatId,
+        error: err instanceof Error ? err.message : String(err),
+      })
     }
   }
 }

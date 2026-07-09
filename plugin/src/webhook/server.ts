@@ -41,6 +41,7 @@ import { sendChannelNotification, normalizeMeta } from '../channel/notify.js'
 import {
   toActivityEvent,
   toTodoWriteEvent,
+  isTaskMutationEvent,
   type TaskMirrorEvent,
 } from '../hooks/claude-events.js'
 import type {
@@ -184,8 +185,15 @@ export interface SessionInfoRecorder {
 // section from the SAME TaskMirrorEvent stream TaskMirror consumes. Optional
 // on the interface so older stubs/tests remain valid.
 export interface ContextHudForWebhook {
-  onSessionStart(chatId: string): Promise<void> | void
+  onSessionStart(
+    chatId: string,
+    opts?: { sessionId?: string; source?: string },
+  ): Promise<void> | void
+  // Stop refreshes the pinned context percentage only — it must NOT finalize
+  // the task surface (Stop is turn-end, not session-end).
   onStop(chatId: string): Promise<void> | void
+  // SessionEnd is the real session end (distinct Claude Code hook).
+  onSessionEnd?(chatId: string, opts?: { sessionId?: string }): Promise<void> | void
   onTodoEvent?(chatId: string, event: TaskMirrorEvent): Promise<void> | void
 }
 
@@ -598,8 +606,16 @@ async function handleRequest(
     if (deps.contextHud) {
       const hud = deps.contextHud
       if (payload.hook_event_name === 'SessionStart') {
-        fireHud(log, () => hud.onSessionStart(payload.chatId))
+        const opts: { sessionId?: string; source?: string } = {
+          sessionId: payload.session_id,
+        }
+        if (typeof payload.source === 'string') opts.source = payload.source
+        fireHud(log, () => hud.onSessionStart(payload.chatId, opts))
+      } else if (payload.hook_event_name === 'SessionEnd') {
+        fireHud(log, () => hud.onSessionEnd?.(payload.chatId, { sessionId: payload.session_id }))
       } else if (payload.hook_event_name === 'Stop') {
+        // Stop refreshes the context percentage only — it no longer finalizes
+        // the task surfaces (Stop is turn-end, not session-end).
         fireHud(log, () => hud.onStop(payload.chatId))
       }
     }
@@ -660,11 +676,15 @@ async function handleRequest(
       }
     }
 
-    // PR-A2 (2026-05-20): TaskMirror handles TodoWrite + Stop hooks. The
-    // mapper returns null for every other event, so the cost when no
-    // TodoWrite is in flight is one schema test per hook — negligible.
-    // Status-pin wave (2026-07-04): the SAME mapped event also feeds the
-    // context HUD's «Задачи» section — fire-and-forget, never blocks the 200.
+    // TaskMirror + HUD «Задачи» section. toTodoWriteEvent maps SessionStart /
+    // SessionEnd (lifecycle) and PostToolUse TodoWrite/TaskCreate/TaskUpdate
+    // (mutations); everything else (including Stop) → null, so the cost when no
+    // task activity is in flight is one schema test per hook — negligible.
+    //
+    // TaskMirror consumes BOTH lifecycle and mutation events (it resets on a
+    // session change and finalizes on SessionEnd). The HUD's onTodoEvent
+    // consumes ONLY mutations — its session lifecycle is driven by the
+    // dedicated onSessionStart / onSessionEnd calls above.
     if (taskMirror || deps.contextHud?.onTodoEvent) {
       const todoEvent = toTodoWriteEvent(payload, log)
       if (todoEvent !== null) {
@@ -679,7 +699,7 @@ async function handleRequest(
             })
           }
         }
-        if (deps.contextHud?.onTodoEvent) {
+        if (deps.contextHud?.onTodoEvent && isTaskMutationEvent(todoEvent)) {
           const hud = deps.contextHud
           fireHud(log, () => hud.onTodoEvent?.(payload.chatId, todoEvent))
         }
