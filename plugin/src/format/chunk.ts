@@ -91,12 +91,46 @@ function chooseCut(text: string, max: number): number {
 
   const slice = text.slice(0, max)
   const lastPara = slice.lastIndexOf('\n\n')
-  if (lastPara >= 0) return lastPara + 2 // include the \n\n in the emitted chunk
+  if (lastPara >= 0) {
+    const cut = lastPara + 2 // include the \n\n in the emitted chunk
+    // Heading-affinity: never end a chunk on a lone heading line — that
+    // orphans the heading at the bottom of one message while its body opens
+    // the next. If the chunk we'd emit ends with a `<b>…</b>`-only line,
+    // back up to the paragraph boundary BEFORE that heading so the heading
+    // travels with its body. Only applied when an earlier boundary exists.
+    const backed = avoidOrphanHeading(text, cut)
+    return backed ?? cut
+  }
 
   const lastLine = slice.lastIndexOf('\n')
   if (lastLine >= 0) return lastLine + 1
 
   return max
+}
+
+// A rendered heading is a whole line that is exactly a single bold span —
+// markdownToTelegramHtml emits `# heading` and `**bold**` alike as
+// `<b>…</b>`. We only treat a line as a heading when the bold span spans the
+// ENTIRE line (a bold word mid-sentence is not a heading).
+const LONE_HEADING_RE = /^<b>[\s\S]*<\/b>$/
+
+/**
+ * If the chunk `text.slice(0, cut)` would end on a lone heading line, return
+ * an earlier paragraph-boundary cut (before that heading) so the heading is
+ * not orphaned. Returns undefined when the chunk does not end on a heading,
+ * or when there is no earlier boundary to back up to (can't help it without
+ * producing an empty chunk).
+ */
+function avoidOrphanHeading(text: string, cut: number): number | undefined {
+  const body = text.slice(0, cut)
+  const trimmed = body.replace(/\n+$/, '')
+  const lastLineStart = trimmed.lastIndexOf('\n') + 1
+  const lastLine = trimmed.slice(lastLineStart).trim()
+  if (!LONE_HEADING_RE.test(lastLine)) return undefined
+
+  const prevPara = trimmed.lastIndexOf('\n\n', lastLineStart - 1)
+  if (prevPara < 0) return undefined // no earlier boundary — keep original cut
+  return prevPara + 2
 }
 
 /**

@@ -136,4 +136,44 @@ describe('splitMessage', () => {
       expect(opens).toBe(closes)
     }
   })
+
+  // Heading-affinity (2026-07-09): a rendered heading (`<b>…</b>` on its own
+  // line, produced by markdownToTelegramHtml for `#`/`**bold**`) must never be
+  // the LAST line of a chunk — that orphans it from the body it introduces.
+  test('does not orphan a lone heading at the end of a chunk', () => {
+    const bodyA = 'a'.repeat(60)
+    const heading = '<b>Заголовок</b>'
+    const bodyB = 'b'.repeat(60)
+    // Boundary tuned so the naive cut (last \n\n within max) would land right
+    // after the heading, orphaning it. max fits bodyA + \n\n + heading + \n\n.
+    const text = `${bodyA}\n\n${heading}\n\n${bodyB}`
+    const max = bodyA.length + 2 + heading.length + 2 + 5
+    const out = splitMessage(text, max)
+    expect(out.length).toBe(2)
+    // The heading must NOT be the tail of chunk 0 — it rides with its body.
+    expect(out[0]!.trimEnd().endsWith(heading)).toBe(false)
+    expect(out[1]).toContain(heading)
+    expect(out[1]).toContain(bodyB)
+    for (const c of out) expect(c.length).toBeLessThanOrEqual(max)
+  })
+
+  test('keeps a heading when it is the only content before the boundary', () => {
+    // No earlier paragraph boundary to back up to — must not loop or drop.
+    const heading = '<b>Only Heading</b>'
+    const bodyB = 'b'.repeat(200)
+    const text = `${heading}\n\n${bodyB}`
+    const out = splitMessage(text, heading.length + 2 + 5)
+    expect(out.join('').replace(/\n/g, '')).toContain('Only Heading')
+    expect(out.join('').replace(/\n/g, '')).toContain(bodyB)
+  })
+
+  // Contract: chunking prefers \n\n, then \n, and preserves internal single
+  // newlines within a chunk (soft breaks survive as visible line breaks in the
+  // HTML path, which relies on parse_mode=HTML rendering \n literally).
+  test('preserves internal single newlines inside a chunk', () => {
+    const text = 'M1 — x\nM2 — y\nM3 — z'
+    const out = splitMessage(text, 4000)
+    expect(out).toEqual([text])
+    expect(out[0]).toContain('\n')
+  })
 })
