@@ -21,6 +21,120 @@
 // byte length so a Cyrillic/emoji-heavy answer is gated correctly.
 export const RICH_MESSAGE_MAX_CHARS = 32768
 
+// ─────────────────────────────────────────────────────────────────────
+// Soft-break hardening (newline preservation on the rich path)
+// ─────────────────────────────────────────────────────────────────────
+//
+// WHY: Bot API 10.1 rich messages render RAW markdown server-side with
+// CommonMark semantics. Under CommonMark a single `\n` between two prose
+// lines is a *soft break* that collapses to a space — so an answer like
+//   «M1 — …\nM2 — …»
+// renders as one merged wall of text on the phone (owner-reported,
+// screenshot-verified 2026-07-09). The plugin's own HTML converter
+// (format/html.ts) keeps newlines literal, so ONLY the rich path leaks.
+//
+// FIX: before the rich body is sent, promote every lone soft break between
+// two plain prose lines into a CommonMark HARD break. We use the backslash-
+// at-end-of-line form (`\` + `\n`) — CommonMark's canonical hard break that
+// survives whitespace-trimming (unlike trailing-two-spaces, which editors
+// and transports silently strip). NOTE FOR LIVE VERIFICATION: confirm on a
+// real device that Telegram's rich renderer honours the backslash hard break;
+// if it does not, switch HARD_BREAK to '  ' (two trailing spaces).
+//
+// SCOPE (deliberately conservative — target the reported bug, nothing else):
+//   * Only a boundary between two *plain prose* lines is hardened. Markdown
+//     block constructs already break on their own, so they are left alone:
+//     list items (`- `, `* `, `1. `), ATX headings (`# `), blockquotes (`> `),
+//     tables (`| … |`), fenced code, and thematic breaks are NOT hardened,
+//     and a break INTO or OUT OF one of them is left untouched.
+//   * Blank lines (`\n\n+`, paragraph breaks) are never touched.
+//   * Fenced code blocks, inline code content, and table blocks pass through
+//     byte-identical (we only ever append `\` to a *plain prose* line, and a
+//     closed inline-code span sits fully inside that line, so its bytes are
+//     unchanged).
+//   * A line already ending in a hard break (trailing `\` or 2+ spaces) or
+//     carrying an unbalanced backtick is left as-is.
+
+// CommonMark hard-line-break token appended before the preserved `\n`.
+const HARD_BREAK = '\\'
+
+// A line that begins a markdown block construct — these already render as
+// their own block, so a soft break adjacent to one needs no hardening.
+const BLOCK_START_RE =
+  /^\s*(?:[-*+]\s|\d+[.)]\s|#{1,6}\s|>|\||```|~~~|(?:[-*_])\s*(?:[-*_])\s*(?:[-*_]))/
+
+/** True when `line` is blank (empty or whitespace-only). */
+function isBlankLine(line: string): boolean {
+  return line.trim().length === 0
+}
+
+/** True when `line` is plain prose: non-blank and not a markdown block start. */
+function isProseLine(line: string): boolean {
+  return !isBlankLine(line) && !BLOCK_START_RE.test(line)
+}
+
+/** True when `line` already ends in a CommonMark hard break. */
+function endsWithHardBreak(line: string): boolean {
+  return /(?:\\|\s{2,})$/.test(line)
+}
+
+/** True when `line` has an odd number of backticks (possibly unbalanced
+ *  inline code) — conservatively skip hardening it. */
+function hasUnbalancedBacktick(line: string): boolean {
+  const count = (line.match(/`/g) ?? []).length
+  return count % 2 === 1
+}
+
+/**
+ * Promote lone soft breaks into CommonMark hard breaks so Telegram's rich
+ * (raw-markdown) renderer shows a real line break instead of collapsing the
+ * newline into a space. Pure and idempotent-ish: re-running never stacks a
+ * second break because a line already ending in `\` is skipped.
+ *
+ * Applied to the RAW markdown body BEFORE redaction/send on the rich path
+ * only — the HTML path keeps newlines literal and must NOT be routed here.
+ */
+export function hardenSoftBreaks(text: string): string {
+  if (text.length === 0) return text
+  // CRLF → LF first so `\r` never rides along into the emitted body.
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  const lines = normalized.split('\n')
+
+  // Resolve fenced-code state per line so prose-looking lines INSIDE a fence
+  // stay protected. A fence delimiter line (```/~~~) toggles the state; the
+  // delimiter lines themselves are treated as protected too.
+  const insideFence: boolean[] = new Array(lines.length).fill(false)
+  let inFence = false
+  for (let i = 0; i < lines.length; i++) {
+    const isFenceDelim = /^\s*(?:```|~~~)/.test(lines[i] as string)
+    // Mark the current line as protected if we are inside a fence OR this is
+    // a delimiter line (opening or closing).
+    insideFence[i] = inFence || isFenceDelim
+    if (isFenceDelim) inFence = !inFence
+  }
+
+  // Rebuild, deciding each boundary (between line i and i+1) independently.
+  let out = ''
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string
+    out += line
+    if (i === lines.length - 1) break // no trailing boundary to consider
+
+    const next = lines[i + 1] as string
+    const harden =
+      !insideFence[i] &&
+      !insideFence[i + 1] &&
+      isProseLine(line) &&
+      isProseLine(next) &&
+      !endsWithHardBreak(line) &&
+      !hasUnbalancedBacktick(line)
+
+    if (harden) out += HARD_BREAK
+    out += '\n'
+  }
+  return out
+}
+
 /**
  * True when `text` fits inside a single rich message. Telegram counts the
  * body in UTF-8 bytes, so we measure bytes — not `text.length` (which counts

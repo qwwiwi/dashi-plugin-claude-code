@@ -8,8 +8,92 @@ import {
   RICH_MESSAGE_MAX_CHARS,
   buildRichMessagePayload,
   contentFitsRichLimits,
+  hardenSoftBreaks,
   richErrorClass,
 } from '../../src/format/rich.js'
+
+describe('hardenSoftBreaks', () => {
+  test('promotes a lone soft break between two prose lines to a hard break', () => {
+    // The reported bug: «M1 — …\nM2 — …» merged into one line by CommonMark.
+    const out = hardenSoftBreaks('M1 — сделал X\nM2 — сделал Y')
+    expect(out).toBe('M1 — сделал X\\\nM2 — сделал Y')
+  })
+
+  test('hardens each break in a 3+ line list-like run', () => {
+    const out = hardenSoftBreaks('M1 — a\nM2 — b\nM3 — c')
+    expect(out).toBe('M1 — a\\\nM2 — b\\\nM3 — c')
+  })
+
+  test('leaves paragraph breaks (\\n\\n) untouched', () => {
+    const text = 'Первый абзац.\n\nВторой абзац.'
+    expect(hardenSoftBreaks(text)).toBe(text)
+  })
+
+  test('bold heading with blank lines around is untouched', () => {
+    const text = 'Итог.\n\n**Заголовок**\n\nТело ответа.'
+    expect(hardenSoftBreaks(text)).toBe(text)
+  })
+
+  test('does not harden markdown list items (they already break)', () => {
+    const text = '- пункт один\n- пункт два\n- пункт три'
+    expect(hardenSoftBreaks(text)).toBe(text)
+  })
+
+  test('does not harden numbered list items', () => {
+    const text = '1. первый\n2. второй\n3. третий'
+    expect(hardenSoftBreaks(text)).toBe(text)
+  })
+
+  test('fenced code block passes through byte-identical', () => {
+    const text = 'Смотри код:\n\n```js\nconst a = 1\nconst b = 2\n```\n\nГотово.'
+    expect(hardenSoftBreaks(text)).toBe(text)
+  })
+
+  test('list-like text INSIDE a fence is not hardened', () => {
+    const text = '```\nM1 — a\nM2 — b\n```'
+    expect(hardenSoftBreaks(text)).toBe(text)
+  })
+
+  test('inline code content is preserved; break after it still hardens', () => {
+    const out = hardenSoftBreaks('Запусти `npm test` сейчас\nПотом смотри лог')
+    expect(out).toBe('Запусти `npm test` сейчас\\\nПотом смотри лог')
+    expect(out).toContain('`npm test`')
+  })
+
+  test('table block passes through byte-identical', () => {
+    const text = '| A | B |\n|---|---|\n| 1 | 2 |'
+    expect(hardenSoftBreaks(text)).toBe(text)
+  })
+
+  test('CRLF is normalized to LF', () => {
+    expect(hardenSoftBreaks('a\r\nb')).toBe('a\\\nb')
+  })
+
+  test('is idempotent — a line already ending in a hard break is not doubled', () => {
+    const once = hardenSoftBreaks('M1 — a\nM2 — b')
+    expect(hardenSoftBreaks(once)).toBe(once)
+  })
+
+  test('leaves a line already ending in two spaces alone', () => {
+    const text = 'M1 — a  \nM2 — b'
+    expect(hardenSoftBreaks(text)).toBe(text)
+  })
+
+  test('empty string returns empty', () => {
+    expect(hardenSoftBreaks('')).toBe('')
+  })
+
+  test('a break into a heading line is not hardened', () => {
+    // prose line followed directly by an ATX heading — heading already breaks.
+    const text = 'вступление\n# Заголовок'
+    expect(hardenSoftBreaks(text)).toBe(text)
+  })
+
+  test('Cyrillic multi-line prose run all hardened', () => {
+    const out = hardenSoftBreaks('Первое дело\nВторое дело\nТретье дело')
+    expect(out).toBe('Первое дело\\\nВторое дело\\\nТретье дело')
+  })
+})
 
 describe('RICH_MESSAGE_MAX_CHARS', () => {
   test('is the Bot API 10.1 rich-message cap (32768)', () => {
