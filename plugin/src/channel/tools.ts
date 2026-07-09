@@ -38,7 +38,9 @@ import { assertSendableFile, isPhotoExtension } from '../security/paths.js'
 import {
   buildRichMessagePayload,
   contentFitsRichLimits,
+  hardenSoftBreaks,
 } from '../format/rich.js'
+import { analyzeFormat, formatHint } from '../format/format-check.js'
 import type { RichLatch } from '../safety/rich-latch.js'
 
 // ─────────────────────────────────────────────────────────────────────
@@ -621,7 +623,15 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         if (richEligible) {
           const richOpts: SendRichMessageOpts = {}
           if (replyToId !== undefined) richOpts.reply_to_message_id = replyToId
-          const res = await telegramApi.sendRichMessage(args.chat_id, args.text, richOpts)
+          // Preserve single newlines: Telegram's rich (raw-markdown) renderer
+          // uses CommonMark, where a lone `\n` is a soft break that collapses
+          // to a space and merges list-like prose lines into one wall of
+          // text. hardenSoftBreaks() promotes those to CommonMark hard breaks
+          // BEFORE the body reaches the safe wrapper's redactor — normalize
+          // → redact → send. It touches only plain-prose boundaries; fenced
+          // code, inline code, tables and paragraph breaks pass through.
+          const richBody = hardenSoftBreaks(args.text)
+          const res = await telegramApi.sendRichMessage(args.chat_id, richBody, richOpts)
           if ('message_id' in res) {
             sentIds.push(res.message_id)
             richSent = true
@@ -714,7 +724,23 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
-        return { content: [{ type: 'text', text: result }] }
+
+        // Observe-only TOV/format check (2026-07-09): compute cheap rule-code
+        // metrics on the OUTGOING body and surface them back to the agent as a
+        // hint. NEVER blocking, NEVER rewriting prose, and NEVER logging the
+        // message text — only rule codes + counts. The one deterministic
+        // rewrite (soft-break hardening) already happened above on the rich
+        // path; this is purely advisory feedback so the model self-corrects.
+        const formatFindings = analyzeFormat(args.text)
+        if (formatFindings.length > 0) {
+          log.info('reply format check', {
+            chat_id: args.chat_id,
+            codes: formatFindings.map((f) => `${f.code}=${f.count}`).join(','),
+          })
+        }
+        const hint = formatHint(formatFindings)
+        const resultText = hint ? `${result}\n${hint}` : result
+        return { content: [{ type: 'text', text: resultText }] }
       }
 
       case 'react': {

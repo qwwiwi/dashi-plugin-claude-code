@@ -16,17 +16,34 @@
 // to the turn as context. It is NEVER sent to Telegram; the only way it
 // reaches the chat is if the model parrots it, so the text stays terse.
 //
+// It also appends a short TONE-OF-VOICE / formatting reminder (2026-07-09) so
+// replies stay readable on the phone: results-first, short headings on their
+// own line with blank lines around, one item per line. The fleet baseline
+// lives in docs/TOV-reminder.md; the hook mirrors it as an embedded constant
+// and can be pointed at a per-agent override file via TOV_REMINDER_PATH.
+//
 // Hard invariants (shared with the other dashi hooks):
 //   * Exit code 0 in EVERY path — a non-zero hook blocks the model; a
 //     missing reminder must never gate the turn.
 //   * stdout carries ONLY the JSON envelope (no logs, no secrets) — anything
 //     else on stdout becomes additional model context.
-//   * No file reads/writes; configuration is env-only.
+//   * The only file read is the OPTIONAL, best-effort TOV reminder file; a
+//     read failure silently falls back to the embedded constant and never
+//     gates the turn. Everything else is env-only.
 //
 // Env:
-//   CHAT_ID   the Telegram chat id this session serves. Negative ids are
-//             groups/supergroups (multichat); anything else is treated as a
-//             direct chat with the warchief. Absent → DM-safe generic.
+//   CHAT_ID              the Telegram chat id this session serves. Negative
+//                        ids are groups/supergroups (multichat); anything
+//                        else is a direct chat. Absent → DM-safe generic.
+//   TOV_REMINDER_ENABLED falsy (0/false/no/off, case-insensitive) disables
+//                        the TOV block. Default: enabled.
+//   TOV_REMINDER_PATH    per-agent override file for the TOV block. Default:
+//                        docs/TOV-reminder.md next to the plugin. Unreadable
+//                        → embedded constant.
+
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const DM_REMINDER =
   'Telegram bridge: the sender reads Telegram, not this terminal — terminal/transcript text never reaches them. ' +
@@ -56,6 +73,55 @@ export function reminderForChat(chatId: string | undefined): string {
   return DM_REMINDER
 }
 
+// Embedded fleet-baseline TOV reminder — a byte-for-byte mirror of
+// docs/TOV-reminder.md. Used when the file is disabled or unreadable so the
+// hook never depends on filesystem state to emit the baseline.
+export const EMBEDDED_TOV_REMINDER =
+  'Пиши владельцу по-русски, кратко и прямо; сначала вывод или решение.\n' +
+  'В длинном ответе используй короткие заголовки отдельной строкой: **Заголовок**.\n' +
+  'Оставляй пустую строку до и после каждого заголовка и между смысловыми блоками.\n' +
+  'Один абзац -- 1-3 предложения. Каждый пункт списка -- с новой строки.\n' +
+  'Выделяй жирным только важные числа, сроки и решения. Без emoji; кавычки «»; тире --.'
+
+/** Falsy env values that switch a boolean-ish flag OFF. Mirrors config.ts. */
+function isFalsyEnv(value: string | undefined): boolean {
+  if (value === undefined) return false
+  return ['0', 'false', 'no', 'off'].includes(value.trim().toLowerCase())
+}
+
+/** Default path to the TOV reminder file: docs/TOV-reminder.md next to the
+ *  plugin root (this script lives in <plugin>/scripts). Resolved from the
+ *  module URL so it works regardless of the process cwd. */
+function defaultTovPath(): string {
+  const here = dirname(fileURLToPath(import.meta.url))
+  return resolve(here, '..', 'docs', 'TOV-reminder.md')
+}
+
+/**
+ * Resolve the TOV reminder block. Returns undefined when disabled. Reads the
+ * override/default file best-effort; any failure falls back to the embedded
+ * baseline so the block is emitted regardless of filesystem state.
+ */
+export function tovReminder(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (isFalsyEnv(env.TOV_REMINDER_ENABLED)) return undefined
+  const path = env.TOV_REMINDER_PATH?.trim() || defaultTovPath()
+  try {
+    const text = readFileSync(path, 'utf8').trim()
+    if (text.length > 0) return text
+  } catch {
+    // fall through to embedded baseline
+  }
+  return EMBEDDED_TOV_REMINDER
+}
+
+/** Compose the full additionalContext string: channel discipline first, then
+ *  the optional TOV block separated by a blank line. */
+export function composeReminder(env: NodeJS.ProcessEnv = process.env): string {
+  const channel = reminderForChat(env.CHAT_ID)
+  const tov = tovReminder(env)
+  return tov ? `${channel}\n\n${tov}` : channel
+}
+
 /** The exact stdout envelope Claude Code reads for UserPromptSubmit context. */
 export function renderContext(text: string): string {
   return JSON.stringify({
@@ -75,7 +141,7 @@ if (import.meta.main) {
   // payload before the stream flushes (Codex review). The payload is one
   // short line, but natural termination is the safe pattern.
   try {
-    process.stdout.write(renderContext(reminderForChat(process.env.CHAT_ID)))
+    process.stdout.write(renderContext(composeReminder(process.env)))
   } catch {
     // Never gate the turn on a reminder failure.
   }
