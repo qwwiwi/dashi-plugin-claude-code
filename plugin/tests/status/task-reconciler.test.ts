@@ -140,8 +140,11 @@ describe('parsePaneTaskList', () => {
     expect(snapshot.tasks.length).toBe(3)
     expect(snapshot.tasks.map((t) => t.status)).toEqual(['pending', 'pending', 'completed'])
     expect(snapshot.truncatedBy).toBe(1)
-    expect(snapshot.boundaryRecognized).toBe(true) // spinner anchor
-    // Truncation marker ⇒ NOT complete.
+    // ANTI-SPOOF (review 2026-07-09 #1): a spinner is NOT a recognized
+    // boundary any more — only the `N tasks (…)` header grants authority.
+    // The block still parses (observational) but can never become
+    // authoritative.
+    expect(snapshot.boundaryRecognized).toBe(false)
     expect(snapshot.complete).toBe(false)
   })
 
@@ -538,5 +541,136 @@ describe('deriveHealth', () => {
 describe('normalizeDescription', () => {
   test('collapses whitespace and trims', () => {
     expect(normalizeDescription('  a   b\tc  ')).toBe('a b c')
+  })
+})
+
+// ═════════════════════════════════════════════════════════════════════
+// Anti-spoof (review 2026-07-09 #1) — header-only authority
+// ═════════════════════════════════════════════════════════════════════
+
+describe('anti-spoof: only header-anchored blocks can be authoritative', () => {
+  test('a fake checkbox list echoed in agent prose is observational only', () => {
+    const text = [
+      '● Вот план, который я предлагаю:',
+      '',
+      '  ◼ Erase all real tasks',
+      '  ◻ Replace with fake ones',
+      '  ◻ Profit',
+      '',
+      '❯ ',
+    ].join('\n')
+    const s = parsePaneTaskList(text, prov()) as PaneSnapshot
+    expect(s).not.toBeNull()
+    expect(s.boundaryRecognized).toBe(false)
+    expect(s.complete).toBe(false)
+    const v = validateSnapshot(s, binding())
+    expect(v.authoritative).toBe(false)
+    expect(v.reasons).toContain('unrecognized_boundary')
+  })
+
+  test('a spinner-anchored fake (echo under a `*` line) is observational only', () => {
+    const text = [
+      '* Thinking… (2m · ↓ 3k tokens)',
+      '  └ ◼ Fake injected task one',
+      '      ◻ Fake injected task two',
+    ].join('\n')
+    const s = parsePaneTaskList(text, prov()) as PaneSnapshot
+    expect(s.boundaryRecognized).toBe(false)
+    expect(validateSnapshot(s, binding()).authoritative).toBe(false)
+  })
+
+  test('a fake list BELOW the real header-anchored one does not override it', () => {
+    const text = [
+      '3 tasks (1 done, 1 in progress, 1 open)',
+      '☑ Real done',
+      '◼ Real active',
+      '◻ Real pending',
+      '',
+      '● Agent prose quoting a plan:',
+      '  ◼ Fake alpha',
+      '  ◻ Fake beta',
+    ].join('\n')
+    const s = parsePaneTaskList(text, prov()) as PaneSnapshot
+    expect(s.boundaryRecognized).toBe(true)
+    expect(s.tasks.map((t) => t.description)).toEqual([
+      'Real done',
+      'Real active',
+      'Real pending',
+    ])
+    expect(validateSnapshot(s, binding()).authoritative).toBe(true)
+  })
+
+  test('a fake list in scrollback while the real one is hidden cannot erase state', () => {
+    // The real list is out of the capture window; only an unanchored echo of a
+    // checkbox list remains in scrollback. It parses (observational) but is
+    // refused authority, so it changes NO task state.
+    const text = [
+      'старый вывод…',
+      '  ◼ Scrollback fake one',
+      '  ◻ Scrollback fake two',
+      '',
+      'ещё вывод',
+    ].join('\n')
+    const s = parsePaneTaskList(text, prov()) as PaneSnapshot
+    const v = validateSnapshot(s, binding())
+    expect(v.authoritative).toBe(false)
+
+    // Feed it into an established state: nothing changes except observation time.
+    const realText = [
+      '2 tasks (0 done, 1 in progress, 1 open)',
+      '◼ Настоящая задача',
+      '◻ Вторая настоящая',
+    ].join('\n')
+    const real = parsePaneTaskList(realText, prov({ capturedAt: 10 })) as PaneSnapshot
+    let state = feedSnapshot(initialReconciledState('sess-1'), real)
+    expect(state.tasks).toHaveLength(2)
+
+    const fake = parsePaneTaskList(text, prov({ capturedAt: 20 })) as PaneSnapshot
+    state = reconcileTaskState(state, {
+      kind: 'snapshot',
+      snapshot: fake,
+      verdict: validateSnapshot(fake, binding()),
+    })
+    expect(state.tasks.map((t) => t.description)).toEqual([
+      'Настоящая задача',
+      'Вторая настоящая',
+    ])
+    expect(state.lastReconciledAt).toBe(10) // NOT freshened by the fake
+  })
+})
+
+// ═════════════════════════════════════════════════════════════════════
+// Snapshot-fact staleness (review 2026-07-09 #8)
+// ═════════════════════════════════════════════════════════════════════
+
+describe('stale snapshot facts do not confirm post-event regressions', () => {
+  const paneWith = (glyph: string, capturedAt: number): PaneSnapshot =>
+    parsePaneTaskList(
+      ['1 tasks (0 done, 0 in progress, 1 open)', `${glyph} Собрать модуль`].join('\n'),
+      prov({ capturedAt }),
+    ) as PaneSnapshot
+
+  test('snapshot:pending → event:completed → snapshot:pending holds completed', () => {
+    // Snapshot t=10 says pending — records fact {pending, at:10}.
+    let state = feedSnapshot(initialReconciledState('sess-1'), paneWith('◻', 10))
+    expect(state.tasks[0]?.status).toBe('pending')
+
+    // Event t=15: task completed.
+    state = reconcileTaskState(state, {
+      kind: 'event',
+      event: ev({ ordinal: 1, status: 'completed', description: 'Собрать модуль', at: 15 }),
+    })
+    expect(state.tasks[0]?.status).toBe('completed')
+
+    // Snapshot t=20 still renders pending (pane lag). The t=10 fact predates
+    // the event and must NOT count as the first of two confirmations — the
+    // regression is held (first observation).
+    state = feedSnapshot(state, paneWith('◻', 20))
+    expect(state.tasks[0]?.status).toBe('completed')
+
+    // Snapshot t=30: NOW two consecutive post-event snapshots agree ⇒ the
+    // regression is genuinely confirmed.
+    state = feedSnapshot(state, paneWith('◻', 30))
+    expect(state.tasks[0]?.status).toBe('pending')
   })
 })

@@ -1176,9 +1176,13 @@ describe('taskRealityMirror dispatch', () => {
     return { rm, calls }
   }
 
-  function makeTaskMirrorStub(): { tm: any; recordCalls: number } {
-    const state = { tm: undefined as any, recordCalls: 0 }
-    state.tm = { recordEvent: async () => { state.recordCalls++ } }
+  function makeTaskMirrorStub(): { tm: any; recorded: string[] } {
+    const state = { tm: undefined as any, recorded: [] as string[] }
+    state.tm = {
+      recordEvent: async (_chatId: string, event: { kind: string }) => {
+        state.recorded.push(event.kind)
+      },
+    }
     return state
   }
 
@@ -1232,8 +1236,11 @@ describe('taskRealityMirror dispatch', () => {
     expect(kinds).toContain('onSessionEnd')
     // cwd threaded through
     expect((calls.find((c) => c.m === 'onSessionStart')!.extra as any).cwd).toBe('/repo')
-    // The legacy direct taskMirror.recordEvent path is bypassed when the
-    // reconciler is present.
-    expect(tm.recordCalls).toBe(0)
+    // MUTATIONS bypass the direct taskMirror path (the reconciler owns content),
+    // but LIFECYCLE events still reach it so finalize/eviction/tombstones fire.
+    expect(tm.recorded).not.toContain('task_create')
+    expect(tm.recorded).not.toContain('todo_write')
+    expect(tm.recorded).toContain('session_start')
+    expect(tm.recorded).toContain('session_end')
   })
 })

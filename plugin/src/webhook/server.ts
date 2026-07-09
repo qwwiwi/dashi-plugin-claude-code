@@ -733,16 +733,32 @@ async function handleRequest(
     // dedicated onSessionStart / onSessionEnd calls above.
     //
     // M3: when the reality mirror is wired it is the SOLE driver of the task
-    // surfaces — mutation events feed it (it reconciles them against the pane
-    // and pushes a freshness-tagged view into both surfaces). The legacy direct
-    // taskMirror.recordEvent + contextHud.onTodoEvent path runs ONLY when the
-    // reconciler is absent, so the two never double-render.
+    // surfaces' CONTENT — mutation events feed it (it reconciles them against
+    // the pane and pushes a freshness-tagged view into both surfaces); the
+    // legacy direct taskMirror.recordEvent(mutation) + contextHud.onTodoEvent
+    // path never runs, so the two never double-render. LIFECYCLE events
+    // (session_start / session_end) still reach TaskMirror so its own epoch
+    // machinery (finalize + eviction + persistence cleanup + tombstones) stays
+    // coherent — the reconciler's frozen ended view lands FIRST (its dispatch
+    // above enqueues synchronously into the same per-chat lock), then finalize.
     if (taskRealityMirror) {
       const todoEvent = toTodoWriteEvent(payload, log)
-      if (todoEvent !== null && isTaskMutationEvent(todoEvent)) {
-        const rm = taskRealityMirror
-        const cwd = payload.cwd
-        fireHud(log, () => rm.onTaskEvent(payload.chatId, todoEvent, { cwd }))
+      if (todoEvent !== null) {
+        if (isTaskMutationEvent(todoEvent)) {
+          const rm = taskRealityMirror
+          const cwd = payload.cwd
+          fireHud(log, () => rm.onTaskEvent(payload.chatId, todoEvent, { cwd }))
+        } else if (taskMirror) {
+          try {
+            await taskMirror.recordEvent(payload.chatId, todoEvent)
+          } catch (err) {
+            log.warn('hook event task mirror lifecycle update failed (ignored)', {
+              chat_id: payload.chatId,
+              hook: payload.hook_event_name,
+              error: err instanceof Error ? err.message : String(err),
+            })
+          }
+        }
       }
     } else if (taskMirror || deps.contextHud?.onTodoEvent) {
       const todoEvent = toTodoWriteEvent(payload, log)

@@ -313,8 +313,22 @@ export class ContextHud {
   // when to CLEAR the task snapshot: a genuine session change clears it; a
   // compact (same id) preserves it. SessionStart fires for startup / resume /
   // clear / compact, so source alone can't tell «new session» from «compacted
-  // same session» — the id does.
+  // same session» — the id does. KEPT across SessionEnd (review 2026-07-09 #2):
+  // deleting it on end made the next startup's sessionChanged=false, so a
+  // brand-new session inherited the dead session's task snapshot.
   private readonly sessionIds = new Map<string, string>()
+  // Per-chat tombstones of ENDED session ids (bounded). A late task event
+  // naming an ended session is dropped — pre-fix it cleared the active
+  // session's work and adopted the dead id. SessionStart with the same id
+  // (resume) un-tombstones. The reconciler's applyReconciledView is exempt:
+  // it manages its own lifecycle and must be able to deliver the frozen
+  // «сессия завершена» view right after SessionEnd.
+  private readonly endedSessions = new Map<string, Set<string>>()
+  // Dedup for reconciler-driven refreshes: hash of the last applied reconciled
+  // «Задачи» render per chat. The reconciler ticks every 20s; when neither the
+  // tasks nor the bucketed freshness label changed, skipping the refresh keeps
+  // editMessageText traffic at zero instead of a no-op edit per tick.
+  private readonly lastReconciledRender = new Map<string, string>()
   // bump() debounce per chat — a burst of inbound messages collapses to one
   // delete+resend (same rationale as TmuxMirror.BUMP_DEBOUNCE_MS).
   private readonly lastBumpAt = new Map<string, number>()
@@ -388,10 +402,15 @@ export class ContextHud {
       // M3: also drop the reconciled view; TaskRealityMirror re-pushes a fresh
       // «НЕ СВЕРЕНО» view for the new session immediately after.
       this.reconciled.delete(chatId)
+      this.lastReconciledRender.delete(chatId)
     }
     // Compact / resume / first-ever start (same or unknown id) preserve the
-    // snapshot. Track the latest known id for the next comparison.
-    if (sessionId !== undefined) this.sessionIds.set(chatId, sessionId)
+    // snapshot. Track the latest known id for the next comparison. A resume
+    // of an ENDED session legitimizes it again (drop the tombstone).
+    if (sessionId !== undefined) {
+      this.sessionIds.set(chatId, sessionId)
+      this.endedSessions.get(chatId)?.delete(sessionId)
+    }
     return this.runSerialized(chatId, async () => {
       try {
         const { text, keyboard } = await this.renderCurrent(chatId)
@@ -423,15 +442,32 @@ export class ContextHud {
 
   // SessionEnd (the REAL session end, unlike Stop): refresh the pinned card.
   // We keep the last task snapshot visible (the next SessionStart with a new id
-  // clears it) but forget the tracked session id so a brand-new session is
-  // correctly treated as a change. Best-effort, serialized like the others.
+  // clears it) and KEEP the tracked session id (review 2026-07-09 #2:
+  // forgetting it made the next startup's sessionChanged=false, so a brand-new
+  // session showed the dead session's tasks). The ended id is tombstoned so a
+  // late task event naming it is dropped instead of clearing the active state.
   async onSessionEnd(chatId: string, opts: { sessionId?: string } = {}): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return
     const { sessionId } = opts
     const prev = this.sessionIds.get(chatId)
+    if (sessionId !== undefined) {
+      // Tombstone even a late end for a session we've moved past — its
+      // stragglers must be dropped too.
+      let set = this.endedSessions.get(chatId)
+      if (set === undefined) {
+        set = new Set()
+        this.endedSessions.set(chatId, set)
+      }
+      set.delete(sessionId)
+      set.add(sessionId)
+      while (set.size > 8) {
+        const oldest = set.values().next().value
+        if (oldest === undefined) break
+        set.delete(oldest)
+      }
+    }
     // Ignore a late SessionEnd for a session we've already moved past.
     if (sessionId !== undefined && prev !== undefined && prev !== sessionId) return
-    this.sessionIds.delete(chatId)
     await this.updateNow(chatId)
   }
 
@@ -446,6 +482,11 @@ export class ContextHud {
   onTodoEvent(chatId: string, event: TaskMirrorEvent): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
     if (event.kind === 'session_start' || event.kind === 'session_end') {
+      return Promise.resolve()
+    }
+    // Drop late stragglers from an ENDED session — they must not clear the
+    // active session's snapshot or resurrect the dead id (review 2026-07-09 #2).
+    if (this.endedSessions.get(chatId)?.has(event.sessionId) === true) {
       return Promise.resolve()
     }
     const prev = this.sessionIds.get(chatId)
@@ -491,6 +532,13 @@ export class ContextHud {
     // Keep the tracked session id coherent so a later onSessionStart correctly
     // detects a genuine change.
     this.sessionIds.set(chatId, view.sessionId)
+    // Reconciler-tick dedup: the mirror ticks every 20s and the freshness label
+    // is minute-bucketed, so most ticks change NOTHING in the rendered section.
+    // Skip the whole refresh when the rendered «Задачи» section is identical to
+    // the previously applied one — no editMessageText per tick.
+    const renderKey = `${view.sessionId}|${renderStatusTasks(view.todos, view.freshness)}`
+    if (this.lastReconciledRender.get(chatId) === renderKey) return Promise.resolve()
+    this.lastReconciledRender.set(chatId, renderKey)
     return this.updateNow(chatId)
   }
 

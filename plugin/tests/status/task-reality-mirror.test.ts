@@ -334,7 +334,15 @@ describe('realignOrdinals — positional-alias re-association', () => {
     return snap
   }
 
-  test('a task that shifts up (a middle task removed) is re-keyed, not remove+add', () => {
+  // Review 2026-07-09 #7 — REVIEWERS DISAGREED, resolved by THIS test.
+  // Required contract for [A#1,B#2,C#3] → [A#1,C#2]:
+  //   • C is re-associated (same task identity, moved to #2) — the §5 goal;
+  //   • B is DISPLACED to a vacated key, NOT stomped, so it survives snapshot 1
+  //     as a first-omission candidate (two-snapshot anti-flap rule);
+  //   • B is deleted only after snapshot 2 confirms the removal.
+  // Codex was right about the original code (C stomped B's key ⇒ B deleted on
+  // the FIRST snapshot); the fix moves B aside instead.
+  test('shift with displacement: C re-keyed onto B\'s slot, B survives snapshot 1, dies on snapshot 2', () => {
     // First snapshot: A#1, B#2, C#3.
     const s1 = snapshotOf('3 tasks (1 done, 1 in progress, 1 open)', ['☑ Alpha', '◼ Beta', '◻ Gamma'], 10)
     let state = reconcileTaskState(initialReconciledState('s1'), {
@@ -348,16 +356,28 @@ describe('realignOrdinals — positional-alias re-association', () => {
     const gamma = aligned.tasks.find((t) => t.description === 'Gamma')!
     expect(gamma.ordinal).toBe(2) // re-keyed from #3 to the vacated #2
     expect(gamma.key).toBe('s1:#2')
+    // Beta was displaced off #2 (not stomped) — it still exists on its own key.
+    const betaAligned = aligned.tasks.find((t) => t.description === 'Beta')!
+    expect(betaAligned.ordinal).not.toBe(2)
 
-    // Reconcile: two tasks (Beta removed, Gamma preserved as the SAME task).
+    // Snapshot 1 reconcile: Gamma preserved as the SAME task; Beta SURVIVES as
+    // a first-omission candidate (anti-flap: removal needs TWO omissions).
     state = reconcileTaskState(aligned, {
       kind: 'snapshot',
       snapshot: s2,
       verdict: validateSnapshot(s2, binding),
     })
-    expect(state.tasks.map((t) => t.description).sort()).toEqual(['Alpha', 'Gamma'])
-    // Gamma kept its completed/in-progress history (paneConfirmed), not re-created.
+    expect(state.tasks.map((t) => t.description).sort()).toEqual(['Alpha', 'Beta', 'Gamma'])
     expect(state.tasks.find((t) => t.description === 'Gamma')!.paneConfirmed).toBe(true)
+
+    // Snapshot 2 (same content): the SECOND consecutive omission deletes Beta.
+    const s3 = snapshotOf('2 tasks (1 done, 0 in progress, 1 open)', ['☑ Alpha', '◻ Gamma'], 30)
+    state = reconcileTaskState(realignOrdinals(state, s3), {
+      kind: 'snapshot',
+      snapshot: s3,
+      verdict: validateSnapshot(s3, binding),
+    })
+    expect(state.tasks.map((t) => t.description).sort()).toEqual(['Alpha', 'Gamma'])
   })
 
   test('does not re-key when the old ordinal is still present (duplicate/swap, not a clean shift)', () => {
@@ -411,5 +431,175 @@ describe('owner gate', () => {
     await flush()
     expect(views).toHaveLength(0)
     expect(fx.captureCount).toBe(0)
+  })
+})
+
+// ── review fix-loop 2026-07-09 ──────────────────────────────────────────
+
+describe('#4 generation token — in-flight captures across a session change', () => {
+  test('a capture started under s1 never commits into the s2 binding', async () => {
+    const clock = new FakeClock()
+    let resolveCapture: ((r: TmuxExecResult) => void) | null = null
+    const exec: TmuxExec = async (args) => {
+      if (args.includes('capture-pane')) {
+        // First capture hangs until we resolve it manually.
+        if (resolveCapture === null) {
+          return await new Promise<TmuxExecResult>((r) => {
+            resolveCapture = r
+          })
+        }
+        return { stdout: NO_LIST_PANE, stderr: '', exitCode: 0 }
+      }
+      return { stdout: '/repo\n', stderr: '', exitCode: 0 }
+    }
+    const { sink, views } = makeSink()
+    const rm = makeMirror(exec, clock, sink)
+
+    rm.onSessionStart(CHAT, { sessionId: 's1', cwd: '/repo' }) // capture #1 pending
+    await flush()
+    expect(resolveCapture).not.toBeNull()
+
+    // Session changes while the capture is in flight.
+    rm.onSessionStart(CHAT, { sessionId: 's2', cwd: '/repo' })
+    await flush()
+
+    // The old capture finally returns a full s1-era task list.
+    resolveCapture!({ stdout: VALID_PANE, stderr: '', exitCode: 0 })
+    await flush()
+
+    // Nothing from the stale capture leaked into s2.
+    const last = views.at(-1)!
+    expect(last.sessionId).toBe('s2')
+    expect(last.todos).toHaveLength(0)
+    expect(last.freshness.kind).toBe('unverified')
+  })
+})
+
+describe('#5 TodoWrite as authoritative event snapshot (events-only degrade)', () => {
+  const todoWrite = (todos: Array<{ id?: string; content: string; status: 'pending' | 'in_progress' | 'completed' }>): TaskMirrorEvent => ({
+    kind: 'todo_write',
+    sessionId: 's1',
+    todos,
+  })
+
+  test('a task removed from the TodoWrite list disappears (no ghosts without tmux)', async () => {
+    const clock = new FakeClock()
+    const fx = makeExec(() => VALID_PANE, { captureOk: () => false }) // no pane at all
+    const { sink, views } = makeSink()
+    const rm = makeMirror(fx.exec, clock, sink)
+
+    rm.onTaskEvent(CHAT, todoWrite([
+      { id: 'a', content: 'Alpha', status: 'in_progress' },
+      { id: 'b', content: 'Beta', status: 'pending' },
+      { id: 'c', content: 'Gamma', status: 'pending' },
+    ]), { cwd: '/repo' })
+    await flush()
+    expect(views.at(-1)!.todos.map((t) => t.content)).toEqual(['Alpha', 'Beta', 'Gamma'])
+
+    clock.advance(1000)
+    rm.onTaskEvent(CHAT, todoWrite([
+      { id: 'a', content: 'Alpha', status: 'completed' },
+      { id: 'c', content: 'Gamma', status: 'in_progress' },
+    ]), { cwd: '/repo' })
+    await flush()
+    const last = views.at(-1)!
+    expect(last.todos.map((t) => t.content)).toEqual(['Alpha', 'Gamma']) // Beta gone
+    expect(last.todos.map((t) => t.status)).toEqual(['completed', 'in_progress'])
+  })
+
+  test('identical descriptions with distinct ids stay distinct tasks', async () => {
+    const clock = new FakeClock()
+    const fx = makeExec(() => NO_LIST_PANE)
+    const { sink, views } = makeSink()
+    const rm = makeMirror(fx.exec, clock, sink)
+
+    rm.onTaskEvent(CHAT, todoWrite([
+      { id: 'a', content: 'Проверить конфиг', status: 'pending' },
+      { id: 'b', content: 'Проверить конфиг', status: 'in_progress' },
+    ]), { cwd: '/repo' })
+    await flush()
+    const last = views.at(-1)!
+    expect(last.todos).toHaveLength(2)
+    expect(last.todos.map((t) => t.status).sort()).toEqual(['in_progress', 'pending'])
+  })
+})
+
+describe('#6 hard TTL — a missed Stop cannot poll forever', () => {
+  test('rec is evicted after ttl even with turnActive stuck true', async () => {
+    const clock = new FakeClock()
+    const fx = makeExec(() => VALID_PANE)
+    const { sink, views } = makeSink()
+    const rm = new TaskRealityMirror({
+      exec: fx.exec,
+      capture: { paneTarget: 'p', lineCount: 200 },
+      log: nullLog,
+      sinks: [sink],
+      ttlMs: 60_000, // short TTL for the test
+      now: () => clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    })
+
+    rm.onUserPromptSubmit(CHAT, { sessionId: 's1', cwd: '/repo' }) // turn opens…
+    await flush()
+    // …and Stop NEVER arrives. Ticks keep capturing until the hard TTL.
+    clock.advance(30_000)
+    await flush()
+    const midCount = fx.captureCount
+    expect(midCount).toBeGreaterThan(1) // still ticking inside the TTL
+
+    clock.advance(120_000) // idle > ttl ⇒ eviction on the next tick
+    await flush()
+    const atEvict = fx.captureCount
+    const viewsAtEvict = views.length
+
+    clock.advance(300_000) // long after — no timers may fire any more
+    await flush()
+    expect(fx.captureCount).toBe(atEvict)
+    expect(views.length).toBe(viewsAtEvict) // no more Telegram-bound pushes
+  })
+})
+
+describe('#9 unresolved pane cwd ⇒ snapshot is observational', () => {
+  test('display-message failure keeps the view unverified despite a perfect pane list', async () => {
+    const clock = new FakeClock()
+    const exec: TmuxExec = async (args) => {
+      if (args.includes('capture-pane')) return { stdout: VALID_PANE, stderr: '', exitCode: 0 }
+      // pane_current_path unobtainable
+      return { stdout: '', stderr: 'no server', exitCode: 1 }
+    }
+    const { sink, views } = makeSink()
+    const rm = makeMirror(exec, clock, sink)
+
+    rm.onSessionStart(CHAT, { sessionId: 's1', cwd: '/repo' })
+    await flush()
+    const last = views.at(-1)!
+    expect(last.freshness.kind).toBe('unverified') // NOT fresh
+    expect(last.todos).toHaveLength(0) // observational: no task state committed
+  })
+})
+
+describe('#2 session tombstones in the reality mirror', () => {
+  test('late mutation from an ended session is dropped; resume un-tombstones', async () => {
+    const clock = new FakeClock()
+    const fx = makeExec(() => NO_LIST_PANE)
+    const { sink, views } = makeSink()
+    const rm = makeMirror(fx.exec, clock, sink)
+
+    rm.onSessionStart(CHAT, { sessionId: 's1', cwd: '/repo' })
+    rm.onSessionEnd(CHAT, { sessionId: 's1' })
+    await flush()
+    const countAfterEnd = views.length
+
+    // Late straggler from s1 — dropped, no view pushed.
+    rm.onTaskEvent(CHAT, createEvent('late ghost'), { cwd: '/repo' })
+    await flush()
+    expect(views.length).toBe(countAfterEnd)
+
+    // Genuine RESUME of s1 legitimizes it again.
+    rm.onSessionStart(CHAT, { sessionId: 's1', cwd: '/repo' })
+    rm.onTaskEvent(CHAT, createEvent('resumed work'), { cwd: '/repo' })
+    await flush()
+    expect(views.at(-1)!.todos.map((t) => t.content)).toEqual(['resumed work'])
   })
 })

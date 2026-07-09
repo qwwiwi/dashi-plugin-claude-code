@@ -921,3 +921,101 @@ describe('applyReconciledView', () => {
     expect(text).toContain('Показаны только события инструментов')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop 2026-07-09 #2 — HUD session epochs / tombstones
+// ─────────────────────────────────────────────────────────────────────
+
+describe('HUD session end/start epochs', () => {
+  test('end(s1) → start(s2): the new session does NOT inherit dead tasks', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'мертвая задача')],
+    })
+    await hud.onSessionEnd(OWNER, { sessionId: 's1' })
+
+    // Pre-fix: onSessionEnd deleted the tracked id → the next startup saw
+    // sessionChanged=false and kept showing the dead session's tasks.
+    await hud.onSessionStart(OWNER, { sessionId: 's2', source: 'startup' })
+    const last = api.edited[api.edited.length - 1]!
+    expect(last.text).not.toContain('мертвая задача')
+  })
+
+  test('end(s1) → resume(s1): tasks preserved and s1 events flow again', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'живая работа')],
+    })
+    await hud.onSessionEnd(OWNER, { sessionId: 's1' })
+
+    // Resume: SAME id → snapshot preserved (compact/resume semantics).
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'resume' })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('живая работа')
+
+    // Un-tombstoned: further s1 events are accepted.
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'completed', 'живая работа')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('1/1')
+  })
+
+  test('a late task event from an ENDED session is dropped (no clobbering the active one)', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onSessionEnd(OWNER, { sessionId: 's1' })
+    await hud.onSessionStart(OWNER, { sessionId: 's2', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's2',
+      todos: [todo('1', 'in_progress', 'актуальная работа')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('актуальная работа')
+
+    // Straggler from dead s1 — must NOT replace s2's snapshot.
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('9', 'pending', 'призрак')],
+    })
+    const last = api.edited[api.edited.length - 1]!
+    expect(last.text).toContain('актуальная работа')
+    expect(last.text).not.toContain('призрак')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop 2026-07-09 SHOULD — reconciled-render dedup
+// ─────────────────────────────────────────────────────────────────────
+
+describe('applyReconciledView dedup', () => {
+  test('identical renders (same bucket, same tasks) skip editMessageText', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    const view = {
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'долгая работа')],
+      freshness: { kind: 'fresh', reconciledAgeMs: 5_000 } as const,
+    }
+    await hud.applyReconciledView(OWNER, view)
+    const editsAfterFirst = api.edited.length
+    // Reconciler ticks: same tasks, same «меньше минуты» bucket.
+    await hud.applyReconciledView(OWNER, { ...view, freshness: { kind: 'fresh', reconciledAgeMs: 25_000 } })
+    await hud.applyReconciledView(OWNER, { ...view, freshness: { kind: 'fresh', reconciledAgeMs: 45_000 } })
+    expect(api.edited.length).toBe(editsAfterFirst) // zero extra edits
+
+    // Bucket crossing («1 мин») changes the render → ONE refresh goes through.
+    await hud.applyReconciledView(OWNER, { ...view, freshness: { kind: 'fresh', reconciledAgeMs: 65_000 } })
+    expect(api.edited.length + api.sent.length).toBeGreaterThan(editsAfterFirst)
+  })
+})

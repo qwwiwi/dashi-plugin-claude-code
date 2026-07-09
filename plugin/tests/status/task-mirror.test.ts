@@ -18,7 +18,7 @@
 //  11. Long todo lines stay under Telegram's 4096-char cap.
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -361,11 +361,19 @@ describe('TaskMirror', () => {
     const finalEdit = editsAfterStop[editsAfterStop.length - 1]
     expect(finalEdit!.text).toContain('сессия завершена')
 
-    // Subsequent event after stop: must send a NEW message (msg_id 201, since
-    // 200 was the original send).
+    // A LATE straggler naming the ENDED session is DROPPED (review 2026-07-09
+    // #2: the session is tombstoned — no resurrection, no new message).
+    await mirror.recordEvent('chat-1', todoEvent([
+      { content: 'Straggler from dead session', status: 'in_progress' },
+    ]))
+    await mirror._idleForTests('chat-1')
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(1)
+
+    // An event from a NEW session gets a fresh message (msg_id 201, since 200
+    // was the original send).
     await mirror.recordEvent('chat-1', todoEvent([
       { content: 'New task', status: 'in_progress' },
-    ]))
+    ], 'sess-B'))
     await mirror._idleForTests('chat-1')
     const sends = api.calls.filter((c) => c.kind === 'send')
     expect(sends.length).toBe(2)
@@ -852,5 +860,226 @@ describe('applyReconciledView', () => {
     })
     await mirror._idleForTests('chat-1')
     expect(api.calls).toHaveLength(0)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop 2026-07-09 — session epochs / tombstones (#2)
+// ─────────────────────────────────────────────────────────────────────
+
+describe('session epochs and tombstones', () => {
+  test('end(s1) → start(s2): s2 is active immediately; late s1 mutation dropped', async () => {
+    const { mirror, api } = makeMirror()
+    await mirror.recordEvent('chat-1', sessionStart('s1', 'startup'))
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Old work', status: 'in_progress' }], 's1'))
+    await mirror._idleForTests('chat-1')
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(1)
+
+    await mirror.recordEvent('chat-1', sessionEnd('s1'))
+    // s2 starts — NO tasks yet, but the session must be tracked as active NOW
+    // (pre-fix nothing was stored until the first mutation).
+    await mirror.recordEvent('chat-1', sessionStart('s2', 'startup'))
+
+    // Late straggler from retired s1: dropped — no reset, no new message.
+    const callsBefore = api.calls.length
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Ghost of s1', status: 'pending' }], 's1'))
+    await mirror._idleForTests('chat-1')
+    expect(api.calls.length).toBe(callsBefore)
+
+    // s2's own first mutation creates a fresh message.
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'New era', status: 'in_progress' }], 's2'))
+    await mirror._idleForTests('chat-1')
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(2)
+    expect(sends[1]!.text).toContain('New era')
+  })
+
+  test('end(s1) → resume(s1): SessionStart un-retires, s1 mutations flow again', async () => {
+    const { mirror, api } = makeMirror()
+    await mirror.recordEvent('chat-1', sessionStart('s1', 'startup'))
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Work', status: 'in_progress' }], 's1'))
+    await mirror._idleForTests('chat-1')
+    await mirror.recordEvent('chat-1', sessionEnd('s1'))
+
+    // Resume: the SAME id starts again (claude -r).
+    await mirror.recordEvent('chat-1', sessionStart('s1', 'resume'))
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Resumed work', status: 'in_progress' }], 's1'))
+    await mirror._idleForTests('chat-1')
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(2) // finalize evicted the old entry → fresh message
+    expect(sends[1]!.text).toContain('Resumed work')
+  })
+
+  test('late SessionEnd naming a RETIRED session does not finalize the active one', async () => {
+    const { mirror, api } = makeMirror()
+    await mirror.recordEvent('chat-1', sessionStart('s1', 'startup'))
+    await mirror.recordEvent('chat-1', sessionStart('s2', 'startup')) // s1 retired
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Active B work', status: 'in_progress' }], 's2'))
+    await mirror._idleForTests('chat-1')
+    const editsBefore = api.calls.filter((c) => c.kind === 'edit').length
+
+    // Late end from dead s1 — must NOT touch s2's mirror.
+    await mirror.recordEvent('chat-1', sessionEnd('s1'))
+    await mirror._idleForTests('chat-1')
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    expect(edits.length).toBe(editsBefore) // no «сессия завершена» edit fired
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop 2026-07-09 — persistence correctness (#3)
+// ─────────────────────────────────────────────────────────────────────
+
+describe('persistence correctness', () => {
+  test('#3a restart with a pending throttled edit replays it (dirty flag)', async () => {
+    const dir = stateDir()
+    const first = makeMirror({ stateDir: dir })
+    await first.mirror.recordEvent('chat-1', todoEvent([{ content: 'Step A', status: 'in_progress' }]))
+    await first.mirror._idleForTests('chat-1')
+    // Second mutation INSIDE the throttle window: persisted eagerly, edit deferred.
+    await first.mirror.recordEvent('chat-1', todoEvent([{ content: 'Step A', status: 'completed' }]))
+    expect(first.api.calls.filter((c) => c.kind === 'edit').length).toBe(0) // still throttled
+
+    // «Crash» before the timer fires → new process, same state dir.
+    const second = makeMirror({ stateDir: dir })
+    // An IDENTICAL follow-up event (pre-fix: suppressed by restored
+    // lastRenderedText, remote message stale forever).
+    await second.mirror.recordEvent('chat-1', todoEvent([{ content: 'Step A', status: 'completed' }]))
+    second.clock.advance(3001) // FakeClock starts at 0 ⇒ let the throttle window pass
+    await second.mirror._idleForTests('chat-1')
+    const edits = second.api.calls.filter((c) => c.kind === 'edit')
+    expect(edits.length).toBeGreaterThanOrEqual(1)
+    expect(edits[edits.length - 1]!.text).toContain('1 done')
+  })
+
+  test('#3a restart after a REJECTED edit replays it', async () => {
+    const dir = stateDir()
+    const first = makeMirror({ stateDir: dir })
+    await first.mirror.recordEvent('chat-1', todoEvent([{ content: 'Step A', status: 'in_progress' }]))
+    await first.mirror._idleForTests('chat-1')
+    first.clock.advance(3001) // past throttle so the edit fires immediately…
+    first.api.failEditWith = new Error('500 telegram hiccup') // …and FAILS
+    await first.mirror.recordEvent('chat-1', todoEvent([{ content: 'Step A', status: 'completed' }]))
+    await first.mirror._idleForTests('chat-1')
+
+    const second = makeMirror({ stateDir: dir })
+    await second.mirror.recordEvent('chat-1', todoEvent([{ content: 'Step A', status: 'completed' }]))
+    second.clock.advance(3001) // FakeClock starts at 0 ⇒ let the throttle window pass
+    await second.mirror._idleForTests('chat-1')
+    const edits = second.api.calls.filter((c) => c.kind === 'edit')
+    expect(edits.length).toBeGreaterThanOrEqual(1)
+    expect(edits[edits.length - 1]!.text).toContain('1 done')
+  })
+
+  test('#3b a persisted snapshot with invalid todos is quarantined, mirror continues fresh', async () => {
+    const dir = stateDir()
+    writeFileSync(
+      join(dir, 'task-mirror-chat-1.json'),
+      JSON.stringify({ messageId: 200, todos: [null] }),
+    )
+    const { mirror, api } = makeMirror({ stateDir: dir })
+    // Pre-fix: threw at `t.id` on EVERY event — permanent wedge.
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Fresh start', status: 'in_progress' }]))
+    await mirror._idleForTests('chat-1')
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(1) // fresh message; invalid snapshot ignored
+    expect(sends[0]!.text).toContain('Fresh start')
+  })
+
+  test('#3c persisted lastActivityMs makes an ancient orphan drop silently after restart', async () => {
+    const dir = stateDir()
+    // Simulate an old install: snapshot persisted 20 minutes ago (clock=0 era).
+    writeFileSync(
+      join(dir, 'task-mirror-chat-1.json'),
+      JSON.stringify({
+        sessionId: 'old-sess',
+        messageId: 200,
+        todos: [{ content: 'Ancient task', status: 'in_progress' }],
+        dirty: false,
+        lastActivityMs: 0,
+      }),
+    )
+    const { mirror, clock, api } = makeMirror({ stateDir: dir })
+    clock.now = 20 * 60 * 1000 // 20 min later; TTL default = 10 min
+
+    // A NEW session arrives: the restored entry is an ancient orphan — it must
+    // be dropped SILENTLY (no «сессия завершена» edit on the old message).
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'New life', status: 'in_progress' }], 'new-sess'))
+    await mirror._idleForTests('chat-1')
+    expect(api.calls.filter((c) => c.kind === 'edit').length).toBe(0)
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(1)
+    expect(sends[0]!.text).toContain('New life')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop 2026-07-09 — restart must not wipe a restored mirror (#10)
+// ─────────────────────────────────────────────────────────────────────
+
+describe('#10 empty-unverified reconciled view after restart', () => {
+  test('does not edit a restored populated message down to «задач нет»', async () => {
+    const dir = stateDir()
+    writeFileSync(
+      join(dir, 'task-mirror-chat-1.json'),
+      JSON.stringify({
+        sessionId: SID,
+        messageId: 200,
+        todos: [{ content: 'Живая задача', status: 'in_progress' }],
+        dirty: false,
+        lastActivityMs: 0,
+      }),
+    )
+    const { mirror, clock, api } = makeMirror({ stateDir: dir })
+    // Reconciler knows nothing yet right after restart.
+    await mirror.applyReconciledView('chat-1', {
+      sessionId: SID,
+      todos: [],
+      freshness: { kind: 'unverified' },
+    })
+    await mirror._idleForTests('chat-1')
+    expect(api.calls).toHaveLength(0) // no «задач нет» wipe
+
+    // Once the reconciler has real data, the message updates normally.
+    await mirror.applyReconciledView('chat-1', {
+      sessionId: SID,
+      todos: [{ content: 'Живая задача', status: 'completed' }],
+      freshness: { kind: 'fresh', reconciledAgeMs: 1_000 },
+    })
+    clock.advance(3001) // FakeClock starts at 0 ⇒ let the throttle window pass
+    await mirror._idleForTests('chat-1')
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    expect(edits.length).toBe(1)
+    expect(edits[0]!.text).toContain('1 done')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop 2026-07-09 — no double «сессия завершена» (SHOULD)
+// ─────────────────────────────────────────────────────────────────────
+
+describe('ended freshness suppresses the duplicate footer', () => {
+  test('finalize after an ended reconciled view says «сессия завершена» exactly once', async () => {
+    const { mirror, api } = makeMirror()
+    await mirror.applyReconciledView('chat-1', {
+      sessionId: SID,
+      todos: [{ content: 'Done work', status: 'completed' }],
+      freshness: { kind: 'fresh', reconciledAgeMs: 1_000 },
+    })
+    await mirror._idleForTests('chat-1')
+    // Reality mirror pushes the frozen ended view…
+    await mirror.applyReconciledView('chat-1', {
+      sessionId: SID,
+      todos: [{ content: 'Done work', status: 'completed' }],
+      freshness: { kind: 'ended', reconciledAtLabel: '08:05' },
+    })
+    await mirror._idleForTests('chat-1')
+    // …then the webhook's session_end lands and finalizes.
+    await mirror.recordEvent('chat-1', sessionEnd())
+    await mirror._idleForTests('chat-1')
+    const all = [...api.calls].reverse()
+    const lastText = all.find((c) => c.kind === 'edit' || c.kind === 'send')!.text
+    const occurrences = (lastText.match(/сессия завершена/g) ?? []).length
+    expect(occurrences).toBe(1)
   })
 })

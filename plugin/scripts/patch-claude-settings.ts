@@ -20,7 +20,8 @@
 //     [--helper /abs/path/to/post-hook.ts]
 
 import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 'fs'
-import { dirname, resolve as pathResolve } from 'path'
+import { homedir } from 'os'
+import { dirname, join, resolve as pathResolve } from 'path'
 import { fileURLToPath } from 'url'
 
 const MARKER = 'dashi-channel-hook'
@@ -336,8 +337,66 @@ function writeAtomic(path: string, contents: string): void {
   }
 }
 
+// ─── wide-feeder narrowing warning (review 2026-07-09 SHOULD-fix) ──────
+// Re-running the patch over an OLD wide install (a `.*` PreToolUse/PostToolUse
+// dashi feeder) silently narrows the feeder set. That is correct for the
+// current surfaces, but a fleet install whose plugin config still enables the
+// per-tool consumers (status / progress reporters) would silently lose their
+// event stream. Detect the narrowing + the enabled consumers and WARN loudly.
+
+/** True when the pre-patch settings carry one of OUR feeders on a wide surface. */
+export function hasWideDashiFeeder(settings: SettingsShape): boolean {
+  const hooks = settings.hooks ?? {}
+  const isOurs = (e: HookEntry | undefined): boolean =>
+    e !== undefined && (e.marker === MARKER || isLegacyDashiEntry(e))
+  for (const e of hooks.PreToolUse ?? []) {
+    if (isOurs(e)) return true // PreToolUse feeder no longer installed at all
+  }
+  for (const e of hooks.PostToolUse ?? []) {
+    if (isOurs(e) && (e.matcher === undefined || e.matcher === '.*' || e.matcher === '')) {
+      return true // unscoped PostToolUse feeder — fired on every tool
+    }
+  }
+  return false
+}
+
+// Best-effort read of the PLUGIN config (not the Claude settings being
+// patched) to see whether the per-tool consumers are enabled. Mirrors the
+// loadConfig path resolution: TELEGRAM_CONFIG_FILE, else
+// <TELEGRAM_STATE_DIR|~/.claude/channels/dashi-telegram-canary>/config.json.
+// Both status.enabled and progress.enabled default to FALSE in the schema, so
+// only an explicit `true` in config.json counts.
+function pluginConsumersEnabled(env: NodeJS.ProcessEnv): boolean {
+  try {
+    const stateRoot =
+      env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'dashi-telegram-canary')
+    const configPath = env.TELEGRAM_CONFIG_FILE ?? join(stateRoot, 'config.json')
+    if (!existsSync(configPath)) return false
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as {
+      status?: { enabled?: unknown }
+      progress?: { enabled?: unknown }
+    }
+    return parsed.status?.enabled === true || parsed.progress?.enabled === true
+  } catch {
+    return false
+  }
+}
+
+function warnIfNarrowing(settings: SettingsShape, env: NodeJS.ProcessEnv): void {
+  if (!hasWideDashiFeeder(settings)) return
+  if (!pluginConsumersEnabled(env)) return
+  process.stderr.write(
+    'WARNING: narrowing the dashi-channel hook feeders (dropping the wide ' +
+      'PreToolUse/PostToolUse `.*` feeder) while the plugin config has ' +
+      'status.enabled/progress.enabled=true — those surfaces consume the ' +
+      'per-tool event stream and will stop updating per tool call. Disable ' +
+      'them in config.json or keep a wide feeder manually.\n',
+  )
+}
+
 export function patchSettingsFile(opts: PatchOptions): void {
   const settings = readSettings(opts.settingsPath)
+  warnIfNarrowing(settings, process.env)
   const patched = applyPatch(settings, opts)
   const out = `${JSON.stringify(patched, null, 2)}\n`
   if (out.includes('TELEGRAM_WEBHOOK_TOKEN=')) {

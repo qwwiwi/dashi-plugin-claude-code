@@ -559,14 +559,21 @@ const progressReporter = new ProgressReporter({ telegramApi, config, log })
 // through redact + HTML validation before leaving the process.
 const taskMirror = new TaskMirror({ telegramApi, config, log, stateDir: statePaths.root })
 
+// Default pane target when tmux_mirror.pane_target is unset. Overridable via
+// JARVIS_PANE_TARGET (review 2026-07-09 SHOULD-fix: the hardcoded
+// `channel-thrall:0.0` fallback breaks on any other host); the historical
+// value stays the default — the canonical session for this plugin on Thrall.
+function resolveDefaultPaneTarget(): string {
+  return (process.env.JARVIS_PANE_TARGET ?? '').trim() || 'channel-thrall:0.0'
+}
+
 // TmuxMirror (2026-05-20) — read-only mirror of the agent's terminal pane
 // into ONE rolling Telegram message. Default-OFF in config; the warchief
 // opts in explicitly. When enabled without an explicit pane_target we
-// fall back to `channel-thrall:0.0` — the canonical session for this
-// plugin on Thrall VPS.
+// fall back to resolveDefaultPaneTarget().
 let tmuxMirror: TmuxMirror | null = null
 if (config.tmux_mirror.enabled) {
-  const target = config.tmux_mirror.pane_target || 'channel-thrall:0.0'
+  const target = config.tmux_mirror.pane_target || resolveDefaultPaneTarget()
   const mirrorChatId = String(config.allowed_chat_ids[0] ?? '')
   if (mirrorChatId === '') {
     log.warn('tmux mirror enabled but no allowed_chat_ids configured — skipping')
@@ -627,7 +634,7 @@ function resolveTaskReconcilerEnabled(): boolean {
 // long list is always in view. Owner-DM-gated; each sink also gates internally.
 let taskRealityMirror: TaskRealityMirror | undefined
 if (resolveTaskReconcilerEnabled()) {
-  const paneTarget = config.tmux_mirror.pane_target || 'channel-thrall:0.0'
+  const paneTarget = config.tmux_mirror.pane_target || resolveDefaultPaneTarget()
   const ownerSet = new Set(hudOwnerChatIds.map(String))
   taskRealityMirror = new TaskRealityMirror({
     exec: defaultTmuxExec,

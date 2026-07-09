@@ -143,10 +143,19 @@ export interface ReconciledTask {
 }
 
 /** Snapshot fingerprint kept for the two-consecutive-snapshot anti-flap rule. */
-interface SnapshotFacts {
+export interface SnapshotFacts {
   status: TaskStatus
   description: string
   descriptionTruncated: boolean
+  /**
+   * capturedAt of the snapshot that recorded this fact. A fact only CONFIRMS
+   * a change (regression / description swap) when it is at least as new as the
+   * committed task's own updatedAt — a fact captured BEFORE an intervening
+   * event is stale and must not count as the first of two consecutive
+   * confirmations (review 2026-07-09, Codex Med: snapshot:pending →
+   * event:completed → snapshot:pending must NOT regress immediately).
+   */
+  at: number
 }
 
 /** The full reconciled state for one session. Treat as immutable between calls. */
@@ -336,9 +345,20 @@ function precedingNonBlank(lines: ReadonlyArray<string>, idx: number): string | 
 
 /**
  * Parse the pane text into a task snapshot, or null when no task list is
- * present. When several blocks exist, the freshest (last) block wins: an
- * anchored block (header/spinner above) is preferred; failing that, the last
- * block of >= 2 task lines is accepted with `boundaryRecognized = false`.
+ * present. When several blocks exist, the freshest (last) block wins: a
+ * HEADER-anchored block is preferred; failing that, the last block of >= 2
+ * task lines is accepted with `boundaryRecognized = false`.
+ *
+ * ANTI-SPOOF (review 2026-07-09, all three reviewers): ONLY the
+ * `N tasks (A done, B in progress, C open)` header grants a recognized
+ * boundary. A spinner-anchored block (`* Imagining…`, `· thinking` etc.) is
+ * trivially reproduced in agent prose or scrollback — a checkbox list the
+ * agent merely ECHOED (quoting a plan, printing a diff) under any `*`/`·`
+ * line would previously have parsed as authoritative and ERASED the real
+ * task state within two capture cycles. Spinner/unanchored blocks are still
+ * parsed (they feed reconciliation health) but carry
+ * `boundaryRecognized=false` ⇒ {@link validateSnapshot} refuses authority
+ * (`unrecognized_boundary`) and they stay observational.
  *
  * `text` is assumed already ANSI-stripped by the capture layer, but we are
  * defensive: classification is line-oriented and never assumes clean input.
@@ -367,11 +387,12 @@ export function parsePaneTaskList(text: string, provenance: PaneProvenance): Pan
           pending: Number.parseInt(hm[4] as string, 10),
         }
         anchored = true
-      } else if (SPINNER_RE.test(above)) {
-        anchored = true
       }
+      // SPINNER_RE deliberately does NOT anchor (anti-spoof, see docstring).
+      // Spinner blocks fall through to the multi-line observational fallback.
     }
-    // Prefer anchored blocks; else accept a multi-line block as a fallback.
+    // Prefer header-anchored blocks; else accept a multi-line block (including
+    // spinner-anchored Style-B renders) as an observational fallback.
     const usable = anchored || block.taskLines.length >= 2
     if (!usable) continue
     // Freshest wins: any later usable block replaces an earlier one, but an
@@ -668,6 +689,7 @@ function applySnapshot(
       status: sTask.status,
       description: sTask.description,
       descriptionTruncated: sTask.descriptionTruncated,
+      at: snapCap,
     })
   }
 
@@ -718,6 +740,14 @@ function mergeSnapshotTask(
   const rankS = statusRank(sTask.status)
   const rankB = statusRank(base.status)
 
+  // A previous-snapshot fact may only CONFIRM a change when it is at least as
+  // new as the committed task's own updatedAt. A fact captured BEFORE an
+  // intervening event is stale: snapshot:pending → event:completed →
+  // snapshot:pending must hold `completed` (first observation of the
+  // regression), not regress immediately (review 2026-07-09, Codex Med).
+  const prevFactsCurrent =
+    prevFacts !== undefined && prevFacts.at >= base.updatedAt ? prevFacts : undefined
+
   // Status resolution.
   let status: TaskStatus
   if (rankS >= rankB) {
@@ -726,8 +756,8 @@ function mergeSnapshotTask(
   } else if (!base.paneConfirmed) {
     // Base is an absorbed provisional / event-only older guess ⇒ reality wins.
     status = sTask.status
-  } else if (prevFacts !== undefined && prevFacts.status === sTask.status) {
-    // Two consecutive snapshots agree on the regression ⇒ confirmed.
+  } else if (prevFactsCurrent !== undefined && prevFactsCurrent.status === sTask.status) {
+    // Two consecutive post-event snapshots agree on the regression ⇒ confirmed.
     status = sTask.status
   } else {
     // First observation of the regression ⇒ hold the higher committed status.
@@ -744,11 +774,11 @@ function mergeSnapshotTask(
       description = sTask.description
       descriptionTruncated = false
     } else if (
-      prevFacts !== undefined &&
-      !prevFacts.descriptionTruncated &&
-      normalizeDescription(prevFacts.description) === normalizeDescription(sTask.description)
+      prevFactsCurrent !== undefined &&
+      !prevFactsCurrent.descriptionTruncated &&
+      normalizeDescription(prevFactsCurrent.description) === normalizeDescription(sTask.description)
     ) {
-      // Two consecutive snapshots agree on the new description ⇒ confirmed.
+      // Two consecutive post-event snapshots agree on the new description ⇒ confirmed.
       description = sTask.description
       descriptionTruncated = false
     }

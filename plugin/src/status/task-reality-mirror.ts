@@ -15,6 +15,19 @@
 // surfaces (context HUD pin + TaskMirror). Every method is best-effort and must
 // never throw into the webhook 200 path.
 //
+// Hardening (review fix-loop 2026-07-09):
+//   • Generation token — every session change / end / eviction bumps
+//     `rec.generation`; an in-flight doCapture re-checks it after EVERY await
+//     and discards its work when stale, so old-pane output can never commit
+//     into a new session binding.
+//   • Session tombstones — a session that received SessionEnd is remembered
+//     (bounded set); late mutations / prompts naming it are dropped instead of
+//     resurrecting state. SessionStart with the same id (resume) un-tombstones.
+//   • Hard TTL — a rec idle past `ttlMs` is EVICTED regardless of turnActive
+//     (a missed Stop must not poll tmux + edit Telegram forever).
+//   • Unresolved pane cwd ⇒ snapshot is OBSERVATIONAL (the cwd cross-check is
+//     the one real provenance check; silently skipping it would neuter it).
+//
 // Degradation: when no pane is capturable (tmux absent, session gone, wrong
 // pane), reconciliation produces no valid snapshot and the view renders
 // «НЕ СВЕРЕНО» (events only) — the surfaces still show the optimistic list.
@@ -42,6 +55,8 @@ import {
   type ReconciledState,
   type ReconciledTask,
   type SessionBinding,
+  type SnapshotFacts,
+  type SnapshotVerdict,
   type ToolTaskEvent,
 } from './task-reconciler.js'
 import { formatUtcHm, type TaskFreshness } from './task-freshness.js'
@@ -77,7 +92,9 @@ export interface TaskRealityMirrorOptions {
   captureIntervalMs?: number
   /** Coalesce window: triggers within this collapse to one capture. Default 5s. */
   coalesceWindowMs?: number
-  /** Orphan-timer TTL: an idle non-active session parks its timer past this. Default 10min. */
+  /** HARD inactivity TTL: a rec idle past this is evicted (timers stopped,
+   *  state dropped) regardless of turnActive — a missed Stop must not keep
+   *  polling forever. Default 10min. */
   ttlMs?: number
   /** Owner-chat gate — the reconciler acts ONLY for owner DM chats. */
   isOwnerChat?: (chatId: string) => boolean
@@ -102,11 +119,17 @@ interface ChatRec {
   coalesceTimer: ReturnType<typeof setTimeout> | null
   lastCaptureAt: number
   capturing: boolean
+  // Monotonic invalidation token. Bumped on session change, session end and
+  // eviction. doCapture snapshots it at entry and re-checks after every await;
+  // a mismatch means the work belongs to a retired binding and is discarded.
+  generation: number
 }
 
 const DEFAULT_CAPTURE_INTERVAL_MS = 20_000
 const DEFAULT_COALESCE_WINDOW_MS = 5_000
 const DEFAULT_TTL_MS = 10 * 60 * 1000
+// Bounded per-chat memory of ended (tombstoned) session ids.
+const MAX_TOMBSTONES = 8
 
 export class TaskRealityMirror {
   private readonly exec: TmuxExec
@@ -121,6 +144,11 @@ export class TaskRealityMirror {
   private readonly setTimer: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>
   private readonly clearTimer: (handle: ReturnType<typeof setTimeout>) => void
   private readonly recs = new Map<string, ChatRec>()
+  // Per-chat tombstones: session ids that received SessionEnd. Late events
+  // naming a tombstoned session are dropped — they must never finalize/clear
+  // the ACTIVE session or resurrect the retired one. SessionStart with the
+  // same id (a genuine resume) removes the tombstone.
+  private readonly endedSessions = new Map<string, Set<string>>()
 
   constructor(opts: TaskRealityMirrorOptions) {
     this.exec = opts.exec
@@ -142,6 +170,9 @@ export class TaskRealityMirror {
   onSessionStart(chatId: string, opts: { sessionId: string; cwd?: string }): void {
     if (!this.isOwnerChat(chatId)) return
     try {
+      // A SessionStart naming a tombstoned id is a genuine RESUME — the
+      // harness is alive again under the same id. Un-tombstone it.
+      this.untombstone(chatId, opts.sessionId)
       const rec = this.ensureRec(chatId, opts.sessionId, opts.cwd)
       this.ensureSession(rec, opts.sessionId)
       rec.ended = false
@@ -157,6 +188,7 @@ export class TaskRealityMirror {
   /** UserPromptSubmit: a turn has begun — mark active, arm the timer, capture now. */
   onUserPromptSubmit(chatId: string, opts: { sessionId: string; cwd?: string }): void {
     if (!this.isOwnerChat(chatId)) return
+    if (this.isTombstoned(chatId, opts.sessionId)) return // late event from a retired session
     try {
       const rec = this.ensureRec(chatId, opts.sessionId, opts.cwd)
       this.ensureSession(rec, opts.sessionId)
@@ -190,20 +222,23 @@ export class TaskRealityMirror {
 
   /**
    * SessionEnd (the REAL end): freeze the surface. Consumes the LATEST
-   * reconciled state — does NOT capture (the pane may already be gone) — stops
-   * the timers, and pushes a frozen «сессия завершена» view.
+   * reconciled state — does NOT capture (the pane may already be gone) —
+   * pushes a frozen «сессия завершена» view, tombstones the session id, then
+   * EVICTS the rec (timers stopped, in-flight captures invalidated). A late
+   * SessionEnd naming a session we've already moved past only tombstones it.
    */
   onSessionEnd(chatId: string, opts: { sessionId: string }): void {
     if (!this.isOwnerChat(chatId)) return
-    const rec = this.recs.get(chatId)
-    if (rec === undefined) return
-    // Ignore a late SessionEnd naming a session we've already moved past.
-    if (rec.sessionId !== opts.sessionId) return
     try {
+      this.tombstone(chatId, opts.sessionId)
+      const rec = this.recs.get(chatId)
+      if (rec === undefined) return
+      // Late end for a retired session: never touch the active rec.
+      if (rec.sessionId !== opts.sessionId) return
       rec.ended = true
       rec.turnActive = false
-      this.disarm(rec)
-      this.pushView(rec)
+      this.pushView(rec) // frozen ended view goes out BEFORE the state is dropped
+      this.evict(rec)
     } catch (err) {
       this.warn('onSessionEnd', chatId, err)
     }
@@ -213,13 +248,24 @@ export class TaskRealityMirror {
   onTaskEvent(chatId: string, event: TaskMirrorEvent, opts: { cwd?: string } = {}): void {
     if (!this.isOwnerChat(chatId)) return
     if (!isTaskMutationEvent(event)) return // lifecycle handled by the entry points above
+    if (this.isTombstoned(chatId, event.sessionId)) return // retired session — drop
     try {
       const rec = this.ensureRec(chatId, event.sessionId, opts.cwd)
       this.ensureSession(rec, event.sessionId)
       rec.lastActivityMs = this.now()
       const now = this.now()
-      for (const te of this.deriveToolEvents(rec, event, now)) {
-        rec.state = reconcileTaskState(rec.state, { kind: 'event', event: te })
+      if (event.kind === 'todo_write') {
+        // TodoWrite IS the harness's own full list — treat it as an
+        // authoritative event snapshot INCLUDING removals, and preserve the
+        // event ids so identical descriptions stay distinct tasks (review
+        // 2026-07-09 #5: the per-task delta path lost removals in the
+        // events-only degrade ⇒ ghosts forever without tmux).
+        applyEventToEventMap(rec.eventMap, event) // keep the map coherent for later task_update matching
+        rec.state = applyTodoWriteToState(rec.state, event.todos, now)
+      } else {
+        for (const te of this.deriveToolEvents(rec, event, now)) {
+          rec.state = reconcileTaskState(rec.state, { kind: 'event', event: te })
+        }
       }
       this.pushView(rec)
     } catch (err) {
@@ -227,9 +273,9 @@ export class TaskRealityMirror {
     }
   }
 
-  /** Stop every timer (process shutdown). */
+  /** Stop every timer and invalidate in-flight captures (process shutdown). */
   stop(): void {
-    for (const rec of this.recs.values()) this.disarm(rec)
+    for (const rec of [...this.recs.values()]) this.evict(rec)
   }
 
   // ─── per-chat state ──────────────────────────────────────────────────
@@ -252,6 +298,7 @@ export class TaskRealityMirror {
         // wait on a brand-new session).
         lastCaptureAt: Number.NEGATIVE_INFINITY,
         capturing: false,
+        generation: 0,
       }
       this.recs.set(chatId, rec)
     } else if (cwd !== undefined && cwd.length > 0 && rec.binding.cwd !== cwd) {
@@ -261,14 +308,51 @@ export class TaskRealityMirror {
   }
 
   // Reset state on a genuine session change (harness task ids restart at #1).
+  // Bumps the generation so any in-flight capture from the OLD session binding
+  // discards itself instead of committing old-pane output into the new state.
   private ensureSession(rec: ChatRec, sessionId: string): void {
     if (rec.sessionId === sessionId) return
+    rec.generation += 1
     rec.sessionId = sessionId
     rec.binding = { ...rec.binding, sessionId }
     rec.state = initialReconciledState(sessionId)
     rec.eventMap = new Map()
     rec.ended = false
     rec.turnActive = false
+  }
+
+  // Drop a rec entirely: timers disarmed, in-flight captures invalidated via
+  // the generation bump, entry removed from the map. Used by SessionEnd, the
+  // hard TTL and stop().
+  private evict(rec: ChatRec): void {
+    this.disarm(rec)
+    rec.generation += 1
+    if (this.recs.get(rec.chatId) === rec) this.recs.delete(rec.chatId)
+  }
+
+  // ─── tombstones ──────────────────────────────────────────────────────
+
+  private tombstone(chatId: string, sessionId: string): void {
+    let set = this.endedSessions.get(chatId)
+    if (set === undefined) {
+      set = new Set()
+      this.endedSessions.set(chatId, set)
+    }
+    set.delete(sessionId) // re-add moves it to the tail (freshest)
+    set.add(sessionId)
+    while (set.size > MAX_TOMBSTONES) {
+      const oldest = set.values().next().value
+      if (oldest === undefined) break
+      set.delete(oldest)
+    }
+  }
+
+  private untombstone(chatId: string, sessionId: string): void {
+    this.endedSessions.get(chatId)?.delete(sessionId)
+  }
+
+  private isTombstoned(chatId: string, sessionId: string): boolean {
+    return this.endedSessions.get(chatId)?.has(sessionId) === true
   }
 
   // ─── capture scheduling ──────────────────────────────────────────────
@@ -288,12 +372,16 @@ export class TaskRealityMirror {
     rec.periodicTimer = null
     if (rec.ended) return
     const idle = this.now() - rec.lastActivityMs
-    if (!rec.turnActive && idle > this.ttlMs) {
-      // Orphan timer: a long-idle session with no SessionEnd. Park the timer
-      // (stop rearming) — a fresh UserPromptSubmit / SessionStart restarts it.
-      this.log.debug('task reality mirror timer parked (idle > ttl)', {
+    if (idle > this.ttlMs) {
+      // HARD TTL (review 2026-07-09 #6): evict regardless of turnActive — a
+      // missed Stop would otherwise leave turnActive=true and the timer would
+      // poll tmux + cross age buckets + edit Telegram forever. A fresh
+      // SessionStart / UserPromptSubmit rebuilds the rec from scratch.
+      this.log.debug('task reality mirror rec evicted (idle > ttl)', {
         chat_id: rec.chatId,
+        idle_ms: idle,
       })
+      this.evict(rec)
       return
     }
     this.triggerCapture(rec, false)
@@ -327,23 +415,29 @@ export class TaskRealityMirror {
     if (rec.capturing || rec.ended) return
     rec.capturing = true
     rec.lastCaptureAt = this.now()
+    // Generation snapshot: if the session changes / ends / evicts while any of
+    // the awaits below is pending, this capture's output belongs to a retired
+    // binding and MUST be discarded (review 2026-07-09 #4).
+    const gen = rec.generation
     try {
       const cap = await capturePaneText(this.exec, this.capture)
+      if (rec.generation !== gen || rec.ended) return
       if (!cap.ok) {
         // No pane / capture failed — no snapshot. Refresh the indicator only
         // (health may transition to stale if a turn is active).
         this.pushView(rec)
         return
       }
-      // Resolve the pane's cwd for provenance. When unobtainable, degrade by
-      // reusing the binding cwd so validateSnapshot skips the cross-check
-      // rather than false-flagging a mismatch (documented M3 degrade).
+      // Resolve the pane's cwd for provenance. When UNRESOLVABLE the snapshot
+      // degrades to OBSERVATIONAL (review 2026-07-09 #9): the cwd cross-check
+      // is the one provenance check with real signal here; substituting the
+      // binding cwd would make validation unconditionally pass and neuter it.
       const paneCwd = await resolvePaneCwd(this.exec, this.capture)
-      const cwd = paneCwd ?? rec.binding.cwd
+      if (rec.generation !== gen || rec.ended) return
       const provenance: PaneProvenance = {
         sessionId: rec.binding.sessionId,
         paneTarget: this.capture.paneTarget,
-        cwd,
+        cwd: paneCwd ?? '',
         capturedAt: this.now(),
       }
       const snapshot = parsePaneTaskList(cap.text, provenance)
@@ -355,7 +449,10 @@ export class TaskRealityMirror {
         this.pushView(rec)
         return
       }
-      const verdict = validateSnapshot(snapshot, rec.binding)
+      const verdict: SnapshotVerdict =
+        paneCwd === null
+          ? { authoritative: false, reasons: ['cwd_mismatch'] }
+          : validateSnapshot(snapshot, rec.binding)
       // §5 positional-alias pre-pass: re-key moved tasks to the snapshot's
       // ordinals by unique description so a genuine move is a merge, not a
       // remove+add. Only meaningful when the snapshot is authoritative.
@@ -418,12 +515,13 @@ export class TaskRealityMirror {
     return { kind: 'fresh', reconciledAgeMs: now - rec.state.lastReconciledAt }
   }
 
-  // ─── tool-event derivation ───────────────────────────────────────────
+  // ─── tool-event derivation (TaskCreate / TaskUpdate only) ─────────────
 
   // Apply the mutation to the event-derived map, then emit ToolTaskEvents for
   // ONLY the tasks whose status/description actually changed (or are new). This
   // keeps unchanged tasks from re-stamping `updatedAt` and wrongly out-ranking
-  // authoritative pane snapshots.
+  // authoritative pane snapshots. TodoWrite takes the applyTodoWriteToState
+  // path instead (full replacement including removals).
   private deriveToolEvents(rec: ChatRec, event: TaskMutationEvent, now: number): ToolTaskEvent[] {
     const pre = new Map(rec.eventMap)
     applyEventToEventMap(rec.eventMap, event)
@@ -499,15 +597,104 @@ export function reconciledToTodos(state: ReconciledState): TodoItem[] {
 }
 
 /**
+ * Fold a TodoWrite payload into the reconciled state as an AUTHORITATIVE event
+ * snapshot (review 2026-07-09 #5). TodoWrite is the harness's own full task
+ * list, so unlike the per-task delta path it must express REMOVALS: an
+ * event-only task absent from the payload is gone. Pane-confirmed tasks absent
+ * from the payload are left to the pane's own two-snapshot omission rule (the
+ * pane may legitimately still show them).
+ *
+ * Event ids are preserved in the task keys (`${sessionId}:~id:<id>` for
+ * non-numeric ids, canonical `#N` for numeric ones) so two tasks with
+ * IDENTICAL descriptions remain distinct instead of collapsing into one
+ * provisional keyed by description.
+ *
+ * Unchanged matched tasks keep their `updatedAt` untouched, so pane snapshots
+ * retain recency authority over them. PURE — returns a new state.
+ */
+export function applyTodoWriteToState(
+  state: ReconciledState,
+  todos: ReadonlyArray<TodoItem>,
+  at: number,
+): ReconciledState {
+  const sessionId = state.sessionId
+  const tasks = state.tasks.map((t) => ({ ...t }))
+  const byKey = new Map(tasks.map((t) => [t.key, t]))
+  const matched = new Set<ReconciledTask>()
+  const additions: ReconciledTask[] = []
+
+  todos.forEach((todo, i) => {
+    const id = todo.id !== undefined && todo.id.length > 0 ? todo.id : `todo-${i + 1}`
+    const ordinal = numericOrdinal(id)
+    const key = ordinal !== undefined ? `${sessionId}:#${ordinal}` : `${sessionId}:~id:${id}`
+    let target = byKey.get(key)
+    if ((target === undefined || matched.has(target)) && ordinal === undefined) {
+      // Fall back to a UNIQUE normalized-description match among not-yet-matched
+      // tasks so an id-less rewrite can attach to a pane-confirmed row.
+      const norm = normalizeDescription(todo.content)
+      const hits = tasks.filter(
+        (t) =>
+          !matched.has(t) &&
+          !t.descriptionTruncated &&
+          normalizeDescription(t.description) === norm,
+      )
+      if (hits.length === 1) target = hits[0]
+    }
+    if (target !== undefined && !matched.has(target)) {
+      matched.add(target)
+      const changed = target.status !== todo.status || target.description !== todo.content
+      if (changed && at >= target.updatedAt) {
+        target.status = todo.status
+        target.description = todo.content
+        target.descriptionTruncated = false
+        target.source = 'event'
+        target.updatedAt = at
+      }
+      return
+    }
+    additions.push({
+      key,
+      ordinal: ordinal ?? null,
+      status: todo.status,
+      description: todo.content,
+      descriptionTruncated: false,
+      source: 'event',
+      provisional: ordinal === undefined,
+      paneConfirmed: false,
+      updatedAt: at,
+    })
+  })
+
+  // Removals: event-only tasks (never pane-confirmed) absent from the full
+  // list are authoritatively gone, unless a NEWER observation touched them.
+  const kept = tasks.filter((t) => matched.has(t) || t.paneConfirmed || t.updatedAt > at)
+
+  return {
+    ...state,
+    tasks: [...kept, ...additions],
+    lastEventAt: Math.max(state.lastEventAt, at),
+  }
+}
+
+/**
  * §5 positional-alias re-association. The live harness renders NO ordinals —
  * keys are positional — so a task that MOVES position looks like a
  * removal-at-old + addition-at-new to the reconciler's canonical-key merge,
  * which would churn the list. Before reconciling an authoritative snapshot,
  * re-key each committed pane-confirmed task to the snapshot ordinal that
- * uniquely matches its normalized description, but ONLY when the move is
- * genuine (the task's old ordinal is not itself present in the snapshot — that
- * would be a duplicate description, not a move). Genuine removals/regressions
- * keep the reconciler's two-snapshot rule untouched.
+ * uniquely matches its normalized description, but ONLY when the move is a
+ * clean SHIFT (the task's old ordinal is vacated in the snapshot — an ordinal
+ * still present would mean a duplicate description or a positional swap, both
+ * ambiguous with positional keys).
+ *
+ * DISPLACEMENT (review 2026-07-09 #7, resolved by test): a mover's target
+ * ordinal may currently be held by a DIFFERENT committed task — e.g.
+ * [A#1,B#2,C#3] → [A#1,C#2]: C moves 3→2 while B still holds key #2. Stomping
+ * B's key would let the reconciler's consumedKeys pass swallow B and delete it
+ * on the FIRST omission, violating the two-snapshot anti-flap contract. So the
+ * displaced task is MOVED to a free ordinal (a vacated mover ordinal, else one
+ * past the end), carrying its prev-snapshot facts, and thereby survives as a
+ * first-omission candidate — dropped only by the SECOND consecutive omission.
  *
  * PURE — returns a new state; `state` is not mutated. Coupled to the M2
  * canonical-key format `${sessionId}:#${ordinal}`.
@@ -530,7 +717,7 @@ export function realignOrdinals(state: ReconciledState, snapshot: PaneSnapshot):
   }
   const snapOrdinals = new Set(snapshot.tasks.map((s) => s.ordinal))
 
-  const remap = new Map<number, number>() // oldOrdinal → newOrdinal
+  const remap = new Map<number, number>() // mover oldOrdinal → newOrdinal
   const takenNew = new Set<number>()
   for (const s of snapshot.tasks) {
     if (s.descriptionTruncated) continue
@@ -538,7 +725,7 @@ export function realignOrdinals(state: ReconciledState, snapshot: PaneSnapshot):
     if (match === undefined || match === null) continue
     const oldOrd = match.ordinal
     if (oldOrd === s.ordinal) continue // already correctly placed
-    // Genuine SHIFT only: the task's old ordinal must be vacated in the new
+    // Clean SHIFT only: the task's old ordinal must be vacated in the new
     // snapshot. If the old ordinal is still present, the description appears in
     // two places (a positional SWAP or a duplicate) — ambiguous with positional
     // keys, so we leave it to the reconciler's two-snapshot rule.
@@ -549,28 +736,57 @@ export function realignOrdinals(state: ReconciledState, snapshot: PaneSnapshot):
   }
   if (remap.size === 0) return state
 
-  // Apply the remap, then float the re-keyed tasks to the END so that if a
-  // re-key target collides with a soon-to-be-removed committed occupant, the
-  // re-keyed (correct) task wins the reconciler's by-key lookup.
-  const remapped = new Set<ReconciledTask>()
-  const mapped = state.tasks.map((t) => {
-    if (t.ordinal !== null && remap.has(t.ordinal)) {
-      const newOrd = remap.get(t.ordinal) as number
-      const nt: ReconciledTask = { ...t, ordinal: newOrd, key: keyOf(newOrd) }
-      remapped.add(nt)
-      return nt
+  // Displacement pass: any committed task sitting on a mover's TARGET ordinal
+  // (and not itself a mover) must be re-keyed away so no duplicate keys exist
+  // and the two-snapshot omission rule still sees it (see docstring).
+  const moverNewOrds = new Set(remap.values())
+  const allOrds = new Set<number>(snapOrdinals)
+  for (const t of state.tasks) if (t.ordinal !== null) allOrds.add(t.ordinal)
+  // Free pool: vacated mover ordinals that are not themselves targets and not
+  // in the snapshot; fallback: ordinals past the maximum in play.
+  const pool = [...remap.keys()].filter((o) => !moverNewOrds.has(o) && !snapOrdinals.has(o))
+  let overflow = Math.max(0, ...allOrds) + 1
+  const nextFree = (): number => {
+    const fromPool = pool.shift()
+    if (fromPool !== undefined) return fromPool
+    while (snapOrdinals.has(overflow) || moverNewOrds.has(overflow)) overflow += 1
+    const out = overflow
+    overflow += 1
+    return out
+  }
+  const displacedRemap = new Map<number, number>()
+  for (const t of state.tasks) {
+    if (t.ordinal === null) continue
+    if (!moverNewOrds.has(t.ordinal)) continue // not on a mover's target
+    if (remap.has(t.ordinal)) continue // it is itself a mover (its key moves anyway)
+    if (displacedRemap.has(t.ordinal)) continue
+    displacedRemap.set(t.ordinal, nextFree())
+  }
+
+  const combined = new Map<number, number>([...remap, ...displacedRemap])
+
+  const tasks = state.tasks.map((t) => {
+    if (t.ordinal !== null && combined.has(t.ordinal)) {
+      const newOrd = combined.get(t.ordinal) as number
+      return { ...t, ordinal: newOrd, key: keyOf(newOrd) }
     }
     return t
   })
-  const tasks = [...mapped.filter((t) => !remapped.has(t)), ...mapped.filter((t) => remapped.has(t))]
 
-  // Re-key prevSnapshotFacts so the two-snapshot removal/regression rule stays
-  // coherent after the move.
-  const prevSnapshotFacts = new Map(state.prevSnapshotFacts)
-  for (const [oldOrd, newOrd] of remap) {
-    const oldKey = keyOf(oldOrd)
-    const facts = prevSnapshotFacts.get(oldKey)
-    prevSnapshotFacts.delete(oldKey)
+  // Re-key prevSnapshotFacts alongside (two-phase so chains/swaps of keys
+  // can't clobber each other) — the omission/regression confirmations must
+  // follow the tasks they describe.
+  const prevSnapshotFacts = new Map<string, SnapshotFacts>(state.prevSnapshotFacts)
+  const liftedFacts = new Map<number, SnapshotFacts>()
+  for (const [oldOrd] of combined) {
+    const facts = prevSnapshotFacts.get(keyOf(oldOrd))
+    if (facts !== undefined) {
+      liftedFacts.set(oldOrd, facts)
+      prevSnapshotFacts.delete(keyOf(oldOrd))
+    }
+  }
+  for (const [oldOrd, newOrd] of combined) {
+    const facts = liftedFacts.get(oldOrd)
     if (facts !== undefined) prevSnapshotFacts.set(keyOf(newOrd), facts)
   }
 

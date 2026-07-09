@@ -419,3 +419,77 @@ describe('applyPatch (pure) — channel reminder', () => {
     expect(ups.filter((e) => e.marker === 'dashi-channel-reminder-hook').length).toBe(1)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop 2026-07-09 SHOULD — wide-feeder narrowing detection
+// ─────────────────────────────────────────────────────────────────────
+
+describe('hasWideDashiFeeder', () => {
+  test('detects an old wide install: dashi feeder on PreToolUse', async () => {
+    const { hasWideDashiFeeder } = await import('../../scripts/patch-claude-settings.js')
+    expect(
+      hasWideDashiFeeder({
+        hooks: {
+          PreToolUse: [
+            { marker: 'dashi-channel-hook', matcher: '.*', hooks: [{ type: 'command', command: 'bun post-hook.ts' }] },
+          ],
+        },
+      }),
+    ).toBe(true)
+  })
+
+  test('detects an unscoped PostToolUse feeder (marked or legacy markerless)', async () => {
+    const { hasWideDashiFeeder } = await import('../../scripts/patch-claude-settings.js')
+    expect(
+      hasWideDashiFeeder({
+        hooks: {
+          PostToolUse: [
+            { marker: 'dashi-channel-hook', matcher: '.*', hooks: [{ type: 'command', command: 'x' }] },
+          ],
+        },
+      }),
+    ).toBe(true)
+    expect(
+      hasWideDashiFeeder({
+        hooks: {
+          PostToolUse: [
+            // legacy markerless entry pointing at our helper, no matcher
+            { hooks: [{ type: 'command', command: "bun '/some/where/post-hook.ts'" }] },
+          ],
+        },
+      }),
+    ).toBe(true)
+  })
+
+  test('a NARROW install (scoped PostToolUse, no PreToolUse feeder) is not flagged', async () => {
+    const { hasWideDashiFeeder } = await import('../../scripts/patch-claude-settings.js')
+    expect(
+      hasWideDashiFeeder({
+        hooks: {
+          PostToolUse: [
+            {
+              marker: 'dashi-channel-hook',
+              matcher: 'TaskCreate|TaskUpdate|TodoWrite',
+              hooks: [{ type: 'command', command: 'x' }],
+            },
+          ],
+          PreToolUse: [
+            // the permission gate is NOT a feeder
+            { marker: 'dashi-permission-gate-hook', matcher: '.*', hooks: [{ type: 'command', command: 'gate' }] },
+          ],
+        },
+      }),
+    ).toBe(false)
+  })
+
+  test('unrelated third-party hooks are not flagged', async () => {
+    const { hasWideDashiFeeder } = await import('../../scripts/patch-claude-settings.js')
+    expect(
+      hasWideDashiFeeder({
+        hooks: {
+          PreToolUse: [{ matcher: '.*', hooks: [{ type: 'command', command: 'some-other-tool' }] }],
+        },
+      }),
+    ).toBe(false)
+  })
+})
