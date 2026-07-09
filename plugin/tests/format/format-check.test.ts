@@ -26,6 +26,26 @@ describe('analyzeFormat', () => {
     expect(codes(code)).not.toContain('P450')
   })
 
+  // Review fix (2026-07-09): a fenced block CONTAINING blank lines used to
+  // leak its code lines into a surrounding "paragraph" and fire P450.
+  test('P450 does not fire on a fenced block containing blank lines', () => {
+    const code = '```\n' + 'x'.repeat(300) + '\n\n' + 'y'.repeat(300) + '\n```'
+    expect(codes(code)).not.toContain('P450')
+  })
+
+  test('P450 still fires on long prose ADJACENT to a fence with blank lines', () => {
+    const prose = 'слово '.repeat(100)
+    const code = '```\na\n\nb\n```'
+    const found = analyzeFormat(`${prose}\n\n${code}`)
+    expect(found.find((f) => f.code === 'P450')?.count).toBe(1)
+  })
+
+  // Review fix (2026-07-09): ``` inside an open ~~~ fence is content, not a
+  // closer — nothing after it may be scored as prose.
+  test('mixed fence chars: prose-like lines after an inner ``` stay protected', () => {
+    expect(codes('~~~\nM1 — a\n```\nM2 — b\nM3 — c\nM4 — d\n~~~')).toEqual([])
+  })
+
   test('SOFTLIST fires on a run of 3+ soft-break prose lines', () => {
     const found = analyzeFormat('M1 — a\nM2 — b\nM3 — c')
     expect(found.find((f) => f.code === 'SOFTLIST')?.count).toBe(1)

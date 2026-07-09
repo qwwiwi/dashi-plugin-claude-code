@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
+import { rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 import {
   EMBEDDED_TOV_REMINDER,
   composeReminder,
@@ -111,6 +115,49 @@ describe('tovReminder', () => {
   test('unreadable TOV_REMINDER_PATH falls back to the embedded baseline', () => {
     const r = tovReminder({ TOV_REMINDER_PATH: '/no/such/file/xyz.md' })
     expect(r).toBe(EMBEDDED_TOV_REMINDER)
+  })
+
+  // Review fix (2026-07-09): TOV_REMINDER_PATH is confined to plugin docs/ —
+  // a path outside (e.g. a .env) must NEVER be injected into model context.
+  test('TOV_REMINDER_PATH outside plugin docs/ is rejected → embedded baseline', () => {
+    // A real, readable file that is NOT under docs/ — must not leak.
+    const r = tovReminder({ TOV_REMINDER_PATH: '/etc/hostname' })
+    expect(r).toBe(EMBEDDED_TOV_REMINDER)
+  })
+
+  test('a docs/ file over the size cap falls back to the embedded baseline', () => {
+    // docs/TOV.md is inside docs/ but has 12+ content lines (> 8-line cap) —
+    // proves the cap fires even for an in-tree file.
+    const here = dirname(fileURLToPath(import.meta.url))
+    const tovFull = resolve(here, '..', '..', 'docs', 'TOV.md')
+    const r = tovReminder({ TOV_REMINDER_PATH: tovFull })
+    expect(r).toBe(EMBEDDED_TOV_REMINDER)
+  })
+
+  test('a distinct in-docs override file is used as-is', () => {
+    const docs = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'docs')
+    const p = join(docs, 'TOV-reminder.tmp-test.md')
+    writeFileSync(p, 'Короткий override.\nВторая строка.')
+    try {
+      expect(tovReminder({ TOV_REMINDER_PATH: p })).toBe('Короткий override.\nВторая строка.')
+    } finally {
+      rmSync(p, { force: true })
+    }
+  })
+
+  test('a symlink inside docs/ escaping the directory is rejected', () => {
+    const docs = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'docs')
+    const link = join(docs, 'TOV-escape.tmp-test.md')
+    try {
+      symlinkSync('/etc/hostname', link)
+    } catch {
+      return // environment forbids symlinks — nothing to verify here
+    }
+    try {
+      expect(tovReminder({ TOV_REMINDER_PATH: link })).toBe(EMBEDDED_TOV_REMINDER)
+    } finally {
+      rmSync(link, { force: true })
+    }
   })
 
   test('embedded baseline is a real 5-line block with no emoji', () => {

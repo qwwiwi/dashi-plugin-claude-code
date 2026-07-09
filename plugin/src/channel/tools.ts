@@ -608,6 +608,20 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         // safe wrapper (caught by the outer try) so we never silently
         // swallow then resend.
         const richLatch = deps.richLatch
+        // Preserve single newlines: Telegram's rich (raw-markdown) renderer
+        // uses CommonMark, where a lone `\n` is a soft break that collapses
+        // to a space and merges list-like prose lines into one wall of
+        // text. hardenSoftBreaks() promotes those to CommonMark hard breaks
+        // BEFORE the body reaches the safe wrapper's redactor — normalize
+        // → redact → send. It touches only plain-prose boundaries; fenced
+        // code, inline code, tables and paragraph breaks pass through.
+        //
+        // Computed BEFORE the eligibility gate: hardening adds bytes (a `\`
+        // per hardened break), so the size limit must be measured on the
+        // body we actually send, not on the pre-hardened text (review fix —
+        // a 32756-byte input hardened past the 32768 cap and burned a doomed
+        // API call before the transparent fallback).
+        const richBody = hardenSoftBreaks(args.text)
         const richEligible =
           config.richMessages.enabled &&
           args.format !== 'text' &&
@@ -616,21 +630,13 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           !richLatch.sendDisabled &&
           !config.richMessages.perChatOptOut.includes(args.chat_id) &&
           files.length === 0 &&
-          contentFitsRichLimits(args.text) &&
+          contentFitsRichLimits(richBody) &&
           isDmChat(args.chat_id)
 
         let richSent = false
         if (richEligible) {
           const richOpts: SendRichMessageOpts = {}
           if (replyToId !== undefined) richOpts.reply_to_message_id = replyToId
-          // Preserve single newlines: Telegram's rich (raw-markdown) renderer
-          // uses CommonMark, where a lone `\n` is a soft break that collapses
-          // to a space and merges list-like prose lines into one wall of
-          // text. hardenSoftBreaks() promotes those to CommonMark hard breaks
-          // BEFORE the body reaches the safe wrapper's redactor — normalize
-          // → redact → send. It touches only plain-prose boundaries; fenced
-          // code, inline code, tables and paragraph breaks pass through.
-          const richBody = hardenSoftBreaks(args.text)
           const res = await telegramApi.sendRichMessage(args.chat_id, richBody, richOpts)
           if ('message_id' in res) {
             sentIds.push(res.message_id)
@@ -731,14 +737,25 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         // message text — only rule codes + counts. The one deterministic
         // rewrite (soft-break hardening) already happened above on the rich
         // path; this is purely advisory feedback so the model self-corrects.
-        const formatFindings = analyzeFormat(args.text)
-        if (formatFindings.length > 0) {
-          log.info('reply format check', {
-            chat_id: args.chat_id,
-            codes: formatFindings.map((f) => `${f.code}=${f.count}`).join(','),
+        //
+        // Guarded (review fix): the message already SHIPPED — a checker throw
+        // here would surface as a tool error and could push the agent into a
+        // duplicate resend. Any failure degrades to "no findings".
+        let hint = ''
+        try {
+          const formatFindings = analyzeFormat(args.text)
+          if (formatFindings.length > 0) {
+            log.info('reply format check', {
+              chat_id: args.chat_id,
+              codes: formatFindings.map((f) => `${f.code}=${f.count}`).join(','),
+            })
+          }
+          hint = formatHint(formatFindings)
+        } catch (err) {
+          log.debug('reply format check failed (ignored)', {
+            error: err instanceof Error ? err.message : String(err),
           })
         }
-        const hint = formatHint(formatFindings)
         const resultText = hint ? `${result}\n${hint}` : result
         return { content: [{ type: 'text', text: resultText }] }
       }

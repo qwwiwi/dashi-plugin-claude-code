@@ -37,12 +37,15 @@
 //                        else is a direct chat. Absent → DM-safe generic.
 //   TOV_REMINDER_ENABLED falsy (0/false/no/off, case-insensitive) disables
 //                        the TOV block. Default: enabled.
-//   TOV_REMINDER_PATH    per-agent override file for the TOV block. Default:
-//                        docs/TOV-reminder.md next to the plugin. Unreadable
-//                        → embedded constant.
+//   TOV_REMINDER_PATH    per-agent override file for the TOV block. MUST live
+//                        inside the plugin docs/ directory (realpath-checked,
+//                        symlinks escaping it are rejected). Default:
+//                        docs/TOV-reminder.md. Unreadable, out-of-tree, or
+//                        over the size cap (8 lines / 1KB) → embedded
+//                        constant.
 
-import { readFileSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { readFileSync, realpathSync } from 'node:fs'
+import { dirname, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const DM_REMINDER =
@@ -89,25 +92,49 @@ function isFalsyEnv(value: string | undefined): boolean {
   return ['0', 'false', 'no', 'off'].includes(value.trim().toLowerCase())
 }
 
-/** Default path to the TOV reminder file: docs/TOV-reminder.md next to the
- *  plugin root (this script lives in <plugin>/scripts). Resolved from the
- *  module URL so it works regardless of the process cwd. */
-function defaultTovPath(): string {
+// Caps on injected TOV content (review fix 2026-07-09): the block rides into
+// EVERY turn's context, so an oversized or mis-pointed file must not bloat
+// per-turn tokens or leak arbitrary file contents into model context.
+// Over-cap or out-of-tree → embedded baseline (never truncated fragments).
+const TOV_MAX_BYTES = 1024
+const TOV_MAX_LINES = 8
+
+/** The plugin docs/ directory (this script lives in <plugin>/scripts).
+ *  Resolved from the module URL so it works regardless of process cwd. */
+function tovDocsDir(): string {
   const here = dirname(fileURLToPath(import.meta.url))
-  return resolve(here, '..', 'docs', 'TOV-reminder.md')
+  return resolve(here, '..', 'docs')
+}
+
+function defaultTovPath(): string {
+  return resolve(tovDocsDir(), 'TOV-reminder.md')
 }
 
 /**
  * Resolve the TOV reminder block. Returns undefined when disabled. Reads the
- * override/default file best-effort; any failure falls back to the embedded
- * baseline so the block is emitted regardless of filesystem state.
+ * override/default file best-effort with two guards, any failure → embedded
+ * baseline (the block is always emitted when enabled):
+ *   * containment — realpath of BOTH the file and docs/ must place the file
+ *     inside the plugin docs/ directory. Rejects TOV_REMINDER_PATH pointing
+ *     elsewhere (e.g. a .env) AND a symlink inside docs/ escaping it.
+ *   * size cap — over TOV_MAX_BYTES bytes or TOV_MAX_LINES lines → baseline,
+ *     keeping the per-turn injected context bounded.
  */
 export function tovReminder(env: NodeJS.ProcessEnv = process.env): string | undefined {
   if (isFalsyEnv(env.TOV_REMINDER_ENABLED)) return undefined
-  const path = env.TOV_REMINDER_PATH?.trim() || defaultTovPath()
+  const requested = env.TOV_REMINDER_PATH?.trim() || defaultTovPath()
   try {
-    const text = readFileSync(path, 'utf8').trim()
-    if (text.length > 0) return text
+    const real = realpathSync(requested)
+    const docsReal = realpathSync(tovDocsDir())
+    if (!real.startsWith(docsReal + sep)) return EMBEDDED_TOV_REMINDER
+    const text = readFileSync(real, 'utf8').trim()
+    if (
+      text.length > 0 &&
+      Buffer.byteLength(text, 'utf8') <= TOV_MAX_BYTES &&
+      text.split('\n').length <= TOV_MAX_LINES
+    ) {
+      return text
+    }
   } catch {
     // fall through to embedded baseline
   }

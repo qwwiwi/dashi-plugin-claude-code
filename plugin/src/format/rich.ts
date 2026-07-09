@@ -86,6 +86,47 @@ function hasUnbalancedBacktick(line: string): boolean {
 }
 
 /**
+ * Per-line fenced-code mask: `true` = the line is a fence delimiter or lives
+ * inside an open fence and must be treated as protected code.
+ *
+ * CommonMark fence matching (review fix 2026-07-09): an OPENING fence is a
+ * run of 3+ backticks or tildes (an info string may follow); the CLOSING
+ * fence must use the SAME character, be at least as LONG as the opener, and
+ * carry nothing but whitespace after the run. The previous scan toggled on
+ * ANY ```/~~~ line, so a ``` line inside an open ~~~ fence was treated as a
+ * closer and hardening injected backslashes into subsequent code lines —
+ * corrupting copy-paste shell snippets.
+ *
+ * Shared by hardenSoftBreaks and the observe-only format checker so both
+ * agree on what counts as protected code.
+ */
+export function fenceProtectedLines(lines: ReadonlyArray<string>): boolean[] {
+  const mask: boolean[] = new Array<boolean>(lines.length).fill(false)
+  let open: { char: string; len: number } | undefined
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^\s*(`{3,}|~{3,})(.*)$/.exec(lines[i] as string)
+    if (open === undefined) {
+      if (m !== null) {
+        mask[i] = true
+        const run = m[1] as string
+        open = { char: run[0] as string, len: run.length }
+      }
+      continue
+    }
+    // Inside an open fence: every line (including the closer) is code.
+    mask[i] = true
+    if (m !== null) {
+      const run = m[1] as string
+      const trailing = (m[2] as string).trim()
+      if (run[0] === open.char && run.length >= open.len && trailing === '') {
+        open = undefined
+      }
+    }
+  }
+  return mask
+}
+
+/**
  * Promote lone soft breaks into CommonMark hard breaks so Telegram's rich
  * (raw-markdown) renderer shows a real line break instead of collapsing the
  * newline into a space. Pure and idempotent-ish: re-running never stacks a
@@ -100,18 +141,9 @@ export function hardenSoftBreaks(text: string): string {
   const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   const lines = normalized.split('\n')
 
-  // Resolve fenced-code state per line so prose-looking lines INSIDE a fence
-  // stay protected. A fence delimiter line (```/~~~) toggles the state; the
-  // delimiter lines themselves are treated as protected too.
-  const insideFence: boolean[] = new Array(lines.length).fill(false)
-  let inFence = false
-  for (let i = 0; i < lines.length; i++) {
-    const isFenceDelim = /^\s*(?:```|~~~)/.test(lines[i] as string)
-    // Mark the current line as protected if we are inside a fence OR this is
-    // a delimiter line (opening or closing).
-    insideFence[i] = inFence || isFenceDelim
-    if (isFenceDelim) inFence = !inFence
-  }
+  // Fence-aware protection with CommonMark open/close matching — prose-
+  // looking lines INSIDE a fence stay byte-identical.
+  const insideFence = fenceProtectedLines(lines)
 
   // Rebuild, deciding each boundary (between line i and i+1) independently.
   let out = ''

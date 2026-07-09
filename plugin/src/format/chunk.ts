@@ -108,18 +108,20 @@ function chooseCut(text: string, max: number): number {
   return max
 }
 
-// A rendered heading is a whole line that is exactly a single bold span —
+// A rendered heading is a whole line that is EXACTLY one bold span —
 // markdownToTelegramHtml emits `# heading` and `**bold**` alike as
-// `<b>…</b>`. We only treat a line as a heading when the bold span spans the
-// ENTIRE line (a bold word mid-sentence is not a heading).
-const LONE_HEADING_RE = /^<b>[\s\S]*<\/b>$/
+// `<b>…</b>`. `[^<]+` keeps the match to a single span: a line with several
+// bold words («<b>a</b> and <b>b</b>») is prose, not a heading (review fix —
+// the previous `[\s\S]*` greedily matched multi-span lines).
+const LONE_HEADING_RE = /^<b>[^<]+<\/b>$/
 
 /**
  * If the chunk `text.slice(0, cut)` would end on a lone heading line, return
  * an earlier paragraph-boundary cut (before that heading) so the heading is
  * not orphaned. Returns undefined when the chunk does not end on a heading,
- * or when there is no earlier boundary to back up to (can't help it without
- * producing an empty chunk).
+ * when there is no earlier boundary to back up to, or when backing up would
+ * emit a WHITESPACE-ONLY chunk (Telegram 400s an empty message and the whole
+ * reply would fail — an orphaned heading is the lesser evil).
  */
 function avoidOrphanHeading(text: string, cut: number): number | undefined {
   const body = text.slice(0, cut)
@@ -130,6 +132,9 @@ function avoidOrphanHeading(text: string, cut: number): number | undefined {
 
   const prevPara = trimmed.lastIndexOf('\n\n', lastLineStart - 1)
   if (prevPara < 0) return undefined // no earlier boundary — keep original cut
+  // Review fix (2026-07-09): text like "\n\n<b>H</b>\n\n…" would back up to a
+  // cut whose chunk is only whitespace — never emit that.
+  if (body.slice(0, prevPara + 2).trim() === '') return undefined
   return prevPara + 2
 }
 

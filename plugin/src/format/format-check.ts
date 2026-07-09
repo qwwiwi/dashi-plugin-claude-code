@@ -19,6 +19,8 @@
 // deterministically on the rich path; here we only report it (the HTML path
 // keeps newlines literal, so SOFTLIST is advisory, not a bug there).
 
+import { fenceProtectedLines } from './rich.js'
+
 const PARAGRAPH_MAX_VISIBLE = 450
 
 // A line that begins a markdown block construct (mirrors rich.ts scope).
@@ -66,31 +68,42 @@ export function analyzeFormat(text: string): FormatFinding[] {
 
   const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
 
-  // P450 — oversized paragraphs. A paragraph is a run of text between blank
-  // lines; fenced code blocks are exempt (code is not prose).
-  const paragraphs = normalized.split(/\n\s*\n/)
+  // Shared fence mask (rich.ts, CommonMark open/close matching) so the
+  // checker and hardenSoftBreaks agree on what counts as protected code.
+  const lines = normalized.split('\n')
+  const fenceMask = fenceProtectedLines(lines)
+
+  // P450 — oversized paragraphs. A paragraph is a run of NON-FENCE lines
+  // between blank lines; fence lines act as paragraph boundaries and their
+  // content never contributes (review fix: a fenced block CONTAINING blank
+  // lines used to leak code lines into a surrounding "paragraph" and fire a
+  // false positive).
   let longParas = 0
-  for (const para of paragraphs) {
-    if (/^\s*```/.test(para.trimStart())) continue // fenced block — skip
-    if (visibleLength(para) > PARAGRAPH_MAX_VISIBLE) longParas++
+  let para: string[] = []
+  const flushPara = (): void => {
+    if (para.length > 0 && visibleLength(para.join('\n')) > PARAGRAPH_MAX_VISIBLE) {
+      longParas++
+    }
+    para = []
   }
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string
+    if (fenceMask[i] || isBlank(line)) {
+      flushPara()
+      continue
+    }
+    para.push(line)
+  }
+  flushPara()
   if (longParas > 0) findings.push({ code: 'P450', count: longParas })
 
   // Line-level scan for HEAD_NB and SOFTLIST, fence-aware.
-  const lines = normalized.split('\n')
-  let inFence = false
   let headNoBlank = 0
   let softRuns = 0
   let proseRun = 0
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] as string
-    const isFenceDelim = /^\s*(?:```|~~~)/.test(line)
-    if (isFenceDelim) {
-      inFence = !inFence
-      proseRun = 0
-      continue
-    }
-    if (inFence) {
+    if (fenceMask[i]) {
       proseRun = 0
       continue
     }
