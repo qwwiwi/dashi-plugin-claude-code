@@ -27,6 +27,7 @@ import { join } from 'node:path'
 import { classifyEditError } from '../safety/telegram-edit-classifier.js'
 import { readContextUsage as realReadContextUsage, type ContextUsage } from './context-usage.js'
 import { applyTaskCreateToMap, applyTaskUpdateToMap } from './task-mirror.js'
+import { renderFreshnessHeader, type TaskFreshness } from './task-freshness.js'
 import type { TaskMirrorEvent } from '../hooks/claude-events.js'
 import type { TodoItem } from '../schemas.js'
 import type { EditOpts, InlineKeyboardLike, SendMessageOpts } from '../channel/tools.js'
@@ -75,6 +76,9 @@ export function buildHudKeyboard(): InlineKeyboardLike {
 export interface HudWorkView {
   todos: ReadonlyArray<TodoItem>
   permissionMode?: string
+  // M3 reality mirror: when present, the «Задачи» header carries a freshness
+  // indicator («сверено … / ДАННЫЕ УСТАРЕЛИ / НЕ СВЕРЕНО / сессия завершена»).
+  freshness?: TaskFreshness
 }
 
 // Caps for the tasks section. The HUD is a compact pinned card, not the full
@@ -113,7 +117,10 @@ function taskLine(todo: TodoItem): string {
  * Empty todos → empty string (the HUD omits the section entirely).
  * PURE — exported for unit tests.
  */
-export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
+export function renderStatusTasks(
+  todos: ReadonlyArray<TodoItem>,
+  freshness?: TaskFreshness,
+): string {
   if (todos.length === 0) return ''
   const inProgress = todos.filter((t) => t.status === 'in_progress')
   const pending = todos.filter((t) => t.status === 'pending')
@@ -127,7 +134,12 @@ export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
   // The header (bar + count) stays OUTSIDE the collapsible quote so progress is
   // always visible when collapsed; the per-task detail goes INSIDE an
   // <blockquote expandable>, so the pin reads «progress — tap to expand the list».
-  const header = `<b>Задачи</b> ${bar} ${done}/${total}`
+  // M3: when a freshness indicator is supplied the bold «Задачи» label is
+  // replaced by the freshness label (+ optional subline), so the pin shows how
+  // recently the list was reconciled against the real pane.
+  const fh = freshness !== undefined ? renderFreshnessHeader(freshness) : { label: '<b>Задачи</b>' }
+  const header = `${fh.label} ${bar} ${done}/${total}`
+  const subLine = 'sub' in fh && fh.sub !== undefined ? `\n${fh.sub}` : ''
 
   const detail: string[] = []
   for (const t of inProgress) detail.push(taskLine(t))
@@ -144,7 +156,7 @@ export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
   // in-progress, and escaping expands after the per-line cut. The header is
   // always kept (counted first); drop overflowing detail lines, mark the cut.
   const out: string[] = []
-  let used = header.length
+  let used = header.length + subLine.length
   let dropped = 0
   for (const line of detail) {
     if (used + 1 + line.length <= TASKS_MAX_CHARS) {
@@ -156,8 +168,8 @@ export function renderStatusTasks(todos: ReadonlyArray<TodoItem>): string {
   }
   if (dropped > 0) out.push(`<i>+${dropped} строк скрыто</i>`)
 
-  if (out.length === 0) return header
-  return `${header}\n<blockquote expandable>${out.join('\n')}</blockquote>`
+  if (out.length === 0) return `${header}${subLine}`
+  return `${header}${subLine}\n<blockquote expandable>${out.join('\n')}</blockquote>`
 }
 
 // «план» is the only mode worth naming; every other Claude Code permission
@@ -193,7 +205,7 @@ export function renderHud(
     work?.permissionMode !== undefined && work.permissionMode.length > 0
       ? `\n<i>режим: ${modeLabel(work.permissionMode)}</i>`
       : ''
-  const tasksBlock = work !== undefined ? renderStatusTasks(work.todos) : ''
+  const tasksBlock = work !== undefined ? renderStatusTasks(work.todos, work.freshness) : ''
   const tasksSection = tasksBlock.length > 0 ? `\n\n${tasksBlock}` : ''
   const tail = `${modelLine}${modeLine}${tasksSection}`
 
@@ -291,6 +303,34 @@ export class ContextHud {
   // does not clear it, so the pinned card keeps showing «что сделали» until
   // the next task replaces the snapshot.
   private readonly work = new Map<string, { todos: ReadonlyArray<TodoItem>; taskMap: Map<string, TodoItem> }>()
+  // M3 reality mirror: the reconciled view (real pane-verified list + freshness)
+  // per chat. When present it SUPERSEDES the event-only `work` snapshot in the
+  // render — the pin then reflects the harness's real task list. Fed by
+  // TaskRealityMirror.applyReconciledView; the raw onTodoEvent path is bypassed
+  // when the reconciler is wired (server.ts), so the two never fight.
+  private readonly reconciled = new Map<string, { todos: ReadonlyArray<TodoItem>; freshness: TaskFreshness }>()
+  // Per-chat session id, tracked from SessionStart + task events. Used to decide
+  // when to CLEAR the task snapshot: a genuine session change clears it; a
+  // compact (same id) preserves it. SessionStart fires for startup / resume /
+  // clear / compact, so source alone can't tell «new session» from «compacted
+  // same session» — the id does. KEPT across SessionEnd (review 2026-07-09 #2):
+  // deleting it on end made the next startup's sessionChanged=false, so a
+  // brand-new session inherited the dead session's task snapshot.
+  private readonly sessionIds = new Map<string, string>()
+  // Per-chat tombstones of ENDED session ids (bounded). A late task event
+  // naming an ended session is dropped — pre-fix it cleared the active
+  // session's work and adopted the dead id. SessionStart with the same id
+  // (resume) un-tombstones. The reconciler's applyReconciledView is exempt:
+  // it manages its own lifecycle and must be able to deliver the frozen
+  // «сессия завершена» view right after SessionEnd.
+  private readonly endedSessions = new Map<string, Set<string>>()
+  // Dedup for reconciler-driven refreshes: hash of the last applied reconciled
+  // «Задачи» render per chat. The reconciler ticks every 20s; when neither the
+  // tasks nor the bucketed freshness label changed, skipping the refresh keeps
+  // editMessageText traffic at zero instead of a no-op edit per tick.
+  private readonly lastReconciledRender = new Map<string, string>()
+  // Chats whose persisted epoch state has been restored this process lifetime.
+  private readonly epochsRestored = new Set<string>()
   // bump() debounce per chat — a burst of inbound messages collapses to one
   // delete+resend (same rationale as TmuxMirror.BUMP_DEBOUNCE_MS).
   private readonly lastBumpAt = new Map<string, number>()
@@ -344,15 +384,51 @@ export class ContextHud {
 
   // SessionStart: ensure the HUD message exists and is pinned, then refresh it.
   // The whole method is best-effort — it never throws. Serialized per chat.
-  onSessionStart(chatId: string): Promise<void> {
+  //
+  // Task snapshot handling: SessionStart fires for startup, resume, clear AND
+  // compact. A compact keeps the SAME session id, so clearing the task list on
+  // every SessionStart would wipe the milestones the warchief is watching every
+  // time the context is auto-compacted. We therefore clear ONLY on a genuine
+  // session change (new id) or an explicit `source === 'clear'`; a compact with
+  // the same id preserves the snapshot.
+  onSessionStart(chatId: string, opts: { sessionId?: string; source?: string } = {}): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
+    const { sessionId, source } = opts
+    this.restoreEpochs(chatId)
+    const prev = this.sessionIds.get(chatId)
+    // Rollback guard (review 2026-07-10 #2): a SessionStart naming an ENDED id
+    // while a DIFFERENT session is tracked is a late/replayed straggler — it
+    // must NOT displace the active session or clear its snapshot. Resume of an
+    // ended id is valid only when no different session is tracked.
+    if (
+      sessionId !== undefined &&
+      prev !== undefined &&
+      prev !== sessionId &&
+      this.endedSessions.get(chatId)?.has(sessionId) === true
+    ) {
+      return Promise.resolve()
+    }
+    const sessionChanged = sessionId !== undefined && prev !== undefined && prev !== sessionId
+    if (source === 'clear' || sessionChanged) {
+      // Genuine reset: drop the prior snapshot so the pin never shows stale
+      // milestones (renderStatusTasks returns '' for an empty list → the
+      // section is omitted until fresh TodoWrite/TaskCreate events arrive).
+      this.work.delete(chatId)
+      // M3: also drop the reconciled view; TaskRealityMirror re-pushes a fresh
+      // «НЕ СВЕРЕНО» view for the new session immediately after.
+      this.reconciled.delete(chatId)
+      this.lastReconciledRender.delete(chatId)
+    }
+    // Compact / resume / first-ever start (same or unknown id) preserve the
+    // snapshot. Track the latest known id for the next comparison. A resume
+    // of an ENDED session legitimizes it again (drop the tombstone).
+    if (sessionId !== undefined) {
+      this.sessionIds.set(chatId, sessionId)
+      this.endedSessions.get(chatId)?.delete(sessionId)
+      this.persistEpoch(chatId)
+    }
     return this.runSerialized(chatId, async () => {
       try {
-        // A new session starts with a clean task list: drop any snapshot left
-        // over from a prior session so the pin never shows stale milestones
-        // (renderStatusTasks returns '' for an empty list → the section is
-        // omitted until the agent emits fresh TodoWrite/TaskCreate events).
-        this.work.delete(chatId)
         const { text, keyboard } = await this.renderCurrent(chatId)
         const ensured = await this.ensureMessage(chatId, text, keyboard)
         if (ensured === undefined) return
@@ -373,19 +449,71 @@ export class ContextHud {
     })
   }
 
-  // Stop / end-of-turn: refresh the percentage. No pin (that is SessionStart's
-  // job); updateNow self-heals a deleted message once.
+  // Stop / end-of-turn: refresh the percentage. Stop carries model /
+  // permission_mode for the pinned card but must NOT finalize task state. No
+  // pin (that is SessionStart's job); updateNow self-heals a deleted message.
   async onStop(chatId: string): Promise<void> {
+    await this.updateNow(chatId)
+  }
+
+  // SessionEnd (the REAL session end, unlike Stop): refresh the pinned card.
+  // We keep the last task snapshot visible (the next SessionStart with a new id
+  // clears it) and KEEP the tracked session id (review 2026-07-09 #2:
+  // forgetting it made the next startup's sessionChanged=false, so a brand-new
+  // session showed the dead session's tasks). The ended id is tombstoned so a
+  // late task event naming it is dropped instead of clearing the active state.
+  async onSessionEnd(chatId: string, opts: { sessionId?: string } = {}): Promise<void> {
+    if (!this.enabled || !this.isOwner(chatId)) return
+    this.restoreEpochs(chatId)
+    const { sessionId } = opts
+    const prev = this.sessionIds.get(chatId)
+    if (sessionId !== undefined) {
+      // Tombstone even a late end for a session we've moved past — its
+      // stragglers must be dropped too. Bound 64 oldest-first (review
+      // 2026-07-10 #2), persisted so tombstones survive a restart.
+      let set = this.endedSessions.get(chatId)
+      if (set === undefined) {
+        set = new Set()
+        this.endedSessions.set(chatId, set)
+      }
+      set.delete(sessionId)
+      set.add(sessionId)
+      while (set.size > 64) {
+        const oldest = set.values().next().value
+        if (oldest === undefined) break
+        set.delete(oldest)
+      }
+      this.persistEpoch(chatId)
+    }
+    // Ignore a late SessionEnd for a session we've already moved past.
+    if (sessionId !== undefined && prev !== undefined && prev !== sessionId) return
     await this.updateNow(chatId)
   }
 
   // Todo events (TodoWrite / TaskCreate / TaskUpdate, mapped by
   // toTodoWriteEvent in the webhook) — update the work view and refresh the
-  // card in place. `todo_session_stop` deliberately does NOT clear the view:
-  // the pinned card keeps the last milestones visible across turns.
+  // card in place. Session lifecycle events are handled by onSessionStart /
+  // onSessionEnd, not here; if one slips through it is ignored.
+  //
+  // A task event whose sessionId differs from the tracked one signals a new
+  // session (we may have missed SessionStart) — reset the stale snapshot and
+  // adopt the new id so the pin never blends two sessions' task lists.
   onTodoEvent(chatId: string, event: TaskMirrorEvent): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
-    if (event.kind === 'todo_session_stop') return Promise.resolve()
+    if (event.kind === 'session_start' || event.kind === 'session_end') {
+      return Promise.resolve()
+    }
+    this.restoreEpochs(chatId)
+    // Drop late stragglers from an ENDED session — they must not clear the
+    // active session's snapshot or resurrect the dead id (review 2026-07-09 #2).
+    if (this.endedSessions.get(chatId)?.has(event.sessionId) === true) {
+      return Promise.resolve()
+    }
+    const prev = this.sessionIds.get(chatId)
+    if (prev !== undefined && prev !== event.sessionId) {
+      this.work.delete(chatId)
+    }
+    this.sessionIds.set(chatId, event.sessionId)
     let state = this.work.get(chatId)
     if (state === undefined) {
       state = { todos: [], taskMap: new Map<string, TodoItem>() }
@@ -407,6 +535,30 @@ export class ContextHud {
         state.todos = Array.from(state.taskMap.values())
         break
     }
+    return this.updateNow(chatId)
+  }
+
+  // M3 reality mirror: adopt the reconciled (pane-verified) task view + its
+  // freshness indicator and refresh the pin in place. This SUPERSEDES the
+  // event-only `work` snapshot in the render, so the pin reflects the harness's
+  // real task list even when the agent skipped the task tools. Best-effort +
+  // serialized like every other HUD op; gates on owner + enabled.
+  applyReconciledView(
+    chatId: string,
+    view: { sessionId: string; todos: ReadonlyArray<TodoItem>; freshness: TaskFreshness },
+  ): Promise<void> {
+    if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
+    this.reconciled.set(chatId, { todos: view.todos, freshness: view.freshness })
+    // Keep the tracked session id coherent so a later onSessionStart correctly
+    // detects a genuine change.
+    this.sessionIds.set(chatId, view.sessionId)
+    // Reconciler-tick dedup: the mirror ticks every 20s and the freshness label
+    // is minute-bucketed, so most ticks change NOTHING in the rendered section.
+    // Skip the whole refresh when the rendered «Задачи» section is identical to
+    // the previously applied one — no editMessageText per tick.
+    const renderKey = `${view.sessionId}|${renderStatusTasks(view.todos, view.freshness)}`
+    if (this.lastReconciledRender.get(chatId) === renderKey) return Promise.resolve()
+    this.lastReconciledRender.set(chatId, renderKey)
     return this.updateNow(chatId)
   }
 
@@ -518,12 +670,15 @@ export class ContextHud {
         usage = null
       }
     }
-    const work: HudWorkView = {
-      todos: this.work.get(chatId)?.todos ?? [],
-      ...(info.permissionMode !== undefined && info.permissionMode.length > 0
+    // M3: the reconciled (pane-verified) view wins over the event-only snapshot.
+    const rv = this.reconciled.get(chatId)
+    const permissionMode =
+      info.permissionMode !== undefined && info.permissionMode.length > 0
         ? { permissionMode: info.permissionMode }
-        : {}),
-    }
+        : {}
+    const work: HudWorkView = rv !== undefined
+      ? { todos: rv.todos, freshness: rv.freshness, ...permissionMode }
+      : { todos: this.work.get(chatId)?.todos ?? [], ...permissionMode }
     return renderHud(usage, this.windowTokens, info.model, work)
   }
 
@@ -645,32 +800,87 @@ export class ContextHud {
     }
   }
 
-  private loadPersisted(chatId: string): number | undefined {
+  // Full persisted shape (schema-versioned; v2 adds the epoch block).
+  private loadPersistedFull(chatId: string): {
+    messageId?: number
+    epoch?: { active?: string; ended?: ReadonlyArray<string> }
+  } {
     try {
       const raw = readFileSync(this.persistPath(chatId), 'utf8')
       const parsed: unknown = JSON.parse(raw)
-      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-        const id = (parsed as { message_id?: unknown }).message_id
-        if (typeof id === 'number' && Number.isInteger(id) && id > 0) return id
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
+      const obj = parsed as Record<string, unknown>
+      const out: { messageId?: number; epoch?: { active?: string; ended?: ReadonlyArray<string> } } = {}
+      const id = obj.message_id
+      if (typeof id === 'number' && Number.isInteger(id) && id > 0) out.messageId = id
+      if (typeof obj.epoch === 'object' && obj.epoch !== null && !Array.isArray(obj.epoch)) {
+        const e = obj.epoch as Record<string, unknown>
+        const active = typeof e.active === 'string' && e.active.length > 0 ? e.active : undefined
+        const ended = Array.isArray(e.ended)
+          ? e.ended.filter((s): s is string => typeof s === 'string' && s.length > 0).slice(-64)
+          : undefined
+        out.epoch = {
+          ...(active !== undefined ? { active } : {}),
+          ...(ended !== undefined ? { ended } : {}),
+        }
       }
+      return out
     } catch {
-      // Missing file / malformed JSON → treat as "no persisted id".
+      return {} // missing file / malformed JSON → nothing persisted
     }
-    return undefined
   }
 
-  private persist(chatId: string, messageId: number): void {
+  private loadPersisted(chatId: string): number | undefined {
+    return this.loadPersistedFull(chatId).messageId
+  }
+
+  // Restore persisted epoch state (tracked session + ended tombstones) ONCE
+  // per chat (review 2026-07-10 #2: HUD epoch state was runtime-only, so a
+  // restart forgot every tombstone and a dead session's stragglers could
+  // clear the active snapshot). Runtime state is never clobbered.
+  private restoreEpochs(chatId: string): void {
+    if (this.epochsRestored.has(chatId)) return
+    this.epochsRestored.add(chatId)
+    const epoch = this.loadPersistedFull(chatId).epoch
+    if (epoch === undefined) return
+    if (epoch.active !== undefined && !this.sessionIds.has(chatId)) {
+      this.sessionIds.set(chatId, epoch.active)
+    }
+    if (epoch.ended !== undefined && !this.endedSessions.has(chatId)) {
+      this.endedSessions.set(chatId, new Set(epoch.ended))
+    }
+  }
+
+  private writePersisted(chatId: string, messageId: number | undefined): void {
     try {
       mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
-      writeFileSync(this.persistPath(chatId), JSON.stringify({ message_id: messageId }), {
-        mode: 0o600,
-      })
+      const active = this.sessionIds.get(chatId)
+      const ended = this.endedSessions.get(chatId)
+      const body = {
+        v: 2,
+        ...(messageId !== undefined ? { message_id: messageId } : {}),
+        epoch: {
+          ...(active !== undefined ? { active } : {}),
+          ...(ended !== undefined && ended.size > 0 ? { ended: [...ended] } : {}),
+        },
+      }
+      writeFileSync(this.persistPath(chatId), JSON.stringify(body), { mode: 0o600 })
     } catch (err) {
       this.log.warn('context hud persist failed (ignored)', {
         chat_id: chatId,
         error: err instanceof Error ? err.message : String(err),
       })
     }
+  }
+
+  private persist(chatId: string, messageId: number): void {
+    this.writePersisted(chatId, messageId)
+  }
+
+  // Refresh ONLY the epoch block, preserving the persisted message id.
+  private persistEpoch(chatId: string): void {
+    const messageId = this.messageIds.get(chatId) ?? this.loadPersistedFull(chatId).messageId
+    this.writePersisted(chatId, messageId)
   }
 }
 

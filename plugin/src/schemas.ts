@@ -260,12 +260,27 @@ export const ClaudeSessionStartSchema = z
   })
   .passthrough()
 
+// SessionEnd is a REAL Claude Code hook event (unlike Stop, which is turn-end).
+// It fires once when the session actually terminates (clear / logout /
+// prompt_input_exit / other). The task surfaces (TaskMirror, context HUD)
+// finalize on THIS event, never on Stop. `reason` is an open string because
+// the harness may add reasons across versions; passthrough keeps unknown
+// fields riding through.
+export const ClaudeSessionEndSchema = z
+  .object({
+    ...ClaudeHookCommonShape,
+    hook_event_name: z.literal('SessionEnd'),
+    reason: z.string().optional(),
+  })
+  .passthrough()
+
 export const ClaudeHookPayloadSchema = z.discriminatedUnion('hook_event_name', [
   ClaudePreToolUseSchema,
   ClaudePostToolUseSchema,
   ClaudeStopSchema,
   ClaudeUserPromptSubmitSchema,
   ClaudeSessionStartSchema,
+  ClaudeSessionEndSchema,
 ])
 export type ClaudeHookPayload = z.infer<typeof ClaudeHookPayloadSchema>
 

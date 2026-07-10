@@ -1156,3 +1156,91 @@ describe('POST /hooks/agent — status-pin wiring', () => {
     expect(todoEvents[0]!.event.kind).toBe('todo_write')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// M3 reality mirror dispatch
+// ─────────────────────────────────────────────────────────────────────
+
+describe('taskRealityMirror dispatch', () => {
+  interface RmCall { m: string; chatId: string; extra?: unknown }
+
+  function makeRealityStub(): { rm: any; calls: RmCall[] } {
+    const calls: RmCall[] = []
+    const rm = {
+      onSessionStart: (chatId: string, o: unknown) => calls.push({ m: 'onSessionStart', chatId, extra: o }),
+      onUserPromptSubmit: (chatId: string, o: unknown) => calls.push({ m: 'onUserPromptSubmit', chatId, extra: o }),
+      onStop: (chatId: string) => calls.push({ m: 'onStop', chatId }),
+      onSessionEnd: (chatId: string, o: unknown) => calls.push({ m: 'onSessionEnd', chatId, extra: o }),
+      onTaskEvent: (chatId: string, ev: unknown, o: unknown) => calls.push({ m: 'onTaskEvent', chatId, extra: { ev, o } }),
+    }
+    return { rm, calls }
+  }
+
+  function makeTaskMirrorStub(): { tm: any; recorded: string[] } {
+    const state = { tm: undefined as any, recorded: [] as string[] }
+    state.tm = {
+      recordEvent: async (_chatId: string, event: { kind: string }) => {
+        state.recorded.push(event.kind)
+      },
+    }
+    return state
+  }
+
+  async function post(h: WebhookServerHandle, body: Record<string, unknown>): Promise<number> {
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${WEBHOOK_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    return resp.status
+  }
+
+  const common = { chatId: 164795011, session_id: 's1', transcript_path: '/tmp/t.jsonl', cwd: '/repo' }
+
+  test('lifecycle hooks route to the reality mirror; mutations bypass taskMirror', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { rm, calls } = makeRealityStub()
+    const tm = makeTaskMirrorStub()
+    const mcp = makeMcpStub()
+    const h = await startWebhookServer(enabledConfig(), {
+      mcpServer: mcp.server,
+      config: enabledConfig(),
+      statePaths: paths,
+      log: createLogger('test'),
+      taskMirror: tm.tm,
+      taskRealityMirror: rm,
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+
+    expect(await post(h, { ...common, hook_event_name: 'SessionStart', source: 'startup' })).toBe(200)
+    expect(await post(h, { ...common, hook_event_name: 'UserPromptSubmit', prompt: 'x' })).toBe(200)
+    expect(
+      await post(h, {
+        ...common,
+        hook_event_name: 'PostToolUse',
+        tool_name: 'TaskCreate',
+        tool_use_id: 'u1',
+        tool_input: { subject: 'Build the thing' },
+        tool_result: 'Task #1 created successfully',
+      }),
+    ).toBe(200)
+    expect(await post(h, { ...common, hook_event_name: 'Stop' })).toBe(200)
+    expect(await post(h, { ...common, hook_event_name: 'SessionEnd', reason: 'clear' })).toBe(200)
+
+    const kinds = calls.map((c) => c.m)
+    expect(kinds).toContain('onSessionStart')
+    expect(kinds).toContain('onUserPromptSubmit')
+    expect(kinds).toContain('onTaskEvent')
+    expect(kinds).toContain('onStop')
+    expect(kinds).toContain('onSessionEnd')
+    // cwd threaded through
+    expect((calls.find((c) => c.m === 'onSessionStart')!.extra as any).cwd).toBe('/repo')
+    // MUTATIONS bypass the direct taskMirror path (the reconciler owns content),
+    // but LIFECYCLE events still reach it so finalize/eviction/tombstones fire.
+    expect(tm.recorded).not.toContain('task_create')
+    expect(tm.recorded).not.toContain('todo_write')
+    expect(tm.recorded).toContain('session_start')
+    expect(tm.recorded).toContain('session_end')
+  })
+})

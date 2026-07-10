@@ -781,6 +781,7 @@ describe('ContextHud onTodoEvent', () => {
 
     const event: TaskMirrorEvent = {
       kind: 'todo_write',
+      sessionId: 's1',
       todos: [todo('1', 'in_progress', 'шаг один'), todo('2', 'pending', 'шаг два')],
     }
     await hud.onTodoEvent(OWNER, event)
@@ -791,19 +792,21 @@ describe('ContextHud onTodoEvent', () => {
     expect(last.text).toContain('0/2')
   })
 
-  test('task_create + task_update accumulate; todo_session_stop keeps the view', async () => {
+  test('task_create + task_update accumulate; session_end keeps the view', async () => {
     const api = new FakeApi()
     const hud = makeHud(api)
-    await hud.onSessionStart(OWNER)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
 
     await hud.onTodoEvent(OWNER, {
       kind: 'task_create',
+      sessionId: 's1',
       toolUseId: 'tu1',
       input: { subject: 'собрать фичу' },
       toolResult: 'Task #7 created successfully',
     })
     await hud.onTodoEvent(OWNER, {
       kind: 'task_update',
+      sessionId: 's1',
       toolUseId: 'tu2',
       input: { taskId: '7', status: 'completed' },
     })
@@ -811,12 +814,269 @@ describe('ContextHud onTodoEvent', () => {
     expect(last.text).toContain('☑ собрать фичу')
     expect(last.text).toContain('1/1')
 
-    const editsBefore = api.edited.length
-    await hud.onTodoEvent(OWNER, { kind: 'todo_session_stop' })
-    expect(api.edited.length).toBe(editsBefore) // stop never clears/re-renders
-    // A later refresh still carries the last snapshot.
+    // SessionEnd refreshes but keeps the last snapshot visible.
+    await hud.onSessionEnd(OWNER, { sessionId: 's1' })
     await hud.updateNow(OWNER)
     last = api.edited[api.edited.length - 1] ?? last
     expect(last.text).toContain('☑ собрать фичу')
+  })
+
+  test('compact (same session id) preserves tasks; a new session id clears them', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'живая задача')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('живая задача')
+
+    // Compact: SAME id → tasks preserved.
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'compact' })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('живая задача')
+
+    // New session id → tasks cleared (section omitted).
+    await hud.onSessionStart(OWNER, { sessionId: 's2', source: 'startup' })
+    expect(api.edited[api.edited.length - 1]!.text).not.toContain('живая задача')
+  })
+
+  test('source=clear wipes tasks even on the same session id', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'сотрётся')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('сотрётся')
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'clear' })
+    expect(api.edited[api.edited.length - 1]!.text).not.toContain('сотрётся')
+  })
+
+  test('a task event with a new session id resets the stale snapshot', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'старое'), todo('2', 'pending', 'ещё старое')],
+    })
+    // A task event from a new session (missed SessionStart) — replace, not blend.
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's2',
+      todos: [todo('9', 'in_progress', 'новое')],
+    })
+    const last = api.edited[api.edited.length - 1]!
+    expect(last.text).toContain('новое')
+    expect(last.text).not.toContain('старое')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// M3 reality mirror — applyReconciledView
+// ─────────────────────────────────────────────────────────────────────
+
+describe('applyReconciledView', () => {
+  test('renders the reconciled list + freshness label into the pinned card', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.applyReconciledView(OWNER, {
+      sessionId: 's1',
+      todos: [
+        { id: '1', content: 'живая задача', status: 'in_progress' },
+        { id: '2', content: 'ещё одна', status: 'pending' },
+      ],
+      freshness: { kind: 'fresh', reconciledAgeMs: 5_000 },
+    })
+    const text = api.sent.length > 0 ? api.sent[0]!.text : api.edited[api.edited.length - 1]!.text
+    expect(text).toContain('<b>Задачи</b> · <i>сверено меньше минуты назад</i>')
+    expect(text).toContain('живая задача')
+  })
+
+  test('non-owner chat is a no-op', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.applyReconciledView('-100999', {
+      sessionId: 's1',
+      todos: [{ id: '1', content: 'x', status: 'pending' }],
+      freshness: { kind: 'unverified' },
+    })
+    expect(api.sent.length).toBe(0)
+  })
+
+  test('«НЕ СВЕРЕНО» when the view is unverified', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.applyReconciledView(OWNER, {
+      sessionId: 's1',
+      todos: [{ id: '1', content: 'только событие', status: 'pending' }],
+      freshness: { kind: 'unverified' },
+    })
+    const text = api.sent[0]!.text
+    expect(text).toContain('<b>Задачи — НЕ СВЕРЕНО</b>')
+    expect(text).toContain('Показаны только события инструментов')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop 2026-07-09 #2 — HUD session epochs / tombstones
+// ─────────────────────────────────────────────────────────────────────
+
+describe('HUD session end/start epochs', () => {
+  test('end(s1) → start(s2): the new session does NOT inherit dead tasks', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'мертвая задача')],
+    })
+    await hud.onSessionEnd(OWNER, { sessionId: 's1' })
+
+    // Pre-fix: onSessionEnd deleted the tracked id → the next startup saw
+    // sessionChanged=false and kept showing the dead session's tasks.
+    await hud.onSessionStart(OWNER, { sessionId: 's2', source: 'startup' })
+    const last = api.edited[api.edited.length - 1]!
+    expect(last.text).not.toContain('мертвая задача')
+  })
+
+  test('end(s1) → resume(s1): tasks preserved and s1 events flow again', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'живая работа')],
+    })
+    await hud.onSessionEnd(OWNER, { sessionId: 's1' })
+
+    // Resume: SAME id → snapshot preserved (compact/resume semantics).
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'resume' })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('живая работа')
+
+    // Un-tombstoned: further s1 events are accepted.
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'completed', 'живая работа')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('1/1')
+  })
+
+  test('a late task event from an ENDED session is dropped (no clobbering the active one)', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onSessionEnd(OWNER, { sessionId: 's1' })
+    await hud.onSessionStart(OWNER, { sessionId: 's2', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's2',
+      todos: [todo('1', 'in_progress', 'актуальная работа')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('актуальная работа')
+
+    // Straggler from dead s1 — must NOT replace s2's snapshot.
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('9', 'pending', 'призрак')],
+    })
+    const last = api.edited[api.edited.length - 1]!
+    expect(last.text).toContain('актуальная работа')
+    expect(last.text).not.toContain('призрак')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop 2026-07-09 SHOULD — reconciled-render dedup
+// ─────────────────────────────────────────────────────────────────────
+
+describe('applyReconciledView dedup', () => {
+  test('identical renders (same bucket, same tasks) skip editMessageText', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    const view = {
+      sessionId: 's1',
+      todos: [todo('1', 'in_progress', 'долгая работа')],
+      freshness: { kind: 'fresh', reconciledAgeMs: 5_000 } as const,
+    }
+    await hud.applyReconciledView(OWNER, view)
+    const editsAfterFirst = api.edited.length
+    // Reconciler ticks: same tasks, same «меньше минуты» bucket.
+    await hud.applyReconciledView(OWNER, { ...view, freshness: { kind: 'fresh', reconciledAgeMs: 25_000 } })
+    await hud.applyReconciledView(OWNER, { ...view, freshness: { kind: 'fresh', reconciledAgeMs: 45_000 } })
+    expect(api.edited.length).toBe(editsAfterFirst) // zero extra edits
+
+    // Bucket crossing («1 мин») changes the render → ONE refresh goes through.
+    await hud.applyReconciledView(OWNER, { ...view, freshness: { kind: 'fresh', reconciledAgeMs: 65_000 } })
+    expect(api.edited.length + api.sent.length).toBeGreaterThan(editsAfterFirst)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop round 2 (2026-07-10) — HUD rollback guard + epochs
+// ─────────────────────────────────────────────────────────────────────
+
+describe('HUD #2v2 rollback guard + persisted epochs', () => {
+  test('late SessionStart for an ENDED session does not displace the active one', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onSessionEnd(OWNER, { sessionId: 's1' })
+    await hud.onSessionStart(OWNER, { sessionId: 's2', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's2',
+      todos: [todo('1', 'in_progress', 'актуальная')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('актуальная')
+
+    // REPLAYED SessionStart for dead s1: must NOT clear s2's snapshot.
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('актуальная')
+
+    // s1 stays tombstoned — its late events remain dropped.
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('9', 'pending', 'призрак')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).not.toContain('призрак')
+  })
+
+  test('epochs survive a restart: a straggler from an ended session stays dropped', async () => {
+    const dir = stateDir()
+    const api1 = new FakeApi()
+    const hud1 = makeHud(api1, { dir })
+    await hud1.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud1.onSessionEnd(OWNER, { sessionId: 's1' })
+
+    // «Restart»: fresh HUD instance, same state dir. Pre-fix the tombstones
+    // were runtime-only — this straggler adopted the dead session again.
+    const api2 = new FakeApi()
+    const hud2 = makeHud(api2, { dir })
+    await hud2.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'pending', 'призрак после рестарта')],
+    })
+    expect(api2.sent.length + api2.edited.length).toBe(0) // dropped
+
+    // A fresh session works normally.
+    await hud2.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's2',
+      todos: [todo('1', 'in_progress', 'новая работа')],
+    })
+    const last =
+      api2.edited.length > 0 ? api2.edited[api2.edited.length - 1]!.text : api2.sent[0]!.text
+    expect(last).toContain('новая работа')
   })
 })

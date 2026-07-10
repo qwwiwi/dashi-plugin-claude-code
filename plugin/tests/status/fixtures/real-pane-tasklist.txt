@@ -1,0 +1,24 @@
+● Конвейер развёрнут: 5 милстонов на доске, два Opus-кодера параллельно в
+  изолированных worktree (M1 фидеры + lifecycle, M2 реконсилятор пейна с
+  реальными фикстурами), M5 добавлен по новой директиве вождя — реальный лимит
+  контекстного окна модели вместо хардкода 200k. Жду нотификации обоих кодеров,
+  дальше M3 интеграция и двойное ревью.
+
+✻ Waiting for 2 background agents to finish
+
+  5 tasks (0 done, 2 in progress, 3 open)
+  ◼ M1 — фидеры + lifecycle-фиксы (Stop ≠ конец сессии, session-id, …
+  ◼ M2 — task-reconciler: парсер tmux-пейна + merge-семантика (pure …
+  ◻ M3 — интеграция: TmuxMirror publish → reconciler → HUD/mirror + …
+  ◻ M4 — двойное ревью, PR, live-применение, боевой ретест пина
+  ◻ M5 — фикс контекст-HUD: реальный лимит окна модели (1M для Fable…
+
+────────────────────────────────────────────────────────────────────────────────
+❯ Дальше сам по конвейеру, доложи когда будет готово
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ctrl+t to hide tasks · ← fo…
+
+  ● main
+  ◯ general-purpose  Реализация task-display fix        12m 5s · ↓ 229.4k tokens
+  ◯ general-purpose  M2: task-reconciler pure module    2m 26s · ↓ 121.5k tokens
+

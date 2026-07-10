@@ -16,17 +16,30 @@
 //   * Throttle via `edit_throttle_ms`. First send bypasses throttle, subsequent
 //     edits within the window defer onto a single timer slot.
 //   * Idempotency: same rendered text → no Telegram round-trip.
-//   * TTL eviction on `session_ttl_ms` of idleness — protects against lost
-//     `session_stop` hooks the way ProgressReporter does.
-//   * `recordEvent` is fire-and-forget; top-level try/catch swallows every
+//   * Session namespacing: the snapshot is keyed on the harness `sessionId`.
+//     A SessionStart with a new id (or a task event carrying one) resets the
+//     mirror; compact / resume of the same id preserve it. The mirror finalizes
+//     ONLY on SessionEnd (the real session end) — NEVER on Stop (turn-end).
+//   * TTL (`session_ttl_ms`) is orphan cleanup ONLY: a same-session snapshot is
+//     never expired for idleness; the TTL merely decides whether a session
+//     change drops the old snapshot silently (stale orphan) or finalizes it
+//     with a marker (fresh handoff).
+//   * Persistence: `{sessionId, messageId, todos}` is written per chat under the
+//     plugin state dir, so a plugin restart restores the rolling message
+//     instead of spamming a fresh one.
+//   * `recordEvent` is serialized per chat and its try/catch swallows every
 //     throw so the webhook 200 path is never blocked.
+
+import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import type { AppConfig } from '../config.js'
 import type { Logger } from '../log.js'
 import type { TaskMirrorEvent } from '../hooks/claude-events.js'
-import type { TodoItem } from '../schemas.js'
+import { TodoItemSchema, type TodoItem } from '../schemas.js'
 import type { TelegramApiForProgress } from './telegram-api.js'
 import { escapeHtml } from '../format/html.js'
+import { renderFreshnessHeader, type TaskFreshness } from './task-freshness.js'
 
 // Telegram editMessageText cap (4096 chars). Default render budget below it
 // — the spec asks for ~3500-char headroom (see plan §3 file 4).
@@ -50,6 +63,44 @@ export interface TaskMirrorDeps {
   now?: () => number
   setTimer?: (cb: () => void, ms: number) => NodeJS.Timeout
   clearTimer?: (handle: NodeJS.Timeout) => void
+  // Plugin state dir. When set, the mirror persists `{sessionId, messageId,
+  // todos}` per chat so a plugin restart restores the rolling message instead
+  // of losing the snapshot. Omitted in unit tests that don't exercise restart.
+  stateDir?: string
+}
+
+// Session-epoch state persisted alongside the snapshot (review 2026-07-10 #2:
+// epoch state lost on restart let a dead session's stragglers switch epochs).
+interface PersistedEpoch {
+  active?: string
+  retired?: ReadonlyArray<string>
+}
+
+// On-disk snapshot persisted per chat under `task-mirror-<chatId>.json`. Lets a
+// plugin restart pick up the SAME rolling message (edit in place) and the SAME
+// session namespace, instead of spamming a fresh message on the next event.
+//
+// Schema-versioned: `v: 2` adds the epoch block and allows EPOCH-ONLY files
+// (no messageId — written by finalize/dropOrphan so tombstones survive a
+// restart even after the message state is gone). v1 files (no `v`) load fine.
+interface PersistedTaskState {
+  v?: number
+  sessionId?: string
+  // Absent in epoch-only (post-finalize) snapshots.
+  messageId?: number
+  todos: ReadonlyArray<TodoItem>
+  // true when `todos` had NOT yet been rendered into the remote message at
+  // persist time (throttled edit pending / edit rejected). On hydration a
+  // dirty snapshot forces one replay edit; otherwise the restored
+  // lastRenderedText would suppress it and the remote message would stay
+  // stale forever (review 2026-07-09 #3a).
+  dirty?: boolean
+  // Absolute epoch ms of the entry's last activity. Without it an ancient
+  // orphan looked freshly-active after every restart and was finalized
+  // gracefully instead of dropped (review 2026-07-09 #3c). Legacy v1 files
+  // fall back to the snapshot file's mtime (review 2026-07-10 #6).
+  lastActivityMs?: number
+  epoch?: PersistedEpoch
 }
 
 // Per-chat lifecycle entry. Field-for-field parallel to ChatProgressEntry,
@@ -57,8 +108,11 @@ export interface TaskMirrorDeps {
 interface ChatTaskEntry {
   chatId: string
   messageId?: number
+  // Session this snapshot belongs to. Harness task ids restart at #1 every
+  // session, so a mutation whose event.sessionId differs resets the mirror.
+  sessionId?: string
   startedAtMs: number
-  // Updated on every recordEvent. Used by TTL eviction in getOrCreate.
+  // Updated on every recordEvent. Used by TTL orphan cleanup on session change.
   lastActivityMs: number
   // Latest TodoWrite snapshot from Claude. Replaced wholesale on each event
   // — TodoWrite is itself the full list, so we never merge incrementally.
@@ -69,6 +123,10 @@ interface ChatTaskEntry {
   // after every mutation so `scheduleFlush` keeps using the existing renderer.
   // Insertion-order Map keeps the visual ordering stable across renders.
   taskMap: Map<string, TodoItem>
+  // M3 reality mirror: freshness indicator for the «Задачи» header. Set by
+  // applyReconciledView; undefined in the legacy event-only path (header stays
+  // the plain «Задачи»).
+  freshness?: TaskFreshness
   // Last text we actually sent / edited. Idempotency gate.
   lastRenderedText?: string
   // Timestamp of the last successful send or edit. Used for throttle.
@@ -81,7 +139,8 @@ interface ChatTaskEntry {
   // Single-slot throttle timer. Non-null while waiting for the throttle
   // window to elapse before publishing.
   pendingTimer: NodeJS.Timeout | null
-  // True once todo_session_stop has been processed. Idempotency guard.
+  // True once the entry has been finalized (session end) or dropped (orphan /
+  // session change). Idempotency + orphan guard for late in-flight flushes.
   stopped: boolean
 }
 
@@ -165,7 +224,27 @@ export class TaskMirror {
   private readonly now: () => number
   private readonly setTimer: (cb: () => void, ms: number) => NodeJS.Timeout
   private readonly clearTimer: (handle: NodeJS.Timeout) => void
+  private readonly stateDir: string | undefined
   private readonly chats: Map<string, ChatTaskEntry>
+  // Per-chat serialization. Session transitions (finalize old → start new) and
+  // throttled flushes must not interleave across concurrent webhook requests,
+  // or a late old-session edit could race the new session's snapshot. Every
+  // recordEvent for a chat is chained through this settled (never-rejecting)
+  // promise — mirrors ContextHud.runSerialized.
+  private readonly chatLocks: Map<string, Promise<void>>
+  // Per-chat ACTIVE session id, tracked from SessionStart/SessionEnd
+  // INDEPENDENTLY of whether a task entry exists (review 2026-07-09 #2:
+  // handleSessionStart previously stored nothing when no tasks existed, so the
+  // new session wasn't authoritative until its first mutation).
+  private readonly activeSessions = new Map<string, string>()
+  // Per-chat tombstones: session ids that received SessionEnd (bounded). A
+  // LATE event naming a retired session must be DROPPED — pre-fix it was
+  // treated as "newer", finalizing/clearing the active session's snapshot and
+  // adopting the dead id. SessionStart with the same id (resume) un-retires.
+  private readonly retiredSessions = new Map<string, Set<string>>()
+  // Chats whose persisted epoch state has been restored this process lifetime
+  // (restoreEpochs is once-per-chat; runtime state is never clobbered).
+  private readonly epochsRestored = new Set<string>()
 
   constructor(deps: TaskMirrorDeps) {
     this.telegramApi = deps.telegramApi
@@ -174,32 +253,55 @@ export class TaskMirror {
     this.now = deps.now ?? (() => Date.now())
     this.setTimer = deps.setTimer ?? ((cb, ms) => setTimeout(cb, ms))
     this.clearTimer = deps.clearTimer ?? ((h) => clearTimeout(h))
+    this.stateDir = deps.stateDir
     this.chats = new Map()
+    this.chatLocks = new Map()
   }
 
   /**
    * Main entry point. Called by the webhook handler for every Claude hook
-   * that mapped to a TaskMirrorEvent. Never throws — top-level try/catch
-   * swallows any failure so the webhook 200 path stays open.
+   * that mapped to a TaskMirrorEvent. Never throws — the inner handler's
+   * try/catch swallows any failure so the webhook 200 path stays open.
    *
-   * Three input shapes:
-   *   - `todo_write`: full list snapshot (legacy TodoWrite tool). Replaces
-   *     `todos` wholesale AND clears `taskMap` so a mid-session switch from
-   *     TodoWrite to TaskCreate/Update starts cleanly.
-   *   - `task_create` / `task_update`: incremental events from the newer
-   *     TaskCreate/TaskUpdate tools. Mutate `taskMap`, then synthesise the
-   *     `todos` array from it.
-   *   - `todo_session_stop`: terminal signal, handled separately.
+   * Serialized per chat so a session transition and its flushes can't
+   * interleave with a concurrent event for the same chat.
    */
   async recordEvent(chatId: string, event: TaskMirrorEvent): Promise<void> {
     if (!this.config.task_mirror.enabled) return
+    await this.runSerialized(chatId, () => this.recordEventInner(chatId, event))
+  }
+
+  /**
+   * Serialized body. Five input shapes:
+   *   - `session_start`: reset the snapshot when the session id changes
+   *     (genuine new session); preserve it on compact / resume of the same id.
+   *   - `session_end`: finalize the surface (marker + evict). The REAL session
+   *     end — Stop no longer reaches here.
+   *   - `todo_write`: full list snapshot (legacy TodoWrite tool). Replaces
+   *     `todos` wholesale AND clears `taskMap`.
+   *   - `task_create` / `task_update`: incremental events. Mutate `taskMap`,
+   *     then synthesise the `todos` array from it.
+   */
+  private async recordEventInner(chatId: string, event: TaskMirrorEvent): Promise<void> {
     try {
-      if (event.kind === 'todo_session_stop') {
-        await this.handleStop(chatId)
+      if (event.kind === 'session_start') {
+        await this.handleSessionStart(chatId, event.sessionId)
         return
       }
+      if (event.kind === 'session_end') {
+        await this.handleSessionEnd(chatId, event.sessionId)
+        return
+      }
+
+      // Task mutation. Reset the mirror first if this event belongs to a
+      // different session than the current snapshot; DROP it entirely when it
+      // names a retired (ended) session — a late straggler must not resurrect
+      // a dead session or clear the active one (review 2026-07-09 #2).
+      const accepted = await this.ensureSessionForMutation(chatId, event.sessionId)
+      if (!accepted) return
       const entry = this.getOrCreate(chatId)
       if (entry.stopped) return
+      entry.sessionId = event.sessionId
       entry.lastActivityMs = this.now()
 
       switch (event.kind) {
@@ -217,13 +319,111 @@ export class TaskMirror {
           entry.todos = Array.from(entry.taskMap.values())
           break
       }
+      // Persist eagerly once the message exists so a restart mid-session
+      // restores the latest todos even if the throttled edit hasn't landed.
+      if (entry.messageId !== undefined) this.persistEntry(entry)
       this.scheduleFlush(entry)
+      // Materialise the FIRST send inside the lock so a following serialized
+      // event edits the same message instead of double-sending. Deferred
+      // (throttled) edits keep messageId already set, so we do NOT await them
+      // and throttling is preserved.
+      if (entry.messageId === undefined && entry.flushPromise !== null) {
+        try {
+          await entry.flushPromise
+        } catch {
+          /* already logged inside executeFlush */
+        }
+      }
     } catch (err) {
       this.log.warn('task mirror recordEvent failed (ignored)', {
         chat_id: chatId,
         error: err instanceof Error ? err.message : String(err),
       })
     }
+  }
+
+  /**
+   * M3 reality mirror entry point. Publishes a reconciled (pane-verified) task
+   * list + freshness indicator into the rolling message. The reconciled list is
+   * the FULL authoritative list, so it replaces the snapshot wholesale (clears
+   * the incremental taskMap). Serialized per chat like recordEvent; never throws.
+   *
+   * When the reconciler is wired (server.ts), the raw recordEvent path is
+   * bypassed and this is the sole driver — so the two never fight over `todos`.
+   * An empty list before any message exists is NOT materialised (we don't post
+   * an empty «задач нет» card for a fresh session with no tasks yet).
+   */
+  async applyReconciledView(
+    chatId: string,
+    view: { sessionId: string; todos: ReadonlyArray<TodoItem>; freshness: TaskFreshness },
+  ): Promise<void> {
+    if (!this.config.task_mirror.enabled) return
+    await this.runSerialized(chatId, () => this.applyReconciledViewInner(chatId, view))
+  }
+
+  private async applyReconciledViewInner(
+    chatId: string,
+    view: { sessionId: string; todos: ReadonlyArray<TodoItem>; freshness: TaskFreshness },
+  ): Promise<void> {
+    try {
+      const accepted = await this.ensureSessionForMutation(chatId, view.sessionId)
+      if (!accepted) return // retired session — drop
+      const entry = this.getOrCreate(chatId)
+      if (entry.stopped) return
+      // Restart guard (review 2026-07-09 #10): right after a plugin restart the
+      // reconciler knows nothing yet (empty, unverified) while the entry may
+      // hold a RESTORED populated message. Applying the empty view would edit
+      // the live card down to «задач нет» — skip it; the reconciler pushes a
+      // real view as soon as events/pane arrive.
+      if (
+        view.todos.length === 0 &&
+        view.freshness.kind === 'unverified' &&
+        entry.todos.length > 0
+      ) {
+        return
+      }
+      entry.sessionId = view.sessionId
+      entry.lastActivityMs = this.now()
+      // Reconciled list is the full authoritative snapshot.
+      entry.taskMap.clear()
+      entry.todos = view.todos
+      entry.freshness = view.freshness
+      // Don't create an empty card for a fresh session with no tasks yet; wait
+      // until a task actually appears. Once a message exists we keep editing it
+      // (a freshness change on a non-empty list still updates in place).
+      if (entry.messageId === undefined && view.todos.length === 0) return
+      if (entry.messageId !== undefined) this.persistEntry(entry)
+      this.scheduleFlush(entry)
+      if (entry.messageId === undefined && entry.flushPromise !== null) {
+        try {
+          await entry.flushPromise
+        } catch {
+          /* already logged inside executeFlush */
+        }
+      }
+    } catch (err) {
+      this.log.warn('task mirror applyReconciledView failed (ignored)', {
+        chat_id: chatId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  // Serialize an operation per chat. The returned promise resolves when THIS op
+  // completes; the next call for the same chat waits for it. `fn` swallows its
+  // own errors (recordEventInner try/catch), so the chain never rejects.
+  private runSerialized(chatId: string, fn: () => Promise<void>): Promise<void> {
+    const prior = this.chatLocks.get(chatId) ?? Promise.resolve()
+    const result = prior.then(fn, fn)
+    const settled: Promise<void> = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    this.chatLocks.set(chatId, settled)
+    void settled.then(() => {
+      if (this.chatLocks.get(chatId) === settled) this.chatLocks.delete(chatId)
+    })
+    return result
   }
 
   /**
@@ -280,20 +480,53 @@ export class TaskMirror {
   // Internals
   // ─────────────────────────────────────────────────────────────────────
 
-  private getOrCreate(chatId: string): ChatTaskEntry {
-    const existing = this.chats.get(chatId)
-    if (existing) {
-      const idle = this.now() - existing.lastActivityMs
-      if (idle > this.config.task_mirror.session_ttl_ms) {
-        this.log.debug('task mirror entry TTL expired, starting fresh thread', {
-          chat_id: chatId,
-          idle_ms: idle,
-        })
-        this.chats.delete(chatId)
-      } else {
-        return existing
-      }
+  // Return the in-memory entry, restoring it from disk first if the process
+  // just restarted. Unlike the old getOrCreate, this NEVER expires an entry by
+  // TTL — an active same-session snapshot must survive idle gaps (the mirror no
+  // longer finalizes on Stop, so idleness is normal). TTL now bites ONLY as
+  // orphan cleanup on a session change (see ensureSessionForMutation).
+  private hydrate(chatId: string): ChatTaskEntry | undefined {
+    this.restoreEpochs(chatId)
+    const mem = this.chats.get(chatId)
+    if (mem) return mem
+    const persisted = this.loadPersisted(chatId)
+    if (!persisted) return undefined
+    // Epoch-only snapshot (post-finalize): tombstones restored above, but
+    // there is no message state to rebuild.
+    if (persisted.messageId === undefined) return undefined
+    const entry = this.reconstructEntry(chatId, { ...persisted, messageId: persisted.messageId })
+    this.chats.set(chatId, entry)
+    // Dirty snapshot: the persisted todos were never acked into the remote
+    // message (throttled edit pending / rejected at crash time). Replay ONE
+    // edit now — reconstructEntry left lastRenderedText unset so the flush is
+    // not suppressed by the idempotency gate (review 2026-07-09 #3a). The
+    // startFlush convergence loop (review 2026-07-10 #5) guarantees a mutation
+    // racing this replay still gets its own follow-up edit.
+    if (persisted.dirty === true) this.scheduleFlush(entry)
+    return entry
+  }
+
+  // Restore persisted session-epoch state (active + retired) ONCE per chat
+  // (review 2026-07-10 #2: epoch state was runtime-only, so a restart forgot
+  // every tombstone and a dead session's stragglers switched epochs again).
+  // Runtime state, when already present, is never clobbered.
+  private restoreEpochs(chatId: string): void {
+    if (this.epochsRestored.has(chatId)) return
+    this.epochsRestored.add(chatId)
+    const persisted = this.loadPersisted(chatId)
+    const epoch = persisted?.epoch
+    if (epoch === undefined) return
+    if (epoch.active !== undefined && !this.activeSessions.has(chatId)) {
+      this.activeSessions.set(chatId, epoch.active)
     }
+    if (epoch.retired !== undefined && !this.retiredSessions.has(chatId)) {
+      this.retiredSessions.set(chatId, new Set(epoch.retired.slice(-TaskMirror.MAX_RETIRED)))
+    }
+  }
+
+  private getOrCreate(chatId: string): ChatTaskEntry {
+    const existing = this.hydrate(chatId)
+    if (existing) return existing
     const entry: ChatTaskEntry = {
       chatId,
       startedAtMs: this.now(),
@@ -309,6 +542,171 @@ export class TaskMirror {
     return entry
   }
 
+  // Rebuild an entry from its persisted snapshot. For a CLEAN snapshot,
+  // lastRenderedText is set so the idempotency gate holds (an identical
+  // follow-up event is a no-op); for a DIRTY one it is left unset so the
+  // hydration replay edit goes through. lastEditAt is 0 so the first
+  // post-restore edit isn't throttled. lastActivityMs restores the ABSOLUTE
+  // persisted timestamp (clamped to now) so an ancient orphan is recognized as
+  // such after a restart instead of looking freshly active.
+  private reconstructEntry(
+    chatId: string,
+    persisted: PersistedTaskState & { messageId: number },
+  ): ChatTaskEntry {
+    const taskMap = new Map<string, TodoItem>()
+    persisted.todos.forEach((t, i) => {
+      taskMap.set(t.id ?? `restored-${i}`, t)
+    })
+    const now = this.now()
+    const lastActivityMs =
+      persisted.lastActivityMs !== undefined ? Math.min(persisted.lastActivityMs, now) : now
+    return {
+      chatId,
+      messageId: persisted.messageId,
+      ...(persisted.sessionId !== undefined ? { sessionId: persisted.sessionId } : {}),
+      startedAtMs: now,
+      lastActivityMs,
+      todos: persisted.todos,
+      taskMap,
+      ...(persisted.dirty === true
+        ? {}
+        : { lastRenderedText: this.safeRender(persisted.todos) }),
+      lastEditAtMs: 0,
+      flushPromise: null,
+      pendingTimer: null,
+      stopped: false,
+    }
+  }
+
+  // ─── session lifecycle ────────────────────────────────────────────────
+
+  // Bounded tombstone bookkeeping (review 2026-07-09 #2; bound raised to 64
+  // per review 2026-07-10 #2 — at 8, a burst of short sessions evicted older
+  // tombstones and their late stragglers could switch epochs again).
+  private static readonly MAX_RETIRED = 64
+
+  private retire(chatId: string, sessionId: string): void {
+    let set = this.retiredSessions.get(chatId)
+    if (set === undefined) {
+      set = new Set()
+      this.retiredSessions.set(chatId, set)
+    }
+    set.delete(sessionId) // re-add moves to the tail (freshest)
+    set.add(sessionId)
+    while (set.size > TaskMirror.MAX_RETIRED) {
+      const oldest = set.values().next().value // oldest-first eviction
+      if (oldest === undefined) break
+      set.delete(oldest)
+    }
+  }
+
+  private isRetired(chatId: string, sessionId: string): boolean {
+    return this.retiredSessions.get(chatId)?.has(sessionId) === true
+  }
+
+  // SessionStart: mark the session ACTIVE for the chat (independent of any
+  // task entry existing), then reset the snapshot on a genuine session change
+  // and preserve it on compact / resume (same id).
+  //
+  // Rollback guard (review 2026-07-10 #2): a SessionStart naming a RETIRED id
+  // while a DIFFERENT session is active is a late/replayed straggler — it
+  // must NOT displace the active session. Resume of a retired id is valid
+  // ONLY when no different session is active.
+  private async handleSessionStart(chatId: string, sessionId: string): Promise<void> {
+    this.restoreEpochs(chatId)
+    if (this.isRetired(chatId, sessionId)) {
+      const active = this.activeSessions.get(chatId)
+      if (active !== undefined && active !== sessionId) {
+        this.log.debug('task mirror dropped late SessionStart for retired session', {
+          chat_id: chatId,
+        })
+        return
+      }
+      this.retiredSessions.get(chatId)?.delete(sessionId) // genuine resume
+    }
+    const active = this.activeSessions.get(chatId)
+    if (active !== undefined && active !== sessionId) this.retire(chatId, active)
+    this.activeSessions.set(chatId, sessionId)
+    this.persistEpochState(chatId)
+
+    const existing = this.hydrate(chatId)
+    if (!existing) return
+    if (existing.sessionId === undefined) {
+      existing.sessionId = sessionId
+      return
+    }
+    if (existing.sessionId === sessionId) return // compact / resume — preserve
+    await this.resetForNewSession(chatId, existing)
+  }
+
+  // SessionEnd (the REAL session end): finalize the surface and TOMBSTONE the
+  // session so late events naming it are dropped. A late SessionEnd naming a
+  // session that is NOT the active one only tombstones it — it must never
+  // finalize the active session's mirror.
+  private async handleSessionEnd(chatId: string, sessionId: string): Promise<void> {
+    this.restoreEpochs(chatId)
+    const active = this.activeSessions.get(chatId)
+    if (active !== undefined && active !== sessionId) {
+      this.retire(chatId, sessionId) // late end from a retired session
+      this.persistEpochState(chatId)
+      return
+    }
+    this.retire(chatId, sessionId)
+    this.activeSessions.delete(chatId)
+
+    const existing = this.hydrate(chatId)
+    if (!existing) {
+      this.persistEpochState(chatId)
+      return
+    }
+    if (existing.sessionId !== undefined && existing.sessionId !== sessionId) {
+      this.persistEpochState(chatId)
+      return
+    }
+    await this.finalize(chatId, existing) // finalize persists the epoch-only snapshot
+  }
+
+  // A task mutation arrived. Returns false when the event must be DROPPED
+  // (retired session). Otherwise resets the entry if the event belongs to a
+  // different session than the current snapshot (missed SessionStart) and
+  // adopts the event's session as active.
+  private async ensureSessionForMutation(chatId: string, sessionId: string): Promise<boolean> {
+    this.restoreEpochs(chatId)
+    if (this.isRetired(chatId, sessionId)) return false // late event from a dead session
+    const active = this.activeSessions.get(chatId)
+    const displaced = active !== undefined && active !== sessionId
+    if (displaced) {
+      // Unknown (not retired) session — a missed SessionStart for a newer one.
+      this.retire(chatId, active)
+    }
+    this.activeSessions.set(chatId, sessionId)
+    if (displaced || active === undefined) {
+      // Persist the epoch transition SYNCHRONOUSLY, BEFORE the awaited
+      // finalize/send below (review 2026-07-10 r3 #5): a crash mid-finalize
+      // must restore «s2 active, s1 retired», not the pre-displacement epoch.
+      this.persistEpochState(chatId)
+    }
+
+    const existing = this.hydrate(chatId)
+    if (!existing) return true
+    if (existing.sessionId === undefined) return true // adopted by the mutation
+    if (existing.sessionId === sessionId) return true
+    await this.resetForNewSession(chatId, existing)
+    return true
+  }
+
+  // Reset on session change. If the old snapshot is fresh, finalize it
+  // gracefully (final «сессия завершена» edit) so the warchief sees the handoff;
+  // if it is past the TTL it is a stale orphan and dropped silently.
+  private async resetForNewSession(chatId: string, existing: ChatTaskEntry): Promise<void> {
+    const idle = this.now() - existing.lastActivityMs
+    if (idle > this.config.task_mirror.session_ttl_ms) {
+      this.dropOrphan(chatId, existing)
+    } else {
+      await this.finalize(chatId, existing)
+    }
+  }
+
   /**
    * Render the current snapshot and schedule a flush. Idempotent — if a
    * flush is already in flight or a timer is armed, just update
@@ -316,7 +714,7 @@ export class TaskMirror {
    */
   private scheduleFlush(entry: ChatTaskEntry): void {
     if (entry.stopped) return
-    const text = this.safeRender(entry.todos)
+    const text = this.safeRender(entry.todos, entry.freshness)
     if (!text || text === entry.lastRenderedText) return
     entry.desiredText = text
 
@@ -345,19 +743,30 @@ export class TaskMirror {
     if (text === undefined || text === entry.lastRenderedText) return
     delete entry.desiredText
 
-    entry.flushPromise = this.executeFlush(entry, text).finally(() => {
+    // Convergence loop (review 2026-07-10 #5): after a SUCCESSFUL flush,
+    // re-run scheduleFlush unconditionally — it re-renders from the CURRENT
+    // todos and no-ops when rendered == lastRenderedText, so a mutation (or a
+    // dirty-hydration replay) that raced this in-flight op always gets its own
+    // follow-up edit. Bounded: each iteration only fires on an actual content
+    // difference, and the just-advanced lastEditAtMs throttles it. After a
+    // FAILED flush we keep the old semantics (reschedule only when a newer
+    // desiredText is pending) so a permanently failing edit cannot tight-loop
+    // — the next event retries.
+    entry.flushPromise = this.executeFlush(entry, text).then((ok) => {
       entry.flushPromise = null
-      if (
-        !entry.stopped &&
-        entry.desiredText !== undefined &&
-        entry.desiredText !== entry.lastRenderedText
-      ) {
+      if (entry.stopped) return
+      if (ok) {
+        this.scheduleFlush(entry)
+        return
+      }
+      if (entry.desiredText !== undefined && entry.desiredText !== entry.lastRenderedText) {
         this.scheduleFlush(entry)
       }
     })
   }
 
-  private async executeFlush(entry: ChatTaskEntry, text: string): Promise<void> {
+  // Returns true when the Telegram op landed (send succeeded / edit succeeded).
+  private async executeFlush(entry: ChatTaskEntry, text: string): Promise<boolean> {
     if (entry.messageId === undefined) {
       try {
         const sent = await this.telegramApi.sendMessage(entry.chatId, text, HTML_OPTS)
@@ -365,49 +774,54 @@ export class TaskMirror {
           entry.messageId = sent.message_id
           entry.lastRenderedText = text
           entry.lastEditAtMs = this.now()
+          this.persistEntry(entry)
         } else {
           this.log.warn('task mirror send completed after stop (orphan)', {
             chat_id: entry.chatId,
             message_id: sent.message_id,
           })
         }
+        return true
       } catch (err) {
         this.log.warn('task mirror sendMessage failed (ignored)', {
           chat_id: entry.chatId,
           error: err instanceof Error ? err.message : String(err),
         })
+        return false
       }
-      return
     }
     try {
       await this.telegramApi.editMessageText(entry.chatId, entry.messageId, text, HTML_OPTS)
       if (!entry.stopped) {
         entry.lastRenderedText = text
         entry.lastEditAtMs = this.now()
+        this.persistEntry(entry)
       }
+      return true
     } catch (err) {
       this.log.warn('task mirror editMessageText failed (ignored)', {
         chat_id: entry.chatId,
         message_id: entry.messageId,
         error: err instanceof Error ? err.message : String(err),
       })
+      return false
     }
   }
 
   /**
-   * Eviction handler — mirrors ProgressReporter.handleStop. Cancels timers,
-   * awaits any in-flight flush, posts a final edit (if a message exists)
-   * with the latest snapshot AND a «сессия завершена» marker line, then
-   * deletes the entry.
+   * Finalize a session. Cancels timers, awaits any in-flight flush, posts a
+   * final edit (if a message exists) with the latest snapshot AND a «сессия
+   * завершена» marker line, then evicts the entry and clears its persisted
+   * snapshot. Called on SessionEnd and on a fresh session change — NEVER on
+   * Stop (Stop is turn-end, not session-end).
    *
-   * Why the marker: without it, if the last TodoWrite snapshot was already
-   * rendered the idempotency gate (`text === lastRenderedText`) skips the
-   * final edit — the warchief never sees a visual «session ended» signal.
-   * Appending a non-empty marker line guarantees the final text differs.
+   * Why the marker: without it, if the last snapshot was already rendered the
+   * idempotency gate (`text === lastRenderedText`) skips the final edit — the
+   * warchief never sees a visual «session ended» signal. Appending a non-empty
+   * marker line guarantees the final text differs.
    */
-  private async handleStop(chatId: string): Promise<void> {
-    const entry = this.chats.get(chatId)
-    if (!entry || entry.stopped) return
+  private async finalize(chatId: string, entry: ChatTaskEntry): Promise<void> {
+    if (entry.stopped) return
     entry.stopped = true
 
     if (entry.pendingTimer !== null) {
@@ -440,6 +854,29 @@ export class TaskMirror {
     }
 
     this.chats.delete(chatId)
+    // Message state is gone, but the epoch (active + retired tombstones) must
+    // SURVIVE the restart — write an epoch-only snapshot instead of deleting
+    // the file (review 2026-07-10 #2).
+    this.persistEpochState(chatId, { dropMessageState: true })
+  }
+
+  /**
+   * Drop a stale orphan (a snapshot whose session changed AND that is past the
+   * TTL — a long-dead session we never got a clean SessionEnd for). Silent: no
+   * «сессия завершена» edit, since the old message is long stale. Cancels the
+   * throttle timer and marks the entry stopped so any in-flight flush no-ops.
+   */
+  private dropOrphan(chatId: string, entry: ChatTaskEntry): void {
+    entry.stopped = true
+    if (entry.pendingTimer !== null) {
+      this.clearTimer(entry.pendingTimer)
+      entry.pendingTimer = null
+    }
+    this.log.debug('task mirror orphan dropped on session change (TTL elapsed)', {
+      chat_id: chatId,
+    })
+    this.chats.delete(chatId)
+    this.persistEpochState(chatId, { dropMessageState: true }) // epoch survives
   }
 
   /**
@@ -449,16 +886,21 @@ export class TaskMirror {
    * session-end signal). Same DEFAULT_MAX_CHARS budget applies — if the
    * snapshot already pushes against the cap, the marker still fits inside
    * the safety margin renderTodoList reserves.
+   *
+   * When the reality mirror already stamped an `ended` freshness header
+   * («Задачи · сессия завершена · сверено HH:MM UTC»), the footer marker is
+   * SKIPPED — otherwise the card would say «сессия завершена» twice.
    */
   private renderFinal(entry: ChatTaskEntry): string {
-    const block = this.safeRender(entry.todos)
+    const block = this.safeRender(entry.todos, entry.freshness)
     if (!block) return ''
+    if (entry.freshness?.kind === 'ended') return block
     return `${block}\n<i>сессия завершена</i>`
   }
 
-  private safeRender(todos: ReadonlyArray<TodoItem>): string {
+  private safeRender(todos: ReadonlyArray<TodoItem>, freshness?: TaskFreshness): string {
     try {
-      return renderTodoList(todos, this.config.task_mirror.collapse_completed_after)
+      return renderTodoList(todos, this.config.task_mirror.collapse_completed_after, undefined, freshness)
     } catch (err) {
       this.log.warn('task mirror render failed (ignored)', {
         error: err instanceof Error ? err.message : String(err),
@@ -466,6 +908,185 @@ export class TaskMirror {
       return ''
     }
   }
+
+  // ─── persistence ──────────────────────────────────────────────────────
+  // Best-effort, same pattern as ContextHud: a persistence failure NEVER
+  // disturbs the surface (the mirror keeps working from memory). Files are
+  // written atomically (temp + rename in the same dir) so a partial write can't
+  // corrupt the snapshot. No-op when no state dir was configured.
+
+  private persistPath(chatId: string): string {
+    const safe = chatId.replace(/[^0-9A-Za-z_-]/g, '_')
+    return join(this.stateDir as string, `task-mirror-${safe}.json`)
+  }
+
+  private currentEpoch(chatId: string): PersistedEpoch {
+    const active = this.activeSessions.get(chatId)
+    const retired = this.retiredSessions.get(chatId)
+    return {
+      ...(active !== undefined ? { active } : {}),
+      ...(retired !== undefined && retired.size > 0 ? { retired: [...retired] } : {}),
+    }
+  }
+
+  private persistEntry(entry: ChatTaskEntry): void {
+    if (this.stateDir === undefined) return
+    if (entry.messageId === undefined) return
+    // dirty = the current todos have NOT been acked into the remote message
+    // yet (throttled edit pending / edit failed). Computed structurally so
+    // every persist site gets it right: the snapshot is clean exactly when
+    // rendering the persisted todos reproduces the last successfully-sent text.
+    const dirty = this.safeRender(entry.todos, entry.freshness) !== entry.lastRenderedText
+    const snapshot: PersistedTaskState = {
+      v: 2,
+      ...(entry.sessionId !== undefined ? { sessionId: entry.sessionId } : {}),
+      messageId: entry.messageId,
+      todos: entry.todos,
+      dirty,
+      lastActivityMs: entry.lastActivityMs,
+      epoch: this.currentEpoch(entry.chatId),
+    }
+    this.writePersisted(entry.chatId, snapshot)
+  }
+
+  // Persist the CURRENT epoch state for a chat (review 2026-07-10 #2: epoch
+  // state was lost on restart). Three shapes:
+  //   • a live in-memory entry with a message → full persistEntry (epoch rides
+  //     along);
+  //   • no live entry but a NOT-yet-hydrated on-disk snapshot → MERGE: keep
+  //     the message state on disk, refresh only the epoch block (clobbering
+  //     it here would erase the restorable message before hydration);
+  //   • `dropMessageState` (finalize / dropOrphan) → EPOCH-ONLY overwrite: the
+  //     message is finalized/orphaned and must never be re-hydrated, but the
+  //     tombstones survive the restart.
+  private persistEpochState(chatId: string, opts: { dropMessageState?: boolean } = {}): void {
+    if (this.stateDir === undefined) return
+    const epoch = this.currentEpoch(chatId)
+    if (opts.dropMessageState !== true) {
+      const mem = this.chats.get(chatId)
+      if (mem !== undefined && mem.messageId !== undefined && !mem.stopped) {
+        this.persistEntry(mem)
+        return
+      }
+      const onDisk = this.loadPersisted(chatId)
+      if (onDisk !== undefined && onDisk.messageId !== undefined) {
+        this.writePersisted(chatId, { ...onDisk, v: 2, epoch })
+        return
+      }
+    }
+    this.writePersisted(chatId, { v: 2, todos: [], epoch })
+  }
+
+  private writePersisted(chatId: string, snapshot: PersistedTaskState): void {
+    if (this.stateDir === undefined) return
+    try {
+      mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
+      const path = this.persistPath(chatId)
+      const tmp = `${path}.tmp.${process.pid}.${Date.now()}`
+      writeFileSync(tmp, JSON.stringify(snapshot), { mode: 0o600 })
+      try {
+        renameSync(tmp, path)
+      } catch (err) {
+        try {
+          unlinkSync(tmp)
+        } catch {
+          /* ignore */
+        }
+        throw err
+      }
+    } catch (err) {
+      this.log.warn('task mirror persist failed (ignored)', {
+        chat_id: chatId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  private loadPersisted(chatId: string): PersistedTaskState | undefined {
+    if (this.stateDir === undefined) return undefined
+    let raw: string
+    try {
+      raw = readFileSync(this.persistPath(chatId), 'utf8')
+    } catch {
+      return undefined // missing file → no persisted snapshot
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+      const obj = parsed as Record<string, unknown>
+      // v2 allows EPOCH-ONLY snapshots without a messageId; a present-but-
+      // malformed messageId still quarantines the whole file.
+      let messageId: number | undefined
+      if (obj.messageId !== undefined) {
+        if (
+          typeof obj.messageId !== 'number' ||
+          !Number.isInteger(obj.messageId) ||
+          obj.messageId <= 0
+        ) {
+          return undefined
+        }
+        messageId = obj.messageId
+      }
+      // Schema-validate EVERY todo (review 2026-07-09 #3b). Pre-fix a snapshot
+      // like `{todos:[null]}` passed the Array.isArray check, then threw at
+      // `t.id` inside reconstructEntry on EVERY subsequent webhook event — a
+      // permanent wedge. An invalid snapshot is quarantined (ignored) and the
+      // mirror continues fresh.
+      if (!Array.isArray(obj.todos)) return undefined
+      const todos: TodoItem[] = []
+      for (const rawItem of obj.todos) {
+        const item = TodoItemSchema.safeParse(rawItem)
+        if (!item.success) {
+          this.log.warn('task mirror persisted snapshot invalid — quarantined, starting fresh', {
+            chat_id: chatId,
+          })
+          return undefined
+        }
+        todos.push(item.data)
+      }
+      const sessionId = typeof obj.sessionId === 'string' ? obj.sessionId : undefined
+      const dirty = obj.dirty === true
+      // Legacy (pre-lastActivityMs) snapshots must NOT fabricate freshness
+      // (review 2026-07-10 #6): fall back to the snapshot FILE's mtime — the
+      // moment it was last written — and, failing even that, to 0
+      // (expired-unknown ⇒ silent orphan drop on the next session change).
+      let lastActivityMs =
+        typeof obj.lastActivityMs === 'number' && Number.isFinite(obj.lastActivityMs)
+          ? obj.lastActivityMs
+          : undefined
+      if (lastActivityMs === undefined) {
+        try {
+          lastActivityMs = statSync(this.persistPath(chatId)).mtimeMs
+        } catch {
+          lastActivityMs = 0
+        }
+      }
+      // Epoch block (v2). Validated defensively: strings only, bounded.
+      let epoch: PersistedEpoch | undefined
+      if (typeof obj.epoch === 'object' && obj.epoch !== null && !Array.isArray(obj.epoch)) {
+        const e = obj.epoch as Record<string, unknown>
+        const active = typeof e.active === 'string' && e.active.length > 0 ? e.active : undefined
+        const retired = Array.isArray(e.retired)
+          ? e.retired.filter((s): s is string => typeof s === 'string' && s.length > 0).slice(-64)
+          : undefined
+        epoch = {
+          ...(active !== undefined ? { active } : {}),
+          ...(retired !== undefined ? { retired } : {}),
+        }
+      }
+      return {
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        ...(messageId !== undefined ? { messageId } : {}),
+        todos,
+        dirty,
+        lastActivityMs,
+        ...(epoch !== undefined ? { epoch } : {}),
+      }
+    } catch {
+      return undefined // malformed JSON → treat as no snapshot
+    }
+  }
+
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -492,9 +1113,17 @@ export function renderTodoList(
   todos: ReadonlyArray<TodoItem>,
   collapseCompletedAfter: number,
   maxChars: number = DEFAULT_MAX_CHARS,
+  freshness?: TaskFreshness,
 ): string {
+  // M3: the bold «Задачи» header is replaced by the reconciliation-freshness
+  // label (+ optional subline) when a freshness value is supplied.
+  const fh = freshness !== undefined ? renderFreshnessHeader(freshness) : { label: '<b>Задачи</b>' }
+  const headerLabel = fh.label
+  const headerSub = 'sub' in fh && fh.sub !== undefined ? fh.sub : undefined
+
   if (todos.length === 0) {
-    return '<b>Задачи</b>\n<i>задач нет</i>'
+    const subLine = headerSub !== undefined ? `\n${headerSub}` : ''
+    return `${headerLabel}${subLine}\n<i>задач нет</i>`
   }
 
   let doneCount = 0
@@ -520,7 +1149,7 @@ export function renderTodoList(
     }
   }
 
-  const header = '<b>Задачи</b>'
+  const headerLines = headerSub !== undefined ? [headerLabel, headerSub] : [headerLabel]
   const counts = `${doneCount} done / ${inProgressCount} in progress / ${pendingCount} pending`
 
   // Show only the last N completed items; older ones collapse into a tail
@@ -531,7 +1160,7 @@ export function renderTodoList(
     : []
   const hiddenCompletedCount = completed.length - visibleCompleted.length
 
-  const lines: string[] = [header, counts, '']
+  const lines: string[] = [...headerLines, counts, '']
   for (const t of inProgress) lines.push(`${ICONS.in_progress} ${escapeTodoLine(t)}`)
   for (const t of pending) lines.push(`${ICONS.pending} ${escapeTodoLine(t)}`)
   if (hiddenCompletedCount > 0) {
@@ -545,8 +1174,8 @@ export function renderTodoList(
   // Over budget. Truncation pass: drop trailing pending lines first, then
   // completed. Always keep header + counts + at least the in-progress block.
   const safeBudget = maxChars - TRUNCATE_MARGIN
-  // Header block (header + counts + blank line) is mandatory.
-  const headerBlock = [header, counts, ''].join('\n')
+  // Header block (header + optional freshness subline + counts + blank line) is mandatory.
+  const headerBlock = [...headerLines, counts, ''].join('\n')
   const inProgressBlock = inProgress
     .map((t) => `${ICONS.in_progress} ${escapeTodoLine(t)}`)
     .join('\n')

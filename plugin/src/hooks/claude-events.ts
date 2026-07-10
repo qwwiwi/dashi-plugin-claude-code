@@ -79,8 +79,14 @@ export type ActivityStatusEvent =
 // thread, todo list) keep independent lifecycles.
 // ─────────────────────────────────────────────────────────────────────
 
+// Every TaskMirror event carries the `sessionId` it belongs to. Harness task
+// numbering restarts at #1 on every new session, so the mirror MUST namespace
+// its snapshot by session — a task event whose sessionId differs from the
+// current snapshot's is a new session and resets the surface. Sourced from the
+// hook payload's `session_id` (always present per ClaudeHookCommonShape).
 export interface TodoWriteEvent {
   readonly kind: 'todo_write'
+  readonly sessionId: string
   readonly todos: ReadonlyArray<TodoItem>
   readonly chatId?: string
 }
@@ -94,27 +100,44 @@ export interface TodoWriteEvent {
 // (Phase 2 — for now the provisional id stays).
 export interface TaskCreateEvent {
   readonly kind: 'task_create'
+  readonly sessionId: string
   readonly toolUseId: string
   readonly input: TaskCreateInput
-  // Populated on PostToolUse when the harness has materialised the task; null
-  // on PreToolUse. Format: usually `Task #<n> created` — TaskMirror runs the
-  // same regex extract as the warchief's terminal renderer.
+  // Populated on PostToolUse when the harness has materialised the task.
+  // Format: usually `Task #<n> created` — TaskMirror runs the same regex
+  // extract as the warchief's terminal renderer. We map ONLY the PostToolUse
+  // pass (see toTodoWriteEvent): a provisional PreToolUse create would race the
+  // permission gate on the same event and, if rejected, leave a phantom task.
   readonly toolResult?: unknown
   readonly chatId?: string
 }
 
 export interface TaskUpdateEvent {
   readonly kind: 'task_update'
+  readonly sessionId: string
   readonly toolUseId: string
   readonly input: TaskUpdateInput
   readonly chatId?: string
 }
 
-// Session-stop signal for TaskMirror specifically. Renamed from the
-// ActivityStatusEvent variant so the TaskMirror dispatcher does not
-// accidentally consume a non-todo Stop hook.
-export interface TodoSessionStopEvent {
-  readonly kind: 'todo_session_stop'
+// Session lifecycle signals for the task surfaces. SessionStart resets the
+// snapshot when the session id changes (a genuine new session) and preserves
+// it otherwise (compact / resume keep the same id). SessionEnd — a REAL Claude
+// Code hook, unlike Stop which is turn-end — finalizes the surface. Stop no
+// longer maps to any TaskMirrorEvent: it must NOT finalize tasks.
+export interface TaskSessionStartEvent {
+  readonly kind: 'session_start'
+  readonly sessionId: string
+  // SessionStart fires for startup / resume / clear / compact. The mirror uses
+  // `sessionId` (not source) as the reset key; source rides along for the HUD.
+  readonly source?: 'startup' | 'resume' | 'clear' | 'compact'
+  readonly chatId?: string
+}
+
+export interface TaskSessionEndEvent {
+  readonly kind: 'session_end'
+  readonly sessionId: string
+  readonly reason?: string
   readonly chatId?: string
 }
 
@@ -122,7 +145,22 @@ export type TaskMirrorEvent =
   | TodoWriteEvent
   | TaskCreateEvent
   | TaskUpdateEvent
-  | TodoSessionStopEvent
+  | TaskSessionStartEvent
+  | TaskSessionEndEvent
+
+// The subset of TaskMirrorEvent that mutates the task snapshot (as opposed to
+// the session lifecycle signals). The context HUD's `onTodoEvent` consumes
+// ONLY these; lifecycle events reach the HUD through its dedicated
+// onSessionStart / onSessionEnd entry points instead.
+export type TaskMutationEvent = TodoWriteEvent | TaskCreateEvent | TaskUpdateEvent
+
+export function isTaskMutationEvent(event: TaskMirrorEvent): event is TaskMutationEvent {
+  return (
+    event.kind === 'todo_write' ||
+    event.kind === 'task_create' ||
+    event.kind === 'task_update'
+  )
+}
 
 /**
  * Convert a validated Claude hook payload to an ActivityStatusEvent.
@@ -170,6 +208,9 @@ export function toActivityEvent(payload: ClaudeHookPayload): ActivityStatusEvent
     }
     case 'Stop':
       return { kind: 'session_stop', ...chatIdProp }
+    case 'SessionEnd':
+      // Real session end also closes the transient status bubble.
+      return { kind: 'session_stop', ...chatIdProp }
     case 'UserPromptSubmit':
       return { kind: 'reasoning', ...chatIdProp }
     case 'SessionStart':
@@ -180,17 +221,21 @@ export function toActivityEvent(payload: ClaudeHookPayload): ActivityStatusEvent
 /**
  * Convert a validated Claude hook payload to a TaskMirrorEvent.
  *
- * Returns non-null ONLY for events TaskMirror cares about:
- *   - PostToolUse with tool_name === 'TodoWrite' → parses tool_input via
- *     TodoWriteInputSchema. On parse failure, logs a warning and returns
- *     null (graceful degradation — the rolling activity thread still
- *     renders correctly because toActivityEvent handles the same payload
- *     independently).
- *   - Stop → returns `{ kind: 'todo_session_stop' }` so TaskMirror can
- *     finalize and evict its per-chat entry.
+ * Returns non-null ONLY for events the task surfaces care about:
+ *   - SessionStart → `session_start` lifecycle event (carries source). The
+ *     mirror resets its snapshot when the session id changes and preserves it
+ *     on compact / resume of the same id.
+ *   - SessionEnd → `session_end` lifecycle event. This is the REAL session end
+ *     — the mirror finalizes here, never on Stop.
+ *   - PostToolUse TodoWrite → `todo_write` (full-list snapshot).
+ *   - PostToolUse TaskCreate → `task_create` with `toolResult`. We map ONLY
+ *     the PostToolUse pass: a provisional PreToolUse create runs concurrently
+ *     with the permission gate on the same event, so a rejected create would
+ *     leave a phantom task in the mirror.
+ *   - PostToolUse TaskUpdate → `task_update`.
  *
- * Every other hook event returns null so the caller can short-circuit
- * before touching TaskMirror.
+ * Stop returns null on purpose (it is turn-end, not session-end). Every other
+ * hook event returns null so the caller can short-circuit.
  */
 export function toTodoWriteEvent(
   payload: ClaudeHookPayload,
@@ -203,10 +248,30 @@ export function toTodoWriteEvent(
     payload.chatId !== undefined && payload.chatId !== ''
       ? { chatId: payload.chatId }
       : {}
+  // session_id is required on every hook payload (ClaudeHookCommonShape); the
+  // mirror namespaces its snapshot by it so a new session starts a clean list.
+  const sessionId = payload.session_id
 
-  if (payload.hook_event_name === 'Stop') {
-    return { kind: 'todo_session_stop', ...chatIdProp }
+  if (payload.hook_event_name === 'SessionStart') {
+    const event: TaskSessionStartEvent = {
+      kind: 'session_start',
+      sessionId,
+      ...(payload.source !== undefined ? { source: payload.source } : {}),
+      ...chatIdProp,
+    }
+    return event
   }
+
+  if (payload.hook_event_name === 'SessionEnd') {
+    const event: TaskSessionEndEvent = {
+      kind: 'session_end',
+      sessionId,
+      ...(typeof payload.reason === 'string' ? { reason: payload.reason } : {}),
+      ...chatIdProp,
+    }
+    return event
+  }
+
   if (payload.hook_event_name === 'PostToolUse' && payload.tool_name === 'TodoWrite') {
     const parsed = TodoWriteInputSchema.safeParse(payload.tool_input)
     if (!parsed.success) {
@@ -215,16 +280,13 @@ export function toTodoWriteEvent(
       })
       return null
     }
-    return { kind: 'todo_write', todos: parsed.data.todos, ...chatIdProp }
+    return { kind: 'todo_write', sessionId, todos: parsed.data.todos, ...chatIdProp }
   }
 
-  // TaskCreate -- emit on PreToolUse so the milestone shows up the moment the
-  // warchief sees it spawn, and again on PostToolUse with `toolResult` so
-  // TaskMirror can reconcile the provisional id with the harness-assigned one.
-  if (
-    (payload.hook_event_name === 'PreToolUse' || payload.hook_event_name === 'PostToolUse') &&
-    payload.tool_name === 'TaskCreate'
-  ) {
+  // TaskCreate -- PostToolUse ONLY. The harness has assigned the real id by
+  // then (carried in `tool_result`) and the create has cleared the permission
+  // gate, so we never record a task that a rejected PreToolUse would orphan.
+  if (payload.hook_event_name === 'PostToolUse' && payload.tool_name === 'TaskCreate') {
     const parsed = TaskCreateInputSchema.safeParse(payload.tool_input)
     if (!parsed.success) {
       log?.warn('TaskCreate tool_input failed schema validation (ignored)', {
@@ -234,11 +296,12 @@ export function toTodoWriteEvent(
     }
     const event: TaskCreateEvent = {
       kind: 'task_create',
+      sessionId,
       toolUseId: payload.tool_use_id,
       input: parsed.data,
       ...chatIdProp,
     }
-    return payload.hook_event_name === 'PostToolUse' && payload.tool_result !== undefined
+    return payload.tool_result !== undefined
       ? { ...event, toolResult: payload.tool_result }
       : event
   }
@@ -256,6 +319,7 @@ export function toTodoWriteEvent(
     }
     return {
       kind: 'task_update',
+      sessionId,
       toolUseId: payload.tool_use_id,
       input: parsed.data,
       ...chatIdProp,

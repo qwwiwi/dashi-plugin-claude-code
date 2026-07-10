@@ -20,7 +20,8 @@
 //     [--helper /abs/path/to/post-hook.ts]
 
 import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 'fs'
-import { dirname, resolve as pathResolve } from 'path'
+import { homedir } from 'os'
+import { dirname, join, resolve as pathResolve } from 'path'
 import { fileURLToPath } from 'url'
 
 const MARKER = 'dashi-channel-hook'
@@ -41,19 +42,42 @@ const REMINDER_MARKER = 'dashi-channel-reminder-hook'
 // the legacy entry in place + append the marked one, firing the hook
 // twice (review §6).
 const HELPER_PATH_FINGERPRINT = 'post-hook.ts'
+
+// All hook events we TOUCH — we filter our own (marker / legacy / gate) entries
+// out of each and rebuild. PreToolUse is iterated so the permission-gate hook
+// still installs there, even though it no longer carries a notification feeder.
 const HOOK_EVENTS = [
   'SessionStart',
   'UserPromptSubmit',
   'PreToolUse',
   'PostToolUse',
+  'SessionEnd',
   'Stop',
 ] as const
 
 type HookEvent = (typeof HOOK_EVENTS)[number]
 
+// NARROW canonical notification-feeder set (2026-07-09). The feeder spawns a
+// `bun` process + HTTP POST for every event it fires on; a `.*` PreToolUse /
+// PostToolUse feeder therefore paid that cost on EVERY tool call — far too much
+// on a 7.8 GB VPS, and the status/progress surfaces that once consumed the
+// per-tool stream are disabled. The surfaces still in use (pinned context HUD +
+// task mirror) need only: session lifecycle (SessionStart / SessionEnd),
+// per-turn context refresh (UserPromptSubmit / Stop), and the task tools
+// (PostToolUse scoped to TaskCreate|TaskUpdate|TodoWrite).
+const FEEDER_EVENTS: ReadonlySet<HookEvent> = new Set<HookEvent>([
+  'SessionStart',
+  'UserPromptSubmit',
+  'PostToolUse',
+  'SessionEnd',
+  'Stop',
+])
+
+// Claude Code hook matchers accept `|`-separated EXACT tool names. Scoping the
+// PostToolUse feeder to the three task tools is what keeps the feeder off the
+// hot path (Bash/Read/Edit/… no longer fire it).
 const MATCHER_BY_EVENT: Partial<Record<HookEvent, string>> = {
-  PreToolUse: '.*',
-  PostToolUse: '.*',
+  PostToolUse: 'TaskCreate|TaskUpdate|TodoWrite',
 }
 
 export interface PatchOptions {
@@ -180,11 +204,12 @@ export function applyPatch(settings: SettingsShape, opts: PatchOptions): Setting
   const hooks: NonNullable<SettingsShape['hooks']> = { ...(settings.hooks ?? {}) }
   const withGate = opts.permissionGateHelperPath !== undefined
   for (const event of HOOK_EVENTS) {
-    const next = buildEntryFor(event, opts)
     const existing = hooks[event] ?? []
     // Drop anything that's clearly ours: notification marker, legacy
     // markerless notification entry, OR the gate marker (re-added below for
-    // PreToolUse). Unrelated entries survive untouched.
+    // PreToolUse). Unrelated entries survive untouched. This also STRIPS a
+    // previously-installed `.*` PreToolUse/PostToolUse feeder (same MARKER), so
+    // re-running the patch migrates an old wide install to the narrow set.
     const filtered = existing.filter(
       (e) =>
         !e ||
@@ -193,9 +218,14 @@ export function applyPatch(settings: SettingsShape, opts: PatchOptions): Setting
           e.marker !== REMINDER_MARKER &&
           !isLegacyDashiEntry(e)),
     )
-    const rebuilt = [...filtered, next]
+    const rebuilt = [...filtered]
+    // The notification feeder is added ONLY for the narrow FEEDER_EVENTS set.
+    // PreToolUse is iterated (for the gate below) but no longer gets a feeder.
+    if (FEEDER_EVENTS.has(event)) {
+      rebuilt.push(buildEntryFor(event, opts))
+    }
     // The gate hook lives on PreToolUse only, and is registered FIRST so its
-    // deny verdict is evaluated before the notification mirror runs.
+    // deny verdict is evaluated before any later hook runs.
     if (event === 'PreToolUse' && withGate) {
       rebuilt.unshift(buildGateEntry(opts))
     }
@@ -205,7 +235,13 @@ export function applyPatch(settings: SettingsShape, opts: PatchOptions): Setting
     if (event === 'UserPromptSubmit' && opts.reminderHelperPath !== undefined) {
       rebuilt.push(buildReminderEntry(opts))
     }
-    hooks[event] = rebuilt
+    // Don't leave an empty array behind (e.g. PreToolUse with no gate): drop
+    // the key so the patched settings stay clean.
+    if (rebuilt.length > 0) {
+      hooks[event] = rebuilt
+    } else {
+      delete hooks[event]
+    }
   }
   return { ...settings, hooks }
 }
@@ -301,8 +337,66 @@ function writeAtomic(path: string, contents: string): void {
   }
 }
 
+// ─── wide-feeder narrowing warning (review 2026-07-09 SHOULD-fix) ──────
+// Re-running the patch over an OLD wide install (a `.*` PreToolUse/PostToolUse
+// dashi feeder) silently narrows the feeder set. That is correct for the
+// current surfaces, but a fleet install whose plugin config still enables the
+// per-tool consumers (status / progress reporters) would silently lose their
+// event stream. Detect the narrowing + the enabled consumers and WARN loudly.
+
+/** True when the pre-patch settings carry one of OUR feeders on a wide surface. */
+export function hasWideDashiFeeder(settings: SettingsShape): boolean {
+  const hooks = settings.hooks ?? {}
+  const isOurs = (e: HookEntry | undefined): boolean =>
+    e !== undefined && (e.marker === MARKER || isLegacyDashiEntry(e))
+  for (const e of hooks.PreToolUse ?? []) {
+    if (isOurs(e)) return true // PreToolUse feeder no longer installed at all
+  }
+  for (const e of hooks.PostToolUse ?? []) {
+    if (isOurs(e) && (e.matcher === undefined || e.matcher === '.*' || e.matcher === '')) {
+      return true // unscoped PostToolUse feeder — fired on every tool
+    }
+  }
+  return false
+}
+
+// Best-effort read of the PLUGIN config (not the Claude settings being
+// patched) to see whether the per-tool consumers are enabled. Mirrors the
+// loadConfig path resolution: TELEGRAM_CONFIG_FILE, else
+// <TELEGRAM_STATE_DIR|~/.claude/channels/dashi-telegram-canary>/config.json.
+// Both status.enabled and progress.enabled default to FALSE in the schema, so
+// only an explicit `true` in config.json counts.
+function pluginConsumersEnabled(env: NodeJS.ProcessEnv): boolean {
+  try {
+    const stateRoot =
+      env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'dashi-telegram-canary')
+    const configPath = env.TELEGRAM_CONFIG_FILE ?? join(stateRoot, 'config.json')
+    if (!existsSync(configPath)) return false
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as {
+      status?: { enabled?: unknown }
+      progress?: { enabled?: unknown }
+    }
+    return parsed.status?.enabled === true || parsed.progress?.enabled === true
+  } catch {
+    return false
+  }
+}
+
+function warnIfNarrowing(settings: SettingsShape, env: NodeJS.ProcessEnv): void {
+  if (!hasWideDashiFeeder(settings)) return
+  if (!pluginConsumersEnabled(env)) return
+  process.stderr.write(
+    'WARNING: narrowing the dashi-channel hook feeders (dropping the wide ' +
+      'PreToolUse/PostToolUse `.*` feeder) while the plugin config has ' +
+      'status.enabled/progress.enabled=true — those surfaces consume the ' +
+      'per-tool event stream and will stop updating per tool call. Disable ' +
+      'them in config.json or keep a wide feeder manually.\n',
+  )
+}
+
 export function patchSettingsFile(opts: PatchOptions): void {
   const settings = readSettings(opts.settingsPath)
+  warnIfNarrowing(settings, process.env)
   const patched = applyPatch(settings, opts)
   const out = `${JSON.stringify(patched, null, 2)}\n`
   if (out.includes('TELEGRAM_WEBHOOK_TOKEN=')) {
