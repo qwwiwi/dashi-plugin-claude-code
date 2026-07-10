@@ -13,3 +13,6 @@ secrets/
 bun.lockb.bak
 coverage/
 .bun/
+._*
+__pycache__/
+*.pyc

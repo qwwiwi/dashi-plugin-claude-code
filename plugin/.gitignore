@@ -17,3 +17,9 @@ bun.lock
 # Issue #7: the bare `state/` pattern recursively excluded the source tree's
 # state module, breaking `bun install` from a clean clone.
 /state/
+# macOS AppleDouble metadata, Finder junk, Python bytecode, timestamped backups.
+._*
+.DS_Store
+__pycache__/
+*.pyc
+*.bak.*
