@@ -194,7 +194,7 @@ chats:
     max_queue_depth: 1                        # сколько inbound сообщений можно поставить в очередь (default 1)
 ```
 
-Per-chat persona-файл резолвится относительно `multichat.workspace_dir` — `PersonaManager` загружает его при первом сообщении и накладывает поверх единой Thrall identity. Никаких отдельных CLAUDE.md per chat не нужно.
+Per-chat persona-файл резолвится относительно `multichat.workspace_dir`. Оверлей накладывает SessionStart-хук `chats/hooks/session-start.sh`: он читает `{workspace}/chats/{chat_id}/persona.md` внутри tmux-сессии и инжектит поверх единой Thrall identity через `additionalContext`. Никаких отдельных CLAUDE.md per chat не нужно.
 
 Логи: `{state_dir}/chats/<chat_id>/{inbox,outbox,processing,dead-letter}/*.json` — JSON-pipe между плагином и tmux-сессией. Outbox dead-letter содержит сообщения которые не удалось отправить в Telegram даже после retry — оператор разбирает руками.
 
@@ -276,7 +276,7 @@ bash scripts/smoke-test-progress.sh --bot-id <expected_bot_id>
 - `bun test tests/hooks/` — hooks + claude-events + install-hooks + post-hook
 - `bun test tests/status/` — StatusManager, TmuxMirror, ProgressReporter, TaskMirror, ActivityRenderer
 - `bun test tests/router/` — MultichatRouter, TmuxSessionPool, inbox-bridge
-- `bun test tests/chats/` — PolicyLoader, PersonaManager
+- `bun test tests/chats/` — PolicyLoader, session-start persona-хук, multichat entrypoint
 - `bun run typecheck` — `tsc --noEmit` strict
 - `bash scripts/smoke-test-progress.sh` — end-to-end webhook + ProgressReporter check (см. секцию Smoke test выше)
 
