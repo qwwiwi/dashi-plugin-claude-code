@@ -6,7 +6,10 @@
 // All timers + the clock are injected (FakeClock) and the tmux exec is a stub,
 // so the tests are deterministic and touch no real tmux / Telegram.
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   TaskRealityMirror,
   enforceEventRemovals,
@@ -896,5 +899,182 @@ describe('#8 displacement chains — full permutation in one pass', () => {
     expect(state.tasks).toHaveLength(2)
     expect(state.tasks.find((t) => t.ordinal === 1)!.description).toBe('Beta')
     expect(state.tasks.find((t) => t.ordinal === 2)!.description).toBe('Alpha')
+  })
+})
+
+// ── review fix-loop round 3 (2026-07-10) ────────────────────────────────
+
+const r3TmpDirs: string[] = []
+function r3StateDir(): string {
+  const d = mkdtempSync(join(tmpdir(), 'task-reality-'))
+  r3TmpDirs.push(d)
+  return d
+}
+afterEach(() => {
+  for (const d of r3TmpDirs.splice(0)) {
+    try {
+      rmSync(d, { recursive: true, force: true })
+    } catch {
+      /* ignore */
+    }
+  }
+})
+
+describe('r3 #1 — reality-mirror epochs persist across a restart', () => {
+  test('a late SessionStart for a pre-restart-ended session cannot displace restored s2', async () => {
+    const dir = r3StateDir()
+    const clock = new FakeClock()
+    const fx = makeExec(() => NO_LIST_PANE)
+    const mk = (): { rm: TaskRealityMirror; views: ReconciledView[] } => {
+      const { sink, views } = makeSink()
+      const rm = new TaskRealityMirror({
+        exec: fx.exec,
+        capture: { paneTarget: 'p', lineCount: 200 },
+        log: nullLog,
+        sinks: [sink],
+        stateDir: dir,
+        now: () => clock.now,
+        setTimer: clock.setTimer,
+        clearTimer: clock.clearTimer,
+      })
+      return { rm, views }
+    }
+
+    const first = mk()
+    first.rm.onSessionStart(CHAT, { sessionId: 's1', cwd: '/repo' })
+    first.rm.onSessionEnd(CHAT, { sessionId: 's1' }) // tombstoned + persisted
+    first.rm.onSessionStart(CHAT, { sessionId: 's2', cwd: '/repo' }) // active=s2, persisted
+    await flush()
+
+    // «Restart»: fresh instance, same state dir. Pre-fix the epoch was
+    // process-local — the late s1 SessionStart displaced restored s2.
+    const second = mk()
+    second.rm.onSessionStart(CHAT, { sessionId: 's1', cwd: '/repo' }) // late straggler
+    await flush()
+    expect(second.views).toHaveLength(0) // dropped — no view for dead s1
+
+    // s1 mutations stay dropped; s2 flows normally.
+    second.rm.onTaskEvent(
+      CHAT,
+      { kind: 'task_create', sessionId: 's1', toolUseId: 't1', input: { subject: 'призрак' } },
+      { cwd: '/repo' },
+    )
+    await flush()
+    expect(second.views).toHaveLength(0)
+
+    second.rm.onTaskEvent(
+      CHAT,
+      { kind: 'task_create', sessionId: 's2', toolUseId: 't2', input: { subject: 'живое s2' } },
+      { cwd: '/repo' },
+    )
+    await flush()
+    expect(second.views.at(-1)!.sessionId).toBe('s2')
+    expect(second.views.at(-1)!.todos.map((t) => t.content)).toEqual(['живое s2'])
+  })
+})
+
+describe('r3 #3 — TodoWrite re-add clears the removal tombstone', () => {
+  test('remove → re-add same key → same-millisecond snapshot: the task survives', async () => {
+    const clock = new FakeClock()
+    const fx = makeExec(() => VALID_PANE)
+    const { sink, views } = makeSink()
+    // coalesceWindowMs: 0 so triggered captures run immediately at the SAME
+    // clock instant as the events — the equal-millisecond edge.
+    const rm = new TaskRealityMirror({
+      exec: fx.exec,
+      capture: { paneTarget: 'p', lineCount: 200 },
+      log: nullLog,
+      sinks: [sink],
+      coalesceWindowMs: 0,
+      now: () => clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    })
+
+    rm.onSessionStart(CHAT, { sessionId: 's1', cwd: '/repo' }) // pane confirms 3 tasks
+    await flush()
+    expect(views.at(-1)!.todos).toHaveLength(3)
+
+    // Same clock instant: TodoWrite removes «Ревью» (#3), then re-adds it.
+    rm.onTaskEvent(
+      CHAT,
+      {
+        kind: 'todo_write',
+        sessionId: 's1',
+        todos: [
+          { id: '1', content: 'Собрать модуль', status: 'completed' },
+          { id: '2', content: 'Написать тесты', status: 'in_progress' },
+        ],
+      },
+      { cwd: '/repo' },
+    )
+    rm.onTaskEvent(
+      CHAT,
+      {
+        kind: 'todo_write',
+        sessionId: 's1',
+        todos: [
+          { id: '1', content: 'Собрать модуль', status: 'completed' },
+          { id: '2', content: 'Написать тесты', status: 'in_progress' },
+          { id: '3', content: 'Ревью', status: 'pending' },
+        ],
+      },
+      { cwd: '/repo' },
+    )
+    await flush()
+
+    // A capture at the SAME millisecond (capturedAt == removal at). Pre-fix
+    // enforceEventRemovals deleted the valid re-addition (capturedAt > at is
+    // false ⇒ stale-pane branch). Post-fix the re-add cleared the tombstone.
+    rm.onStop(CHAT) // immediate capture (coalesce window is 0)
+    await flush()
+    const last = views.at(-1)!
+    expect(last.todos.some((t) => t.content === 'Ревью')).toBe(true)
+  })
+})
+
+describe('r3 #4 — descriptions duplicated in the SNAPSHOT do not participate', () => {
+  test('committed [X#1, A#2] vs snapshot [A#1, A#2] → no remap of A', () => {
+    const binding: SessionBinding = { sessionId: 's1', paneTarget: 'p', cwd: '/repo' }
+    const provAt = (capturedAt: number): PaneProvenance => ({
+      sessionId: 's1',
+      paneTarget: 'p',
+      cwd: '/repo',
+      capturedAt,
+    })
+    const chrome = ['', '────────────────────────────────────────', '  ⏵⏵ bypass permissions on']
+    const snapOf = (header: string, lines: string[], at: number) =>
+      parsePaneTaskList([header, ...lines, ...chrome].join('\n'), provAt(at))!
+
+    const s1 = snapOf('2 tasks (0 done, 1 in progress, 1 open)', ['◼ Задача X', '◻ Задача A'], 10)
+    const state = reconcileTaskState(initialReconciledState('s1'), {
+      kind: 'snapshot',
+      snapshot: s1,
+      verdict: validateSnapshot(s1, binding),
+    })
+
+    // Snapshot repeats «Задача A» twice — which copy corresponds to the
+    // committed A#2 is ambiguous ⇒ NO remap; X#1 follows the omission rules.
+    const dup = snapOf('2 tasks (0 done, 2 in progress, 0 open)', ['◼ Задача A', '◼ Задача A'], 20)
+    const aligned = realignOrdinals(state, dup)
+    expect(aligned.tasks.find((t) => t.description === 'Задача A')!.ordinal).toBe(2)
+    expect(aligned.tasks.find((t) => t.description === 'Задача X')!.ordinal).toBe(1)
+
+    // X survives snapshot 1 as a first-omission candidate (two-snapshot rule)…
+    let next = reconcileTaskState(aligned, {
+      kind: 'snapshot',
+      snapshot: dup,
+      verdict: validateSnapshot(dup, binding),
+    })
+    expect(next.tasks.some((t) => t.description === 'Задача X')).toBe(true)
+
+    // …and is dropped by the SECOND consecutive omission.
+    const dup2 = snapOf('2 tasks (0 done, 2 in progress, 0 open)', ['◼ Задача A', '◼ Задача A'], 30)
+    next = reconcileTaskState(realignOrdinals(next, dup2), {
+      kind: 'snapshot',
+      snapshot: dup2,
+      verdict: validateSnapshot(dup2, binding),
+    })
+    expect(next.tasks.some((t) => t.description === 'Задача X')).toBe(false)
   })
 })

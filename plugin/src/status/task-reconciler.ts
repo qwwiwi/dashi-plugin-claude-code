@@ -383,24 +383,50 @@ function isFurnitureLite(line: string): boolean {
   return FURNITURE_LITE_RES.some((re) => re.test(line))
 }
 
+// Lines allowed BELOW a chrome separator/footer: the input box (`❯ <typed>`),
+// further separators/footers, status bullets (● main / ◯ subagents) and the
+// furniture-lite set. Anything else is prose and DISQUALIFIES the candidate
+// chrome (review 2026-07-10 r3 #2: a crafted `──────` line inside prose must
+// not grant bottom anchoring — real harness chrome has ONLY chrome below it,
+// all the way to the capture end).
+const BELOW_CHROME_RES: readonly RegExp[] = [
+  /^\s*❯/u, // input-box prompt (may carry typed text)
+  /^\s*[●◯○◉]\s/u, // status bullets under the footer (main / subagents)
+]
+
+function isBelowChromeFurniture(line: string): boolean {
+  if (isFurnitureLite(line)) return true
+  if (CHROME_START_RES.some((re) => re.test(line))) return true
+  return BELOW_CHROME_RES.some((re) => re.test(line))
+}
+
 interface BottomRegionVerdict {
   /** No prose between the block and the capture end / harness chrome. */
   clean: boolean
-  /** An input-box separator or ⏵⏵ footer was seen below the block. */
+  /** VALIDATED harness chrome was seen below the block. */
   sawChrome: boolean
 }
 
 /**
  * Scan the lines BELOW a block (from `end` to capture end). The region is
  * `clean` when only furniture-lite lines appear up to the first harness-chrome
- * line (separator / footer); everything below that first chrome line is the
- * input box + status area and is accepted unconditionally. Any prose line
- * (assistant bullet, free text) before chrome ⇒ not clean.
+ * line (separator / footer) AND everything below that chrome line is itself
+ * chrome-classified (input box, footers, status bullets, blanks). A prose line
+ * anywhere — before OR after a candidate separator — disqualifies the region:
+ * a separator echoed inside prose is not the input box (review 2026-07-10 r3
+ * #2).
  */
 function scanBottomRegion(lines: ReadonlyArray<string>, end: number): BottomRegionVerdict {
   for (let k = end; k < lines.length; k += 1) {
     const line = lines[k] ?? ''
     if (CHROME_START_RES.some((re) => re.test(line))) {
+      // Candidate chrome: valid ONLY when the whole tail below it is also
+      // chrome/furniture — real harness chrome sits at the very bottom.
+      for (let m = k + 1; m < lines.length; m += 1) {
+        if (!isBelowChromeFurniture(lines[m] ?? '')) {
+          return { clean: false, sawChrome: false }
+        }
+      }
       return { clean: true, sawChrome: true }
     }
     if (!isFurnitureLite(line)) {
@@ -426,10 +452,15 @@ function scanBottomRegion(lines: ReadonlyArray<string>, end: number): BottomRegi
  *   3. POSITIONAL bottom anchoring: nothing but furniture (blank lines,
  *      task/truncation lines, spinner/Tip lines) between the block and the
  *      first piece of harness chrome (input-box `────` separator / `⏵⏵`
- *      footer) or the capture end — any prose below the block demotes it;
+ *      footer) or the capture end — any prose below the block demotes it.
+ *      Chrome itself is VALIDATED: everything below a candidate separator up
+ *      to the capture end must be chrome-classified (input box, footers,
+ *      status bullets, blanks) — a `────` line echoed inside prose does not
+ *      count (review 2026-07-10 r3 #2);
  *   4. harness-furniture presence: a spinner line immediately above the
- *      header OR harness chrome below the block. A block cut off at the very
- *      end of the capture with neither is scrollback, not the live list.
+ *      header OR validated harness chrome below the block. A block cut off at
+ *      the very end of the capture with neither is scrollback, not the live
+ *      list.
  * A block failing 2-4 still parses (observational: it feeds reconciliation
  * health) but carries `boundaryRecognized=false` ⇒ {@link validateSnapshot}
  * refuses authority (`unrecognized_boundary`).

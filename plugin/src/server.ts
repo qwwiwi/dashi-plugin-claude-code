@@ -645,6 +645,9 @@ if (resolveTaskReconcilerEnabled()) {
     },
     log,
     sinks: [contextHud, taskMirror],
+    // Session-epoch persistence (active + tombstones) — survives restarts so
+    // late lifecycle stragglers can't roll the epoch back (review r3 #1).
+    stateDir: statePaths.root,
     // Owner DM only (positive numeric chat id in the owner set) — the pane is
     // the single global DM session; a group chat must never be reconciled.
     isOwnerChat: (chatId: string): boolean => {

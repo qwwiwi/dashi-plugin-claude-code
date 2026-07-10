@@ -1202,3 +1202,41 @@ describe('#6 legacy snapshots without lastActivityMs use file mtime', () => {
     expect(edits[0]!.text).toContain('сессия завершена')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop round 3 (2026-07-10)
+// ─────────────────────────────────────────────────────────────────────
+
+describe('r3 #5 — epoch persists BEFORE the awaited displacement finalize', () => {
+  test('crash mid-finalize (hanging edit) still leaves s2 active, s1 retired on disk', async () => {
+    const dir = stateDir()
+    const api = makeFakeApi()
+    const clock = new FakeClock()
+    const { mirror } = makeMirror({ api, clock, stateDir: dir })
+
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Работа s1', status: 'in_progress' }], 's1'))
+    await mirror._idleForTests('chat-1')
+    clock.advance(3001)
+
+    // Finalize's final edit HANGS — simulates a crash between the epoch
+    // mutation and message delivery. Pre-fix the epoch was persisted only
+    // after the awaited edit, so a crash here restored the OLD epoch.
+    api.api.editMessageText = () => new Promise<void>(() => {})
+    void mirror.recordEvent('chat-1', todoEvent([{ content: 'Работа s2', status: 'in_progress' }], 's2'))
+    await new Promise((r) => setTimeout(r, 0))
+    await new Promise((r) => setTimeout(r, 0))
+
+    const { readFileSync } = await import('node:fs')
+    const persisted = JSON.parse(
+      readFileSync(join(dir, 'task-mirror-chat-1.json'), 'utf8'),
+    ) as { epoch?: { active?: string; retired?: string[] } }
+    expect(persisted.epoch?.active).toBe('s2')
+    expect(persisted.epoch?.retired).toContain('s1')
+
+    // «Restart»: the persisted epoch drops the dead session's stragglers.
+    const second = makeMirror({ stateDir: dir })
+    await second.mirror.recordEvent('chat-1', todoEvent([{ content: 'призрак s1', status: 'pending' }], 's1'))
+    await second.mirror._idleForTests('chat-1')
+    expect(second.api.calls).toHaveLength(0)
+  })
+})

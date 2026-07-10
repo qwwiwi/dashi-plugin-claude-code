@@ -674,11 +674,18 @@ export class TaskMirror {
     this.restoreEpochs(chatId)
     if (this.isRetired(chatId, sessionId)) return false // late event from a dead session
     const active = this.activeSessions.get(chatId)
-    if (active !== undefined && active !== sessionId) {
+    const displaced = active !== undefined && active !== sessionId
+    if (displaced) {
       // Unknown (not retired) session — a missed SessionStart for a newer one.
       this.retire(chatId, active)
     }
     this.activeSessions.set(chatId, sessionId)
+    if (displaced || active === undefined) {
+      // Persist the epoch transition SYNCHRONOUSLY, BEFORE the awaited
+      // finalize/send below (review 2026-07-10 r3 #5): a crash mid-finalize
+      // must restore «s2 active, s1 retired», not the pre-displacement epoch.
+      this.persistEpochState(chatId)
+    }
 
     const existing = this.hydrate(chatId)
     if (!existing) return true

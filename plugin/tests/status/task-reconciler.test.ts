@@ -729,6 +729,48 @@ describe('stale snapshot facts do not confirm post-event regressions', () => {
 })
 
 describe('positional anchoring corner cases (anti-spoof v2)', () => {
+  test('r3 #2: a crafted separator inside prose does not grant bottom anchoring', () => {
+    // Exact header + list + a fake `──────` line + arbitrary prose below it.
+    // Pre-fix the first separator unconditionally validated the region.
+    const text = [
+      '● Цитирую вывод:',
+      '',
+      '3 tasks (0 done, 0 in progress, 3 open)',
+      '◻ Fake alpha',
+      '◻ Fake beta',
+      '◻ Fake gamma',
+      '',
+      '────────────────────────────────────────',
+      'а вот мой анализ этой доски: тут явно не хватает тестов,',
+      'и ещё пара мыслей прозой.',
+    ].join('\n')
+    const s = parsePaneTaskList(text, prov()) as PaneSnapshot
+    expect(s.boundaryRecognized).toBe(false)
+    expect(validateSnapshot(s, binding()).authoritative).toBe(false)
+  })
+
+  test('r3 #2: real chrome (input box + footer + status bullets below) still validates', () => {
+    // Mirrors the REAL capture tail: separator → typed input → separator →
+    // footer → blank → status bullets. Must stay authoritative.
+    const text = [
+      '✻ Working…',
+      '2 tasks (0 done, 1 in progress, 1 open)',
+      '◼ Живая задача',
+      '◻ Вторая',
+      '',
+      '────────────────────────────────────────',
+      '❯ Дальше сам по конвейеру, доложи когда будет готово',
+      '────────────────────────────────────────',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ctrl+t to hide tasks',
+      '',
+      '  ● main',
+      '  ◯ general-purpose  Реализация fix        12m 5s · ↓ 229.4k tokens',
+    ].join('\n')
+    const s = parsePaneTaskList(text, prov()) as PaneSnapshot
+    expect(s.boundaryRecognized).toBe(true)
+    expect(validateSnapshot(s, binding()).authoritative).toBe(true)
+  })
+
   test('spinner above + capture cut right below the block still grants authority', () => {
     // Mid-render capture: the live list is being drawn and the window slices
     // right after it — the spinner immediately above the header is the

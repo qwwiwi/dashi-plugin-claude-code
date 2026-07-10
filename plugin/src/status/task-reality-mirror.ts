@@ -32,6 +32,9 @@
 // pane), reconciliation produces no valid snapshot and the view renders
 // «НЕ СВЕРЕНО» (events only) — the surfaces still show the optimistic list.
 
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+
 import type { Logger } from '../log.js'
 import type { TodoItem } from '../schemas.js'
 import type { TaskMirrorEvent, TaskMutationEvent } from '../hooks/claude-events.js'
@@ -98,6 +101,11 @@ export interface TaskRealityMirrorOptions {
   ttlMs?: number
   /** Owner-chat gate — the reconciler acts ONLY for owner DM chats. */
   isOwnerChat?: (chatId: string) => boolean
+  /** Plugin state dir. When set, the session-epoch state (active + retired
+   *  tombstones) is persisted per chat (`task-reality-epoch-<chat>.json`) so a
+   *  plugin restart cannot be rolled back by late lifecycle stragglers
+   *  (review 2026-07-10 r3 #1). Omitted in unit tests that don't exercise it. */
+  stateDir?: string
   now?: () => number
   setTimer?: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>
   clearTimer?: (handle: ReturnType<typeof setTimeout>) => void
@@ -157,11 +165,18 @@ export class TaskRealityMirror {
   private readonly setTimer: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>
   private readonly clearTimer: (handle: ReturnType<typeof setTimeout>) => void
   private readonly recs = new Map<string, ChatRec>()
+  private readonly stateDir: string | undefined
   // Per-chat tombstones: session ids that received SessionEnd. Late events
   // naming a tombstoned session are dropped — they must never finalize/clear
   // the ACTIVE session or resurrect the retired one. SessionStart with the
   // same id (a genuine resume) removes the tombstone.
   private readonly endedSessions = new Map<string, Set<string>>()
+  // Per-chat ACTIVE session id — survives rec eviction (unlike recs) and, via
+  // persistence, plugin restarts. Cleared by SessionEnd; kept by hard-TTL
+  // eviction (the session never ended, it just went silent).
+  private readonly activeSessions = new Map<string, string>()
+  // Chats whose persisted epoch state has been restored this process lifetime.
+  private readonly epochsRestored = new Set<string>()
 
   constructor(opts: TaskRealityMirrorOptions) {
     this.exec = opts.exec
@@ -172,6 +187,7 @@ export class TaskRealityMirror {
     this.coalesceWindowMs = opts.coalesceWindowMs ?? DEFAULT_COALESCE_WINDOW_MS
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS
     this.isOwnerChat = opts.isOwnerChat ?? ((): boolean => true)
+    this.stateDir = opts.stateDir
     this.now = opts.now ?? ((): number => Date.now())
     this.setTimer = opts.setTimer ?? ((cb, ms): ReturnType<typeof setTimeout> => setTimeout(cb, ms))
     this.clearTimer = opts.clearTimer ?? ((h): void => clearTimeout(h))
@@ -183,13 +199,16 @@ export class TaskRealityMirror {
   onSessionStart(chatId: string, opts: { sessionId: string; cwd?: string }): void {
     if (!this.isOwnerChat(chatId)) return
     try {
+      this.restoreEpochs(chatId)
       // Rollback guard (review 2026-07-10 #2): a SessionStart naming a
       // TOMBSTONED id while a DIFFERENT session is active is a late/replayed
       // straggler — it must NOT displace the active session. A resume of a
       // tombstoned id is valid only when no different session is active.
+      // «Active» comes from activeSessions (persisted, survives restart —
+      // review 2026-07-10 r3 #1), not the transient rec.
       if (this.isTombstoned(chatId, opts.sessionId)) {
-        const active = this.recs.get(chatId)
-        if (active !== undefined && !active.ended && active.sessionId !== opts.sessionId) {
+        const active = this.activeSessions.get(chatId)
+        if (active !== undefined && active !== opts.sessionId) {
           this.log.debug('task reality mirror dropped late SessionStart for tombstoned session', {
             chat_id: chatId,
           })
@@ -197,6 +216,7 @@ export class TaskRealityMirror {
         }
         // Genuine RESUME — the harness is alive again under the same id.
         this.untombstone(chatId, opts.sessionId)
+        this.persistEpochs(chatId)
       }
       const rec = this.ensureRec(chatId, opts.sessionId, opts.cwd)
       this.ensureSession(rec, opts.sessionId)
@@ -213,6 +233,7 @@ export class TaskRealityMirror {
   /** UserPromptSubmit: a turn has begun — mark active, arm the timer, capture now. */
   onUserPromptSubmit(chatId: string, opts: { sessionId: string; cwd?: string }): void {
     if (!this.isOwnerChat(chatId)) return
+    this.restoreEpochs(chatId)
     if (this.isTombstoned(chatId, opts.sessionId)) return // late event from a retired session
     try {
       const rec = this.ensureRec(chatId, opts.sessionId, opts.cwd)
@@ -255,7 +276,12 @@ export class TaskRealityMirror {
   onSessionEnd(chatId: string, opts: { sessionId: string }): void {
     if (!this.isOwnerChat(chatId)) return
     try {
+      this.restoreEpochs(chatId)
       this.tombstone(chatId, opts.sessionId)
+      if (this.activeSessions.get(chatId) === opts.sessionId) {
+        this.activeSessions.delete(chatId)
+      }
+      this.persistEpochs(chatId)
       const rec = this.recs.get(chatId)
       if (rec === undefined) return
       // Late end for a retired session: never touch the active rec.
@@ -273,6 +299,7 @@ export class TaskRealityMirror {
   onTaskEvent(chatId: string, event: TaskMirrorEvent, opts: { cwd?: string } = {}): void {
     if (!this.isOwnerChat(chatId)) return
     if (!isTaskMutationEvent(event)) return // lifecycle handled by the entry points above
+    this.restoreEpochs(chatId)
     if (this.isTombstoned(chatId, event.sessionId)) return // retired session — drop
     try {
       const rec = this.ensureRec(chatId, event.sessionId, opts.cwd)
@@ -291,6 +318,13 @@ export class TaskRealityMirror {
         // Removed PANE-CONFIRMED tasks get a versioned tombstone (review
         // 2026-07-10 #4): only a NEWER pane snapshot may resurrect them.
         for (const r of applied.removals) rec.eventRemovedAt.set(r.key, r.at)
+        // A TodoWrite that REINTRODUCES a removed key reasserts the task with
+        // full event authority — its tombstone must be CLEARED, or an
+        // equal-millisecond pane snapshot would delete the valid re-addition
+        // via enforceEventRemovals (review 2026-07-10 r3 #3).
+        for (const key of [...rec.eventRemovedAt.keys()]) {
+          if (rec.state.tasks.some((t) => t.key === key)) rec.eventRemovedAt.delete(key)
+        }
         while (rec.eventRemovedAt.size > 64) {
           const oldest = rec.eventRemovedAt.keys().next().value
           if (oldest === undefined) break
@@ -339,6 +373,7 @@ export class TaskRealityMirror {
         eventRemovedAt: new Map(),
       }
       this.recs.set(chatId, rec)
+      this.setActive(chatId, sessionId)
     } else if (cwd !== undefined && cwd.length > 0 && rec.binding.cwd !== cwd) {
       rec.binding = { ...rec.binding, cwd }
       // A binding change invalidates in-flight captures (their provenance was
@@ -361,6 +396,14 @@ export class TaskRealityMirror {
     rec.eventRemovedAt = new Map()
     rec.ended = false
     rec.turnActive = false
+    this.setActive(rec.chatId, sessionId)
+  }
+
+  // Track (and persist) the active session id for the chat.
+  private setActive(chatId: string, sessionId: string): void {
+    if (this.activeSessions.get(chatId) === sessionId) return
+    this.activeSessions.set(chatId, sessionId)
+    this.persistEpochs(chatId)
   }
 
   // Drop a rec entirely: timers disarmed, in-flight captures invalidated via
@@ -395,6 +438,77 @@ export class TaskRealityMirror {
 
   private isTombstoned(chatId: string, sessionId: string): boolean {
     return this.endedSessions.get(chatId)?.has(sessionId) === true
+  }
+
+  // ─── epoch persistence (review 2026-07-10 r3 #1) ─────────────────────
+  // The reality mirror's epoch state (active session + retired tombstones)
+  // was process-local: after a restart a late SessionStart for a session that
+  // ended PRE-restart displaced the restored active one. Persisted per chat
+  // in its own schema-versioned file with the same atomic tmp+rename pattern
+  // as TaskMirror. Best-effort: persistence failures never disturb the mirror.
+
+  private epochPath(chatId: string): string {
+    const safe = chatId.replace(/[^0-9A-Za-z_-]/g, '_')
+    return join(this.stateDir as string, `task-reality-epoch-${safe}.json`)
+  }
+
+  private persistEpochs(chatId: string): void {
+    if (this.stateDir === undefined) return
+    try {
+      mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
+      const active = this.activeSessions.get(chatId)
+      const retired = this.endedSessions.get(chatId)
+      const body = {
+        v: 1,
+        ...(active !== undefined ? { active } : {}),
+        retired: retired !== undefined ? [...retired] : [],
+      }
+      const path = this.epochPath(chatId)
+      const tmp = `${path}.tmp.${process.pid}.${Date.now()}`
+      writeFileSync(tmp, JSON.stringify(body), { mode: 0o600 })
+      try {
+        renameSync(tmp, path)
+      } catch (err) {
+        try {
+          unlinkSync(tmp)
+        } catch {
+          /* ignore */
+        }
+        throw err
+      }
+    } catch (err) {
+      this.warn('persistEpochs', chatId, err)
+    }
+  }
+
+  // Restore persisted epoch state ONCE per chat; runtime state is never
+  // clobbered. Called at the top of every lifecycle/event entry point so the
+  // tombstone checks always see post-restart truth.
+  private restoreEpochs(chatId: string): void {
+    if (this.epochsRestored.has(chatId)) return
+    this.epochsRestored.add(chatId)
+    if (this.stateDir === undefined) return
+    try {
+      const raw = readFileSync(this.epochPath(chatId), 'utf8')
+      const parsed: unknown = JSON.parse(raw)
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return
+      const obj = parsed as Record<string, unknown>
+      if (
+        typeof obj.active === 'string' &&
+        obj.active.length > 0 &&
+        !this.activeSessions.has(chatId)
+      ) {
+        this.activeSessions.set(chatId, obj.active)
+      }
+      if (Array.isArray(obj.retired) && !this.endedSessions.has(chatId)) {
+        const retired = obj.retired
+          .filter((s): s is string => typeof s === 'string' && s.length > 0)
+          .slice(-MAX_TOMBSTONES)
+        if (retired.length > 0) this.endedSessions.set(chatId, new Set(retired))
+      }
+    } catch {
+      // Missing file / malformed JSON → nothing persisted.
+    }
   }
 
   // ─── capture scheduling ──────────────────────────────────────────────
@@ -836,15 +950,28 @@ export function realignOrdinals(state: ReconciledState, snapshot: PaneSnapshot):
   }
   const snapOrdinals = new Set(snapshot.tasks.map((s) => s.ordinal))
 
-  // Full simultaneous permutation over unique exact descriptions (#8).
+  // A description participates in the permutation ONLY when it is unique on
+  // BOTH sides (review 2026-07-10 r3 #4): `byDesc` already nulls committed
+  // duplicates; this counts the SNAPSHOT side — committed [X#1, A#2] against
+  // snapshot [A#1, A#2] must not remap A (which copy is which is ambiguous).
+  const snapDescCount = new Map<string, number>()
+  for (const s of snapshot.tasks) {
+    if (s.descriptionTruncated) continue
+    const d = normalizeDescription(s.description)
+    snapDescCount.set(d, (snapDescCount.get(d) ?? 0) + 1)
+  }
+
+  // Full simultaneous permutation over descriptions unique on both sides (#8).
   const consumed = new Set<ReconciledTask>()
   const remap = new Map<number, number>() // mover oldOrdinal → newOrdinal
   const takenNew = new Set<number>()
   for (const s of snapshot.tasks) {
     if (s.descriptionTruncated) continue
-    const match = byDesc.get(normalizeDescription(s.description))
+    const d = normalizeDescription(s.description)
+    if (snapDescCount.get(d) !== 1) continue // duplicated in the snapshot — ambiguous
+    const match = byDesc.get(d)
     if (match === undefined || match === null) continue
-    if (consumed.has(match)) continue // duplicate description in the SNAPSHOT
+    if (consumed.has(match)) continue // defensive (unreachable with unique counts)
     consumed.add(match)
     if (match.ordinal === s.ordinal) continue // already correctly placed
     if (takenNew.has(s.ordinal)) continue
