@@ -1019,3 +1019,64 @@ describe('applyReconciledView dedup', () => {
     expect(api.edited.length + api.sent.length).toBeGreaterThan(editsAfterFirst)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop round 2 (2026-07-10) — HUD rollback guard + epochs
+// ─────────────────────────────────────────────────────────────────────
+
+describe('HUD #2v2 rollback guard + persisted epochs', () => {
+  test('late SessionStart for an ENDED session does not displace the active one', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api)
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud.onSessionEnd(OWNER, { sessionId: 's1' })
+    await hud.onSessionStart(OWNER, { sessionId: 's2', source: 'startup' })
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's2',
+      todos: [todo('1', 'in_progress', 'актуальная')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('актуальная')
+
+    // REPLAYED SessionStart for dead s1: must NOT clear s2's snapshot.
+    await hud.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    expect(api.edited[api.edited.length - 1]!.text).toContain('актуальная')
+
+    // s1 stays tombstoned — its late events remain dropped.
+    await hud.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('9', 'pending', 'призрак')],
+    })
+    expect(api.edited[api.edited.length - 1]!.text).not.toContain('призрак')
+  })
+
+  test('epochs survive a restart: a straggler from an ended session stays dropped', async () => {
+    const dir = stateDir()
+    const api1 = new FakeApi()
+    const hud1 = makeHud(api1, { dir })
+    await hud1.onSessionStart(OWNER, { sessionId: 's1', source: 'startup' })
+    await hud1.onSessionEnd(OWNER, { sessionId: 's1' })
+
+    // «Restart»: fresh HUD instance, same state dir. Pre-fix the tombstones
+    // were runtime-only — this straggler adopted the dead session again.
+    const api2 = new FakeApi()
+    const hud2 = makeHud(api2, { dir })
+    await hud2.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's1',
+      todos: [todo('1', 'pending', 'призрак после рестарта')],
+    })
+    expect(api2.sent.length + api2.edited.length).toBe(0) // dropped
+
+    // A fresh session works normally.
+    await hud2.onTodoEvent(OWNER, {
+      kind: 'todo_write',
+      sessionId: 's2',
+      todos: [todo('1', 'in_progress', 'новая работа')],
+    })
+    const last =
+      api2.edited.length > 0 ? api2.edited[api2.edited.length - 1]!.text : api2.sent[0]!.text
+    expect(last).toContain('новая работа')
+  })
+})

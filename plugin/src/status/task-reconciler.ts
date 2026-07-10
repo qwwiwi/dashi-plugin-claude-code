@@ -263,6 +263,8 @@ interface RawBlock {
   truncatedBy: number | null
   /** an interior line we could not attribute (a wrap) ⇒ incomplete. */
   hasUnattributedLine: boolean
+  /** Exclusive index of the first line NOT consumed by this block. */
+  end: number
 }
 
 /**
@@ -285,6 +287,7 @@ function collectBlocks(lines: ReadonlyArray<string>): RawBlock[] {
       taskLines: [first],
       truncatedBy: null,
       hasUnattributedLine: false,
+      end: i + 1,
     }
     const glyphIndent = first.indent
     i += 1
@@ -312,6 +315,9 @@ function collectBlocks(lines: ReadonlyArray<string>): RawBlock[] {
       }
       break
     }
+    // `i` now points at the first line NOT consumed by this block (a truncation
+    // marker was consumed; the breaking blank/wrap/dedent line was not).
+    block.end = i
     blocks.push(block)
   }
   return blocks
@@ -336,11 +342,72 @@ function isNoiseLine(line: string): boolean {
 
 /** Nearest non-blank line above `idx`, or null. */
 function precedingNonBlank(lines: ReadonlyArray<string>, idx: number): string | null {
+  const k = precedingNonBlankIdx(lines, idx)
+  return k >= 0 ? (lines[k] ?? '') : null
+}
+
+/** Index of the nearest non-blank line above `idx`, or -1. */
+function precedingNonBlankIdx(lines: ReadonlyArray<string>, idx: number): number {
   for (let k = idx - 1; k >= 0; k -= 1) {
     const line = lines[k] ?? ''
-    if (line.trim() !== '') return line
+    if (line.trim() !== '') return k
   }
-  return null
+  return -1
+}
+
+// ─── positional anchoring (anti-spoof v2, review 2026-07-10 #1) ────────
+//
+// Harness chrome: the input-box separator and the ⏵⏵ footer. Once one of
+// these appears below the task block, everything under it (input box content,
+// subagent-status bullets ● / ◯, hints) is harness furniture by construction —
+// the live task list ALWAYS renders directly above the input box.
+const CHROME_START_RES: readonly RegExp[] = [
+  /^\s*[─━]{10,}/u, // ──── input-box separator
+  /^\s*⏵⏵/u, // ⏵⏵ bypass-permissions footer
+]
+
+// Furniture-lite: lines that may legitimately sit between the live task block
+// and the input box WITHOUT implying prose. Deliberately EXCLUDES assistant /
+// subagent bullets (● ◯ ○ ◉) and free text — those mark conversation content,
+// which never renders below the live list.
+const FURNITURE_LITE_RES: readonly RegExp[] = [
+  SPINNER_RE,
+  /^\s*(?:[└├]\s+)?Tip:/iu,
+  /^\s*Listening for channel messages/iu,
+]
+
+function isFurnitureLite(line: string): boolean {
+  if (line.trim() === '') return true
+  if (TRUNCATION_RE.test(line)) return true
+  if (classifyTaskLine(line, 0) !== null) return true
+  return FURNITURE_LITE_RES.some((re) => re.test(line))
+}
+
+interface BottomRegionVerdict {
+  /** No prose between the block and the capture end / harness chrome. */
+  clean: boolean
+  /** An input-box separator or ⏵⏵ footer was seen below the block. */
+  sawChrome: boolean
+}
+
+/**
+ * Scan the lines BELOW a block (from `end` to capture end). The region is
+ * `clean` when only furniture-lite lines appear up to the first harness-chrome
+ * line (separator / footer); everything below that first chrome line is the
+ * input box + status area and is accepted unconditionally. Any prose line
+ * (assistant bullet, free text) before chrome ⇒ not clean.
+ */
+function scanBottomRegion(lines: ReadonlyArray<string>, end: number): BottomRegionVerdict {
+  for (let k = end; k < lines.length; k += 1) {
+    const line = lines[k] ?? ''
+    if (CHROME_START_RES.some((re) => re.test(line))) {
+      return { clean: true, sawChrome: true }
+    }
+    if (!isFurnitureLite(line)) {
+      return { clean: false, sawChrome: false }
+    }
+  }
+  return { clean: true, sawChrome: false }
 }
 
 /**
@@ -349,16 +416,34 @@ function precedingNonBlank(lines: ReadonlyArray<string>, idx: number): string | 
  * HEADER-anchored block is preferred; failing that, the last block of >= 2
  * task lines is accepted with `boundaryRecognized = false`.
  *
- * ANTI-SPOOF (review 2026-07-09, all three reviewers): ONLY the
- * `N tasks (A done, B in progress, C open)` header grants a recognized
- * boundary. A spinner-anchored block (`* Imagining…`, `· thinking` etc.) is
- * trivially reproduced in agent prose or scrollback — a checkbox list the
- * agent merely ECHOED (quoting a plan, printing a diff) under any `*`/`·`
- * line would previously have parsed as authoritative and ERASED the real
- * task state within two capture cycles. Spinner/unanchored blocks are still
- * parsed (they feed reconciliation health) but carry
- * `boundaryRecognized=false` ⇒ {@link validateSnapshot} refuses authority
- * (`unrecognized_boundary`) and they stay observational.
+ * ANTI-SPOOF (review 2026-07-09 + v2 2026-07-10): boundary recognition
+ * (⇒ authority-eligibility) requires ALL of:
+ *   1. a `N tasks (A done, B in progress, C open)` HEADER above the block —
+ *      spinner lines never anchor (trivially reproduced in prose);
+ *   2. the block is the LAST header-anchored block in the capture (a quoted
+ *      list echoed in prose sits ABOVE the live list, which the harness
+ *      always renders directly above the input box);
+ *   3. POSITIONAL bottom anchoring: nothing but furniture (blank lines,
+ *      task/truncation lines, spinner/Tip lines) between the block and the
+ *      first piece of harness chrome (input-box `────` separator / `⏵⏵`
+ *      footer) or the capture end — any prose below the block demotes it;
+ *   4. harness-furniture presence: a spinner line immediately above the
+ *      header OR harness chrome below the block. A block cut off at the very
+ *      end of the capture with neither is scrollback, not the live list.
+ * A block failing 2-4 still parses (observational: it feeds reconciliation
+ * health) but carries `boundaryRecognized=false` ⇒ {@link validateSnapshot}
+ * refuses authority (`unrecognized_boundary`).
+ *
+ * RESIDUAL RISK (documented per review 2026-07-10 #1): pane authority is
+ * still pane-CONTENT trust. An adversary who gets the agent to print an
+ * EXACT header + checkbox list as its very last output — sitting immediately
+ * above the input box while no real list is rendered (idle between turns) —
+ * satisfies 1-4 and gains authority until the next real render. Bounds on
+ * the damage: tool events retain per-task recency authority (a newer event
+ * beats any snapshot), removals/regressions need TWO consecutive confirming
+ * snapshots, and the next genuine task render reclaims the bottom slot.
+ * Eliminating the residue entirely would require out-of-band ground truth
+ * (harness API), which does not exist today.
  *
  * `text` is assumed already ANSI-stripped by the capture layer, but we are
  * defensive: classification is line-oriented and never assumes clean input.
@@ -404,6 +489,22 @@ export function parsePaneTaskList(text: string, provenance: PaneProvenance): Pan
     }
   }
   if (chosen === null) return null
+
+  // Positional anchoring (anti-spoof v2, conditions 2-4 in the docstring).
+  // The selection loop above already guarantees condition 2 (later header
+  // blocks replace earlier ones, so `chosen` anchored ⇒ last header block).
+  if (chosenAnchored) {
+    const region = scanBottomRegion(lines, chosen.end)
+    const headerIdx = precedingNonBlankIdx(lines, chosen.first)
+    const aboveHeader =
+      headerIdx >= 0 ? precedingNonBlank(lines, headerIdx) : null
+    const spinnerAboveHeader = aboveHeader !== null && SPINNER_RE.test(aboveHeader)
+    const positional = region.clean && (region.sawChrome || spinnerAboveHeader)
+    if (!positional) {
+      // Demote: parses (observational) but never gains authority.
+      chosenAnchored = false
+    }
+  }
 
   const tasks: ParsedTask[] = []
   let ordinalsDerived = false

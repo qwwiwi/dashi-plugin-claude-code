@@ -27,6 +27,13 @@ export type TaskFreshness =
    * reconciliation. No growing age — the label never changes after this.
    */
   | { readonly kind: 'ended'; readonly reconciledAtLabel: string | null }
+  /**
+   * Reconciliation stopped WITHOUT a clean session end (hard-TTL eviction of
+   * an orphaned session). Frozen terminal state — the surface must never keep
+   * saying «сверено недавно» for data nobody updates any more
+   * (review 2026-07-10 #7).
+   */
+  | { readonly kind: 'expired' }
 
 /** The rendered two-part header: a bold label line + an optional italic subline. */
 export interface FreshnessHeader {
@@ -79,5 +86,7 @@ export function renderFreshnessHeader(f: TaskFreshness): FreshnessHeader {
             ? `<b>Задачи</b> · <i>сессия завершена · сверено ${f.reconciledAtLabel} UTC</i>`
             : '<b>Задачи</b> · <i>сессия завершена</i>',
       }
+    case 'expired':
+      return { label: '<b>Задачи</b> · <i>данные не обновляются</i>' }
   }
 }

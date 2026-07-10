@@ -579,16 +579,25 @@ describe('anti-spoof: only header-anchored blocks can be authoritative', () => {
     expect(validateSnapshot(s, binding()).authoritative).toBe(false)
   })
 
-  test('a fake list BELOW the real header-anchored one does not override it', () => {
+  test('an exact-header fake in prose ABOVE the real list — the real (last, bottom-anchored) wins', () => {
     const text = [
+      '● Вот как выглядела доска (цитирую):',
+      '',
+      '  3 tasks (0 done, 0 in progress, 3 open)',
+      '  ◻ Fake alpha',
+      '  ◻ Fake beta',
+      '  ◻ Fake gamma',
+      '',
+      '● продолжаю работу…',
+      '',
       '3 tasks (1 done, 1 in progress, 1 open)',
       '☑ Real done',
       '◼ Real active',
       '◻ Real pending',
       '',
-      '● Agent prose quoting a plan:',
-      '  ◼ Fake alpha',
-      '  ◻ Fake beta',
+      '────────────────────────────────────────',
+      '❯ ',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
     ].join('\n')
     const s = parsePaneTaskList(text, prov()) as PaneSnapshot
     expect(s.boundaryRecognized).toBe(true)
@@ -598,6 +607,40 @@ describe('anti-spoof: only header-anchored blocks can be authoritative', () => {
       'Real pending',
     ])
     expect(validateSnapshot(s, binding()).authoritative).toBe(true)
+  })
+
+  test('an exact-header fake with prose BELOW it is observational (not bottom-anchored)', () => {
+    const text = [
+      '● Цитирую состояние доски:',
+      '',
+      '3 tasks (0 done, 0 in progress, 3 open)',
+      '◻ Fake alpha',
+      '◻ Fake beta',
+      '◻ Fake gamma',
+      '',
+      '● а дальше я сделаю вот что…',
+      '',
+      '────────────────────────────────────────',
+      '❯ ',
+    ].join('\n')
+    const s = parsePaneTaskList(text, prov()) as PaneSnapshot
+    expect(s.boundaryRecognized).toBe(false) // prose below ⇒ demoted
+    expect(validateSnapshot(s, binding()).authoritative).toBe(false)
+  })
+
+  test('an exact-header fake cut off at the capture end (no chrome, no spinner) is observational', () => {
+    // Scrollback slice: the capture window ends right below the quoted block —
+    // no harness chrome below and no spinner above ⇒ demoted.
+    const text = [
+      'какая-то старая строка вывода',
+      '3 tasks (0 done, 0 in progress, 3 open)',
+      '◻ Fake alpha',
+      '◻ Fake beta',
+      '◻ Fake gamma',
+    ].join('\n')
+    const s = parsePaneTaskList(text, prov()) as PaneSnapshot
+    expect(s.boundaryRecognized).toBe(false)
+    expect(validateSnapshot(s, binding()).authoritative).toBe(false)
   })
 
   test('a fake list in scrollback while the real one is hidden cannot erase state', () => {
@@ -617,9 +660,13 @@ describe('anti-spoof: only header-anchored blocks can be authoritative', () => {
 
     // Feed it into an established state: nothing changes except observation time.
     const realText = [
+      '✻ Working…',
       '2 tasks (0 done, 1 in progress, 1 open)',
       '◼ Настоящая задача',
       '◻ Вторая настоящая',
+      '',
+      '────────────────────────────────────────',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
     ].join('\n')
     const real = parsePaneTaskList(realText, prov({ capturedAt: 10 })) as PaneSnapshot
     let state = feedSnapshot(initialReconciledState('sess-1'), real)
@@ -646,7 +693,13 @@ describe('anti-spoof: only header-anchored blocks can be authoritative', () => {
 describe('stale snapshot facts do not confirm post-event regressions', () => {
   const paneWith = (glyph: string, capturedAt: number): PaneSnapshot =>
     parsePaneTaskList(
-      ['1 tasks (0 done, 0 in progress, 1 open)', `${glyph} Собрать модуль`].join('\n'),
+      [
+        '1 tasks (0 done, 0 in progress, 1 open)',
+        `${glyph} Собрать модуль`,
+        '',
+        '────────────────────────────────────────',
+        '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+      ].join('\n'),
       prov({ capturedAt }),
     ) as PaneSnapshot
 
@@ -672,5 +725,22 @@ describe('stale snapshot facts do not confirm post-event regressions', () => {
     // regression is genuinely confirmed.
     state = feedSnapshot(state, paneWith('◻', 30))
     expect(state.tasks[0]?.status).toBe('pending')
+  })
+})
+
+describe('positional anchoring corner cases (anti-spoof v2)', () => {
+  test('spinner above + capture cut right below the block still grants authority', () => {
+    // Mid-render capture: the live list is being drawn and the window slices
+    // right after it — the spinner immediately above the header is the
+    // harness-furniture signal that keeps it authoritative.
+    const text = [
+      '✻ Compacting… (11s · ↑ 2.1k tokens)',
+      '2 tasks (0 done, 1 in progress, 1 open)',
+      '◼ Живая задача',
+      '◻ Вторая',
+    ].join('\n')
+    const s = parsePaneTaskList(text, prov()) as PaneSnapshot
+    expect(s.boundaryRecognized).toBe(true)
+    expect(validateSnapshot(s, binding()).authoritative).toBe(true)
   })
 })

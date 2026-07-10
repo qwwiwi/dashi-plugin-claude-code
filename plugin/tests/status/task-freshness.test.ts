@@ -118,3 +118,11 @@ describe('surface embedding — TaskMirror', () => {
     expect(renderTodoList(todos, 5).startsWith('<b>Задачи</b>\n')).toBe(true)
   })
 })
+
+describe('expired (hard-TTL terminal state, review 2026-07-10 #7)', () => {
+  test('verbatim label', () => {
+    expect(renderFreshnessHeader({ kind: 'expired' })).toEqual({
+      label: '<b>Задачи</b> · <i>данные не обновляются</i>',
+    })
+  })
+})

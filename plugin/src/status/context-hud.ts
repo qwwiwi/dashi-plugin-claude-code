@@ -329,6 +329,8 @@ export class ContextHud {
   // tasks nor the bucketed freshness label changed, skipping the refresh keeps
   // editMessageText traffic at zero instead of a no-op edit per tick.
   private readonly lastReconciledRender = new Map<string, string>()
+  // Chats whose persisted epoch state has been restored this process lifetime.
+  private readonly epochsRestored = new Set<string>()
   // bump() debounce per chat — a burst of inbound messages collapses to one
   // delete+resend (same rationale as TmuxMirror.BUMP_DEBOUNCE_MS).
   private readonly lastBumpAt = new Map<string, number>()
@@ -392,7 +394,20 @@ export class ContextHud {
   onSessionStart(chatId: string, opts: { sessionId?: string; source?: string } = {}): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
     const { sessionId, source } = opts
+    this.restoreEpochs(chatId)
     const prev = this.sessionIds.get(chatId)
+    // Rollback guard (review 2026-07-10 #2): a SessionStart naming an ENDED id
+    // while a DIFFERENT session is tracked is a late/replayed straggler — it
+    // must NOT displace the active session or clear its snapshot. Resume of an
+    // ended id is valid only when no different session is tracked.
+    if (
+      sessionId !== undefined &&
+      prev !== undefined &&
+      prev !== sessionId &&
+      this.endedSessions.get(chatId)?.has(sessionId) === true
+    ) {
+      return Promise.resolve()
+    }
     const sessionChanged = sessionId !== undefined && prev !== undefined && prev !== sessionId
     if (source === 'clear' || sessionChanged) {
       // Genuine reset: drop the prior snapshot so the pin never shows stale
@@ -410,6 +425,7 @@ export class ContextHud {
     if (sessionId !== undefined) {
       this.sessionIds.set(chatId, sessionId)
       this.endedSessions.get(chatId)?.delete(sessionId)
+      this.persistEpoch(chatId)
     }
     return this.runSerialized(chatId, async () => {
       try {
@@ -448,11 +464,13 @@ export class ContextHud {
   // late task event naming it is dropped instead of clearing the active state.
   async onSessionEnd(chatId: string, opts: { sessionId?: string } = {}): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return
+    this.restoreEpochs(chatId)
     const { sessionId } = opts
     const prev = this.sessionIds.get(chatId)
     if (sessionId !== undefined) {
       // Tombstone even a late end for a session we've moved past — its
-      // stragglers must be dropped too.
+      // stragglers must be dropped too. Bound 64 oldest-first (review
+      // 2026-07-10 #2), persisted so tombstones survive a restart.
       let set = this.endedSessions.get(chatId)
       if (set === undefined) {
         set = new Set()
@@ -460,11 +478,12 @@ export class ContextHud {
       }
       set.delete(sessionId)
       set.add(sessionId)
-      while (set.size > 8) {
+      while (set.size > 64) {
         const oldest = set.values().next().value
         if (oldest === undefined) break
         set.delete(oldest)
       }
+      this.persistEpoch(chatId)
     }
     // Ignore a late SessionEnd for a session we've already moved past.
     if (sessionId !== undefined && prev !== undefined && prev !== sessionId) return
@@ -484,6 +503,7 @@ export class ContextHud {
     if (event.kind === 'session_start' || event.kind === 'session_end') {
       return Promise.resolve()
     }
+    this.restoreEpochs(chatId)
     // Drop late stragglers from an ENDED session — they must not clear the
     // active session's snapshot or resurrect the dead id (review 2026-07-09 #2).
     if (this.endedSessions.get(chatId)?.has(event.sessionId) === true) {
@@ -780,32 +800,87 @@ export class ContextHud {
     }
   }
 
-  private loadPersisted(chatId: string): number | undefined {
+  // Full persisted shape (schema-versioned; v2 adds the epoch block).
+  private loadPersistedFull(chatId: string): {
+    messageId?: number
+    epoch?: { active?: string; ended?: ReadonlyArray<string> }
+  } {
     try {
       const raw = readFileSync(this.persistPath(chatId), 'utf8')
       const parsed: unknown = JSON.parse(raw)
-      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-        const id = (parsed as { message_id?: unknown }).message_id
-        if (typeof id === 'number' && Number.isInteger(id) && id > 0) return id
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
+      const obj = parsed as Record<string, unknown>
+      const out: { messageId?: number; epoch?: { active?: string; ended?: ReadonlyArray<string> } } = {}
+      const id = obj.message_id
+      if (typeof id === 'number' && Number.isInteger(id) && id > 0) out.messageId = id
+      if (typeof obj.epoch === 'object' && obj.epoch !== null && !Array.isArray(obj.epoch)) {
+        const e = obj.epoch as Record<string, unknown>
+        const active = typeof e.active === 'string' && e.active.length > 0 ? e.active : undefined
+        const ended = Array.isArray(e.ended)
+          ? e.ended.filter((s): s is string => typeof s === 'string' && s.length > 0).slice(-64)
+          : undefined
+        out.epoch = {
+          ...(active !== undefined ? { active } : {}),
+          ...(ended !== undefined ? { ended } : {}),
+        }
       }
+      return out
     } catch {
-      // Missing file / malformed JSON → treat as "no persisted id".
+      return {} // missing file / malformed JSON → nothing persisted
     }
-    return undefined
   }
 
-  private persist(chatId: string, messageId: number): void {
+  private loadPersisted(chatId: string): number | undefined {
+    return this.loadPersistedFull(chatId).messageId
+  }
+
+  // Restore persisted epoch state (tracked session + ended tombstones) ONCE
+  // per chat (review 2026-07-10 #2: HUD epoch state was runtime-only, so a
+  // restart forgot every tombstone and a dead session's stragglers could
+  // clear the active snapshot). Runtime state is never clobbered.
+  private restoreEpochs(chatId: string): void {
+    if (this.epochsRestored.has(chatId)) return
+    this.epochsRestored.add(chatId)
+    const epoch = this.loadPersistedFull(chatId).epoch
+    if (epoch === undefined) return
+    if (epoch.active !== undefined && !this.sessionIds.has(chatId)) {
+      this.sessionIds.set(chatId, epoch.active)
+    }
+    if (epoch.ended !== undefined && !this.endedSessions.has(chatId)) {
+      this.endedSessions.set(chatId, new Set(epoch.ended))
+    }
+  }
+
+  private writePersisted(chatId: string, messageId: number | undefined): void {
     try {
       mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
-      writeFileSync(this.persistPath(chatId), JSON.stringify({ message_id: messageId }), {
-        mode: 0o600,
-      })
+      const active = this.sessionIds.get(chatId)
+      const ended = this.endedSessions.get(chatId)
+      const body = {
+        v: 2,
+        ...(messageId !== undefined ? { message_id: messageId } : {}),
+        epoch: {
+          ...(active !== undefined ? { active } : {}),
+          ...(ended !== undefined && ended.size > 0 ? { ended: [...ended] } : {}),
+        },
+      }
+      writeFileSync(this.persistPath(chatId), JSON.stringify(body), { mode: 0o600 })
     } catch (err) {
       this.log.warn('context hud persist failed (ignored)', {
         chat_id: chatId,
         error: err instanceof Error ? err.message : String(err),
       })
     }
+  }
+
+  private persist(chatId: string, messageId: number): void {
+    this.writePersisted(chatId, messageId)
+  }
+
+  // Refresh ONLY the epoch block, preserving the persisted message id.
+  private persistEpoch(chatId: string): void {
+    const messageId = this.messageIds.get(chatId) ?? this.loadPersistedFull(chatId).messageId
+    this.writePersisted(chatId, messageId)
   }
 }
 

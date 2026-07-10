@@ -1083,3 +1083,122 @@ describe('ended freshness suppresses the duplicate footer', () => {
     expect(occurrences).toBe(1)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Review fix-loop round 2 (2026-07-10)
+// ─────────────────────────────────────────────────────────────────────
+
+describe('#2v2 rollback guard + persisted epochs', () => {
+  test('late SessionStart for a RETIRED session does not displace the active one', async () => {
+    const { mirror, api, clock } = makeMirror()
+    await mirror.recordEvent('chat-1', sessionStart('s1', 'startup'))
+    await mirror.recordEvent('chat-1', sessionEnd('s1'))
+    await mirror.recordEvent('chat-1', sessionStart('s2', 'startup'))
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Активная работа', status: 'in_progress' }], 's2'))
+    await mirror._idleForTests('chat-1')
+    const sendsBefore = api.calls.filter((c) => c.kind === 'send').length
+
+    // REPLAYED SessionStart for dead s1 while s2 is active: dropped entirely —
+    // s2's snapshot is not finalized and s1 stays retired.
+    await mirror.recordEvent('chat-1', sessionStart('s1', 'startup'))
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'призрак', status: 'pending' }], 's1'))
+    await mirror._idleForTests('chat-1')
+    expect(api.calls.filter((c) => c.kind === 'send').length).toBe(sendsBefore)
+    const lastEdit = api.calls.filter((c) => c.kind === 'edit').pop()
+    if (lastEdit) expect(lastEdit.text).not.toContain('призрак')
+
+    // s2 continues normally.
+    clock.advance(3001) // clear the edit throttle
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Активная работа', status: 'completed' }], 's2'))
+    await mirror._idleForTests('chat-1')
+    const all = [...api.calls].reverse()
+    expect(all.find((c) => c.kind === 'edit' || c.kind === 'send')!.text).toContain('1 done')
+  })
+
+  test('epochs survive a restart: a straggler from an ended session stays dropped', async () => {
+    const dir = stateDir()
+    const first = makeMirror({ stateDir: dir })
+    await first.mirror.recordEvent('chat-1', sessionStart('s1', 'startup'))
+    await first.mirror.recordEvent('chat-1', todoEvent([{ content: 'Работа', status: 'in_progress' }], 's1'))
+    await first.mirror._idleForTests('chat-1')
+    await first.mirror.recordEvent('chat-1', sessionEnd('s1')) // finalize → epoch-only snapshot
+
+    // «Restart»: fresh mirror, same state dir. Pre-fix the tombstones were
+    // runtime-only, so this straggler resurrected the dead session.
+    const second = makeMirror({ stateDir: dir })
+    await second.mirror.recordEvent('chat-1', todoEvent([{ content: 'призрак s1', status: 'pending' }], 's1'))
+    await second.mirror._idleForTests('chat-1')
+    expect(second.api.calls).toHaveLength(0) // dropped — no send, no edit
+
+    // A genuinely new session works.
+    await second.mirror.recordEvent('chat-1', todoEvent([{ content: 'Новая сессия', status: 'in_progress' }], 's2'))
+    await second.mirror._idleForTests('chat-1')
+    expect(second.api.calls.filter((c) => c.kind === 'send')).toHaveLength(1)
+  })
+})
+
+describe('#5 flush convergence', () => {
+  test('a mutation racing an in-flight flush still lands its own edit', async () => {
+    const { mirror, api, clock } = makeMirror()
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Шаг 1', status: 'in_progress' }]))
+    await mirror._idleForTests('chat-1')
+    clock.advance(3001)
+    // Two mutations in quick succession: the first fires an immediate edit,
+    // the second lands while it is in flight. The convergence loop must
+    // deliver the SECOND content without waiting for another event.
+    void mirror.recordEvent('chat-1', todoEvent([{ content: 'Шаг 1', status: 'completed' }]))
+    await mirror.recordEvent('chat-1', todoEvent([
+      { content: 'Шаг 1', status: 'completed' },
+      { content: 'Шаг 2', status: 'in_progress' },
+    ]))
+    clock.advance(3001) // let the converged follow-up pass the throttle
+    await mirror._idleForTests('chat-1')
+    const lastEdit = api.calls.filter((c) => c.kind === 'edit').pop()!
+    expect(lastEdit.text).toContain('Шаг 2')
+  })
+})
+
+describe('#6 legacy snapshots without lastActivityMs use file mtime', () => {
+  test('an old v1 file (old mtime) is dropped silently on session change', async () => {
+    const dir = stateDir()
+    const path = join(dir, 'task-mirror-chat-1.json')
+    // v1 shape: no lastActivityMs, no dirty, no epoch.
+    writeFileSync(path, JSON.stringify({
+      sessionId: 'old-sess',
+      messageId: 200,
+      todos: [{ content: 'Ancient', status: 'in_progress' }],
+    }))
+    const twentyMinAgo = (Date.now() - 20 * 60 * 1000) / 1000
+    const { utimesSync } = await import('node:fs')
+    utimesSync(path, twentyMinAgo, twentyMinAgo)
+
+    const { mirror, clock, api } = makeMirror({ stateDir: dir })
+    clock.now = Date.now() // real clock so mtime comparison is meaningful
+
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Новая', status: 'in_progress' }], 'new-sess'))
+    await mirror._idleForTests('chat-1')
+    // Pre-fix: missing lastActivityMs defaulted to NOW ⇒ artificial freshness
+    // ⇒ graceful finalize EDIT on the ancient message. Now: silent drop.
+    expect(api.calls.filter((c) => c.kind === 'edit')).toHaveLength(0)
+    expect(api.calls.filter((c) => c.kind === 'send')).toHaveLength(1)
+  })
+
+  test('an old v1 file with FRESH mtime still finalizes gracefully', async () => {
+    const dir = stateDir()
+    const path = join(dir, 'task-mirror-chat-1.json')
+    writeFileSync(path, JSON.stringify({
+      sessionId: 'old-sess',
+      messageId: 200,
+      todos: [{ content: 'Recent', status: 'in_progress' }],
+    })) // mtime = now
+    const { mirror, clock, api } = makeMirror({ stateDir: dir })
+    clock.now = Date.now()
+
+    await mirror.recordEvent('chat-1', todoEvent([{ content: 'Новая', status: 'in_progress' }], 'new-sess'))
+    await mirror._idleForTests('chat-1')
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    expect(edits).toHaveLength(1)
+    expect(edits[0]!.messageId).toBe(200)
+    expect(edits[0]!.text).toContain('сессия завершена')
+  })
+})
