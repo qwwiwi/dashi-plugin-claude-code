@@ -675,15 +675,29 @@ export function loadAutonomyState(
 // Keep at most this many `*.json.corrupt-*` evidence files per chat key.
 const MAX_CORRUPT_FILES = 3
 
-// Rename `autonomy-<key>.json` → `autonomy-<key>.json.corrupt-<ts>-<rand>`
-// and prune older evidence beyond MAX_CORRUPT_FILES. The ms timestamp is
-// fixed-width for the foreseeable future, so a lexicographic sort of the
-// filenames is chronological. Best-effort: every step is allowed to fail.
+// Per-process monotonic sequence for corrupt-evidence suffixes. Several
+// corruptions can land in the SAME millisecond (a tight retry loop); with a
+// random tie-breaker the lexicographic prune order within that ms was decided
+// by the random hex — the «oldest» pruned could actually be the NEWEST file
+// (flaky forensics test caught in review). The seq resolves same-ms ties
+// deterministically. Cross-PROCESS ties are out of scope: the single-writer
+// assumption (module header) means one process produces this evidence.
+let corruptEvidenceSeq = 0
+
+// Rename `autonomy-<key>.json` → `autonomy-<key>.json.corrupt-<ts>-<seq>-<rand>`
+// and prune older evidence beyond MAX_CORRUPT_FILES. The suffix is MONOTONIC
+// within the process so a lexicographic filename sort IS chronological:
+// zero-padded 14-digit ms timestamp (fixes digit-length ordering for good),
+// then the zero-padded base36 seq (same-ms ties), and the crypto-rand LAST —
+// uniqueness across restarts only, never an ordering key. Best-effort: every
+// step is allowed to fail.
 function preserveCorruptFile(paths: AutonomyPaths, chatId: string): void {
   try {
     const key = canonicalChatKey(chatId)
     const file = autonomyStatePath(paths, chatId)
-    const suffix = `${Date.now()}-${randomBytes(3).toString('hex')}`
+    const ts = String(Date.now()).padStart(14, '0')
+    const seq = (corruptEvidenceSeq++).toString(36).padStart(4, '0')
+    const suffix = `${ts}-${seq}-${randomBytes(3).toString('hex')}`
     renameSync(file, join(paths.root, `autonomy-${key}.json.corrupt-${suffix}`))
     const prefix = `autonomy-${key}.json.corrupt-`
     const evidence = readdirSync(paths.root)
