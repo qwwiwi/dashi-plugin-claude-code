@@ -38,6 +38,13 @@ const TAIL_BYTES = 256 * 1024
 export interface ContextUsage {
   usedTokens: number
   pct: number
+  // The `message.model` id carried by the assistant turn we sourced the usage
+  // from (e.g. "claude-fable-5"), or undefined when that line has no usable
+  // model field. Claude Code hook payloads carry NO model field, but the
+  // transcript assistant lines DO — so this is the HUD's only path to the true
+  // context window (Fable = 1M). Only the SAME line the usage came from is
+  // consulted; we never scan other lines for a model.
+  model?: string
 }
 
 // Coerce an unknown usage field to a non-negative finite integer, or null if
@@ -85,7 +92,7 @@ export function computeContextUsage(
 
     const message = record.message
     if (typeof message !== 'object' || message === null) continue
-    const msg = message as { role?: unknown; usage?: unknown }
+    const msg = message as { role?: unknown; usage?: unknown; model?: unknown }
     if (msg.role !== 'assistant') continue
 
     const usage = msg.usage
@@ -110,7 +117,14 @@ export function computeContextUsage(
     // last genuine one.
     if (usedTokens === 0) continue
     const pct = windowTokens > 0 ? usedTokens / windowTokens : 0
-    return { usedTokens, pct }
+    // Capture the model from THIS same turn (the one the usage came from). Hook
+    // payloads omit the model entirely, so the transcript is the only source.
+    // Absent / empty / non-string → leave undefined; never scan other lines.
+    const result: ContextUsage = { usedTokens, pct }
+    if (typeof msg.model === 'string' && msg.model.length > 0) {
+      result.model = msg.model
+    }
+    return result
   }
   return null
 }

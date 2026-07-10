@@ -10,12 +10,15 @@ import {
 } from '../../src/status/context-usage.js'
 
 // Build one transcript line. `isSidechain` defaults to false (main thread).
+// `model` (when set) lands on `message.model`, mirroring a real Claude Code
+// assistant line ("claude-fable-5" etc.).
 function assistantLine(
   usage: Record<string, number> | null,
-  opts: { isSidechain?: boolean } = {},
+  opts: { isSidechain?: boolean; model?: unknown } = {},
 ): string {
   const message: Record<string, unknown> = { role: 'assistant', content: [] }
   if (usage !== null) message.usage = usage
+  if ('model' in opts) message.model = opts.model
   return JSON.stringify({
     type: 'assistant',
     isSidechain: opts.isSidechain ?? false,
@@ -161,6 +164,74 @@ describe('computeContextUsage', () => {
   test('FIX-13: all turns zero-sum → null (no usable window)', () => {
     const lines = [assistantLine({ input_tokens: 0 }), assistantLine({ input_tokens: 0 })]
     expect(computeContextUsage(lines, 200000)).toBeNull()
+  })
+
+  // Model capture: hook payloads carry no model, so the transcript is the HUD's
+  // only source of the true context window (Fable = 1M).
+  test('model comes from the last usable assistant line', () => {
+    const lines = [
+      assistantLine({ input_tokens: 10, cache_read_input_tokens: 50000 }, {
+        model: 'claude-fable-5',
+      }),
+    ]
+    const result = computeContextUsage(lines, 1_000_000)
+    expect(result).toEqual({
+      usedTokens: 50010,
+      pct: 50010 / 1_000_000,
+      model: 'claude-fable-5',
+    })
+  })
+
+  test('model absent → undefined (field never set)', () => {
+    const lines = [assistantLine({ input_tokens: 50000 })]
+    const result = computeContextUsage(lines, 200000)
+    expect(result).toEqual({ usedTokens: 50000, pct: 50000 / 200000 })
+    expect(result?.model).toBeUndefined()
+  })
+
+  test('model empty string → undefined', () => {
+    const lines = [assistantLine({ input_tokens: 50000 }, { model: '' })]
+    expect(computeContextUsage(lines, 200000)?.model).toBeUndefined()
+  })
+
+  test('model non-string (e.g. number) → undefined', () => {
+    const lines = [assistantLine({ input_tokens: 50000 }, { model: 42 })]
+    expect(computeContextUsage(lines, 200000)?.model).toBeUndefined()
+  })
+
+  test('model comes from the LATEST usable turn, not an earlier one', () => {
+    const lines = [
+      assistantLine({ input_tokens: 1, cache_read_input_tokens: 10000 }, { model: 'opus' }),
+      assistantLine({ input_tokens: 2, cache_read_input_tokens: 20000 }, {
+        model: 'claude-fable-5',
+      }),
+    ]
+    expect(computeContextUsage(lines, 200000)?.model).toBe('claude-fable-5')
+  })
+
+  test('sidechain line carrying a model is still skipped (no leak of subagent model)', () => {
+    const lines = [
+      assistantLine({ input_tokens: 5, cache_read_input_tokens: 40000 }, { model: 'opus' }), // main
+      assistantLine({ input_tokens: 900, cache_read_input_tokens: 900 }, {
+        isSidechain: true,
+        model: 'claude-fable-5',
+      }),
+    ]
+    const result = computeContextUsage(lines, 200000)
+    expect(result?.usedTokens).toBe(40005)
+    expect(result?.model).toBe('opus')
+  })
+
+  test('model is NOT scavenged from a different line when the usable turn lacks it', () => {
+    const lines = [
+      assistantLine({ input_tokens: 1, cache_read_input_tokens: 10000 }, {
+        model: 'claude-fable-5',
+      }), // earlier, has model
+      assistantLine({ input_tokens: 2, cache_read_input_tokens: 20000 }), // latest usable, NO model
+    ]
+    // The latest usable turn wins and it has no model — do not borrow from the
+    // earlier line.
+    expect(computeContextUsage(lines, 200000)?.model).toBeUndefined()
   })
 })
 
