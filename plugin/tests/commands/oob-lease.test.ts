@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { handleOobCommand, parseOobCommand, type OobContext } from '../../src/commands/oob.js'
-import { activeLeases, loadAutonomyState } from '../../src/autonomy/store.js'
+import { activeLeases, loadAutonomyState, revokeLease, updateAutonomyState } from '../../src/autonomy/store.js'
 import type { AppConfig } from '../../src/config.js'
 import type { Logger } from '../../src/log.js'
 import type { TelegramApi } from '../../src/channel/tools.js'
@@ -131,5 +131,47 @@ describe('/lease misconfig', () => {
     delete (ctx as { stateDir?: string }).stateDir
     const res = await handleOobCommand(parse('/lease deploy'), ctx)
     expect(res.replyToTelegram!.text).toContain('недоступно')
+  })
+})
+
+describe('/lease fail-closed grammar (fix-loop #3/#6)', () => {
+  test('malformed trailing ttl → usage error, NO lease', async () => {
+    for (const bad of ['/lease аудит; ttl=200h', '/lease аудит; ttl=0h', '/lease аудит; ttl=4.5h', '/lease аудит; ttl=abch']) {
+      const res = await handleOobCommand(parse(bad), mkCtx())
+      expect(res.replyToTelegram!.text).toContain('некорректный ttl')
+      expect(res.replyToTelegram!.text).toContain('usage')
+    }
+    expect(loadAutonomyState({ root }, CHAT).leases.length).toBe(0)
+  })
+
+  test('non-option `;` belongs to the scope — no silent truncation, echoed in full', async () => {
+    const res = await handleOobCommand(parse('/lease аудит; production'), mkCtx())
+    const lease = activeLeases(loadAutonomyState({ root }, CHAT), Date.now())[0]!
+    expect(lease.scope).toBe('аудит; production')
+    // The confirmation echoes the EXACT granted scope.
+    expect(res.replyToTelegram!.text).toContain('аудит; production')
+  })
+
+  test('scope over 400 code points → usage error, NO lease', async () => {
+    const res = await handleOobCommand(parse(`/lease ${'x'.repeat(401)}`), mkCtx())
+    expect(res.replyToTelegram!.text).toContain('400')
+    expect(loadAutonomyState({ root }, CHAT).leases.length).toBe(0)
+  })
+})
+
+describe('/lease duplicate against a TERMINAL lease states the real status (fix-loop #8)', () => {
+  test('revoked lease → «ОТОЗВАН», not «уже активен»; no re-mint', async () => {
+    await handleOobCommand(parse('/lease deploy'), mkCtx({ messageId: 5 }))
+    // Revoke the minted lease through the store.
+    const minted = loadAutonomyState({ root }, CHAT).leases[0]!
+    await updateAutonomyState({ root }, CHAT, (state) => {
+      const r = revokeLease(state, minted.id, Date.now(), 'owner', 'test')
+      return { state: r.state, result: r.outcome }
+    })
+    // Replay the SAME command message.
+    const res = await handleOobCommand(parse('/lease deploy'), mkCtx({ messageId: 5 }))
+    expect(res.replyToTelegram!.text).toContain('ОТОЗВАН')
+    expect(res.replyToTelegram!.text).not.toContain('уже активен')
+    expect(loadAutonomyState({ root }, CHAT).leases.length).toBe(1) // no second lease
   })
 })

@@ -382,6 +382,23 @@ async function handleLeaseCommand(
     }
   }
 
+  // Fail-closed grammar errors (fix-loop #3/#6/#8): a present-but-malformed
+  // trailing ttl option or an over-long scope is a USAGE ERROR — nothing is
+  // granted, nothing is silently defaulted or truncated.
+  if (cmd.kind === 'invalid') {
+    const reason = cmd.reason === 'ttl'
+      ? 'некорректный ttl — допустимо целое 1..72 в форме <code>ttl=48h</code>'
+      : 'scope длиннее 400 символов — сократи формулировку'
+    return {
+      handled: true,
+      command: 'lease',
+      replyToTelegram: {
+        text: `<b>/lease</b> — ${reason}.\n<i>usage: /lease &lt;scope&gt;[; ttl=48h]</i>`,
+        parseMode: 'HTML',
+      },
+    }
+  }
+
   // Grant. Idempotency key ties a replayed /lease command to one lease.
   const grantSourceId = `cmd:${ctx.chatId}:${ctx.messageId ?? Date.now()}`
   const res = await grantLease(
@@ -423,7 +440,33 @@ async function handleLeaseCommand(
     outcome: res.outcome,
     lease_id: lease?.id,
   })
+
+  // Honest refusal on a source-id collision with a DIFFERENT scope
+  // (fix-loop #2, Fable): never silently swallow a legit grant.
+  if (res.outcome === 'source_conflict') {
+    return {
+      handled: true,
+      command: 'lease',
+      replyToTelegram: {
+        text: '<b>мандат НЕ выдан</b> — этот запрос уже обрабатывался с ДРУГИМ scope (source_conflict). Отправь команду новым сообщением.',
+        parseMode: 'HTML',
+      },
+    }
+  }
+
   if (lease === undefined) {
+    // duplicate_source whose lease tombstone was already pruned — the ledger
+    // still remembers the grant. Honest report, no re-mint.
+    if (res.outcome === 'duplicate_source') {
+      return {
+        handled: true,
+        command: 'lease',
+        replyToTelegram: {
+          text: '<b>мандат не выдан повторно</b> — этот грант уже был обработан ранее (запись мандата уже удалена ротацией).',
+          parseMode: 'HTML',
+        },
+      }
+    }
     return {
       handled: true,
       command: 'lease',
@@ -433,15 +476,25 @@ async function handleLeaseCommand(
       },
     }
   }
-  const left = humanizeDurationMs(lease.expiresAtMs - Date.now())
-  const heading = res.outcome === 'duplicate_source' || res.outcome === 'duplicate_scope'
-    ? 'мандат уже активен'
-    : 'мандат выдан'
+
+  // Heading states the REAL status (fix-loop #8): a duplicate against a
+  // TERMINAL lease must not claim «уже активен».
+  const now = Date.now()
+  let heading: string
+  if (res.outcome === 'duplicate_source' || res.outcome === 'duplicate_scope') {
+    if (lease.revokedAtMs !== undefined) heading = 'мандат по этому гранту был ОТОЗВАН — новый не выдан'
+    else if (lease.consumedAtMs !== undefined && lease.consumedAtMs !== null) heading = 'мандат по этому гранту уже ИСПОЛЬЗОВАН — новый не выдан'
+    else if (lease.expiresAtMs <= now) heading = 'мандат по этому гранту ИСТЁК — новый не выдан'
+    else heading = 'мандат уже активен'
+  } else {
+    heading = 'мандат выдан'
+  }
+  const left = humanizeDurationMs(lease.expiresAtMs - now)
   const text =
     `<b>${heading}</b>\n`
     + `<code>${escapeHtml(lease.id)}</code>\n`
     + `scope: «${escapeHtml(lease.scope)}»\n`
-    + `истекает через ${escapeHtml(left)}`
+    + (lease.expiresAtMs > now ? `истекает через ${escapeHtml(left)}` : 'без остатка действия')
   return {
     handled: true,
     command: 'lease',
