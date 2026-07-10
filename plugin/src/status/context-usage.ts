@@ -170,7 +170,22 @@ export async function readContextUsage(
 }
 
 /**
- * Format usage as a compact human string, e.g. `114k / 200k (57%)`.
+ * Format a WINDOW (denominator) token count compactly: whole millions render as
+ * `1M` / `2M`, everything else as `<n>k`. So a 1M-window model reads `… / 1M`
+ * instead of the noisy `… / 1000k`, while the historical 200k stays `200k`.
+ * The USED (numerator) side keeps the plain `k` suffix — see formatContextUsage
+ * / renderHud — because it is rarely a clean million.
+ */
+export function formatWindowTokens(windowTokens: number): string {
+  if (windowTokens >= 1_000_000 && windowTokens % 1_000_000 === 0) {
+    return `${windowTokens / 1_000_000}M`
+  }
+  return `${Math.round(windowTokens / 1000)}k`
+}
+
+/**
+ * Format usage as a compact human string, e.g. `114k / 200k (57%)` (or
+ * `151k / 1M (15%)` for a 1M window).
  *
  * Pure and separate from computation so the caller controls presentation.
  * Token counts are rounded to the nearest 1k; the percentage to an integer.
@@ -181,7 +196,6 @@ export function formatContextUsage(
   windowTokens: number,
 ): string {
   const usedK = Math.round(u.usedTokens / 1000)
-  const windowK = Math.round(windowTokens / 1000)
   const pct = windowTokens > 0 ? Math.round((u.usedTokens / windowTokens) * 100) : 0
-  return `${usedK}k / ${windowK}k (${pct}%)`
+  return `${usedK}k / ${formatWindowTokens(windowTokens)} (${pct}%)`
 }

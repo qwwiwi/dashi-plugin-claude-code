@@ -1155,6 +1155,47 @@ describe('POST /hooks/agent — status-pin wiring', () => {
     expect(todoEvents[0]!.chatId).toBe('164795011')
     expect(todoEvents[0]!.event.kind).toBe('todo_write')
   })
+
+  test('model is captured from a Stop hook (mid-session model switch)', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const recorded: Array<{ chatId: string | undefined; info: Record<string, unknown> }> = []
+    const h = await startWebhookServer(enabledConfig(), {
+      mcpServer: mcp.server,
+      config: enabledConfig(),
+      statePaths: paths,
+      log: createLogger('test'),
+      sessionInfo: {
+        record: (chatId, info) => {
+          recorded.push({ chatId, info: info as Record<string, unknown> })
+        },
+      },
+      contextHud: { onSessionStart: () => {}, onStop: () => {}, onTodoEvent: () => {} },
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'Stop',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+        model: 'claude-fable-5',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(recorded.length).toBe(1)
+    // The Stop hook now feeds model into SessionInfoStore so the HUD follows a
+    // mid-session model switch and resolves the 1M Fable window.
+    expect(recorded[0]!.info.model).toBe('claude-fable-5')
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────

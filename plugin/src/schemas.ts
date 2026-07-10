@@ -237,6 +237,10 @@ export const ClaudeStopSchema = z
     ...ClaudeHookCommonShape,
     hook_event_name: z.literal('Stop'),
     effort: z.unknown().optional(),
+    // Stop carries the model of the turn that just ended, so a mid-session model
+    // switch (e.g. Opus → Fable) is observable at turn boundaries and the
+    // context HUD can follow the window. Optional — older harness builds omit it.
+    model: z.string().optional(),
   })
   .passthrough()
 

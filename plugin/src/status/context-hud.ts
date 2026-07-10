@@ -24,8 +24,13 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+import { resolveContextWindowForModel } from '../config.js'
 import { classifyEditError } from '../safety/telegram-edit-classifier.js'
-import { readContextUsage as realReadContextUsage, type ContextUsage } from './context-usage.js'
+import {
+  formatWindowTokens,
+  readContextUsage as realReadContextUsage,
+  type ContextUsage,
+} from './context-usage.js'
 import { applyTaskCreateToMap, applyTaskUpdateToMap } from './task-mirror.js'
 import { renderFreshnessHeader, type TaskFreshness } from './task-freshness.js'
 import type { TaskMirrorEvent } from '../hooks/claude-events.js'
@@ -213,7 +218,7 @@ export function renderHud(
     return { text: `🧠 <b>Контекст</b>: —${tail}`, keyboard }
   }
 
-  const windowK = Math.round(windowTokens / 1000)
+  const windowLabel = formatWindowTokens(windowTokens)
   const usedK = Math.round(usage.usedTokens / 1000)
   const rawPct = windowTokens > 0 ? (usage.usedTokens / windowTokens) * 100 : 0
   // Clamp to 0..100 for BOTH the bar and the displayed percentage so an
@@ -222,7 +227,7 @@ export function renderHud(
   const filled = Math.max(0, Math.min(BAR_SEGMENTS, Math.round(pct / 10)))
   const bar = BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(BAR_SEGMENTS - filled)
 
-  const text = `🧠 <b>Контекст</b>: ${bar} ${pct}% (${usedK}k / ${windowK}k)${tail}`
+  const text = `🧠 <b>Контекст</b>: ${bar} ${pct}% (${usedK}k / ${windowLabel})${tail}`
   return { text, keyboard }
 }
 
@@ -270,7 +275,15 @@ export interface ContextHudOptions {
   api: HudTelegramApi
   log: Logger
   sessionInfo: SessionInfoReader
+  // Fallback context window (tokens) used when the session model is unknown or
+  // absent — the model-unaware default (resolveContextWindowTokens).
   windowTokens: number
+  // Explicit operator override (config context_window_tokens / JARVIS_CONTEXT_WINDOW),
+  // or undefined when unset. When present it wins over per-model auto-detection
+  // (resolveContextWindowForModel); when absent the model table drives the
+  // window so a Fable-5 session reports its true 1M window. Optional so the many
+  // test literals that predate it keep compiling.
+  windowOverride?: number | undefined
   // Owner chat(s) — the ONLY chats the HUD acts in. Stringified for comparison
   // against the hook payload's chatId.
   ownerChatIds: ReadonlyArray<string | number>
@@ -292,6 +305,7 @@ export class ContextHud {
   private readonly log: Logger
   private readonly sessionInfo: SessionInfoReader
   private readonly windowTokens: number
+  private readonly windowOverride?: number | undefined
   private readonly owner: ReadonlySet<string>
   private readonly stateDir: string
   private readonly enabled: boolean
@@ -347,6 +361,7 @@ export class ContextHud {
     this.log = opts.log
     this.sessionInfo = opts.sessionInfo
     this.windowTokens = opts.windowTokens
+    this.windowOverride = opts.windowOverride
     this.owner = new Set(opts.ownerChatIds.map((id) => String(id)))
     this.stateDir = opts.stateDir
     this.enabled = opts.enabled
@@ -661,10 +676,19 @@ export class ContextHud {
     chatId: string,
   ): Promise<{ text: string; keyboard: InlineKeyboardLike }> {
     const info = this.sessionInfo.get(chatId)
+    // Model-aware window: an explicit operator override wins; otherwise the
+    // session model id (SessionStart/Stop hook) drives the denominator so a
+    // Fable-5 session reports its 1M window instead of the 200k default. An
+    // unknown/absent model falls back to the configured default (windowTokens).
+    // Recomputed each render so a mid-session model switch is picked up.
+    const windowTokens = resolveContextWindowForModel(info.model, {
+      override: this.windowOverride,
+      fallback: this.windowTokens,
+    })
     let usage: ContextUsage | null = null
     if (info.transcriptPath !== undefined && info.transcriptPath.length > 0) {
       try {
-        usage = await this.readUsage(info.transcriptPath, this.windowTokens)
+        usage = await this.readUsage(info.transcriptPath, windowTokens)
       } catch {
         // readContextUsage already swallows I/O; guard the injected fn too.
         usage = null
@@ -679,7 +703,7 @@ export class ContextHud {
     const work: HudWorkView = rv !== undefined
       ? { todos: rv.todos, freshness: rv.freshness, ...permissionMode }
       : { todos: this.work.get(chatId)?.todos ?? [], ...permissionMode }
-    return renderHud(usage, this.windowTokens, info.model, work)
+    return renderHud(usage, windowTokens, info.model, work)
   }
 
   // Resolve the HUD message id for a chat: in-memory cache → persisted file →

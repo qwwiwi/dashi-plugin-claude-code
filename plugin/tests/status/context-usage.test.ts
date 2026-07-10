@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   computeContextUsage,
   formatContextUsage,
+  formatWindowTokens,
 } from '../../src/status/context-usage.js'
 
 // Build one transcript line. `isSidechain` defaults to false (main thread).
@@ -214,5 +215,25 @@ describe('formatContextUsage', () => {
 
   test('windowTokens <= 0 → 0%', () => {
     expect(formatContextUsage({ usedTokens: 50000 }, 0)).toBe('50k / 0k (0%)')
+  })
+
+  test('1M window renders «1M» denominator (not 1000k)', () => {
+    // 151k of a 1M window ≈ 15%.
+    expect(formatContextUsage({ usedTokens: 151000 }, 1_000_000)).toBe('151k / 1M (15%)')
+  })
+})
+
+describe('formatWindowTokens', () => {
+  test('historical 200k window stays «200k»', () => {
+    expect(formatWindowTokens(200_000)).toBe('200k')
+  })
+
+  test('whole millions render as «M»', () => {
+    expect(formatWindowTokens(1_000_000)).toBe('1M')
+    expect(formatWindowTokens(2_000_000)).toBe('2M')
+  })
+
+  test('non-whole-million large window falls back to «k»', () => {
+    expect(formatWindowTokens(1_500_000)).toBe('1500k')
   })
 })

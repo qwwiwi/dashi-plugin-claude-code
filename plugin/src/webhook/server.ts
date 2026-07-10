@@ -586,7 +586,7 @@ async function handleRequest(
   if (payload.kind === 'claude_hook') {
     // Capture the latest session facts (transcript_path + model) so /status and
     // the context HUD can read them. transcript_path + session_id ride on every
-    // hook; model is present only on SessionStart. Pure in-memory record.
+    // hook; model rides on SessionStart and Stop. Pure in-memory record.
     if (deps.sessionInfo) {
       const info: {
         transcriptPath?: string
@@ -597,12 +597,15 @@ async function handleRequest(
         transcriptPath: payload.transcript_path,
         sessionId: payload.session_id,
       }
-      if (
-        payload.hook_event_name === 'SessionStart'
-        && typeof payload.model === 'string'
-        && payload.model.length > 0
-      ) {
-        info.model = payload.model
+      // model rides on SessionStart AND Stop (a mid-session model switch is
+      // observable at turn boundaries). Capture it from any hook that carries a
+      // non-empty value; SessionInfoStore MERGES, so a hook without model never
+      // wipes the last known one. Read via a narrow cast rather than the
+      // discriminated-union narrowing so both variants are handled uniformly and
+      // any future model-bearing hook is picked up automatically.
+      const hookModel = (payload as { model?: unknown }).model
+      if (typeof hookModel === 'string' && hookModel.length > 0) {
+        info.model = hookModel
       }
       // permission_mode rides on any hook that carries it (schema-optional).
       // The status pin renders «план» / «выполнение» from the latest value.
