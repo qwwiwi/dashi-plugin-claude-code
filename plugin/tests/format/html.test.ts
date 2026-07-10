@@ -185,3 +185,34 @@ describe('isTelegramHtmlParseError', () => {
     expect(isTelegramHtmlParseError(42)).toBe(false)
   })
 })
+
+describe('markdownToTelegramHtml — newline preservation contract', () => {
+  // The HTML path relies on parse_mode=HTML, where a literal `\n` renders as a
+  // real line break (unlike the rich/CommonMark path). markdownToTelegramHtml
+  // must therefore keep single newlines intact so list-like prose does not
+  // merge into one wall of text.
+  test('single \\n between list-like prose lines survives', () => {
+    const out = markdownToTelegramHtml('M1 — x\nM2 — y\nM3 — z')
+    expect(out).toBe('M1 — x\nM2 — y\nM3 — z')
+  })
+
+  test('blank-line paragraph breaks survive', () => {
+    const out = markdownToTelegramHtml('Первый абзац.\n\nВторой абзац.')
+    expect(out).toBe('Первый абзац.\n\nВторой абзац.')
+  })
+
+  test('bold heading with blank lines around keeps its newlines', () => {
+    const out = markdownToTelegramHtml('Итог.\n\n**Заголовок**\n\nТело.')
+    expect(out).toBe('Итог.\n\n<b>Заголовок</b>\n\nТело.')
+  })
+
+  test('# heading renders as <b> on its own line, newlines intact', () => {
+    const out = markdownToTelegramHtml('вступление\n\n# Заголовок\n\nтело')
+    expect(out).toBe('вступление\n\n<b>Заголовок</b>\n\nтело')
+  })
+
+  test('newlines inside a fenced code block are preserved verbatim', () => {
+    const out = markdownToTelegramHtml('```\nM1 — a\nM2 — b\n```')
+    expect(out).toContain('M1 — a\nM2 — b')
+  })
+})

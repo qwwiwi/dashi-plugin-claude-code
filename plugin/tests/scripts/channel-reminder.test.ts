@@ -1,6 +1,16 @@
 import { describe, expect, test } from 'bun:test'
 
-import { reminderForChat, renderContext } from '../../scripts/channel-reminder.js'
+import { rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import {
+  EMBEDDED_TOV_REMINDER,
+  composeReminder,
+  reminderForChat,
+  renderContext,
+  tovReminder,
+} from '../../scripts/channel-reminder.js'
 
 describe('reminderForChat', () => {
   test('positive (DM) chat id → strict reply-tool reminder', () => {
@@ -83,5 +93,98 @@ describe('channel-reminder.ts — process contract', () => {
     const r = runHook(undefined, 'hi')
     expect(r.status).toBe(0)
     expect(JSON.parse(r.stdout).hookSpecificOutput.additionalContext).toContain('Telegram')
+  })
+})
+
+describe('tovReminder', () => {
+  test('default (no env) returns the docs/TOV-reminder.md baseline', () => {
+    const r = tovReminder({})
+    expect(r).toBeDefined()
+    expect(r).toContain('по-русски')
+    expect(r).toContain('**Заголовок**')
+    // Default path reads the committed file, which mirrors the embedded const.
+    expect(r).toBe(EMBEDDED_TOV_REMINDER)
+  })
+
+  test('TOV_REMINDER_ENABLED=off disables the block', () => {
+    expect(tovReminder({ TOV_REMINDER_ENABLED: 'off' })).toBeUndefined()
+    expect(tovReminder({ TOV_REMINDER_ENABLED: '0' })).toBeUndefined()
+    expect(tovReminder({ TOV_REMINDER_ENABLED: 'false' })).toBeUndefined()
+  })
+
+  test('unreadable TOV_REMINDER_PATH falls back to the embedded baseline', () => {
+    const r = tovReminder({ TOV_REMINDER_PATH: '/no/such/file/xyz.md' })
+    expect(r).toBe(EMBEDDED_TOV_REMINDER)
+  })
+
+  // Review fix (2026-07-09): TOV_REMINDER_PATH is confined to plugin docs/ —
+  // a path outside (e.g. a .env) must NEVER be injected into model context.
+  test('TOV_REMINDER_PATH outside plugin docs/ is rejected → embedded baseline', () => {
+    // A real, readable file that is NOT under docs/ — must not leak.
+    const r = tovReminder({ TOV_REMINDER_PATH: '/etc/hostname' })
+    expect(r).toBe(EMBEDDED_TOV_REMINDER)
+  })
+
+  test('a docs/ file over the size cap falls back to the embedded baseline', () => {
+    // docs/TOV.md is inside docs/ but has 12+ content lines (> 8-line cap) —
+    // proves the cap fires even for an in-tree file.
+    const here = dirname(fileURLToPath(import.meta.url))
+    const tovFull = resolve(here, '..', '..', 'docs', 'TOV.md')
+    const r = tovReminder({ TOV_REMINDER_PATH: tovFull })
+    expect(r).toBe(EMBEDDED_TOV_REMINDER)
+  })
+
+  test('a distinct in-docs override file is used as-is', () => {
+    const docs = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'docs')
+    const p = join(docs, 'TOV-reminder.tmp-test.md')
+    writeFileSync(p, 'Короткий override.\nВторая строка.')
+    try {
+      expect(tovReminder({ TOV_REMINDER_PATH: p })).toBe('Короткий override.\nВторая строка.')
+    } finally {
+      rmSync(p, { force: true })
+    }
+  })
+
+  test('a symlink inside docs/ escaping the directory is rejected', () => {
+    const docs = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'docs')
+    const link = join(docs, 'TOV-escape.tmp-test.md')
+    try {
+      symlinkSync('/etc/hostname', link)
+    } catch {
+      return // environment forbids symlinks — nothing to verify here
+    }
+    try {
+      expect(tovReminder({ TOV_REMINDER_PATH: link })).toBe(EMBEDDED_TOV_REMINDER)
+    } finally {
+      rmSync(link, { force: true })
+    }
+  })
+
+  test('embedded baseline is a real 5-line block with no emoji', () => {
+    expect(EMBEDDED_TOV_REMINDER.split('\n').length).toBe(5)
+    // No emoji (basic surrogate-pair check).
+    expect(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(EMBEDDED_TOV_REMINDER)).toBe(false)
+  })
+})
+
+describe('composeReminder', () => {
+  test('DM: channel discipline first, then TOV block', () => {
+    const r = composeReminder({ CHAT_ID: '164795011' })
+    expect(r).toContain('mcp__dashi-channel__reply')
+    expect(r).toContain('по-русски')
+    // Channel reminder precedes the TOV block.
+    expect(r.indexOf('mcp__dashi-channel__reply')).toBeLessThan(r.indexOf('по-русски'))
+  })
+
+  test('TOV disabled → only the channel reminder', () => {
+    const r = composeReminder({ CHAT_ID: '164795011', TOV_REMINDER_ENABLED: 'no' })
+    expect(r).toBe(reminderForChat('164795011'))
+  })
+
+  test('added TOV context stays within ~10 lines', () => {
+    const r = composeReminder({ CHAT_ID: '164795011' })
+    const channelLines = reminderForChat('164795011').split('\n').length
+    const added = r.split('\n').length - channelLines
+    expect(added).toBeLessThanOrEqual(10)
   })
 })

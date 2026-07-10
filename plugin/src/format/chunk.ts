@@ -91,12 +91,51 @@ function chooseCut(text: string, max: number): number {
 
   const slice = text.slice(0, max)
   const lastPara = slice.lastIndexOf('\n\n')
-  if (lastPara >= 0) return lastPara + 2 // include the \n\n in the emitted chunk
+  if (lastPara >= 0) {
+    const cut = lastPara + 2 // include the \n\n in the emitted chunk
+    // Heading-affinity: never end a chunk on a lone heading line — that
+    // orphans the heading at the bottom of one message while its body opens
+    // the next. If the chunk we'd emit ends with a `<b>…</b>`-only line,
+    // back up to the paragraph boundary BEFORE that heading so the heading
+    // travels with its body. Only applied when an earlier boundary exists.
+    const backed = avoidOrphanHeading(text, cut)
+    return backed ?? cut
+  }
 
   const lastLine = slice.lastIndexOf('\n')
   if (lastLine >= 0) return lastLine + 1
 
   return max
+}
+
+// A rendered heading is a whole line that is EXACTLY one bold span —
+// markdownToTelegramHtml emits `# heading` and `**bold**` alike as
+// `<b>…</b>`. `[^<]+` keeps the match to a single span: a line with several
+// bold words («<b>a</b> and <b>b</b>») is prose, not a heading (review fix —
+// the previous `[\s\S]*` greedily matched multi-span lines).
+const LONE_HEADING_RE = /^<b>[^<]+<\/b>$/
+
+/**
+ * If the chunk `text.slice(0, cut)` would end on a lone heading line, return
+ * an earlier paragraph-boundary cut (before that heading) so the heading is
+ * not orphaned. Returns undefined when the chunk does not end on a heading,
+ * when there is no earlier boundary to back up to, or when backing up would
+ * emit a WHITESPACE-ONLY chunk (Telegram 400s an empty message and the whole
+ * reply would fail — an orphaned heading is the lesser evil).
+ */
+function avoidOrphanHeading(text: string, cut: number): number | undefined {
+  const body = text.slice(0, cut)
+  const trimmed = body.replace(/\n+$/, '')
+  const lastLineStart = trimmed.lastIndexOf('\n') + 1
+  const lastLine = trimmed.slice(lastLineStart).trim()
+  if (!LONE_HEADING_RE.test(lastLine)) return undefined
+
+  const prevPara = trimmed.lastIndexOf('\n\n', lastLineStart - 1)
+  if (prevPara < 0) return undefined // no earlier boundary — keep original cut
+  // Review fix (2026-07-09): text like "\n\n<b>H</b>\n\n…" would back up to a
+  // cut whose chunk is only whitespace — never emit that.
+  if (body.slice(0, prevPara + 2).trim() === '') return undefined
+  return prevPara + 2
 }
 
 /**

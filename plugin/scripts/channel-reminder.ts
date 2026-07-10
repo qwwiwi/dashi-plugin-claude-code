@@ -16,17 +16,37 @@
 // to the turn as context. It is NEVER sent to Telegram; the only way it
 // reaches the chat is if the model parrots it, so the text stays terse.
 //
+// It also appends a short TONE-OF-VOICE / formatting reminder (2026-07-09) so
+// replies stay readable on the phone: results-first, short headings on their
+// own line with blank lines around, one item per line. The fleet baseline
+// lives in docs/TOV-reminder.md; the hook mirrors it as an embedded constant
+// and can be pointed at a per-agent override file via TOV_REMINDER_PATH.
+//
 // Hard invariants (shared with the other dashi hooks):
 //   * Exit code 0 in EVERY path — a non-zero hook blocks the model; a
 //     missing reminder must never gate the turn.
 //   * stdout carries ONLY the JSON envelope (no logs, no secrets) — anything
 //     else on stdout becomes additional model context.
-//   * No file reads/writes; configuration is env-only.
+//   * The only file read is the OPTIONAL, best-effort TOV reminder file; a
+//     read failure silently falls back to the embedded constant and never
+//     gates the turn. Everything else is env-only.
 //
 // Env:
-//   CHAT_ID   the Telegram chat id this session serves. Negative ids are
-//             groups/supergroups (multichat); anything else is treated as a
-//             direct chat with the warchief. Absent → DM-safe generic.
+//   CHAT_ID              the Telegram chat id this session serves. Negative
+//                        ids are groups/supergroups (multichat); anything
+//                        else is a direct chat. Absent → DM-safe generic.
+//   TOV_REMINDER_ENABLED falsy (0/false/no/off, case-insensitive) disables
+//                        the TOV block. Default: enabled.
+//   TOV_REMINDER_PATH    per-agent override file for the TOV block. MUST live
+//                        inside the plugin docs/ directory (realpath-checked,
+//                        symlinks escaping it are rejected). Default:
+//                        docs/TOV-reminder.md. Unreadable, out-of-tree, or
+//                        over the size cap (8 lines / 1KB) → embedded
+//                        constant.
+
+import { readFileSync, realpathSync } from 'node:fs'
+import { dirname, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const DM_REMINDER =
   'Telegram bridge: the sender reads Telegram, not this terminal — terminal/transcript text never reaches them. ' +
@@ -56,6 +76,79 @@ export function reminderForChat(chatId: string | undefined): string {
   return DM_REMINDER
 }
 
+// Embedded fleet-baseline TOV reminder — a byte-for-byte mirror of
+// docs/TOV-reminder.md. Used when the file is disabled or unreadable so the
+// hook never depends on filesystem state to emit the baseline.
+export const EMBEDDED_TOV_REMINDER =
+  'Пиши владельцу по-русски, кратко и прямо; сначала вывод или решение.\n' +
+  'В длинном ответе используй короткие заголовки отдельной строкой: **Заголовок**.\n' +
+  'Оставляй пустую строку до и после каждого заголовка и между смысловыми блоками.\n' +
+  'Один абзац -- 1-3 предложения. Каждый пункт списка -- с новой строки.\n' +
+  'Выделяй жирным только важные числа, сроки и решения. Без emoji; кавычки «»; тире --.'
+
+/** Falsy env values that switch a boolean-ish flag OFF. Mirrors config.ts. */
+function isFalsyEnv(value: string | undefined): boolean {
+  if (value === undefined) return false
+  return ['0', 'false', 'no', 'off'].includes(value.trim().toLowerCase())
+}
+
+// Caps on injected TOV content (review fix 2026-07-09): the block rides into
+// EVERY turn's context, so an oversized or mis-pointed file must not bloat
+// per-turn tokens or leak arbitrary file contents into model context.
+// Over-cap or out-of-tree → embedded baseline (never truncated fragments).
+const TOV_MAX_BYTES = 1024
+const TOV_MAX_LINES = 8
+
+/** The plugin docs/ directory (this script lives in <plugin>/scripts).
+ *  Resolved from the module URL so it works regardless of process cwd. */
+function tovDocsDir(): string {
+  const here = dirname(fileURLToPath(import.meta.url))
+  return resolve(here, '..', 'docs')
+}
+
+function defaultTovPath(): string {
+  return resolve(tovDocsDir(), 'TOV-reminder.md')
+}
+
+/**
+ * Resolve the TOV reminder block. Returns undefined when disabled. Reads the
+ * override/default file best-effort with two guards, any failure → embedded
+ * baseline (the block is always emitted when enabled):
+ *   * containment — realpath of BOTH the file and docs/ must place the file
+ *     inside the plugin docs/ directory. Rejects TOV_REMINDER_PATH pointing
+ *     elsewhere (e.g. a .env) AND a symlink inside docs/ escaping it.
+ *   * size cap — over TOV_MAX_BYTES bytes or TOV_MAX_LINES lines → baseline,
+ *     keeping the per-turn injected context bounded.
+ */
+export function tovReminder(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (isFalsyEnv(env.TOV_REMINDER_ENABLED)) return undefined
+  const requested = env.TOV_REMINDER_PATH?.trim() || defaultTovPath()
+  try {
+    const real = realpathSync(requested)
+    const docsReal = realpathSync(tovDocsDir())
+    if (!real.startsWith(docsReal + sep)) return EMBEDDED_TOV_REMINDER
+    const text = readFileSync(real, 'utf8').trim()
+    if (
+      text.length > 0 &&
+      Buffer.byteLength(text, 'utf8') <= TOV_MAX_BYTES &&
+      text.split('\n').length <= TOV_MAX_LINES
+    ) {
+      return text
+    }
+  } catch {
+    // fall through to embedded baseline
+  }
+  return EMBEDDED_TOV_REMINDER
+}
+
+/** Compose the full additionalContext string: channel discipline first, then
+ *  the optional TOV block separated by a blank line. */
+export function composeReminder(env: NodeJS.ProcessEnv = process.env): string {
+  const channel = reminderForChat(env.CHAT_ID)
+  const tov = tovReminder(env)
+  return tov ? `${channel}\n\n${tov}` : channel
+}
+
 /** The exact stdout envelope Claude Code reads for UserPromptSubmit context. */
 export function renderContext(text: string): string {
   return JSON.stringify({
@@ -75,7 +168,7 @@ if (import.meta.main) {
   // payload before the stream flushes (Codex review). The payload is one
   // short line, but natural termination is the safe pattern.
   try {
-    process.stdout.write(renderContext(reminderForChat(process.env.CHAT_ID)))
+    process.stdout.write(renderContext(composeReminder(process.env)))
   } catch {
     // Never gate the turn on a reminder failure.
   }

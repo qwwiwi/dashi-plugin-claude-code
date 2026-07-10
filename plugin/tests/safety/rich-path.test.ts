@@ -339,6 +339,35 @@ describe("callTool('reply') rich gate", () => {
     h.cleanup()
   })
 
+  test('rich body is the HARDENED markdown (soft breaks promoted before send)', async () => {
+    const h = makeHarness({ richBehaviour: async () => ({ message_id: 4242 }) })
+    const result = await callTool(
+      replyReq({ chat_id: PRINCE_DM, text: 'M1 — a\nM2 — b' }),
+      h.deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(h.recorder.sendRich).toHaveLength(1)
+    expect(h.recorder.sendRich[0]?.rawMarkdown).toBe('M1 — a\\\nM2 — b')
+    h.cleanup()
+  })
+
+  // Review fix (2026-07-09): the size gate must measure the body WE SEND —
+  // hardening adds one byte per promoted break, so a text that fits pre-
+  // hardening can exceed the cap post-hardening. Rich must be skipped without
+  // burning a doomed API call.
+  test('fits pre-hardening but over the cap after hardening → rich skipped', async () => {
+    const h = makeHarness({})
+    // 1024 prose lines × 31 bytes + 1023 newlines = 32767 ≤ 32768 (fits raw);
+    // hardening adds 1023 backslashes → 33790 > 32768 (over the cap).
+    const text = Array.from({ length: 1024 }, () => 'a'.repeat(31)).join('\n')
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(32768)
+    const result = await callTool(replyReq({ chat_id: PRINCE_DM, text }), h.deps)
+    expect(result.isError).toBeUndefined()
+    expect(h.recorder.sendRich).toHaveLength(0) // gate measured the sent body
+    expect(h.recorder.sendMessage.length).toBeGreaterThanOrEqual(1) // HTML path
+    h.cleanup()
+  })
+
   test('> 32768 bytes → rich skipped, HTML path used', async () => {
     const h = makeHarness({})
     const huge = 'a'.repeat(32769)

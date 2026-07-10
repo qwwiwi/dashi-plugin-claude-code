@@ -136,4 +136,80 @@ describe('splitMessage', () => {
       expect(opens).toBe(closes)
     }
   })
+
+  // Heading-affinity (2026-07-09): a rendered heading (`<b>…</b>` on its own
+  // line, produced by markdownToTelegramHtml for `#`/`**bold**`) must never be
+  // the LAST line of a chunk — that orphans it from the body it introduces.
+  test('does not orphan a lone heading at the end of a chunk', () => {
+    const bodyA = 'a'.repeat(60)
+    const heading = '<b>Заголовок</b>'
+    const bodyB = 'b'.repeat(60)
+    // Boundary tuned so the naive cut (last \n\n within max) would land right
+    // after the heading, orphaning it. max fits bodyA + \n\n + heading + \n\n.
+    const text = `${bodyA}\n\n${heading}\n\n${bodyB}`
+    const max = bodyA.length + 2 + heading.length + 2 + 5
+    const out = splitMessage(text, max)
+    expect(out.length).toBe(2)
+    // The heading must NOT be the tail of chunk 0 — it rides with its body.
+    expect(out[0]!.trimEnd().endsWith(heading)).toBe(false)
+    expect(out[1]).toContain(heading)
+    expect(out[1]).toContain(bodyB)
+    for (const c of out) expect(c.length).toBeLessThanOrEqual(max)
+  })
+
+  test('keeps a heading when it is the only content before the boundary', () => {
+    // No earlier paragraph boundary to back up to — must not loop or drop.
+    const heading = '<b>Only Heading</b>'
+    const bodyB = 'b'.repeat(200)
+    const text = `${heading}\n\n${bodyB}`
+    const out = splitMessage(text, heading.length + 2 + 5)
+    expect(out.join('').replace(/\n/g, '')).toContain('Only Heading')
+    expect(out.join('').replace(/\n/g, '')).toContain(bodyB)
+  })
+
+  // Contract: chunking prefers \n\n, then \n, and preserves internal single
+  // newlines within a chunk (soft breaks survive as visible line breaks in the
+  // HTML path, which relies on parse_mode=HTML rendering \n literally).
+  test('preserves internal single newlines inside a chunk', () => {
+    const text = 'M1 — x\nM2 — y\nM3 — z'
+    const out = splitMessage(text, 4000)
+    expect(out).toEqual([text])
+    expect(out[0]).toContain('\n')
+  })
+
+  // Review fix (2026-07-09): heading-affinity back-up must never produce a
+  // whitespace-only chunk — Telegram 400s an empty message and the whole
+  // reply fails.
+  test('never emits a whitespace-only chunk for a blank-line-then-heading start', () => {
+    const heading = '<b>H</b>'
+    const body = 'b'.repeat(200)
+    const text = `\n\n${heading}\n\n${body}`
+    const max = 2 + heading.length + 2 + 5
+    const out = splitMessage(text, max)
+    for (const c of out) {
+      expect(c.trim().length).toBeGreaterThan(0)
+      expect(c.length).toBeLessThanOrEqual(max)
+    }
+    // Nothing lost: heading and full body survive across chunks.
+    const joined = out.join('')
+    expect(joined).toContain(heading)
+    expect(joined.replace(/\n/g, '').replace(heading, '')).toContain('b'.repeat(50))
+  })
+
+  // Review fix (2026-07-09): LONE_HEADING_RE must match only a line that is
+  // EXACTLY one bold span — multiple bold words in prose are not a heading
+  // and must not trigger the back-up.
+  test('a line with multiple bold spans is not treated as a heading', () => {
+    const line = '<b>a</b> and <b>b</b>'
+    const bodyA = 'a'.repeat(60)
+    const bodyB = 'b'.repeat(60)
+    const text = `${bodyA}\n\n${line}\n\n${bodyB}`
+    const max = bodyA.length + 2 + line.length + 2 + 5
+    const out = splitMessage(text, max)
+    expect(out.length).toBe(2)
+    // Naive paragraph cut applies: chunk 0 ends right after the multi-bold
+    // line (no heading back-up), chunk 1 is the remaining body.
+    expect(out[0]!.trimEnd().endsWith(line)).toBe(true)
+    expect(out[1]).toContain(bodyB)
+  })
 })
