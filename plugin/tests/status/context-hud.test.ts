@@ -437,8 +437,8 @@ function makeCards(): {
 
 // The core of this PR: hook payloads carry NO model field, so the HUD must
 // derive the window from the transcript-provided model (readContextUsage →
-// usage.model). Precedence: override > hook model (info.model) > transcript
-// model > fallback.
+// usage.model). Precedence: override > transcript model (usage.model, per-turn
+// FRESH) > hook model (info.model) > fallback.
 describe('ContextHud model-from-transcript window', () => {
   test('hook model absent + transcript model "claude-fable-5" → 1M window + model line', async () => {
     const api = new FakeApi()
@@ -453,16 +453,30 @@ describe('ContextHud model-from-transcript window', () => {
     expect(text).toContain('<i>claude-fable-5</i>') // model line rendered
   })
 
-  test('hook model wins over transcript model', async () => {
+  test('transcript model wins over hook model (per-turn fresh is authoritative)', async () => {
     const api = new FakeApi()
     const hud = makeHud(api, {
+      // Stale hook says opus, but the transcript's fresh turn says Fable —
+      // e.g. after a mid-session /model switch. Transcript must win.
       session: fakeSession({ transcriptPath: '/t/a.jsonl', model: 'claude-opus-4-8' }),
       usage: { usedTokens: 100_000, pct: 0.5, model: 'claude-fable-5' },
     })
     await hud.onSessionStart(OWNER)
     const text = api.sent[0]!.text
-    expect(text).toContain('/ 200k)') // opus (hook) → 200k, not Fable's 1M
-    expect(text).toContain('<i>claude-opus-4-8</i>')
+    expect(text).toContain('/ 1M)') // Fable (transcript) → 1M, not opus 200k
+    expect(text).toContain('<i>claude-fable-5</i>')
+  })
+
+  test('hook model used when the transcript carries none', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api, {
+      session: fakeSession({ transcriptPath: '/t/a.jsonl', model: 'claude-fable-5' }),
+      usage: { usedTokens: 100_000, pct: 0.5 }, // no transcript model
+    })
+    await hud.onSessionStart(OWNER)
+    const text = api.sent[0]!.text
+    expect(text).toContain('/ 1M)') // hook Fable → 1M when transcript is silent
+    expect(text).toContain('<i>claude-fable-5</i>')
   })
 
   test('explicit windowOverride still wins over the transcript model', async () => {

@@ -55,6 +55,21 @@ function toNonNegNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
 }
 
+// Sanitize a transcript `message.model` value into a usable model id, or
+// undefined when it is not one. Accept only a non-empty string; trim it; cap
+// the length. A real model id is ~20 chars — a value past MODEL_ID_MAX_LEN (or
+// one that trims to empty) is a malformed/garbage line (e.g. a multi-KB blob
+// from a corrupt JSONL record), NOT a model, so it is DROPPED whole rather than
+// truncated-and-used. Never scan other lines: only THIS turn's field is read.
+const MODEL_ID_MAX_LEN = 100
+
+function sanitizeModelId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  if (trimmed.length === 0 || trimmed.length > MODEL_ID_MAX_LEN) return undefined
+  return trimmed
+}
+
 /**
  * Scan transcript lines BACKWARDS and return the context usage of the last
  * main-thread assistant turn that carries a `message.usage`.
@@ -121,8 +136,9 @@ export function computeContextUsage(
     // payloads omit the model entirely, so the transcript is the only source.
     // Absent / empty / non-string → leave undefined; never scan other lines.
     const result: ContextUsage = { usedTokens, pct }
-    if (typeof msg.model === 'string' && msg.model.length > 0) {
-      result.model = msg.model
+    const model = sanitizeModelId(msg.model)
+    if (model !== undefined) {
+      result.model = model
     }
     return result
   }

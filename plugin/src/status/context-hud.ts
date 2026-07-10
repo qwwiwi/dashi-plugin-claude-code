@@ -690,13 +690,22 @@ export class ContextHud {
         usage = null
       }
     }
-    // Model-aware window. Precedence: explicit operator override > hook-provided
-    // model (info.model, still honored if a future harness adds one) >
-    // transcript-derived model (message.model) > configured default. So a
-    // Fable-5 session reports its 1M window instead of the 200k default even
-    // though no hook carries the model. Recomputed each render so a mid-session
-    // model switch is picked up.
-    const model = info.model ?? usage?.model
+    // Model-aware window. Precedence: explicit operator override >
+    // transcript-derived model (message.model — per-turn FRESH and authoritative,
+    // it is the id the API actually served this turn) > hook-provided model
+    // (info.model, honored only as a fallback if a future harness adds one) >
+    // configured default. Transcript-first because (a) a hook model unknown to
+    // the table must not block a valid transcript model, and (b) SessionInfoStore
+    // MERGES hook facts, so a stale hook model would otherwise stick past a
+    // mid-session /model switch and beat the fresh transcript value. Empty-string
+    // guards defend against an alternative SessionInfoReader implementation.
+    // Recomputed each render so a mid-session model switch is picked up.
+    const transcriptModel = usage?.model
+    const hookModel = info.model
+    const model = (transcriptModel !== undefined && transcriptModel.length > 0
+      ? transcriptModel
+      : undefined)
+      ?? (hookModel !== undefined && hookModel.length > 0 ? hookModel : undefined)
     const windowTokens = resolveContextWindowForModel(model, {
       override: this.windowOverride,
       fallback: this.windowTokens,
