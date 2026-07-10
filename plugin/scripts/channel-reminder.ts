@@ -34,7 +34,14 @@
 // Env:
 //   CHAT_ID              the Telegram chat id this session serves. Negative
 //                        ids are groups/supergroups (multichat); anything
-//                        else is a direct chat. Absent → DM-safe generic.
+//                        else is a direct chat. Absent → DM-safe generic. Also
+//                        keys the autonomy-registry lookup below.
+//   TELEGRAM_STATE_DIR   (or MULTICHAT_STATE_DIR) the plugin state root. When
+//                        set, the per-turn autonomy block (active mandates +
+//                        open owner questions) is read from
+//                        <state-dir>/autonomy-<chat>.json and appended. Absent
+//                        or unreadable → the block is silently omitted
+//                        (fail-open; a broken registry never gates the turn).
 //   TOV_REMINDER_ENABLED falsy (0/false/no/off, case-insensitive) disables
 //                        the TOV block. Default: enabled.
 //   TOV_REMINDER_PATH    per-agent override file for the TOV block. MUST live
@@ -47,6 +54,8 @@
 import { readFileSync, realpathSync } from 'node:fs'
 import { dirname, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+import { buildAutonomyReminderBlock, loadAutonomyState } from '../src/autonomy/store.js'
 
 const DM_REMINDER =
   'Telegram bridge: the sender reads Telegram, not this terminal — terminal/transcript text never reaches them. ' +
@@ -141,12 +150,40 @@ export function tovReminder(env: NodeJS.ProcessEnv = process.env): string | unde
   return EMBEDDED_TOV_REMINDER
 }
 
+/**
+ * Resolve the per-turn AUTONOMY block from the durable registry, or undefined
+ * when there is nothing active / the state can't be located. FAIL-OPEN: any
+ * error returns undefined so the reminder still ships without the block — a
+ * broken registry must never gate the turn.
+ *
+ * State dir resolution mirrors the other dashi hooks
+ * (read-receipt/fallback-reply): TELEGRAM_STATE_DIR ?? MULTICHAT_STATE_DIR. The
+ * chat id comes from CHAT_ID (the same var reminderForChat reads). When neither
+ * a state dir nor a chat id is available (e.g. a per-chat session whose env was
+ * wiped), the block is simply omitted.
+ */
+export function autonomyReminder(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  try {
+    const chatId = (env.CHAT_ID ?? '').trim()
+    if (chatId === '') return undefined
+    const stateDir = env.TELEGRAM_STATE_DIR ?? env.MULTICHAT_STATE_DIR
+    if (!stateDir || stateDir.trim() === '') return undefined
+    const state = loadAutonomyState({ root: stateDir }, chatId)
+    return buildAutonomyReminderBlock(state, Date.now())
+  } catch {
+    // Never gate the turn on an autonomy-state failure.
+    return undefined
+  }
+}
+
 /** Compose the full additionalContext string: channel discipline first, then
- *  the optional TOV block separated by a blank line. */
+ *  the optional autonomy block, then the optional TOV block — each separated by
+ *  a blank line. */
 export function composeReminder(env: NodeJS.ProcessEnv = process.env): string {
   const channel = reminderForChat(env.CHAT_ID)
+  const autonomy = autonomyReminder(env)
   const tov = tovReminder(env)
-  return tov ? `${channel}\n\n${tov}` : channel
+  return [channel, autonomy, tov].filter((s): s is string => s !== undefined && s.length > 0).join('\n\n')
 }
 
 /** The exact stdout envelope Claude Code reads for UserPromptSubmit context. */

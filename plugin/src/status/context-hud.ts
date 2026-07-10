@@ -25,6 +25,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { resolveContextWindowForModel } from '../config.js'
+import { buildAutonomyHudLine, loadAutonomyState } from '../autonomy/store.js'
 import { classifyEditError } from '../safety/telegram-edit-classifier.js'
 import {
   formatWindowTokens,
@@ -203,6 +204,7 @@ export function renderHud(
   windowTokens: number,
   model?: string,
   work?: HudWorkView,
+  autonomyLine?: string,
 ): { text: string; keyboard: InlineKeyboardLike } {
   const keyboard = buildHudKeyboard()
   const modelLine = model !== undefined && model.length > 0 ? `\n<i>${escapeHtml(model)}</i>` : ''
@@ -210,9 +212,14 @@ export function renderHud(
     work?.permissionMode !== undefined && work.permissionMode.length > 0
       ? `\n<i>режим: ${modeLabel(work.permissionMode)}</i>`
       : ''
+  // Autonomy pin line (PR-1): one compact line when active mandates / open
+  // owner questions exist. Already HTML-escaped by buildAutonomyHudLine (the
+  // HUD passes escapeHtml), so it is safe under the card's HTML parse mode.
+  const autonomyBlock =
+    autonomyLine !== undefined && autonomyLine.length > 0 ? `\n${autonomyLine}` : ''
   const tasksBlock = work !== undefined ? renderStatusTasks(work.todos, work.freshness) : ''
   const tasksSection = tasksBlock.length > 0 ? `\n\n${tasksBlock}` : ''
-  const tail = `${modelLine}${modeLine}${tasksSection}`
+  const tail = `${modelLine}${modeLine}${autonomyBlock}${tasksSection}`
 
   if (usage === null) {
     return { text: `🧠 <b>Контекст</b>: —${tail}`, keyboard }
@@ -719,7 +726,21 @@ export class ContextHud {
     const work: HudWorkView = rv !== undefined
       ? { todos: rv.todos, freshness: rv.freshness, ...permissionMode }
       : { todos: this.work.get(chatId)?.todos ?? [], ...permissionMode }
-    return renderHud(usage, windowTokens, model, work)
+    // Autonomy pin line (PR-1). Best-effort: a broken/missing registry must
+    // never break HUD rendering, so load + line-build are guarded and degrade
+    // to no line. Escaped via escapeHtml for the card's HTML parse mode.
+    let autonomyLine: string | undefined
+    try {
+      const state = loadAutonomyState({ root: this.stateDir }, chatId, this.log)
+      autonomyLine = buildAutonomyHudLine(state, Date.now(), { escape: escapeHtml })
+    } catch (err) {
+      this.log.warn('context hud autonomy line failed (ignored)', {
+        chat_id: chatId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      autonomyLine = undefined
+    }
+    return renderHud(usage, windowTokens, model, work, autonomyLine)
   }
 
   // Resolve the HUD message id for a chat: in-memory cache → persisted file →

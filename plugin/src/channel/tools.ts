@@ -1,7 +1,8 @@
 // MCP tool surface for the Telegram channel.
 //
-// 5 tools: reply, react, download_attachment, edit_message, status.
-// Status is currently a stub (returns not_implemented) — T11 will wire it.
+// 6 tools: reply, react, download_attachment, edit_message, status, autonomy.
+// `autonomy` (PR-1) is a READ + resolve surface over the durable autonomy
+// registry (leases + open questions); it can never GRANT a lease.
 //
 // All tool args are validated through Zod schemas; we never reach into
 // `req.params.arguments` with `as Record<string, unknown>` casts. If a
@@ -21,12 +22,20 @@ import type { Logger } from '../log.js'
 import type { MultichatPolicy } from '../chats/policy-loader.js'
 import type { StatusManager, StatusState } from '../status/status-manager.js'
 import {
+  AutonomyArgsSchema,
   DownloadAttachmentArgsSchema,
   EditMessageArgsSchema,
   ReactArgsSchema,
   ReplyArgsSchema,
   StatusArgsSchema,
 } from '../schemas.js'
+import {
+  consumeLease,
+  loadAutonomyState,
+  renderAutonomyStatus,
+  resolveQuestion,
+  saveAutonomyState,
+} from '../autonomy/store.js'
 import { assertAllowedChat } from '../telegram/gate.js'
 import type { GuestQueryRegistry } from '../telegram/guest-queries.js'
 import {
@@ -403,6 +412,35 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         },
       },
       required: ['chat_id', 'state'],
+    },
+  },
+  {
+    name: 'autonomy',
+    description:
+      'Inspect and resolve the durable autonomy registry for a chat — the owner-granted mandates (leases) that survive context compaction, plus open questions to the owner. Pass chat_id from the inbound <channel> meta. action="status" returns active leases (id, scope, time left) and open questions (id, summary, age, default action, sticky flag). action="consume" marks a lease consumed (pass lease_id). action="resolve_question" sets a question answered/bypassed (pass question_id and resolution). This tool CANNOT grant a lease — grants come from the owner via the authenticated button flow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string' },
+        action: {
+          type: 'string',
+          enum: ['status', 'consume', 'resolve_question'],
+        },
+        lease_id: {
+          type: 'string',
+          description: 'Required when action="consume". The lease id (e.g. L-20260710-a1b2).',
+        },
+        question_id: {
+          type: 'string',
+          description: 'Required when action="resolve_question". The question id (e.g. Q-20260710-a1b2).',
+        },
+        resolution: {
+          type: 'string',
+          enum: ['answered', 'bypassed'],
+          description: 'Required when action="resolve_question". How the question was resolved.',
+        },
+      },
+      required: ['chat_id', 'action'],
     },
   },
 ]
@@ -847,6 +885,42 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
               : { kind: 'thinking' }
         await statusManager.updateByChatId(args.chat_id, state)
         return { content: [{ type: 'text', text: 'status updated' }] }
+      }
+
+      case 'autonomy': {
+        const parsed = AutonomyArgsSchema.safeParse(rawArgs)
+        if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
+        const args = parsed.data
+        try {
+          assertAllowedChat(args.chat_id, config, deps.policy)
+        } catch (err) {
+          return toolError(name, err instanceof Error ? err.message : String(err))
+        }
+
+        const now = Date.now()
+        const state = loadAutonomyState(statePaths, args.chat_id, log)
+
+        if (args.action === 'status') {
+          return { content: [{ type: 'text', text: renderAutonomyStatus(state, now) }] }
+        }
+
+        if (args.action === 'consume') {
+          // lease_id presence is enforced by the schema's superRefine.
+          const leaseId = args.lease_id as string
+          const { state: next, outcome } = consumeLease(state, leaseId, now)
+          if (outcome === 'not_found') return toolError(name, `lease not found: ${leaseId}`)
+          if (outcome === 'already_consumed') return toolError(name, `lease already consumed: ${leaseId}`)
+          saveAutonomyState(statePaths, args.chat_id, next)
+          return { content: [{ type: 'text', text: `lease consumed: ${leaseId}` }] }
+        }
+
+        // action === 'resolve_question' (question_id + resolution enforced by schema).
+        const questionId = args.question_id as string
+        const resolution = args.resolution as 'answered' | 'bypassed'
+        const { state: next, outcome } = resolveQuestion(state, questionId, resolution, now)
+        if (outcome === 'not_found') return toolError(name, `question not found: ${questionId}`)
+        saveAutonomyState(statePaths, args.chat_id, next)
+        return { content: [{ type: 'text', text: `question ${questionId} resolved: ${resolution}` }] }
       }
 
       default:
