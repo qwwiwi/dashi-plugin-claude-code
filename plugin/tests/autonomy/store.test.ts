@@ -63,7 +63,7 @@ function seedState(): AutonomyState {
 
 describe('emptyAutonomyState', () => {
   test('is a versioned empty registry', () => {
-    expect(emptyAutonomyState()).toEqual({ version: AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [] })
+    expect(emptyAutonomyState()).toEqual({ version: AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [], usedGrantSources: [] })
   })
 })
 
@@ -98,7 +98,7 @@ describe('round-trip persistence', () => {
   })
 
   test('save always stamps the current schema version', () => {
-    const state = { version: 999 as unknown as typeof AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [] }
+    const state = { version: 999 as unknown as typeof AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [], usedGrantSources: [] }
     saveAutonomyState(paths(), '1', state)
     expect(loadAutonomyState(paths(), '1').version).toBe(AUTONOMY_STATE_VERSION)
   })
