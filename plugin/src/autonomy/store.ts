@@ -18,14 +18,23 @@
 // (+ best-effort directory fsync), 0o600. A corrupt/missing file loads as
 // empty state and NEVER throws — a broken registry must never break delivery.
 //
-// SINGLE-WRITER ASSUMPTION (review 2026-07-10 fix-loop #1): the MCP/webhook
-// server process is the ONLY writer of these files. The hooks
-// (channel-reminder, HUD render path) are strictly READ-ONLY consumers.
-// Within the server process, ALL mutations MUST go through
+// SINGLE-WRITER MODEL (fix-loop #1 + fix-loop-2 #1/#2, Sol architecture
+// review): the MCP/webhook server process is the DESIGNED sole writer of
+// these files; the hooks (channel-reminder, HUD render path) are strictly
+// READ-ONLY consumers. Within the process, ALL mutations MUST go through
 // `updateAutonomyState`, which serializes load→mutate→save per chat via an
-// in-process promise chain — two concurrent `consume` calls can never both
-// observe the pre-consume state. Cross-PROCESS locking is deliberately out of
-// scope: there is no second writer process by design.
+// in-process promise chain. Two additional guarantees make a second-process
+// writer SAFE to detect rather than silently corrupting:
+//   * `revision` counter — every save increments it; updateAutonomyState
+//     re-reads the on-disk revision before writing and, when it moved under
+//     us, reloads + re-applies the mutator on the fresh state (logged as
+//     `autonomy_state_revision_conflict`).
+//   * writer heartbeat lock — `autonomy-writer.lock` (writerId + pid +
+//     refreshedAtMs, refreshed lazily on write). A FRESH lock held by a
+//     DIFFERENT writerId refuses the mutation with `writer_conflict`; a
+//     stale or own lock is taken over / refreshed atomically. Freshness +
+//     writerId is the criterion — pid is diagnostic only, PID-existence is
+//     deliberately NOT used as a lock.
 
 import {
   closeSync,
@@ -33,12 +42,13 @@ import {
   fsyncSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
   writeSync,
 } from 'node:fs'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 
 import type { StatePaths } from '../config.js'
@@ -56,10 +66,16 @@ export const AUTONOMY_STATE_VERSION = 1 as const
 export type LeaseSource = 'ask_card' | 'owner_cmd' | 'manual'
 
 export interface AutonomyLease {
-  // e.g. `L-20260710-a1b2`. Stable across the lease's lifetime.
+  // e.g. `L-20260710-a1b2c3d4`. Stable across the lease's lifetime.
   id: string
   // Verbatim owner-granted scope text (never paraphrased).
   scope: string
+  // Integrity anchor for the scope text (fix-loop-2 #3):
+  // `sha256:<hex(sha256(utf8 scope))>`. Lets a later audit prove the scope
+  // was not silently edited. Optional on read (pre-digest files).
+  scopeDigest?: string
+  // Version of the scope-digest scheme (1 = sha256 over raw utf8 bytes).
+  scopeVersion?: number
   grantedAtMs: number
   expiresAtMs: number
   source: LeaseSource
@@ -67,6 +83,11 @@ export interface AutonomyLease {
   grantorMessageId?: number
   // Set to a timestamp when the lease is consumed; null/undefined while active.
   consumedAtMs?: number | null
+  // Revocation is a TERMINAL state distinct from consumption (fix-loop-2 #4):
+  // consumed = the mandate was USED; revoked = authority was WITHDRAWN.
+  revokedAtMs?: number
+  revokedBy?: string
+  revokeReason?: string
   notes?: string
 }
 
@@ -89,6 +110,10 @@ export interface OpenQuestion {
 
 export interface AutonomyState {
   version: typeof AUTONOMY_STATE_VERSION
+  // Monotonic save counter (fix-loop-2 #1): every successful save writes
+  // `revision + 1`. updateAutonomyState compares the loaded revision against
+  // the on-disk one right before writing to DETECT a cross-process writer.
+  revision: number
   leases: AutonomyLease[]
   questions: OpenQuestion[]
 }
@@ -104,13 +129,15 @@ export type AutonomyPaths = Pick<StatePaths, 'root'>
 // ─────────────────────────────────────────────────────────────────────
 
 export function emptyAutonomyState(): AutonomyState {
-  return { version: AUTONOMY_STATE_VERSION, leases: [], questions: [] }
+  return { version: AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [] }
 }
 
-// A lease is active when it has NOT been consumed and has NOT expired.
+// A lease is active when it has NOT been consumed, NOT been revoked and has
+// NOT expired.
 function isLeaseActive(lease: AutonomyLease, nowMs: number): boolean {
   const consumed = lease.consumedAtMs !== undefined && lease.consumedAtMs !== null
-  return !consumed && lease.expiresAtMs > nowMs
+  const revoked = lease.revokedAtMs !== undefined
+  return !consumed && !revoked && lease.expiresAtMs > nowMs
 }
 
 /** Active leases (not consumed, not expired), soonest-expiry first. */
@@ -201,6 +228,8 @@ export function addLease(
   const lease: AutonomyLease = {
     id: input.id ?? uniqueId(() => newLeaseId(nowMs), existing),
     scope: input.scope,
+    scopeDigest: computeScopeDigest(input.scope),
+    scopeVersion: SCOPE_DIGEST_VERSION,
     grantedAtMs: input.grantedAtMs ?? nowMs,
     expiresAtMs: input.expiresAtMs,
     source: input.source,
@@ -211,13 +240,23 @@ export function addLease(
   return { state: { ...state, leases: [...state.leases, lease] }, lease, outcome: 'ok' }
 }
 
-export type ConsumeOutcome = 'ok' | 'not_found' | 'already_consumed' | 'expired'
+// Scope-digest scheme v1: sha256 over the RAW utf8 bytes of the verbatim
+// scope text, hex-encoded, prefixed with the algorithm (fix-loop-2 #3).
+export const SCOPE_DIGEST_VERSION = 1 as const
+
+export function computeScopeDigest(scope: string): string {
+  return `sha256:${createHash('sha256').update(scope, 'utf8').digest('hex')}`
+}
+
+export type ConsumeOutcome = 'ok' | 'not_found' | 'already_consumed' | 'revoked' | 'expired'
 
 /**
  * Mark a lease consumed. Returns the new state and an outcome the caller turns
  * into user-facing text:
  *   `not_found`         — unknown id.
  *   `already_consumed`  — the id exists but was consumed earlier.
+ *   `revoked`           — the mandate's authority was withdrawn (fix-loop-2
+ *                         #4): a revoked lease can never be consumed.
  *   `expired`           — the mandate's window has passed (fix-loop #8): the
  *                         consume is refused honestly instead of reporting a
  *                         success on a dead mandate.
@@ -230,6 +269,9 @@ export function consumeLease(
   const idx = state.leases.findIndex((l) => l.id === id)
   if (idx === -1) return { state, outcome: 'not_found' }
   const lease = state.leases[idx] as AutonomyLease
+  if (lease.revokedAtMs !== undefined) {
+    return { state, outcome: 'revoked' }
+  }
   if (lease.consumedAtMs !== undefined && lease.consumedAtMs !== null) {
     return { state, outcome: 'already_consumed' }
   }
@@ -238,6 +280,41 @@ export function consumeLease(
   }
   const leases = state.leases.slice()
   leases[idx] = { ...lease, consumedAtMs: nowMs }
+  return { state: { ...state, leases }, outcome: 'ok' }
+}
+
+export type RevokeOutcome = 'ok' | 'not_found' | 'already_consumed' | 'already_revoked' | 'expired'
+
+/**
+ * Revoke a lease — withdraw its authority (fix-loop-2 #4). TERMINAL and
+ * distinct from consumption. Kept simple by design:
+ *   `already_consumed` — a used mandate cannot be revoked (nothing to withdraw);
+ *   `already_revoked`  — revocation is final;
+ *   `expired`          — an expired mandate has no authority left, revoke is a
+ *                        no-op (reported honestly, state untouched).
+ */
+export function revokeLease(
+  state: AutonomyState,
+  id: string,
+  nowMs: number,
+  revokedBy: string,
+  reason?: string,
+): { state: AutonomyState; outcome: RevokeOutcome } {
+  const idx = state.leases.findIndex((l) => l.id === id)
+  if (idx === -1) return { state, outcome: 'not_found' }
+  const lease = state.leases[idx] as AutonomyLease
+  if (lease.revokedAtMs !== undefined) return { state, outcome: 'already_revoked' }
+  if (lease.consumedAtMs !== undefined && lease.consumedAtMs !== null) {
+    return { state, outcome: 'already_consumed' }
+  }
+  if (lease.expiresAtMs <= nowMs) return { state, outcome: 'expired' }
+  const leases = state.leases.slice()
+  leases[idx] = {
+    ...lease,
+    revokedAtMs: nowMs,
+    revokedBy,
+    ...(reason !== undefined ? { revokeReason: reason } : {}),
+  }
   return { state: { ...state, leases }, outcome: 'ok' }
 }
 
@@ -354,7 +431,10 @@ export function renderAutonomyStatus(state: AutonomyState, nowMs: number): strin
     lines.push(`Активные мандаты (${leases.length}):`)
     for (const l of leases) {
       const left = humanizeDurationMs(l.expiresAtMs - nowMs)
-      lines.push(`  ${l.id}: «${truncate(l.scope, SCOPE_MAX_CHARS)}» — ещё ${left} (source: ${l.source})`)
+      // Short scope-digest anchor (first 12 hex chars) — tool status ONLY,
+      // never in the reminder/HUD surfaces (fix-loop-2 #3).
+      const digest = l.scopeDigest !== undefined ? ` [${l.scopeDigest.slice(7, 19)}]` : ''
+      lines.push(`  ${l.id}: «${truncate(l.scope, SCOPE_MAX_CHARS)}» — ещё ${left} (source: ${l.source})${digest}`)
     }
   }
 
@@ -482,6 +562,9 @@ function coerceState(parsed: unknown): AutonomyState {
   const out = emptyAutonomyState()
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return out
   const obj = parsed as Record<string, unknown>
+  if (typeof obj.revision === 'number' && Number.isFinite(obj.revision) && obj.revision >= 0) {
+    out.revision = Math.floor(obj.revision)
+  }
   if (Array.isArray(obj.leases)) {
     for (const raw of obj.leases) {
       const lease = coerceLease(raw)
@@ -522,6 +605,11 @@ function coerceLease(raw: unknown): AutonomyLease | undefined {
   else if (typeof o.consumedAtMs === 'number' && Number.isFinite(o.consumedAtMs)) {
     lease.consumedAtMs = o.consumedAtMs
   }
+  if (typeof o.scopeDigest === 'string' && o.scopeDigest.length > 0) lease.scopeDigest = o.scopeDigest
+  if (typeof o.scopeVersion === 'number' && Number.isFinite(o.scopeVersion)) lease.scopeVersion = o.scopeVersion
+  if (typeof o.revokedAtMs === 'number' && Number.isFinite(o.revokedAtMs)) lease.revokedAtMs = o.revokedAtMs
+  if (typeof o.revokedBy === 'string') lease.revokedBy = o.revokedBy
+  if (typeof o.revokeReason === 'string') lease.revokeReason = o.revokeReason
   if (typeof o.notes === 'string') lease.notes = o.notes
   return lease
 }
@@ -576,7 +664,42 @@ export function loadAutonomyState(
         code: 'autonomy_state_parse_error',
       })
     }
+    // Forensics (fix-loop-2 #5): move the corrupt file aside so the next
+    // save does not destroy evidence — a rogue-empty-state incident stays
+    // investigable. Best-effort, never throws.
+    preserveCorruptFile(paths, chatId)
     return emptyAutonomyState()
+  }
+}
+
+// Keep at most this many `*.json.corrupt-*` evidence files per chat key.
+const MAX_CORRUPT_FILES = 3
+
+// Rename `autonomy-<key>.json` → `autonomy-<key>.json.corrupt-<ts>-<rand>`
+// and prune older evidence beyond MAX_CORRUPT_FILES. The ms timestamp is
+// fixed-width for the foreseeable future, so a lexicographic sort of the
+// filenames is chronological. Best-effort: every step is allowed to fail.
+function preserveCorruptFile(paths: AutonomyPaths, chatId: string): void {
+  try {
+    const key = canonicalChatKey(chatId)
+    const file = autonomyStatePath(paths, chatId)
+    const suffix = `${Date.now()}-${randomBytes(3).toString('hex')}`
+    renameSync(file, join(paths.root, `autonomy-${key}.json.corrupt-${suffix}`))
+    const prefix = `autonomy-${key}.json.corrupt-`
+    const evidence = readdirSync(paths.root)
+      .filter((f) => f.startsWith(prefix))
+      .sort()
+    while (evidence.length > MAX_CORRUPT_FILES) {
+      const oldest = evidence.shift()
+      if (oldest === undefined) break
+      try {
+        unlinkSync(join(paths.root, oldest))
+      } catch {
+        // best-effort
+      }
+    }
+  } catch {
+    // best-effort — forensics must never break the load path
   }
 }
 
@@ -595,17 +718,30 @@ export function saveAutonomyState(
   chatId: string,
   state: AutonomyState,
 ): void {
-  mkdirSync(paths.root, { recursive: true, mode: 0o700 })
-  const key = canonicalChatKey(chatId)
-  const target = autonomyStatePath(paths, chatId)
-  const rand = randomBytes(3).toString('hex')
-  const tmp = join(paths.root, `autonomy-${key}.tmp.${process.pid}.${Date.now()}.${rand}`)
-  // Normalize on write: always stamp the current schema version.
+  // Normalize on write: stamp the current schema version and INCREMENT the
+  // revision counter (fix-loop-2 #1) — every save is observable on disk.
+  const nextRevision = (Number.isFinite(state.revision) ? state.revision : 0) + 1
   const body = JSON.stringify(
-    { version: AUTONOMY_STATE_VERSION, leases: state.leases, questions: state.questions },
+    {
+      version: AUTONOMY_STATE_VERSION,
+      revision: nextRevision,
+      leases: state.leases,
+      questions: state.questions,
+    },
     null,
     2,
   )
+  atomicWriteInRoot(paths, `autonomy-${canonicalChatKey(chatId)}.json`, body)
+}
+
+// Shared atomic writer for files in the state root (state files + the writer
+// lock). tmp('wx') + fchmod 0600 + fsync + rename + tmp cleanup on ANY
+// failure + best-effort directory fsync.
+function atomicWriteInRoot(paths: AutonomyPaths, filename: string, body: string): void {
+  mkdirSync(paths.root, { recursive: true, mode: 0o700 })
+  const target = join(paths.root, filename)
+  const rand = randomBytes(3).toString('hex')
+  const tmp = join(paths.root, `${filename}.tmp.${process.pid}.${Date.now()}.${rand}`)
   let fd: number | undefined
   let renamed = false
   try {
@@ -648,6 +784,92 @@ export function saveAutonomyState(
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Writer heartbeat lock (fix-loop-2 #2). One lock per state root, shared by
+// all chats. Sol's criterion: freshness + writerId, NEVER bare PID-existence
+// (pid stored for diagnostics only).
+// ─────────────────────────────────────────────────────────────────────
+
+export const WRITER_LOCK_FILENAME = 'autonomy-writer.lock'
+// Refresh the own lock lazily when it is older than this (no timers).
+export const WRITER_LOCK_REFRESH_MS = 30_000
+// A FOREIGN lock younger than this blocks mutations; older is stale and is
+// taken over.
+export const WRITER_LOCK_STALE_MS = 90_000
+
+// Random per-process writer identity — two processes can never share it even
+// with equal pids across container boundaries.
+export const AUTONOMY_WRITER_ID = randomBytes(8).toString('hex')
+
+interface WriterLock {
+  writerId: string
+  pid: number
+  refreshedAtMs: number
+}
+
+function readWriterLock(paths: AutonomyPaths): WriterLock | undefined {
+  try {
+    const raw = readFileSync(join(paths.root, WRITER_LOCK_FILENAME), 'utf8')
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const o = parsed as Record<string, unknown>
+    if (typeof o.writerId !== 'string' || o.writerId.length === 0) return undefined
+    if (typeof o.refreshedAtMs !== 'number' || !Number.isFinite(o.refreshedAtMs)) return undefined
+    return {
+      writerId: o.writerId,
+      pid: typeof o.pid === 'number' && Number.isFinite(o.pid) ? o.pid : -1,
+      refreshedAtMs: o.refreshedAtMs,
+    }
+  } catch {
+    // Missing or corrupt lock → treated as absent (take-over path).
+    return undefined
+  }
+}
+
+function writeWriterLock(paths: AutonomyPaths, nowMs: number): void {
+  atomicWriteInRoot(
+    paths,
+    WRITER_LOCK_FILENAME,
+    JSON.stringify({ writerId: AUTONOMY_WRITER_ID, pid: process.pid, refreshedAtMs: nowMs }),
+  )
+}
+
+/**
+ * Ensure THIS process holds the writer lock. Returns false when a FRESH lock
+ * belongs to a different writer (the caller must refuse the mutation).
+ *   * missing/corrupt lock → take it (write own), true;
+ *   * own lock → refresh when older than WRITER_LOCK_REFRESH_MS, true;
+ *   * foreign fresh (<WRITER_LOCK_STALE_MS) → log + false;
+ *   * foreign stale → take over atomically, true.
+ */
+export function acquireWriterLock(
+  paths: AutonomyPaths,
+  nowMs: number = Date.now(),
+  log?: Logger,
+): boolean {
+  const lock = readWriterLock(paths)
+  if (lock === undefined) {
+    writeWriterLock(paths, nowMs)
+    return true
+  }
+  if (lock.writerId === AUTONOMY_WRITER_ID) {
+    if (nowMs - lock.refreshedAtMs > WRITER_LOCK_REFRESH_MS) writeWriterLock(paths, nowMs)
+    return true
+  }
+  if (nowMs - lock.refreshedAtMs < WRITER_LOCK_STALE_MS) {
+    if (log) {
+      log.warn('autonomy writer lock held by another live process — mutation refused', {
+        code: 'autonomy_writer_conflict',
+        holder_pid: lock.pid,
+      })
+    }
+    return false
+  }
+  // Stale foreign lock — the holder stopped heartbeating; take over.
+  writeWriterLock(paths, nowMs)
+  return true
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Serialized read-modify-write (fix-loop #1). ALL mutations of the per-chat
 // file MUST route through here — a bare load→mutate→save in a caller races
 // (two concurrent consumes both observing the pre-consume state).
@@ -658,25 +880,69 @@ export function saveAutonomyState(
 // single-writer assumption in the module header.
 const updateChains = new Map<string, Promise<void>>()
 
+// Cheap read of the ON-DISK revision, never throws. Missing/corrupt/invalid
+// → 0 (matches what loadAutonomyState would produce for the same file).
+function peekRevision(paths: AutonomyPaths, chatId: string): number {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(autonomyStatePath(paths, chatId), 'utf8'))
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      const r = (parsed as Record<string, unknown>).revision
+      if (typeof r === 'number' && Number.isFinite(r) && r >= 0) return Math.floor(r)
+    }
+    return 0
+  } catch {
+    return 0
+  }
+}
+
+// Result of a serialized update. `writer_conflict` = a FRESH writer lock is
+// held by another process — the mutation was refused entirely (fix-loop-2 #2).
+export type UpdateResult<T> = { kind: 'ok'; result: T } | { kind: 'writer_conflict' }
+
 /**
  * Atomically (within this process) apply `mutator` to the chat's state:
  * load → mutate → save, serialized per chat via a promise chain. The mutator
  * is pure/synchronous and returns the next state plus a result; when it
  * returns the SAME state reference (a failed/no-op mutation), the save is
- * skipped. Returns the mutator's result.
+ * skipped.
+ *
+ * Cross-process guards (fix-loop-2):
+ *   * writer lock — a fresh foreign `autonomy-writer.lock` refuses the whole
+ *     mutation with `{ kind: 'writer_conflict' }`;
+ *   * revision check — right before writing, the on-disk revision is
+ *     re-read; if it moved under us (a second-process writer slipped past
+ *     the lock window), the state is RELOADED and the mutator re-applied on
+ *     the fresh state, so the foreign write is absorbed, not clobbered.
+ *     Within the in-process queue this never triggers.
  */
 export function updateAutonomyState<T>(
   paths: AutonomyPaths,
   chatId: string,
   mutator: (state: AutonomyState) => { state: AutonomyState; result: T },
   log?: Logger,
-): Promise<T> {
+): Promise<UpdateResult<T>> {
   const key = `${paths.root}|${canonicalChatKey(chatId)}`
-  const step = (): T => {
-    const state = loadAutonomyState(paths, chatId, log)
-    const { state: next, result } = mutator(state)
-    if (next !== state) saveAutonomyState(paths, chatId, next)
-    return result
+  const step = (): UpdateResult<T> => {
+    if (!acquireWriterLock(paths, Date.now(), log)) {
+      return { kind: 'writer_conflict' }
+    }
+    let state = loadAutonomyState(paths, chatId, log)
+    let out = mutator(state)
+    if (out.state === state) return { kind: 'ok', result: out.result }
+    // Detect a cross-process write between our load and this write.
+    if (peekRevision(paths, chatId) !== state.revision) {
+      if (log) {
+        log.warn('autonomy state revision moved under writer — re-applying mutator on fresh state', {
+          chat_id: chatId,
+          code: 'autonomy_state_revision_conflict',
+        })
+      }
+      state = loadAutonomyState(paths, chatId, log)
+      out = mutator(state)
+      if (out.state === state) return { kind: 'ok', result: out.result }
+    }
+    saveAutonomyState(paths, chatId, out.state)
+    return { kind: 'ok', result: out.result }
   }
   const prior = updateChains.get(key) ?? Promise.resolve()
   // Run after the prior op regardless of its outcome (the chain must never

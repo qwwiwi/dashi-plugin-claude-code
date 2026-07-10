@@ -779,3 +779,78 @@ describe('autonomy tool — fix-loop invariants', () => {
     rmSync(deps.statePaths.root, { recursive: true, force: true })
   })
 })
+
+// Fix-loop-2 (Sol): revoke action, revoked-consume, writer_conflict surface.
+import { revokeLease, WRITER_LOCK_FILENAME } from '../../src/autonomy/store.js'
+import { writeFileSync as wfsTools } from 'node:fs'
+
+describe('autonomy tool — fix-loop-2', () => {
+  test('revoke: withdraws an active lease (revokedBy=agent, reason stored)', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addLease(emptyAutonomyState(), { id: 'L-rv', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' }, Date.now()).state,
+    )
+    const res = await callTool(
+      callReq('autonomy', { chat_id: OWNER_CHAT, action: 'revoke', lease_id: 'L-rv', reason: 'scope drift' }),
+      deps,
+    )
+    expect(res.isError).toBeUndefined()
+    expect(res.content[0]?.text).toContain('lease revoked: L-rv')
+    const lease = loadAutonomyState(deps.statePaths, OWNER_CHAT).leases[0]
+    expect(lease?.revokedBy).toBe('agent')
+    expect(lease?.revokeReason).toBe('scope drift')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('revoke without lease_id → schema error', async () => {
+    const deps = makeDeps()
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'revoke' }), deps)
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('lease_id')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('consume of a revoked lease → honest "revoked" error', async () => {
+    const deps = makeDeps()
+    const seeded = addLease(emptyAutonomyState(), { id: 'L-rv2', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' }, Date.now()).state
+    saveAutonomyState(deps.statePaths, OWNER_CHAT, revokeLease(seeded, 'L-rv2', Date.now(), 'owner').state)
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-rv2' }), deps)
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('lease revoked')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('revoke of an already-revoked lease → error; of a consumed lease → error', async () => {
+    const deps = makeDeps()
+    const base = addLease(emptyAutonomyState(), { id: 'L-a', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' }, Date.now()).state
+    saveAutonomyState(deps.statePaths, OWNER_CHAT, revokeLease(base, 'L-a', Date.now(), 'owner').state)
+    const again = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'revoke', lease_id: 'L-a' }), deps)
+    expect(again.isError).toBe(true)
+    expect(again.content[0]?.text).toContain('already revoked')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('fresh foreign writer lock → mutation refused with writer_conflict text', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addLease(emptyAutonomyState(), { id: 'L-wl', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' }, Date.now()).state,
+    )
+    wfsTools(
+      join(deps.statePaths.root, WRITER_LOCK_FILENAME),
+      JSON.stringify({ writerId: 'feedfacedeadbeef', pid: 99999, refreshedAtMs: Date.now() }),
+      'utf8',
+    )
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-wl' }), deps)
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('writer_conflict')
+    // The lease is untouched — and status (read-only) still works.
+    const status = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'status' }), deps)
+    expect(status.isError).toBeUndefined()
+    expect(status.content[0]?.text).toContain('L-wl')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+})

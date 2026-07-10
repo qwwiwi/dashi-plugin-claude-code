@@ -34,7 +34,9 @@ import {
   loadAutonomyState,
   renderAutonomyStatus,
   resolveQuestion,
+  revokeLease,
   updateAutonomyState,
+  type UpdateResult,
 } from '../autonomy/store.js'
 import { assertAllowedChat } from '../telegram/gate.js'
 import type { GuestQueryRegistry } from '../telegram/guest-queries.js'
@@ -417,18 +419,22 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'autonomy',
     description:
-      'Inspect and resolve the durable autonomy registry for a chat — the owner-granted mandates (leases) that survive context compaction, plus open questions to the owner. Pass chat_id from the inbound <channel> meta. action="status" returns active leases (id, scope, time left) and open questions (id, summary, age, default action, sticky flag). action="consume" marks a lease consumed (pass lease_id). action="resolve_question" sets a question answered/bypassed (pass question_id and resolution). This tool CANNOT grant a lease — grants come from the owner via the authenticated button flow.',
+      'Inspect and resolve the durable autonomy registry for a chat — the owner-granted mandates (leases) that survive context compaction, plus open questions to the owner. Pass chat_id from the inbound <channel> meta. action="status" returns active leases (id, scope, time left) and open questions (id, summary, age, default action, sticky flag). action="consume" marks a lease consumed (pass lease_id). action="revoke" withdraws a lease\'s authority (pass lease_id, optional reason) — self-revoke only shrinks authority. action="resolve_question" sets a question answered/bypassed (pass question_id and resolution). This tool CANNOT grant a lease — grants come from the owner via the authenticated button flow.',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string' },
         action: {
           type: 'string',
-          enum: ['status', 'consume', 'resolve_question'],
+          enum: ['status', 'consume', 'revoke', 'resolve_question'],
         },
         lease_id: {
           type: 'string',
-          description: 'Required when action="consume". The lease id (e.g. L-20260710-a1b2).',
+          description: 'Required when action="consume" or action="revoke". The lease id (e.g. L-20260710-a1b2c3d4).',
+        },
+        reason: {
+          type: 'string',
+          description: 'Optional short reason for action="revoke" (stored as revokeReason).',
         },
         question_id: {
           type: 'string',
@@ -905,13 +911,21 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           return { content: [{ type: 'text', text: renderAutonomyStatus(state, now) }] }
         }
 
+        // Honest refusal when a FRESH writer lock is held by another process
+        // (fix-loop-2 #2) — shared by all three mutating actions.
+        const writerConflict = (): CallToolResult =>
+          toolError(
+            name,
+            'autonomy registry is write-locked by another live writer process — mutation refused (writer_conflict), retry later',
+          )
+
         if (args.action === 'consume') {
           // lease_id presence is enforced by the schema's superRefine. The
           // mutation routes through updateAutonomyState — the serialized
           // read-modify-write — so two concurrent consumes can never both
           // succeed (fix-loop #1).
           const leaseId = args.lease_id as string
-          const outcome = await updateAutonomyState(
+          const upd = await updateAutonomyState(
             statePaths,
             args.chat_id,
             (state) => {
@@ -920,11 +934,16 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
             },
             log,
           )
-          switch (outcome) {
+          if (upd.kind === 'writer_conflict') return writerConflict()
+          switch (upd.result) {
             case 'not_found':
               return toolError(name, `lease not found: ${leaseId}`)
             case 'already_consumed':
               return toolError(name, `lease already consumed: ${leaseId}`)
+            case 'revoked':
+              // Terminal revoked state (fix-loop-2 #4): withdrawn authority
+              // can never be consumed.
+              return toolError(name, `lease revoked: ${leaseId} — the mandate's authority was withdrawn, it cannot be consumed`)
             case 'expired':
               // Honest refusal (fix-loop #8): the mandate's window has
               // passed — do not report success on a dead mandate.
@@ -934,10 +953,38 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           }
         }
 
+        if (args.action === 'revoke') {
+          // Self-revoke (fix-loop-2 #4): the agent may WITHDRAW its own
+          // authority (revokedBy='agent') — shrinking is safe; granting is not.
+          const leaseId = args.lease_id as string
+          const upd = await updateAutonomyState(
+            statePaths,
+            args.chat_id,
+            (state) => {
+              const r = revokeLease(state, leaseId, now, 'agent', args.reason)
+              return { state: r.state, result: r.outcome }
+            },
+            log,
+          )
+          if (upd.kind === 'writer_conflict') return writerConflict()
+          switch (upd.result) {
+            case 'not_found':
+              return toolError(name, `lease not found: ${leaseId}`)
+            case 'already_consumed':
+              return toolError(name, `lease already consumed: ${leaseId} — a used mandate cannot be revoked`)
+            case 'already_revoked':
+              return toolError(name, `lease already revoked: ${leaseId}`)
+            case 'expired':
+              return toolError(name, `lease expired: ${leaseId} — an expired mandate has no authority left, nothing to revoke`)
+            case 'ok':
+              return { content: [{ type: 'text', text: `lease revoked: ${leaseId}` }] }
+          }
+        }
+
         // action === 'resolve_question' (question_id + resolution enforced by schema).
         const questionId = args.question_id as string
         const resolution = args.resolution as 'answered' | 'bypassed'
-        const outcome = await updateAutonomyState(
+        const upd: UpdateResult<ReturnType<typeof resolveQuestion>['outcome']> = await updateAutonomyState(
           statePaths,
           args.chat_id,
           (state) => {
@@ -946,7 +993,8 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           },
           log,
         )
-        switch (outcome) {
+        if (upd.kind === 'writer_conflict') return writerConflict()
+        switch (upd.result) {
           case 'not_found':
             return toolError(name, `question not found: ${questionId}`)
           case 'sticky_forbidden':

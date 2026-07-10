@@ -22,8 +22,13 @@ import {
   questionAgeMs,
   renderAutonomyStatus,
   resolveQuestion,
+  revokeLease,
   saveAutonomyState,
   updateAutonomyState,
+  AUTONOMY_WRITER_ID,
+  WRITER_LOCK_FILENAME,
+  acquireWriterLock,
+  computeScopeDigest,
   type AutonomyState,
 } from '../../src/autonomy/store.js'
 
@@ -58,16 +63,18 @@ function seedState(): AutonomyState {
 
 describe('emptyAutonomyState', () => {
   test('is a versioned empty registry', () => {
-    expect(emptyAutonomyState()).toEqual({ version: AUTONOMY_STATE_VERSION, leases: [], questions: [] })
+    expect(emptyAutonomyState()).toEqual({ version: AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [] })
   })
 })
 
 describe('round-trip persistence', () => {
-  test('save then load returns identical state', () => {
+  test('save then load returns identical content (revision bumped by the save)', () => {
     const state = seedState()
     saveAutonomyState(paths(), '164795011', state)
     const loaded = loadAutonomyState(paths(), '164795011')
-    expect(loaded).toEqual(state)
+    expect(loaded.leases).toEqual(state.leases)
+    expect(loaded.questions).toEqual(state.questions)
+    expect(loaded.revision).toBe(state.revision + 1)
   })
 
   test('file lives at autonomy-<chatId>.json in the state root', () => {
@@ -91,7 +98,7 @@ describe('round-trip persistence', () => {
   })
 
   test('save always stamps the current schema version', () => {
-    const state = { version: 999 as unknown as typeof AUTONOMY_STATE_VERSION, leases: [], questions: [] }
+    const state = { version: 999 as unknown as typeof AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [] }
     saveAutonomyState(paths(), '1', state)
     expect(loadAutonomyState(paths(), '1').version).toBe(AUTONOMY_STATE_VERSION)
   })
@@ -324,7 +331,11 @@ describe('updateAutonomyState — serialized read-modify-write', () => {
         const r = consumeLease(state, 'L-race', NOW)
         return { state: r.state, result: r.outcome }
       })
-    const [a, b] = await Promise.all([consume(), consume()])
+    const [ua, ub] = await Promise.all([consume(), consume()])
+    expect(ua.kind).toBe('ok')
+    expect(ub.kind).toBe('ok')
+    const a = ua.kind === 'ok' ? ua.result : 'conflict'
+    const b = ub.kind === 'ok' ? ub.result : 'conflict'
     expect([a, b].sort()).toEqual(['already_consumed', 'ok'])
     // On disk: consumed exactly once.
     const final = loadAutonomyState(paths(), '1')
@@ -345,11 +356,11 @@ describe('updateAutonomyState — serialized read-modify-write', () => {
 
   test('no-op mutation (same state reference) skips the save', async () => {
     // No file exists; a not_found consume returns the same state → no write.
-    const outcome = await updateAutonomyState(paths(), '3', (state) => {
+    const upd = await updateAutonomyState(paths(), '3', (state) => {
       const r = consumeLease(state, 'L-none', NOW)
       return { state: r.state, result: r.outcome }
     })
-    expect(outcome).toBe('not_found')
+    expect(upd).toEqual({ kind: 'ok', result: 'not_found' })
     expect(readdirSync(root)).not.toContain('autonomy-3.json')
   })
 })
@@ -446,5 +457,205 @@ describe('buildAutonomyHudLine', () => {
     state = addLease(state, { id: 'L-1', scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW).state
     state = addLease(state, { id: 'L-2', scope: 's', expiresAtMs: NOW + 2 * HOUR, source: 'manual' }, NOW).state
     expect(buildAutonomyHudLine(state, NOW) as string).toContain('+1')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Fix-loop-2 (Sol architecture review): revision counter, writer lock,
+// scopeDigest, revoke terminal state, corrupt-file forensics.
+// ─────────────────────────────────────────────────────────────────────
+
+import { existsSync, writeFileSync as wfs, readFileSync as rfs } from 'node:fs'
+
+describe('revision counter (fix-loop-2 #1)', () => {
+  test('every save increments the on-disk revision', () => {
+    saveAutonomyState(paths(), '1', emptyAutonomyState())
+    expect(loadAutonomyState(paths(), '1').revision).toBe(1)
+    saveAutonomyState(paths(), '1', loadAutonomyState(paths(), '1'))
+    expect(loadAutonomyState(paths(), '1').revision).toBe(2)
+    saveAutonomyState(paths(), '1', loadAutonomyState(paths(), '1'))
+    expect(loadAutonomyState(paths(), '1').revision).toBe(3)
+  })
+
+  test('external revision bump between load and save → mutator re-applied on fresh state (no lost update)', async () => {
+    // Seed: lease A, on-disk revision 1.
+    saveAutonomyState(
+      paths(),
+      '9',
+      addLease(emptyAutonomyState(), { id: 'L-A', scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW).state,
+    )
+    let mutatorCalls = 0
+    const upd = await updateAutonomyState(paths(), '9', (state) => {
+      mutatorCalls++
+      if (mutatorCalls === 1) {
+        // Simulate a SECOND-PROCESS writer landing between our load and save:
+        // it adds L-EXT and bumps the on-disk revision under us.
+        saveAutonomyState(paths(), '9', addLease(state, { id: 'L-EXT', scope: 'x', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW).state)
+      }
+      const r = addLease(state, { id: 'L-MINE', scope: 'm', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW)
+      return { state: r.state, result: r.outcome }
+    })
+    expect(upd).toEqual({ kind: 'ok', result: 'ok' })
+    // The mutator ran TWICE: stale apply detected, fresh re-apply persisted.
+    expect(mutatorCalls).toBe(2)
+    const final = loadAutonomyState(paths(), '9')
+    const ids = final.leases.map((l) => l.id).sort()
+    // BOTH the external write and ours survived — nothing was lost.
+    expect(ids).toEqual(['L-A', 'L-EXT', 'L-MINE'])
+  })
+})
+
+describe('writer heartbeat lock (fix-loop-2 #2)', () => {
+  const lockPath = () => join(root, WRITER_LOCK_FILENAME)
+
+  test('fresh FOREIGN lock blocks the mutation with writer_conflict', async () => {
+    wfs(lockPath(), JSON.stringify({ writerId: 'feedfacedeadbeef', pid: 424242, refreshedAtMs: Date.now() }), 'utf8')
+    const upd = await updateAutonomyState(paths(), '1', (state) => {
+      const r = addLease(state, { id: 'L-x', scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW)
+      return { state: r.state, result: r.outcome }
+    })
+    expect(upd).toEqual({ kind: 'writer_conflict' })
+    // Nothing was written; the foreign lock still stands.
+    expect(loadAutonomyState(paths(), '1').leases).toEqual([])
+    expect((JSON.parse(rfs(lockPath(), 'utf8')) as { writerId: string }).writerId).toBe('feedfacedeadbeef')
+  })
+
+  test('STALE foreign lock is taken over and the mutation proceeds', async () => {
+    wfs(lockPath(), JSON.stringify({ writerId: 'feedfacedeadbeef', pid: 424242, refreshedAtMs: Date.now() - 120_000 }), 'utf8')
+    const upd = await updateAutonomyState(paths(), '1', (state) => {
+      const r = addLease(state, { id: 'L-x', scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW)
+      return { state: r.state, result: r.outcome }
+    })
+    expect(upd).toEqual({ kind: 'ok', result: 'ok' })
+    expect((JSON.parse(rfs(lockPath(), 'utf8')) as { writerId: string }).writerId).toBe(AUTONOMY_WRITER_ID)
+    expect(loadAutonomyState(paths(), '1').leases.length).toBe(1)
+  })
+
+  test('own aged lock refreshes lazily on write', () => {
+    const before = Date.now()
+    wfs(lockPath(), JSON.stringify({ writerId: AUTONOMY_WRITER_ID, pid: process.pid, refreshedAtMs: before - 60_000 }), 'utf8')
+    expect(acquireWriterLock(paths(), before)).toBe(true)
+    const after = JSON.parse(rfs(lockPath(), 'utf8')) as { writerId: string; refreshedAtMs: number }
+    expect(after.writerId).toBe(AUTONOMY_WRITER_ID)
+    expect(after.refreshedAtMs).toBe(before) // refreshed, not left at -60s
+  })
+
+  test('own FRESH lock is not rewritten (lazy refresh only)', () => {
+    const stamped = Date.now() - 1000
+    wfs(lockPath(), JSON.stringify({ writerId: AUTONOMY_WRITER_ID, pid: process.pid, refreshedAtMs: stamped }), 'utf8')
+    expect(acquireWriterLock(paths(), Date.now())).toBe(true)
+    const after = JSON.parse(rfs(lockPath(), 'utf8')) as { refreshedAtMs: number }
+    expect(after.refreshedAtMs).toBe(stamped) // untouched — under refresh window
+  })
+
+  test('missing/corrupt lock is acquired', () => {
+    expect(acquireWriterLock(paths(), Date.now())).toBe(true)
+    wfs(lockPath(), '{broken', 'utf8')
+    expect(acquireWriterLock(paths(), Date.now())).toBe(true)
+    expect((JSON.parse(rfs(lockPath(), 'utf8')) as { writerId: string }).writerId).toBe(AUTONOMY_WRITER_ID)
+  })
+})
+
+describe('scopeDigest (fix-loop-2 #3)', () => {
+  test('stable for identical text, differs on any byte change', () => {
+    const a = computeScopeDigest('ship the wave')
+    expect(a).toBe(computeScopeDigest('ship the wave'))
+    expect(a).toMatch(/^sha256:[0-9a-f]{64}$/)
+    expect(computeScopeDigest('ship the wavE')).not.toBe(a)
+    expect(computeScopeDigest('ship the wave ')).not.toBe(a)
+  })
+
+  test('addLease stores digest + scopeVersion; digest matches the scope', () => {
+    const { lease } = addLease(emptyAutonomyState(), { scope: 'катить волну', expiresAtMs: NOW + HOUR, source: 'ask_card' }, NOW)
+    expect(lease?.scopeDigest).toBe(computeScopeDigest('катить волну'))
+    expect(lease?.scopeVersion).toBe(1)
+  })
+
+  test('status render shows the first 12 hex chars of the digest', () => {
+    const { state } = addLease(emptyAutonomyState(), { id: 'L-d', scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW)
+    const short = computeScopeDigest('s').slice(7, 19)
+    expect(renderAutonomyStatus(state, NOW)).toContain(`[${short}]`)
+    // But NOT in the reminder / HUD surfaces.
+    expect(buildAutonomyReminderBlock(state, NOW)).not.toContain(short)
+    expect(buildAutonomyHudLine(state, NOW)).not.toContain(short)
+  })
+})
+
+describe('revokeLease (fix-loop-2 #4)', () => {
+  const withLease = (over: Partial<Parameters<typeof addLease>[1]> = {}) =>
+    addLease(emptyAutonomyState(), { id: 'L-r', scope: 's', expiresAtMs: NOW + HOUR, source: 'manual', ...over }, NOW).state
+
+  test('ok: sets revokedAtMs/revokedBy/revokeReason', () => {
+    const r = revokeLease(withLease(), 'L-r', NOW, 'agent', 'scope drift')
+    expect(r.outcome).toBe('ok')
+    expect(r.state.leases[0]?.revokedAtMs).toBe(NOW)
+    expect(r.state.leases[0]?.revokedBy).toBe('agent')
+    expect(r.state.leases[0]?.revokeReason).toBe('scope drift')
+  })
+
+  test('not_found', () => {
+    expect(revokeLease(emptyAutonomyState(), 'L-x', NOW, 'agent').outcome).toBe('not_found')
+  })
+
+  test('consumed lease cannot be revoked (already_consumed)', () => {
+    const consumed = consumeLease(withLease(), 'L-r', NOW).state
+    expect(revokeLease(consumed, 'L-r', NOW, 'agent').outcome).toBe('already_consumed')
+  })
+
+  test('revocation is final (already_revoked)', () => {
+    const revoked = revokeLease(withLease(), 'L-r', NOW, 'agent').state
+    expect(revokeLease(revoked, 'L-r', NOW, 'agent').outcome).toBe('already_revoked')
+  })
+
+  test('expired lease → expired no-op', () => {
+    const st = withLease({ expiresAtMs: NOW - 1 })
+    const r = revokeLease(st, 'L-r', NOW, 'agent')
+    expect(r.outcome).toBe('expired')
+    expect(r.state.leases[0]?.revokedAtMs).toBeUndefined()
+  })
+
+  test('activeLeases excludes revoked; consume of revoked → revoked outcome', () => {
+    const revoked = revokeLease(withLease(), 'L-r', NOW, 'agent').state
+    expect(activeLeases(revoked, NOW)).toEqual([])
+    expect(consumeLease(revoked, 'L-r', NOW).outcome).toBe('revoked')
+  })
+
+  test('revoked state round-trips through persistence', () => {
+    const revoked = revokeLease(withLease(), 'L-r', NOW, 'owner', 'changed my mind').state
+    saveAutonomyState(paths(), '5', revoked)
+    const loaded = loadAutonomyState(paths(), '5')
+    expect(loaded.leases[0]?.revokedAtMs).toBe(NOW)
+    expect(loaded.leases[0]?.revokedBy).toBe('owner')
+    expect(loaded.leases[0]?.revokeReason).toBe('changed my mind')
+  })
+})
+
+describe('corrupt-file forensics (fix-loop-2 #5)', () => {
+  test('corrupt file is preserved as evidence; load returns empty; subsequent save works', () => {
+    const file = autonomyStatePath(paths(), '7')
+    wfs(file, '{definitely broken', 'utf8')
+    const loaded = loadAutonomyState(paths(), '7')
+    expect(loaded).toEqual(emptyAutonomyState())
+    // Original renamed aside — the slot is free, evidence kept.
+    expect(existsSync(file)).toBe(false)
+    const evidence = readdirSync(root).filter((f) => f.startsWith('autonomy-7.json.corrupt-'))
+    expect(evidence.length).toBe(1)
+    expect(rfs(join(root, evidence[0]!), 'utf8')).toBe('{definitely broken')
+    // A subsequent save lands cleanly on the canonical name.
+    saveAutonomyState(paths(), '7', addLease(emptyAutonomyState(), { id: 'L-n', scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW).state)
+    expect(loadAutonomyState(paths(), '7').leases.length).toBe(1)
+  })
+
+  test('keeps at most 3 evidence files, oldest pruned', () => {
+    for (let i = 0; i < 5; i++) {
+      wfs(autonomyStatePath(paths(), '8'), `{broken-${i}`, 'utf8')
+      loadAutonomyState(paths(), '8')
+    }
+    const evidence = readdirSync(root).filter((f) => f.startsWith('autonomy-8.json.corrupt-')).sort()
+    expect(evidence.length).toBe(3)
+    // The NEWEST corruption is among the kept files.
+    const bodies = evidence.map((f) => rfs(join(root, f), 'utf8'))
+    expect(bodies).toContain('{broken-4')
+    expect(bodies).not.toContain('{broken-0')
   })
 })

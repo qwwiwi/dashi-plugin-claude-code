@@ -129,19 +129,24 @@ export type StatusArgs = z.infer<typeof StatusArgsSchema>
 // lease — granting arrives in PR-2 via the authenticated button relay.
 //   status            → compact human-readable dump of active leases + open Qs.
 //   consume           → mark a lease consumed (requires lease_id).
+//   revoke            → withdraw a lease's authority (requires lease_id,
+//                       optional reason; revokedBy='agent'). Self-revoke only
+//                       SHRINKS authority, so the tool may do it — it still
+//                       can never GRANT.
 //   resolve_question  → set a question answered/bypassed (requires question_id
 //                       + resolution).
 export const AutonomyArgsSchema = z
   .object({
     chat_id: z.union([z.number(), z.string()]).transform((v) => String(v)),
-    action: z.enum(['status', 'consume', 'resolve_question']),
+    action: z.enum(['status', 'consume', 'revoke', 'resolve_question']),
     lease_id: z.string().min(1).optional(),
     question_id: z.string().min(1).optional(),
     resolution: z.enum(['answered', 'bypassed']).optional(),
+    reason: z.string().min(1).max(1000).optional(),
   })
   .superRefine((a, ctx) => {
-    if (a.action === 'consume' && a.lease_id === undefined) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'action="consume" requires lease_id', path: ['lease_id'] })
+    if ((a.action === 'consume' || a.action === 'revoke') && a.lease_id === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `action="${a.action}" requires lease_id`, path: ['lease_id'] })
     }
     if (a.action === 'resolve_question') {
       if (a.question_id === undefined) {
