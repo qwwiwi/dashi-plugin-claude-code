@@ -12,11 +12,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
-  clampTtlHours,
   grantLease,
   isAffirmativeLabel,
   LEASE_DEFAULT_TTL_HOURS,
-  LEASE_MAX_TTL_HOURS,
+  LEASE_SCOPE_MAX_CODEPOINTS,
   parseLeaseCommandArgs,
   parseLeaseMarker,
   stripLeaseMarkerForDisplay,
@@ -28,6 +27,7 @@ import {
   autonomyStatePath,
   computeScopeDigest,
   emptyAutonomyState,
+  GRANT_SOURCE_LEDGER_MAX_AGE_MS,
   loadAutonomyState,
   PRUNE_MAX_AGE_MS,
   pruneAutonomyState,
@@ -71,11 +71,35 @@ describe('parseLeaseMarker', () => {
     expect(m!.displayText).toBe('catch up the wave')
   })
 
-  test('ttl parsed and clamped at 72h', () => {
+  test('valid ttl values: integer 1..72', () => {
     expect(parseLeaseMarker('[LEASE: x; ttl=48h] q')!.ttlHours).toBe(48)
-    expect(parseLeaseMarker('[LEASE: x; ttl=200h] q')!.ttlHours).toBe(LEASE_MAX_TTL_HOURS)
-    // ttl=0h or negative → default (a dead-on-arrival mandate is a mistake).
-    expect(parseLeaseMarker('[LEASE: x; ttl=0h] q')!.ttlHours).toBe(LEASE_DEFAULT_TTL_HOURS)
+    expect(parseLeaseMarker('[LEASE: x; ttl=1h] q')!.ttlHours).toBe(1)
+    expect(parseLeaseMarker('[LEASE: x; ttl=72h] q')!.ttlHours).toBe(72)
+    expect(parseLeaseMarker('[LEASE: x; TTL=12H] q')!.ttlHours).toBe(12)
+  })
+
+  test('FAIL-CLOSED ttl matrix — present but malformed → whole marker invalid (null)', () => {
+    const bad = [
+      'ttl=0h', // zero
+      'ttl=-5h', // negative
+      'ttl=4.5h', // float
+      'ttl=200h', // >72 — NOT clamped, invalid
+      'ttl=73h', // just over the cap
+      'ttl=xh', // garbage
+      'ttl=h', // no digits
+      'ttl=48', // missing h
+      'ttl = 48h', // inner whitespace
+      'ttl=４８h', // non-ASCII (fullwidth) digits
+      'ttl=٤٨h', // non-ASCII (arabic-indic) digits
+    ]
+    for (const seg of bad) {
+      expect(parseLeaseMarker(`[LEASE: x; ${seg}] q`)).toBeNull()
+    }
+  })
+
+  test('duplicate ttl / duplicate supersede → invalid', () => {
+    expect(parseLeaseMarker('[LEASE: x; ttl=2h; ttl=3h] q')).toBeNull()
+    expect(parseLeaseMarker('[LEASE: x; supersede; supersede] q')).toBeNull()
   })
 
   test('supersede flag recognised (order-independent)', () => {
@@ -113,9 +137,24 @@ describe('parseLeaseMarker', () => {
     expect(parseLeaseMarker('   [LEASE: x] q')!.scope).toBe('x')
   })
 
-  test('unknown option segments are ignored but the card is still valid', () => {
-    const m = parseLeaseMarker('[LEASE: scope; frobnicate; ttl=5h] q')
-    expect(m).toMatchObject({ scope: 'scope', ttlHours: 5 })
+  test('unknown option segment → whole marker invalid (closed grammar, fail-closed)', () => {
+    expect(parseLeaseMarker('[LEASE: scope; frobnicate; ttl=5h] q')).toBeNull()
+    // A scope containing `;` inside the marker → invalid rather than silently
+    // truncated at the first `;`.
+    expect(parseLeaseMarker('[LEASE: аудит; production] q')).toBeNull()
+    // Empty option segment (trailing `;`) → invalid.
+    expect(parseLeaseMarker('[LEASE: x;] q')).toBeNull()
+  })
+
+  test('scope over 400 code points → invalid (fail-closed, never clipped)', () => {
+    const okScope = 'а'.repeat(LEASE_SCOPE_MAX_CODEPOINTS)
+    expect(parseLeaseMarker(`[LEASE: ${okScope}] q`)!.scope).toBe(okScope)
+    const longScope = 'а'.repeat(LEASE_SCOPE_MAX_CODEPOINTS + 1)
+    expect(parseLeaseMarker(`[LEASE: ${longScope}] q`)).toBeNull()
+    // Astral-plane characters counted as code points, not UTF-16 units.
+    const astral = '𝕏'.repeat(LEASE_SCOPE_MAX_CODEPOINTS)
+    expect(parseLeaseMarker(`[LEASE: ${astral}] q`)!.scope).toBe(astral)
+    expect(parseLeaseMarker(`[LEASE: ${astral}𝕏] q`)).toBeNull()
   })
 })
 
@@ -128,14 +167,10 @@ describe('stripLeaseMarkerForDisplay', () => {
   })
 })
 
-describe('clampTtlHours', () => {
-  test('default / cap / floor', () => {
-    expect(clampTtlHours(undefined)).toBe(24)
-    expect(clampTtlHours(48)).toBe(48)
-    expect(clampTtlHours(1000)).toBe(72)
-    expect(clampTtlHours(0)).toBe(24)
-    expect(clampTtlHours(-5)).toBe(24)
-    expect(clampTtlHours(Number.NaN)).toBe(24)
+describe('default ttl', () => {
+  test('24h applies ONLY when ttl is entirely absent', () => {
+    expect(parseLeaseMarker('[LEASE: x] q')!.ttlHours).toBe(LEASE_DEFAULT_TTL_HOURS)
+    expect(parseLeaseCommandArgs('scope')).toEqual({ kind: 'grant', scope: 'scope', ttlHours: LEASE_DEFAULT_TTL_HOURS })
   })
 })
 
@@ -170,10 +205,32 @@ describe('parseLeaseCommandArgs', () => {
       kind: 'grant', scope: 'деплой стейджинга', ttlHours: 24,
     })
   })
-  test('scope + ttl', () => {
+  test('trailing ttl option is parsed off', () => {
     expect(parseLeaseCommandArgs('деплой; ttl=48h')).toEqual({
       kind: 'grant', scope: 'деплой', ttlHours: 48,
     })
+  })
+  test('non-option `;` segments BELONG to the scope — no silent truncation (fix-loop #6)', () => {
+    expect(parseLeaseCommandArgs('аудит; production')).toEqual({
+      kind: 'grant', scope: 'аудит; production', ttlHours: 24,
+    })
+    // `;` in the middle + trailing ttl: only the TRAILING option is stripped.
+    expect(parseLeaseCommandArgs('аудит; production; ttl=12h')).toEqual({
+      kind: 'grant', scope: 'аудит; production', ttlHours: 12,
+    })
+    // Trailing non-option segment → everything (incl. an inner ttl=…) is scope.
+    expect(parseLeaseCommandArgs('x; ttl=48h; y')).toEqual({
+      kind: 'grant', scope: 'x; ttl=48h; y', ttlHours: 24,
+    })
+  })
+  test('trailing option-like but MALFORMED ttl → invalid (usage error, no grant)', () => {
+    for (const bad of ['ttl=200h', 'ttl=0h', 'ttl=4.5h', 'ttl=abch', 'ttl = 48h', 'ttl=-1h', 'ttl=48']) {
+      expect(parseLeaseCommandArgs(`аудит; ${bad}`)).toEqual({ kind: 'invalid', reason: 'ttl' })
+    }
+  })
+  test('scope over 400 code points → invalid', () => {
+    const long = 'x'.repeat(LEASE_SCOPE_MAX_CODEPOINTS + 1)
+    expect(parseLeaseCommandArgs(long)).toEqual({ kind: 'invalid', reason: 'scope_too_long' })
   })
   test('only a ttl option with no scope → bare', () => {
     expect(parseLeaseCommandArgs('; ttl=48h')).toEqual({ kind: 'bare' })
@@ -198,18 +255,34 @@ describe('applyLeaseGrant', () => {
     expect(r.state.leases.length).toBe(1)
   })
 
-  test('same grantSourceId → idempotent no-op (duplicate_source), one lease', () => {
+  test('grant records the sourceId in the durable ledger', () => {
+    const r = applyLeaseGrant(emptyAutonomyState(), { ...base, scope: 's', grantSourceId: 'src-1' }, NOW)
+    expect(r.state.usedGrantSources).toEqual([
+      { sourceId: 'src-1', scopeDigest: computeScopeDigest('s'), atMs: NOW },
+    ])
+  })
+
+  test('same grantSourceId + same scope → idempotent no-op (duplicate_source), one lease', () => {
     let state = emptyAutonomyState()
     const first = applyLeaseGrant(state, { ...base, scope: 's', grantSourceId: 'ask:aaaaa:0' }, NOW)
     state = first.state
-    const second = applyLeaseGrant(state, { ...base, scope: 'DIFFERENT scope', grantSourceId: 'ask:aaaaa:0' }, NOW)
+    const second = applyLeaseGrant(state, { ...base, scope: 's', grantSourceId: 'ask:aaaaa:0' }, NOW)
     expect(second.outcome).toBe('duplicate_source')
     expect(second.lease!.id).toBe(first.lease!.id) // returns the existing lease
     expect(second.state.leases.length).toBe(1)
     expect(second.state).toBe(state) // unchanged reference
   })
 
-  test('identical ACTIVE scope (different source) → duplicate_scope no-op', () => {
+  test('same grantSourceId + DIFFERENT scope → source_conflict, no grant (Fable)', () => {
+    let state = emptyAutonomyState()
+    state = applyLeaseGrant(state, { ...base, scope: 's', grantSourceId: 'ask:aaaaa:0' }, NOW).state
+    const second = applyLeaseGrant(state, { ...base, scope: 'DIFFERENT scope', grantSourceId: 'ask:aaaaa:0' }, NOW)
+    expect(second.outcome).toBe('source_conflict')
+    expect(second.lease).toBeUndefined()
+    expect(second.state.leases.length).toBe(1) // nothing minted
+  })
+
+  test('identical ACTIVE scope (different source) → duplicate_scope, NEW sourceId recorded in ledger', () => {
     let state = emptyAutonomyState()
     const first = applyLeaseGrant(state, { ...base, scope: 'same', grantSourceId: 'src-1' }, NOW)
     state = first.state
@@ -217,6 +290,45 @@ describe('applyLeaseGrant', () => {
     expect(second.outcome).toBe('duplicate_scope')
     expect(second.lease!.id).toBe(first.lease!.id)
     expect(second.state.leases.length).toBe(1)
+    // fix-loop #2: the deduped attempt's sourceId is ALSO in the ledger.
+    expect(second.state.usedGrantSources.map((u) => u.sourceId).sort()).toEqual(['src-1', 'src-2'])
+  })
+
+  test('LEDGER blocks re-mint after the lease died (revoked → replayed sourceId)', () => {
+    // Grant via src-2 as a duplicate_scope against src-1's lease, then revoke
+    // the lease and prune its tombstone — the src-2 replay must STILL be
+    // recognised (Codex HIGH exploit: replay after expiry/revoke re-minted).
+    let state = emptyAutonomyState()
+    const first = applyLeaseGrant(state, { ...base, scope: 'same', grantSourceId: 'src-1' }, NOW)
+    state = first.state
+    state = applyLeaseGrant(state, { ...base, scope: 'same', grantSourceId: 'src-2' }, NOW).state
+    state = revokeLease(state, first.lease!.id, NOW + HOUR, 'owner').state
+    // 20 days later the lease tombstone is pruned; the ledger survives.
+    const pruned = pruneAutonomyState(state, NOW + 20 * DAY)
+    expect(pruned.leases.length).toBe(0)
+    expect(pruned.usedGrantSources.length).toBe(2)
+    const replay = applyLeaseGrant(pruned, { ...base, scope: 'same', grantSourceId: 'src-2' }, NOW + 20 * DAY)
+    expect(replay.outcome).toBe('duplicate_source')
+    expect(replay.state.leases.length).toBe(0) // NO fresh lease minted
+    // And a replayed sourceId with a different scope is still a conflict.
+    const conflict = applyLeaseGrant(pruned, { ...base, scope: 'other', grantSourceId: 'src-2' }, NOW + 20 * DAY)
+    expect(conflict.outcome).toBe('source_conflict')
+  })
+
+  test('legacy pre-ledger lease record dedups and back-fills the ledger', () => {
+    // Simulate a pre-ledger file: a lease with grantSourceId but no ledger.
+    let state = emptyAutonomyState()
+    state = addLease(state, {
+      scope: 's', expiresAtMs: NOW + DAY, source: 'ask_card', grantSourceId: 'legacy-1',
+    }, NOW).state
+    expect(state.usedGrantSources.length).toBe(0)
+    const replay = applyLeaseGrant(state, { ...base, scope: 's', grantSourceId: 'legacy-1' }, NOW)
+    expect(replay.outcome).toBe('duplicate_source')
+    expect(replay.state.leases.length).toBe(1)
+    expect(replay.state.usedGrantSources.map((u) => u.sourceId)).toEqual(['legacy-1'])
+    // Legacy record with a different scope → conflict.
+    const conflict = applyLeaseGrant(state, { ...base, scope: 'other', grantSourceId: 'legacy-1' }, NOW)
+    expect(conflict.outcome).toBe('source_conflict')
   })
 
   test('different scopes coexist (no supersede)', () => {
@@ -363,6 +475,20 @@ describe('pruneAutonomyState', () => {
     expect(pruneAutonomyState(s, NOW).leases.map((l) => l.id)).toEqual(['L-edge'])
   })
 
+  test('replay ledger kept 90 days — out-living the 14-day lease tombstones', () => {
+    let s = emptyAutonomyState()
+    s = applyLeaseGrant(s, {
+      scope: 's', expiresAtMs: NOW + HOUR, source: 'ask_card', grantSourceId: 'src-old',
+    }, NOW).state
+    // 60 days later: lease tombstone gone, ledger entry KEPT.
+    const at60 = pruneAutonomyState(s, NOW + 60 * DAY)
+    expect(at60.leases.length).toBe(0)
+    expect(at60.usedGrantSources.map((u) => u.sourceId)).toEqual(['src-old'])
+    // Past 90 days: ledger entry dropped too.
+    const at91 = pruneAutonomyState(s, NOW + GRANT_SOURCE_LEDGER_MAX_AGE_MS + DAY)
+    expect(at91.usedGrantSources.length).toBe(0)
+  })
+
   test('applied on the save path via updateAutonomyState', async () => {
     // Seed an old consumed lease directly on disk, then trigger any mutation.
     let seed = emptyAutonomyState()
@@ -384,8 +510,8 @@ describe('pruneAutonomyState', () => {
 // version>1 read-only (PR-1 leftover 4b)
 // ─────────────────────────────────────────────────────────────────────
 
-describe('version>1 read-only', () => {
-  test('loads (coerces) a future-version file best-effort', () => {
+describe('unsupported-version read-only (raw value compared BEFORE coercion)', () => {
+  test('loads (coerces) an unsupported-version file best-effort', () => {
     writeFileSync(
       autonomyStatePath(paths(), '1'),
       JSON.stringify({
@@ -397,21 +523,36 @@ describe('version>1 read-only', () => {
       'utf8',
     )
     const loaded = loadAutonomyState(paths(), '1')
-    expect(loaded.version as number).toBe(2) // preserved so the guard can see it
+    expect(loaded.unsupportedVersion).toBe(2) // raw value preserved for the guard
     expect(loaded.leases.length).toBe(1)
   })
 
-  test('mutation on a future-version file is refused and NEVER overwrites it', async () => {
+  // fix-loop #5 (Codex MED): 1.9 used to coerce to 1 and get OVERWRITTEN as
+  // v1. Anything that is not exactly the integer 1 is read-only now.
+  for (const rawVersion of [2, 1.9, '2', 'abc'] as const) {
+    test(`version ${JSON.stringify(rawVersion)} → mutation refused, file byte-identical`, async () => {
+      const file = autonomyStatePath(paths(), '1')
+      const body = JSON.stringify({ version: rawVersion, revision: 7, leases: [], questions: [] })
+      writeFileSync(file, body, 'utf8')
+      const res = await updateAutonomyState(paths(), '1', (state) => {
+        const r = addLease(state, { id: 'L-x', scope: 's', expiresAtMs: NOW + DAY, source: 'manual' }, NOW)
+        return { state: r.state, result: r.outcome }
+      }, undefined, NOW)
+      expect(res.kind).toBe('version_unsupported')
+      // File byte-identical — no downgrade write happened.
+      const { readFileSync } = await import('node:fs')
+      expect(readFileSync(file, 'utf8')).toBe(body)
+    })
+  }
+
+  test('exactly integer 1 stays writable', async () => {
     const file = autonomyStatePath(paths(), '1')
-    const body = JSON.stringify({ version: 2, revision: 7, leases: [], questions: [] })
-    writeFileSync(file, body, 'utf8')
+    writeFileSync(file, JSON.stringify({ version: 1, revision: 7, leases: [], questions: [] }), 'utf8')
     const res = await updateAutonomyState(paths(), '1', (state) => {
       const r = addLease(state, { id: 'L-x', scope: 's', expiresAtMs: NOW + DAY, source: 'manual' }, NOW)
       return { state: r.state, result: r.outcome }
     }, undefined, NOW)
-    expect(res.kind).toBe('version_unsupported')
-    // File byte-identical — no downgrade write happened.
-    const { readFileSync } = await import('node:fs')
-    expect(readFileSync(file, 'utf8')).toBe(body)
+    expect(res.kind).toBe('ok')
+    expect(loadAutonomyState(paths(), '1').leases.length).toBe(1)
   })
 })
