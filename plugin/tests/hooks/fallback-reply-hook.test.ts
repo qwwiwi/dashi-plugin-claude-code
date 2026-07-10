@@ -104,6 +104,61 @@ describe('analyzeCurrentTurn', () => {
     expect(analyzeCurrentTurn(transcript).replied).toBe(true)
   })
 
+  // fix-loop #7: a reply whose tool_result came back isError did NOT reach the
+  // owner (e.g. blocked by the ask-guard) → it must NOT count as delivered, so
+  // the turn's final text stays eligible for the fallback (re-guarded there).
+  test('(a2) BLOCKED reply (isError result) does NOT set replied — final text forwards', () => {
+    const transcript = [
+      line('user', TG_PROMPT('164795011', 10)),
+      line('assistant', [{ type: 'text', text: 'жду го' }], 'u1'),
+      line(
+        'assistant',
+        [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'жду го' } }],
+        'u2',
+      ),
+      line('user', [{ type: 'tool_result', tool_use_id: 'tu1', is_error: true, content: 'ASK_GUARD ...' }]),
+    ].join('\n')
+    const r = analyzeCurrentTurn(transcript)
+    expect(r.replied).toBe(false)
+    expect(r.text).toBe('жду го')
+    expect(r.chatId).toBe('164795011')
+  })
+
+  test('(a3) SUCCESSFUL reply (non-error result) DOES set replied (suppress)', () => {
+    const transcript = [
+      line('user', TG_PROMPT('1', 10)),
+      line(
+        'assistant',
+        [{ type: 'tool_use', id: 'tu2', name: 'mcp__dashi-channel__reply', input: {} }],
+        'u2',
+      ),
+      line('user', [{ type: 'tool_result', tool_use_id: 'tu2', content: 'sent' }]),
+    ].join('\n')
+    expect(analyzeCurrentTurn(transcript).replied).toBe(true)
+  })
+
+  test('(a4) reply tool_use without an id still counts as replied (legacy transcript)', () => {
+    // No id on the tool_use → can never match an is_error tool_use_id → replied.
+    const transcript = [
+      line('user', TG_PROMPT('1', 10)),
+      line('assistant', [{ type: 'tool_use', name: 'mcp__dashi-channel__reply', input: {} }], 'u2'),
+    ].join('\n')
+    expect(analyzeCurrentTurn(transcript).replied).toBe(true)
+  })
+
+  test('(a5) a BLOCKED reply followed by a later SUCCESSFUL reply → replied (delivered)', () => {
+    // Same turn: first reply blocked (tu1 isError), agent rephrases and the
+    // second reply (tu2) succeeds → the owner got an answer → suppress.
+    const transcript = [
+      line('user', TG_PROMPT('1', 10)),
+      line('assistant', [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: {} }], 'u1'),
+      line('user', [{ type: 'tool_result', tool_use_id: 'tu1', is_error: true, content: 'blocked' }]),
+      line('assistant', [{ type: 'tool_use', id: 'tu2', name: 'mcp__dashi-channel__reply', input: {} }], 'u2'),
+      line('user', [{ type: 'tool_result', tool_use_id: 'tu2', content: 'sent' }]),
+    ].join('\n')
+    expect(analyzeCurrentTurn(transcript).replied).toBe(true)
+  })
+
   test('(b) no reply tool + final text + telegram chat_id → would forward', () => {
     const transcript = [
       line('user', TG_PROMPT('164795011', 10)),

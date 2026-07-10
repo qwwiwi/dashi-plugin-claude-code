@@ -20,7 +20,11 @@
 //
 // Suppression invariants (no duplicate to the warchief):
 //   * If the turn called mcp__dashi-channel__reply OR
-//     mcp__dashi-channel__edit_message → a reply already reached him → silent.
+//     mcp__dashi-channel__edit_message AND that call SUCCEEDED → a reply already
+//     reached him → silent. fix-loop #7: a reply whose tool_result came back
+//     isError (e.g. blocked by the ask-guard) did NOT reach him, so it does NOT
+//     suppress the fallback — the turn's final text is still forwarded, and the
+//     fallback route re-runs the same guard on it.
 //   * If the turn has no final assistant text (pure tool / pure thinking) →
 //     nothing to forward → silent.
 //   * If the turn was not answering a Telegram message (no `<channel
@@ -164,17 +168,43 @@ interface TranscriptLine {
   readonly uuid?: unknown
 }
 
-/** True when a content array contains a tool_use block whose name is a reply tool. */
-function contentCallsReplyTool(content: unknown): boolean {
-  if (!Array.isArray(content)) return false
+/**
+ * The `id`s of reply-tool tool_use blocks in an assistant content array. A
+ * block with no string `id` (legacy/synthetic transcripts) yields the sentinel
+ * '' so it is still counted as a reply (it can never match an is_error result,
+ * which always carries a real tool_use_id) — preserving the pre-fix behaviour
+ * for transcripts that omit ids.
+ */
+function replyToolUseIds(content: unknown): string[] {
+  if (!Array.isArray(content)) return []
+  const ids: string[] = []
   for (const block of content) {
     if (block === null || typeof block !== 'object') continue
     const b = block as Record<string, unknown>
     if (b.type === 'tool_use' && typeof b.name === 'string' && REPLY_TOOL_NAMES.has(b.name)) {
-      return true
+      ids.push(typeof b.id === 'string' ? b.id : '')
     }
   }
-  return false
+  return ids
+}
+
+/**
+ * The `tool_use_id`s of tool_result blocks flagged `is_error: true` in a
+ * user-role tool_result echo. fix-loop #7: a reply that the choke point BLOCKED
+ * returns an isError tool_result — it did NOT reach the owner, so it must not
+ * suppress the fallback.
+ */
+function errorToolResultIds(content: unknown): string[] {
+  if (!Array.isArray(content)) return []
+  const ids: string[] = []
+  for (const block of content) {
+    if (block === null || typeof block !== 'object') continue
+    const b = block as Record<string, unknown>
+    if (b.type === 'tool_result' && b.is_error === true && typeof b.tool_use_id === 'string') {
+      ids.push(b.tool_use_id)
+    }
+  }
+  return ids
 }
 
 /** Collect the joined text blocks of an assistant content array (empty when none). */
@@ -247,6 +277,11 @@ export function analyzeCurrentTurn(transcript: string): TurnResult {
   let text: string | undefined
   let uuid: string | undefined
   let replied = false
+  // fix-loop #7: tool_use_ids of reply results that came back isError. We walk
+  // BACKWARD, so a tool_result echo (later in the transcript) is seen BEFORE
+  // its tool_use (earlier) — this set is populated by the time we reach the
+  // reply tool_use, so a BLOCKED reply never sets `replied`.
+  const erroredReplyIds = new Set<string>()
   for (let i = lines.length - 1; i >= 0; i--) {
     let obj: unknown
     try {
@@ -274,11 +309,18 @@ export function analyzeCurrentTurn(transcript: string): TurnResult {
           promptText !== undefined ? extractLeadingTelegramChatId(promptText) : undefined
         return { text, uuid, replied, chatId, promptText }
       }
+      // tool_result echo — record any isError reply results before continuing.
+      for (const id of errorToolResultIds(content)) erroredReplyIds.add(id)
       continue
     }
 
     if (role !== 'assistant') continue
-    if (contentCallsReplyTool(content)) replied = true
+    // A reply counts as delivered ONLY if its result was NOT isError. A blocked
+    // reply (ask-guard isError) leaves the owner unanswered → the turn's final
+    // text must still be eligible for the fallback (which re-guards it).
+    for (const id of replyToolUseIds(content)) {
+      if (!erroredReplyIds.has(id)) replied = true
+    }
     if (text === undefined) {
       const t = assistantText(content)
       if (t.length > 0) {
