@@ -67,11 +67,32 @@ interface AskPattern {
 }
 
 const TIER1: ReadonlyArray<AskPattern> = [
-  // «жду (го|отмашк…|твоего слова|подтвержден…|команд…|добро)»
+  // «жду (го|отмашк…|твоего слова|команд…|добро)». NB: «подтвержден…» is
+  // NOT here — it moved to ASK_WAIT_CONFIRM below (fix-loop #4), which only
+  // fires when the confirmation-wait is OWNER-directed, so a status-wait like
+  // «жду подтверждения оплаты от провайдера» / «жду подтверждения вебхука»
+  // no longer self-gates.
   {
     code: 'ASK_WAIT_GO',
     re: new RegExp(
-      `${B}жду\\s+(?:го|отмашк${LETTER}*|твоего\\s+слова|подтвержден${LETTER}*|команд${LETTER}*|добро)${A}`,
+      `${B}жду\\s+(?:го|отмашк${LETTER}*|твоего\\s+слова|команд${LETTER}*|добро)${A}`,
+      'i',
+    ),
+  },
+  // «жду подтверждени(е|я)» — fires ONLY when owner-directed (fix-loop #4,
+  // Codex MED-4 / Fable MED-4). A bare «жду подтверждения» that ENDS the clause
+  // (nothing meaningful after — end-of-line or punctuation) is an owner-wait;
+  // «жду подтверждения от тебя / твоего / вождь» is explicitly owner-directed.
+  // But «жду подтверждения <noun>» (оплаты / завершения workflow от GitHub /
+  // вебхука / CI / от провайдера) is a STATUS wait on an external system, not a
+  // self-gate — the trailing noun after «подтверждения» is not owner-ref/terminal,
+  // so the lookahead fails and it does NOT fire. Same ASK_WAIT_GO code as the
+  // generic wait so the finding taxonomy (and existing logs/tests) are stable.
+  {
+    code: 'ASK_WAIT_GO',
+    re: new RegExp(
+      `${B}жду\\s+подтвержден(?:и[еяю]|ья)` +
+        `(?=\\s*(?:[.,!?…)]|$)|\\s+(?:от\\s+тебя|тво[её]${LETTER}*|вожд${LETTER}*)(?!${LETTER}))`,
       'i',
     ),
   },
@@ -117,12 +138,60 @@ const TIER1: ReadonlyArray<AskPattern> = [
 // (they need the owner's word regardless of any lease), so their presence
 // anywhere in the SAME text suppresses every finding. Case-insensitive covers
 // «БД»/«DB» and any cased Cyrillic.
-// `ден[ье]г` deliberately covers BOTH «деньги/деньгах/деньгами» (stem `деньг`)
-// and the common genitive «денег» (as in «списание денег») — the bare `деньг`
-// stem misses «денег», a false-negative that would let a real money-ask be
-// intercepted as a self-gate.
-const HARD_GATE_RE =
-  /(?:ден[ье]г|платеж|биллинг|prod.?(?:баз[а-яё]*|бд|db)|миграци|rm -rf|force-push|деструктив|массов[а-яё]*\s+(?:отправк|рассылк)|model config|gateway|рестарт\s+(?:канала|gateway))/i
+//
+// The vocabulary is deliberately BROAD (fix-loop #1, Codex BLOCK-1 / Fable
+// HIGH-1 — safety-critical): a hard-gate ask that leaks through the guard is a
+// far worse failure than an over-exemption (which merely delivers a benign
+// reply). Conservative principle: WHEN UNCERTAIN, EXEMPT. The regex is tested
+// against a ё→е-folded copy of the message (see `foldYo`), so «платёж» folds to
+// «платеж» and matches the `платеж` stem without a separate ё-branch.
+//
+// `ден[ье]г` covers «деньги/деньгах» (stem `деньг`) AND the genitive «денег».
+const HARD_GATE_RE = new RegExp(
+  [
+    // ── money / payments ──
+    'ден[ье]г', // деньги / денег
+    'оплат[а-яё]*', // оплата / оплаты / оплат / оплатить
+    'платеж[а-яё]*', // платёж→платеж (folded) / платежный / платежи
+    'биллинг',
+    'billing',
+    'payment',
+    // ── prod DB / migrations (Latin `prod` AND Cyrillic «прод») ──
+    '(?:prod|прод)[\\s.\\-]?(?:баз[а-яё]*|бд|db)', // prod бд / прод-базу
+    'production\\s+database',
+    'миграци[а-яё]*',
+    'migrat', // migration / migrate
+    'drop\\s+table',
+    'truncate',
+    'delete\\s+from',
+    // ── destructive ──
+    'rm\\s+-rf',
+    'force-?push',
+    'git\\s+reset\\s+--hard',
+    'git\\s+clean',
+    'удал[а-яё]*', // удалю / удаление / удалить (data deletion)
+    'деструктив[а-яё]*',
+    // ── mass sends ──
+    'массов[а-яё]*', // массовая (рассылка/отправка/…)
+    'рассылк[а-яё]*', // рассылка (inherently a mass send)
+    'отправк[а-яё]*\\s+(?:по\\s+)?(?:баз|юзер|всем|пользовател)', // отправка по базе/юзерам/всем
+    'mass\\s+send',
+    'broadcast',
+    // ── model / gateway / bot config + own-channel restarts ──
+    'model\\s+config',
+    'gateway',
+    'конфиг\\s+(?:модел[а-яё]*|gateway)', // конфиг модели / конфиг gateway
+    'рестарт\\s+(?:канала|gateway|бота)',
+  ].join('|'),
+  'i',
+)
+
+// Fold «ё»→«е» (both cases) on a COPY used only for the hard-gate test, so
+// «платёж» matches the `платеж` stem. Never mutates the text scanned for
+// tier-1 findings (that scan keeps ё so Cyrillic boundaries stay exact).
+function foldYo(s: string): string {
+  return s.replace(/ё/g, 'е').replace(/Ё/g, 'Е')
+}
 
 // A blockquote line (`>` prefix) — treated as protected like fenced code, so a
 // quoted permission-ask (e.g. the agent echoing the owner) never fires.
@@ -138,32 +207,60 @@ function clip(s: string, maxChars: number): string {
 
 const SNIPPET_MAX_CHARS = 60
 
+// Why a message was hard-gate exempted (fix-loop #2, Codex HIGH-3 / Fable
+// LOW-5). `hard_gate` = the marker is in real prose. `hard_gate_protected_only`
+// = the marker survives ONLY inside a fenced/quoted zone (the fence/quote-masked
+// prose does NOT match) — STILL exempt (whole-text OR fails safe against
+// over-blocking), but flagged so calibration week can see this class and decide
+// whether a quoted hard-gate word is masking a genuine self-gate.
+export type AskExemptReason = 'hard_gate' | 'hard_gate_protected_only'
+
+export interface AskGuardAnalysis {
+  // One finding per distinct tier-1 pattern that fired, or empty when clean or
+  // exempt.
+  findings: AskGuardFinding[]
+  // Set ONLY when a hard-gate exemption suppressed the scan. Undefined for a
+  // clean pass (findings may be non-empty) and for the no-lease/empty
+  // short-circuits.
+  exemptReason?: AskExemptReason
+}
+
 /**
- * Analyze `text` for self-gating permission-asks. Returns one finding per
- * distinct tier-1 pattern that fired, or an empty array when clean.
+ * Full analysis of `text` for self-gating permission-asks. PURE + stateless:
+ * identical input → identical output, which is what makes the no-resend-valve
+ * guarantee hold in the reply path.
  *
- * Short-circuits (empty result) when:
- *   * `opts.hasActiveLease` is false — no lease, no enforcement;
- *   * the text is empty;
- *   * the text mentions a HARD-GATE action anywhere — such asks are always
- *     legitimate.
+ * Short-circuits (empty findings, no exemptReason) when there is no active
+ * lease or the text is empty.
  *
- * PURE + stateless: identical input → identical output, which is what makes
- * the no-resend-valve guarantee hold in the reply path.
+ * Hard-gate exemption is judged on the WHOLE message (the spec: "if the SAME
+ * text contains hard-gate markers") so an over-exemption always fails safe —
+ * but we ALSO recompute the marker on the fence/quote-masked prose to classify
+ * whether the exemption came only from a protected zone (`exemptReason`).
  */
-export function analyzeAsk(text: string, opts: { hasActiveLease: boolean }): AskGuardFinding[] {
-  if (!opts.hasActiveLease) return []
-  if (text.length === 0) return []
+export function analyzeAskDetailed(
+  text: string,
+  opts: { hasActiveLease: boolean },
+): AskGuardAnalysis {
+  if (!opts.hasActiveLease) return { findings: [] }
+  if (text.length === 0) return { findings: [] }
 
   const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-
-  // Hard-gate exemption is judged on the WHOLE message (the spec: "if the SAME
-  // text contains hard-gate markers"). A permission-ask that touches money /
-  // prod / migrations etc. is legitimate no matter the lease.
-  if (HARD_GATE_RE.test(normalized)) return []
-
   const lines = normalized.split('\n')
   const fenceMask = fenceProtectedLines(lines)
+
+  // Whole-text hard-gate test (the authoritative, fail-safe check).
+  if (HARD_GATE_RE.test(foldYo(normalized))) {
+    // Recompute on prose with fenced/blockquoted lines stripped. If the marker
+    // is gone, the exemption rested ONLY on a protected zone → distinct code.
+    const prose = lines
+      .filter((l, i) => !fenceMask[i] && !BLOCKQUOTE_RE.test(l as string))
+      .join('\n')
+    const reason: AskExemptReason = HARD_GATE_RE.test(foldYo(prose))
+      ? 'hard_gate'
+      : 'hard_gate_protected_only'
+    return { findings: [], exemptReason: reason }
+  }
 
   const findings: AskGuardFinding[] = []
   const seen = new Set<string>()
@@ -180,7 +277,15 @@ export function analyzeAsk(text: string, opts: { hasActiveLease: boolean }): Ask
       }
     }
   }
-  return findings
+  return { findings }
+}
+
+/**
+ * Thin wrapper returning ONLY the findings array — the stable surface used by
+ * unit tests and any caller that does not need the exemption classification.
+ */
+export function analyzeAsk(text: string, opts: { hasActiveLease: boolean }): AskGuardFinding[] {
+  return analyzeAskDetailed(text, opts).findings
 }
 
 const SCOPE_CLIP_CHARS = 80
@@ -199,14 +304,27 @@ export function askGuardAdvisoryHint(leaseId: string): string {
 
 /**
  * The block-mode refusal text (returned as an isError tool result WITHOUT
- * sending). Tells the agent to act in-scope and report, and points at the
- * un-guarded AskUserQuestion card path for a genuine product question.
+ * sending). fix-loop #3 (Codex HIGH-2 / Fable MED-2): the guard must NOT assert
+ * that the ask is in-scope/authorized — it cannot know that. Instead it lays
+ * out BOTH branches and lets the model self-check against the actual lease
+ * scope(s):
+ *   1) hard-gate → the AskUserQuestion card path (never guarded);
+ *   2) covered by an active mandate's scope → act-with-veto and report.
+ * All active lease scopes are listed (not just the soonest-expiry one) so the
+ * model can match its intended action against the real granted text.
  */
-export function askGuardBlockMessage(leaseId: string, scope: string): string {
+export function askGuardBlockMessage(leaseId: string, scopes: readonly string[]): string {
+  const scopeList =
+    scopes.length > 0
+      ? scopes.map((s) => `«${clip(s, SCOPE_CLIP_CHARS)}»`).join('; ')
+      : '(scope не указан)'
   return (
-    `ASK_GUARD: активен мандат ${leaseId} («${clip(scope, SCOPE_CLIP_CHARS)}»). ` +
-    'Это in-scope вопрос-разрешение — действуй сам и доложи результат ' +
-    '(«делаю X, скажи стоп если против»). Если это НАСТОЯЩИЙ продуктовый ' +
-    'вопрос — отправь его карточкой AskUserQuestion (кнопки), этот путь не гардится.'
+    `ASK_GUARD (мандат ${leaseId}): этот вопрос-разрешение НЕ отправлен. ` +
+    '1) Если это деньги/prod-БД/деструктив/массовые отправки/конфиг модели или ' +
+    'gateway — это hard-gate: отправь вопрос карточкой AskUserQuestion (кнопки), ' +
+    'этот путь НЕ гейтится. ' +
+    '2) Если действие покрыто scope активного мандата — действуй act-with-veto ' +
+    '(«делаю X, скажи стоп если против») и доложи результат. ' +
+    `Активные мандаты: ${scopeList}.`
   )
 }

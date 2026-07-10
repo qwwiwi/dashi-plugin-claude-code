@@ -12,6 +12,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   analyzeAsk,
+  analyzeAskDetailed,
   askGuardAdvisoryHint,
   askGuardBlockMessage,
 } from '../../src/safety/ask-guard.js'
@@ -202,6 +203,157 @@ describe('analyzeAsk — hard-gate suppression', () => {
   })
 })
 
+// fix-loop #1 (Codex BLOCK-1 / Fable HIGH-1) — the hard-gate vocabulary must
+// exempt EVERY phrase both reviews raised. Each row is a self-gating ask that
+// ALSO names a hard-gate action → it must NOT self-gate (findings === []). The
+// Fable probe phrases and the Codex examples are enumerated verbatim.
+describe('analyzeAsk — hard-gate vocabulary (fix-loop #1, table-driven)', () => {
+  const EXEMPT: ReadonlyArray<[string, string]> = [
+    // — Fable probe phrases —
+    ['прод БД', 'жду го на запись в прод БД'],
+    ['прод-базу', 'дай добро — трону прод-базу'],
+    ['платёж (ё-fold)', 'могу продолжать? это платёж'],
+    ['оплата', 'жду отмашки на оплату подписки'],
+    ['оплаты', 'дай го — проведу оплаты'],
+    ['рассылка по базе', 'жду го на рассылку по базе'],
+    ['удаление данных', 'дай добро на удаление данных'],
+    // — Codex examples / hard-gate canon —
+    ['удалю данные', 'жду го — удалю данные пользователя'],
+    ['DROP TABLE', 'подтверди, и запущу DROP TABLE users'],
+    ['TRUNCATE', 'могу продолжать? это TRUNCATE logs'],
+    ['DELETE FROM', 'жду твоего слова на DELETE FROM orders'],
+    ['git reset --hard', 'дай го на git reset --hard origin/main'],
+    ['git clean', 'жду отмашки — сделаю git clean -fdx'],
+    ['production database', 'дай добро: migrate the production database'],
+    ['migration', 'жду го на migration to prod'],
+    ['migrate', 'могу начинать? нужно migrate now'],
+    ['billing', 'жду твоего слова по billing change'],
+    ['payment', 'дай добро на payment config edit'],
+    ['mass send', 'жду го на mass send to all users'],
+    ['broadcast', 'дай добро — broadcast to everyone'],
+    ['рестарт бота', 'могу продолжать? нужен рестарт бота'],
+    ['конфиг модели', 'жду го — правлю конфиг модели'],
+    ['конфиг gateway', 'дай добро на конфиг gateway'],
+    // — already-covered canon, kept as a regression floor —
+    ['rm -rf', 'дай го на rm -rf каталога'],
+    ['force-push', 'подтверди, и сделаю force-push'],
+    ['деньги', 'жду го на списание денег'],
+  ]
+
+  for (const [label, body] of EXEMPT) {
+    test(`«${label}» exempts (delivers): ${body}`, () => {
+      expect(analyzeAsk(body, { hasActiveLease: LEASE })).toEqual([])
+    })
+  }
+})
+
+// The self-gate phrases must STILL fire when NO hard-gate marker is present —
+// the broadened vocabulary must not swallow the guard entirely.
+describe('analyzeAsk — self-gates still fire without a hard-gate marker (fix-loop #1)', () => {
+  const FIRES: ReadonlyArray<[string, string, string]> = [
+    ['ASK_WAIT_GO', 'жду го', 'жду го, мой вождь'],
+    ['ASK_GIVE_GO', 'дай добро', 'дай добро — и я задеплою лендинг'],
+    ['ASK_SAY_YES', 'скажи да', 'скажи да — и я запущу сборку'],
+    ['ASK_CONFIRM_THEN', 'подтверди, и', 'подтверди, и начну'],
+    ['ASK_NEED_YES', 'нужно твоё да', 'для мержа нужно твоё да'],
+    ['ASK_CAN_I', 'могу продолжать?', 'могу продолжать?'],
+    ['ASK_WAIT_DECISION', 'жду решения по мержу', 'жду решения по мержу'],
+  ]
+  for (const [code, label, body] of FIRES) {
+    test(`«${label}» still fires ${code}`, () => {
+      const f = analyzeAsk(body, { hasActiveLease: LEASE })
+      expect(f.map((x) => x.code)).toContain(code)
+    })
+  }
+})
+
+// fix-loop #2 (Codex HIGH-3 / Fable LOW-5) — hard-gate vs protected zones.
+describe('analyzeAskDetailed — protected-only hard-gate classification (fix-loop #2)', () => {
+  test('marker in real prose → exemptReason "hard_gate"', () => {
+    const r = analyzeAskDetailed('жду го на списание денег', { hasActiveLease: LEASE })
+    expect(r.findings).toEqual([])
+    expect(r.exemptReason).toBe('hard_gate')
+  })
+
+  test('marker ONLY inside a fence → exemptReason "hard_gate_protected_only", still exempt', () => {
+    const body = 'жду го\n```\nплатеж по счёту\n```'
+    const r = analyzeAskDetailed(body, { hasActiveLease: LEASE })
+    // Still exempt (whole-text OR fails safe)...
+    expect(r.findings).toEqual([])
+    // ...but flagged as protected-only for calibration.
+    expect(r.exemptReason).toBe('hard_gate_protected_only')
+  })
+
+  test('marker ONLY inside a blockquote → protected-only', () => {
+    const body = 'жду го\n> контекст: платёж пройдёт завтра'
+    const r = analyzeAskDetailed(body, { hasActiveLease: LEASE })
+    expect(r.findings).toEqual([])
+    expect(r.exemptReason).toBe('hard_gate_protected_only')
+  })
+
+  test('a clean self-gate carries no exemptReason', () => {
+    const r = analyzeAskDetailed('жду го', { hasActiveLease: LEASE })
+    expect(r.findings.map((x) => x.code)).toContain('ASK_WAIT_GO')
+    expect(r.exemptReason).toBeUndefined()
+  })
+
+  test('no lease → no findings, no exemptReason (short-circuit)', () => {
+    const r = analyzeAskDetailed('жду го на списание денег', { hasActiveLease: false })
+    expect(r.findings).toEqual([])
+    expect(r.exemptReason).toBeUndefined()
+  })
+})
+
+// fix-loop #4 (Codex MED-4 / Fable MED-4) — «жду подтверждения X» must fire
+// only when owner-directed; a wait on an external system's confirmation is a
+// legitimate status, not a self-gate.
+describe('analyzeAsk — «жду подтверждения» false-positive narrowing (fix-loop #4)', () => {
+  test('bare «жду подтверждения» (clause end) fires ASK_WAIT_GO', () => {
+    const f = analyzeAsk('всё собрано, жду подтверждения.', { hasActiveLease: LEASE })
+    expect(f.map((x) => x.code)).toContain('ASK_WAIT_GO')
+  })
+
+  test('«жду подтверждения от тебя» fires (owner-directed)', () => {
+    const f = analyzeAsk('жду подтверждения от тебя', { hasActiveLease: LEASE })
+    expect(f.map((x) => x.code)).toContain('ASK_WAIT_GO')
+  })
+
+  test('«жду подтверждение, вождь» fires (owner-directed)', () => {
+    const f = analyzeAsk('жду подтверждение, вождь', { hasActiveLease: LEASE })
+    expect(f.map((x) => x.code)).toContain('ASK_WAIT_GO')
+  })
+
+  test('«жду подтверждения твоего решения» fires (owner-directed)', () => {
+    const f = analyzeAsk('жду подтверждения твоего решения', { hasActiveLease: LEASE })
+    expect(f.map((x) => x.code)).toContain('ASK_WAIT_GO')
+  })
+
+  // Status waits on external systems — must NOT fire.
+  test('«жду подтверждения завершения workflow от GitHub» does NOT fire', () => {
+    expect(
+      analyzeAsk('жду подтверждения завершения workflow от GitHub', { hasActiveLease: LEASE }),
+    ).toEqual([])
+  })
+
+  test('«жду подтверждения вебхука» does NOT fire', () => {
+    expect(analyzeAsk('жду подтверждения вебхука', { hasActiveLease: LEASE })).toEqual([])
+  })
+
+  test('«жду подтверждения от провайдера» (bank/provider) does NOT fire', () => {
+    // Note: no «оплаты» here, so the narrowing (not the hard-gate) is what
+    // suppresses it — «от провайдера» is not an owner reference.
+    expect(analyzeAsk('жду подтверждения от провайдера', { hasActiveLease: LEASE })).toEqual([])
+  })
+
+  test('«жду подтверждения статуса CI» (CI) does NOT fire', () => {
+    expect(analyzeAsk('жду подтверждения статуса CI', { hasActiveLease: LEASE })).toEqual([])
+  })
+
+  test('«жду подтверждения от внешней системы» does NOT fire', () => {
+    expect(analyzeAsk('жду подтверждения от внешней системы', { hasActiveLease: LEASE })).toEqual([])
+  })
+})
+
 describe('analyzeAsk — fenced-code exclusion', () => {
   test('an ask INSIDE a ``` fence never fires', () => {
     const body = '```\nжду го\n```'
@@ -271,7 +423,7 @@ describe('askGuardAdvisoryHint / askGuardBlockMessage', () => {
   })
 
   test('block message names the lease, the scope, and the AskUserQuestion escape', () => {
-    const msg = askGuardBlockMessage('L-20260710-abcd1234', 'реализуй M3 ask-guard по порядку')
+    const msg = askGuardBlockMessage('L-20260710-abcd1234', ['реализуй M3 ask-guard по порядку'])
     expect(msg).toContain('ASK_GUARD')
     expect(msg).toContain('L-20260710-abcd1234')
     expect(msg).toContain('реализуй M3 ask-guard')
@@ -280,9 +432,35 @@ describe('askGuardAdvisoryHint / askGuardBlockMessage', () => {
 
   test('block message clips an over-long scope', () => {
     const longScope = 'очень длинный скоуп '.repeat(20)
-    const msg = askGuardBlockMessage('L-1', longScope)
+    const msg = askGuardBlockMessage('L-1', [longScope])
     // The full scope must not be echoed verbatim (it is clipped to ~80 cps).
     expect(msg).toContain('…')
     expect(msg.length).toBeLessThan(longScope.length + 200)
+  })
+
+  // fix-loop #3: the block message must NOT assert the ask is in-scope /
+  // authorized (that is exactly the false claim the reviewers flagged). It
+  // presents both branches (hard-gate → card; in-scope → act-with-veto) and
+  // lets the model self-check.
+  test('block message does NOT claim the ask is authorized/in-scope', () => {
+    const msg = askGuardBlockMessage('L-1', ['deploy the frontend'])
+    // Presents the hard-gate escape and the act-with-veto branch...
+    expect(msg).toContain('AskUserQuestion')
+    expect(msg.toLowerCase()).toContain('act-with-veto')
+    expect(msg).toContain('hard-gate')
+    // ...but never asserts «это in-scope вопрос» (the removed false claim).
+    expect(msg).not.toContain('Это in-scope')
+  })
+
+  test('block message lists ALL active lease scopes, not just the first', () => {
+    const msg = askGuardBlockMessage('L-1', ['scope alpha', 'scope beta'])
+    expect(msg).toContain('scope alpha')
+    expect(msg).toContain('scope beta')
+  })
+
+  test('block message tolerates an empty scope list', () => {
+    const msg = askGuardBlockMessage('L-1', [])
+    expect(msg).toContain('ASK_GUARD')
+    expect(msg).toContain('L-1')
   })
 })
