@@ -330,6 +330,26 @@ export const AppConfigSchema = z.object({
     enabled: z.boolean().default(false),
     allowed_user_ids: z.array(z.number().int().positive()).optional(),
   }).optional(),
+  // Ask-guard (autonomy M3, 2026-07-10) — the ENFORCEMENT of owner-granted
+  // autonomy mandates on the owner-egress reply path. When the agent holds an
+  // ACTIVE lease for a chat and still writes a «жду го / дай добро»-style
+  // self-gating permission-ask, the guard intercepts (see safety/ask-guard.ts).
+  //
+  //   `mode`:
+  //     'off'      — never engage (equivalent to the kill-switch);
+  //     'advisory' — the reply IS sent, plus an `ask_guard_hint` nudging the
+  //                  agent to act-with-veto (the calibration-week default);
+  //     'block'    — the reply is REFUSED (isError, not sent); the agent must
+  //                  act in-scope and report, or ask via the AskUserQuestion
+  //                  card (that path is never guarded).
+  //
+  // The block is OPTIONAL (no `.default({})`), like `hud`/`guest_mode` below,
+  // so the many pre-M3 test config literals stay valid without adding it.
+  // `resolveAskGuardMode` applies the 'advisory' default and the env overrides
+  // (`ASK_GUARD_MODE`, kill-switch `ASK_GUARD_ENABLED=0`) in one place.
+  ask_guard: z.object({
+    mode: z.enum(['off', 'advisory', 'block']).default('advisory'),
+  }).optional(),
   // Context HUD (wave 3B) — a single pinned Telegram message in the owner's
   // chat that shows context-window usage (bar + percentage) plus the «Сжать»
   // action button, refreshed after each turn (SessionStart / Stop hooks).
@@ -962,6 +982,39 @@ export function resolveContextWindowTokens(config: AppConfig): number {
 
 export function resolveHudEnabled(config: AppConfig): boolean {
   return config.hud?.enabled ?? true
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveAskGuardMode — the effective ask-guard mode (autonomy M3). The
+// `ask_guard` config block is optional, so callers MUST go through this
+// helper rather than reading `config.ask_guard?.mode` directly: the
+// 'advisory' default AND the direct-env overrides live in exactly one place.
+//
+// Precedence (first decisive wins):
+//   1. kill-switch `ASK_GUARD_ENABLED` set to a falsy value (0/false/no/off)
+//      → 'off' (a hard OFF that beats any configured mode);
+//   2. `ASK_GUARD_MODE` env (off|advisory|block, case-insensitive);
+//   3. `config.ask_guard.mode`;
+//   4. 'advisory' (the calibration-week default).
+//
+// These two env vars are read from process.env directly (NOT via the
+// TELEGRAM_-prefixed RuntimeEnvSchema) — the same pattern as
+// resolveContextWindowOverride reading JARVIS_CONTEXT_WINDOW.
+// ─────────────────────────────────────────────────────────────────────
+
+export type AskGuardMode = 'off' | 'advisory' | 'block'
+
+export function resolveAskGuardMode(config: AppConfig): AskGuardMode {
+  const enabled = process.env.ASK_GUARD_ENABLED
+  if (enabled !== undefined && /^(0|false|no|off)$/i.test(enabled.trim())) {
+    return 'off'
+  }
+  const envMode = process.env.ASK_GUARD_MODE
+  if (envMode !== undefined) {
+    const m = envMode.trim().toLowerCase()
+    if (m === 'off' || m === 'advisory' || m === 'block') return m
+  }
+  return config.ask_guard?.mode ?? 'advisory'
 }
 
 // ─────────────────────────────────────────────────────────────────────
