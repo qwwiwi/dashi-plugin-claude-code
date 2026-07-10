@@ -40,8 +40,17 @@ describe('resolveContextWindowForModel — family table', () => {
     expect(resolveContextWindowForModel('claude-haiku-4')).toBe(200_000)
   })
 
-  test('case-insensitive substring match', () => {
+  test('case-insensitive match', () => {
     expect(resolveContextWindowForModel('CLAUDE-FABLE-5')).toBe(1_000_000)
+  })
+
+  test('family matches only on token boundaries — no mid-word false positive', () => {
+    // 'claude-unfabled-5' contains 'fable' as a raw substring but is NOT a
+    // Fable model — must fall through to the 200k default (codex LOW).
+    expect(resolveContextWindowForModel('claude-unfabled-5')).toBe(200_000)
+    // The real forms still match.
+    expect(resolveContextWindowForModel('claude-fable-5')).toBe(1_000_000)
+    expect(resolveContextWindowForModel('fable')).toBe(1_000_000)
   })
 
   test('the exported table is the source of the numbers', () => {
@@ -104,6 +113,15 @@ describe('resolveContextWindowForModel — override wins', () => {
   test('override is floored', () => {
     expect(resolveContextWindowForModel('gpt-5', { override: 250_000.9 })).toBe(250_000)
   })
+
+  test('fractional override 0.5 never yields a 0 window — floor happens BEFORE validation', () => {
+    // Old order (validate `> 0` then floor) let 0.5 slip through and floor to
+    // 0, giving a zero denominator (codex MED). Must be treated as invalid.
+    expect(resolveContextWindowForModel('claude-fable-5', { override: 0.5 })).toBe(1_000_000)
+    expect(resolveContextWindowForModel('gpt-5', { override: 0.5 })).toBe(200_000)
+    // Same rule on fallback: a fractional-below-1 fallback coerces to 200k.
+    expect(resolveContextWindowForModel('gpt-5', { fallback: 0.5 })).toBe(200_000)
+  })
 })
 
 describe('resolveContextWindowOverride — config + env chain', () => {
@@ -142,6 +160,16 @@ describe('resolveContextWindowOverride — config + env chain', () => {
     expect(resolveContextWindowOverride(cfg(undefined))).toBeUndefined()
     process.env[KEY] = '0'
     expect(resolveContextWindowOverride(cfg(undefined))).toBeUndefined()
+  })
+
+  test('invalid config value (0) falls through to a valid env override', () => {
+    // config context_window_tokens: 0 must NOT suppress JARVIS_CONTEXT_WINDOW —
+    // an unusable config value falls through to the env check (codex MED).
+    process.env[KEY] = '1000000'
+    expect(resolveContextWindowOverride(cfg(0))).toBe(1_000_000)
+    // And with no env either, an invalid config value means «no override».
+    delete process.env[KEY]
+    expect(resolveContextWindowOverride(cfg(0))).toBeUndefined()
   })
 
   test('resolveContextWindowTokens applies the 200k default when nothing set', () => {

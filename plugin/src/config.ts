@@ -852,6 +852,38 @@ export const MODEL_CONTEXT_WINDOWS: ReadonlyArray<ModelContextWindowRule> = [
 // token (word-boundaried so it never trips on unrelated ids).
 const ONE_MILLION_MARKER = /\[1m\]|(?:^|[^a-z0-9])1m(?:[^a-z0-9]|$)/i
 
+// Normalize an operator-supplied window value to a usable token count, or
+// undefined when it is unusable. Floor FIRST, then accept only >= 1 — the
+// other order lets a fractional 0.5 pass the `> 0` check and floor to 0,
+// producing a zero denominator (codex review MED, 2026-07-10).
+function normalizeWindowValue(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value)) return undefined
+  const floored = Math.floor(value)
+  return floored >= 1 ? floored : undefined
+}
+
+// Token-boundary match of a family id against a model id (both lowercased).
+// A raw substring check made 'claude-unfabled-5' match 'fable' → 1M (codex
+// review LOW, 2026-07-10). The family must be delimited by a separator
+// (- / : _ .) or the start/end of the string on BOTH sides; separators INSIDE
+// the family id (e.g. 'claude-opus-4') still match normally.
+const FAMILY_SEPARATORS = new Set(['-', '/', ':', '_', '.'])
+
+function matchesModelFamily(id: string, family: string): boolean {
+  let from = 0
+  while (from <= id.length - family.length) {
+    const idx = id.indexOf(family, from)
+    if (idx === -1) return false
+    const before = idx === 0 ? undefined : id[idx - 1]
+    const afterChar = id[idx + family.length]
+    const boundary = (c: string | undefined): boolean =>
+      c === undefined || FAMILY_SEPARATORS.has(c)
+    if (boundary(before) && boundary(afterChar)) return true
+    from = idx + 1
+  }
+  return false
+}
+
 /**
  * Resolve the context-window size (tokens) for a session model id.
  *
@@ -860,7 +892,7 @@ const ONE_MILLION_MARKER = /\[1m\]|(?:^|[^a-z0-9])1m(?:[^a-z0-9]|$)/i
  *     / `JARVIS_CONTEXT_WINDOW`). ALWAYS wins so a wrong table guess is fixable
  *     without a code change.
  *  2. An explicit `[1m]` / `1m` window marker on the model id → 1M.
- *  3. The MODEL_CONTEXT_WINDOWS family table (first substring match).
+ *  3. The MODEL_CONTEXT_WINDOWS family table (first token-boundary match).
  *  4. `opts.fallback` (defaults to DEFAULT_CONTEXT_WINDOW_TOKENS = 200k) —
  *     unknown or absent model.
  *
@@ -871,18 +903,14 @@ export function resolveContextWindowForModel(
   model: string | undefined,
   opts?: { override?: number | undefined; fallback?: number | undefined },
 ): number {
-  const fallback =
-    opts?.fallback !== undefined && Number.isFinite(opts.fallback) && opts.fallback > 0
-      ? Math.floor(opts.fallback)
-      : DEFAULT_CONTEXT_WINDOW_TOKENS
-  if (opts?.override !== undefined && Number.isFinite(opts.override) && opts.override > 0) {
-    return Math.floor(opts.override)
-  }
+  const fallback = normalizeWindowValue(opts?.fallback) ?? DEFAULT_CONTEXT_WINDOW_TOKENS
+  const override = normalizeWindowValue(opts?.override)
+  if (override !== undefined) return override
   if (model === undefined || model.length === 0) return fallback
   const id = model.toLowerCase()
   if (ONE_MILLION_MARKER.test(id)) return 1_000_000
   for (const rule of MODEL_CONTEXT_WINDOWS) {
-    if (id.includes(rule.match)) return rule.windowTokens
+    if (matchesModelFamily(id, rule.match)) return rule.windowTokens
   }
   return fallback
 }
@@ -895,11 +923,15 @@ export function resolveContextWindowForModel(
  * unset value falls through to the model table.
  */
 export function resolveContextWindowOverride(config: AppConfig): number | undefined {
-  if (config.context_window_tokens !== undefined) return config.context_window_tokens
+  // Normalize the config value like every other operator input. An UNUSABLE
+  // config value (0, negative, NaN — possible when the config object bypassed
+  // schema validation, e.g. test literals) must FALL THROUGH to the env check,
+  // not suppress a valid JARVIS_CONTEXT_WINDOW (codex review MED, 2026-07-10).
+  const fromConfig = normalizeWindowValue(config.context_window_tokens)
+  if (fromConfig !== undefined) return fromConfig
   const env = process.env.JARVIS_CONTEXT_WINDOW
   if (env !== undefined && env.trim().length > 0) {
-    const n = Number(env.trim())
-    if (Number.isFinite(n) && n > 0) return Math.floor(n)
+    return normalizeWindowValue(Number(env.trim()))
   }
   return undefined
 }
