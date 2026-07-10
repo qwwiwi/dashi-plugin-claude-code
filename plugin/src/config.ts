@@ -1004,15 +1004,35 @@ export function resolveHudEnabled(config: AppConfig): boolean {
 
 export type AskGuardMode = 'off' | 'advisory' | 'block'
 
-export function resolveAskGuardMode(config: AppConfig): AskGuardMode {
+// Minimal structural logger (avoids importing the full Logger type here and a
+// config.ts ↔ log.ts cycle). Matches Logger.warn's shape.
+export interface AskGuardModeLogger {
+  warn: (msg: string, ctx?: Record<string, unknown>) => void
+}
+
+export function resolveAskGuardMode(
+  config: AppConfig,
+  log?: AskGuardModeLogger,
+): AskGuardMode {
   const enabled = process.env.ASK_GUARD_ENABLED
   if (enabled !== undefined && /^(0|false|no|off)$/i.test(enabled.trim())) {
     return 'off'
   }
   const envMode = process.env.ASK_GUARD_MODE
-  if (envMode !== undefined) {
+  if (envMode !== undefined && envMode.trim() !== '') {
     const m = envMode.trim().toLowerCase()
     if (m === 'off' || m === 'advisory' || m === 'block') return m
+    // fix-loop #6 (Codex LOW-6): a SET-but-INVALID env value (e.g. «of», a typo
+    // of «off») must NOT silently fall through to a configured `block` — that
+    // would surprise-enable enforcement from a typo. Fail to the calibration
+    // default (advisory) and warn, so the misconfiguration is visible.
+    if (log) {
+      log.warn('ASK_GUARD_MODE set to an invalid value — defaulting to advisory', {
+        code: 'ask_guard_mode_invalid',
+        value: envMode.trim().slice(0, 32),
+      })
+    }
+    return 'advisory'
   }
   return config.ask_guard?.mode ?? 'advisory'
 }

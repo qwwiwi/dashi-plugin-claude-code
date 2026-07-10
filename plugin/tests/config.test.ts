@@ -599,10 +599,30 @@ describe('resolveAskGuardMode', () => {
     expect(resolveAskGuardMode(cfg)).toBe('block')
   })
 
-  test('an invalid ASK_GUARD_MODE falls through to the config/default', () => {
+  test('an invalid ASK_GUARD_MODE resolves to advisory (no config set)', () => {
     const cfg = loadConfig(env())
     process.env.ASK_GUARD_MODE = 'nonsense'
     expect(resolveAskGuardMode(cfg)).toBe('advisory')
+  })
+
+  // fix-loop #6 (Codex LOW-6): a SET-but-INVALID env value must NOT silently
+  // retain a configured `block` — it resolves to advisory and logs a warning.
+  test('an invalid ASK_GUARD_MODE does NOT retain a configured block → advisory + warn', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ ask_guard: { mode: 'block' } }))
+    const cfg = loadConfig(env())
+    process.env.ASK_GUARD_MODE = 'of' // typo of «off»
+    const warns: string[] = []
+    const log = { warn: (msg: string) => warns.push(msg) }
+    expect(resolveAskGuardMode(cfg, log)).toBe('advisory')
+    expect(warns.length).toBe(1)
+    expect(warns[0]).toContain('ASK_GUARD_MODE')
+  })
+
+  test('an empty ASK_GUARD_MODE is treated as unset (falls through to config)', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ ask_guard: { mode: 'block' } }))
+    const cfg = loadConfig(env())
+    process.env.ASK_GUARD_MODE = '   '
+    expect(resolveAskGuardMode(cfg)).toBe('block')
   })
 
   test('kill-switch ASK_GUARD_ENABLED=0 forces off, beating a configured block', () => {
