@@ -54,6 +54,13 @@ import type {
 import type { InlineKeyboardLike, TelegramApi } from '../channel/tools.js'
 import { escapeHtml } from '../format/html.js'
 import { classifyEditError } from '../safety/telegram-edit-classifier.js'
+import { addQuestion, updateAutonomyState, type AutonomyPaths } from '../autonomy/store.js'
+import {
+  grantLease,
+  isAffirmativeLabel,
+  parseLeaseMarker,
+  stripLeaseMarkerForDisplay,
+} from '../autonomy/grant.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // Constants
@@ -128,7 +135,9 @@ export function renderClosedQuestionBody(
   outcomeLineHtml: string,
 ): string {
   const header = clipRaw(`Вопрос ${currentIndex + 1}/${totalQuestions}`, MAX_HEADER_CHARS)
-  const question = escapeHtml(clipRaw(questionRaw, MAX_QUESTION_CHARS))
+  // Strip any `[LEASE: …]` grant marker so the owner sees the clean question,
+  // never the plumbing (autonomy M2).
+  const question = escapeHtml(clipRaw(stripLeaseMarkerForDisplay(questionRaw), MAX_QUESTION_CHARS))
   return `<b>${escapeHtml(header)}</b>\n${question}\n\n${outcomeLineHtml}`
 }
 
@@ -143,6 +152,12 @@ export interface AskUserQuestionUiDeps {
   relay: AskUserQuestionRelay
   /** Override clock for tests. */
   now?: () => number
+  // Autonomy M2: state root for the durable lease/question registry. When set,
+  // an affirmative tap on a `[LEASE: …]` card mints a lease, and a timed-out
+  // question is auto-registered as an open question. Optional so pre-M2 wiring
+  // (and tests that don't exercise autonomy) still construct the UI. Every
+  // registry access is fail-open — a store error NEVER breaks the ask flow.
+  autonomyPaths?: AutonomyPaths
 }
 
 export interface AskUserQuestionUi {
@@ -320,7 +335,8 @@ export function renderQuestionBody(
     `Вопрос ${pending.currentIndex + 1}/${pending.questions.length}`,
     MAX_HEADER_CHARS,
   )
-  const questionRaw = clipRaw(q.question, MAX_QUESTION_CHARS)
+  // Strip any `[LEASE: …]` grant marker before display (autonomy M2).
+  const questionRaw = clipRaw(stripLeaseMarkerForDisplay(q.question), MAX_QUESTION_CHARS)
   const opts = q.options.slice(0, MAX_KEYBOARD_OPTIONS)
 
   // Assemble piecewise. `pieces` is the running list of fully-formed
@@ -838,6 +854,66 @@ export function createAskUserQuestionUi(
     }
   }
 
+  // Autonomy M2 — mint a lease when the OWNER taps an affirmative option on a
+  // `[LEASE: …]` card.
+  //
+  // SECURITY INVARIANT: this runs ONLY from handleAskCallback's `choose`
+  // branch, AFTER `isAuthorized(ctx.from.id)` has passed — i.e. behind the
+  // owner allowlist. It is one of exactly TWO lease-grant call sites in the
+  // whole plugin (the other is the `/lease` owner command); no agent-callable
+  // surface (MCP tool, hook) can reach a grant. Fail-open: any registry error
+  // is logged and swallowed so the ask flow is never broken by the store.
+  async function maybeGrantLeaseFromTap(input: {
+    questionText: string
+    chosenLabel: string
+    requestId: string
+    questionIndex: number
+    chatId: string | undefined
+    grantorMessageId: number | undefined
+  }): Promise<void> {
+    if (!deps.autonomyPaths || input.chatId === undefined) return
+    const marker = parseLeaseMarker(input.questionText)
+    if (!marker) return
+    if (!isAffirmativeLabel(input.chosenLabel)) return
+    try {
+      const res = await grantLease(
+        deps.autonomyPaths,
+        input.chatId,
+        {
+          scope: marker.scope,
+          ttlHours: marker.ttlHours,
+          source: 'ask_card',
+          // Idempotency: a double-tap / replayed callback carrying the same
+          // requestId+questionIndex mints exactly one lease.
+          grantSourceId: `ask:${input.requestId}:${input.questionIndex}`,
+          supersede: marker.supersede,
+          ...(input.grantorMessageId !== undefined ? { grantorMessageId: input.grantorMessageId } : {}),
+        },
+        log,
+        now(),
+      )
+      if (res.kind === 'ok') {
+        log.info('autonomy lease granted from ask card', {
+          request_id: input.requestId,
+          chat_id: input.chatId,
+          outcome: res.outcome,
+          lease_id: res.lease?.id,
+        })
+      } else {
+        log.warn('autonomy lease grant from ask card refused', {
+          request_id: input.requestId,
+          chat_id: input.chatId,
+          reason: res.kind,
+        })
+      }
+    } catch (err) {
+      log.warn('autonomy lease grant from ask card threw (ignored)', {
+        request_id: input.requestId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
   // Codex HIGH (2026-07-02): the follow-up rendering path is decided by the
   // relay's SYNCHRONOUS mutation outcome, NOT by re-inferring state from
   // `getPending()` after an await. The pre-fix code awaited the callback ack
@@ -897,6 +973,50 @@ export function createAskUserQuestionUi(
     }
   }
 
+  // Autonomy M2 — register a timed-out question in the durable registry so an
+  // un-answered ask survives a compact/restart. summary = first 100 chars of
+  // the (marker-stripped) question. defaultAction is left undefined: the
+  // AskUserQuestion payload has no "recommended option" marker to read (the
+  // option schema is label+description+preview), so there is nothing to carry.
+  // sticky=false. Fail-open — a registry error never breaks settle handling.
+  const TIMED_OUT_SUMMARY_MAX = 100
+  async function maybeRegisterTimedOutQuestion(event: AskSettleEvent): Promise<void> {
+    if (!deps.autonomyPaths || !event.chatId) return
+    const clean = stripLeaseMarkerForDisplay(event.questionText ?? '')
+    const summary = Array.from(clean).slice(0, TIMED_OUT_SUMMARY_MAX).join('')
+    try {
+      const upd = await updateAutonomyState(
+        deps.autonomyPaths,
+        event.chatId,
+        (state) => {
+          const r = addQuestion(
+            state,
+            {
+              summary,
+              sticky: false,
+              ...(event.telegramMessageId !== undefined ? { messageId: event.telegramMessageId } : {}),
+            },
+            now(),
+          )
+          return { state: r.state, result: r.outcome }
+        },
+        log,
+        now(),
+      )
+      if (upd.kind === 'ok') {
+        log.info('autonomy open question registered on timeout', {
+          request_id: event.requestId,
+          chat_id: event.chatId,
+        })
+      }
+    } catch (err) {
+      log.warn('autonomy timeout question registration threw (ignored)', {
+        request_id: event.requestId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
   // Close the currently-open question card on a settle the UI did NOT drive
   // (internal timeout / external expire). Best-effort — never throws.
   async function handleSettle(event: AskSettleEvent): Promise<void> {
@@ -905,6 +1025,11 @@ export function createAskUserQuestionUi(
       // close + completion message); acting here would double-post. Only the
       // timeout/expire family leaves a card open with a live keyboard.
       if (event.status !== 'timeout') return
+      // Autonomy M2: auto-register the un-answered question so it survives a
+      // compact/restart and surfaces in the reminder/HUD until resolved.
+      // Runs even when the card can't be closed (no chatId/messageId) — a
+      // registry write only needs the chat id. Fail-open (never throws).
+      await maybeRegisterTimedOutQuestion(event)
       if (!event.chatId || event.telegramMessageId === undefined) return
       const body = renderClosedQuestionBody(
         event.questionText ?? '',
@@ -1025,6 +1150,19 @@ export function createAskUserQuestionUi(
         // trail, while any await placed between the mutation and the
         // follow-up render widens the timeout race window (Codex HIGH).
         await advanceAfterAnswer(snap, outcome)
+        // Autonomy M2: an affirmative tap on a `[LEASE: …]` card mints a lease.
+        // Guarded by `outcome.applied` so a stale/no-op tap grants nothing;
+        // uses the pre-mutation snapshot (raw question text + card message id).
+        if (outcome.applied) {
+          await maybeGrantLeaseFromTap({
+            questionText: snap.questionText,
+            chosenLabel,
+            requestId: parsed.requestId,
+            questionIndex: snap.questionIndex,
+            chatId: snap.chatId ?? ctx.chatId,
+            grantorMessageId: snap.messageId,
+          })
+        }
         await ctx.answerCallbackQuery().catch(() => {})
         return
       }
