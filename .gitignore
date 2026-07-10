@@ -10,6 +10,7 @@ secrets/
 *.key
 *.pem
 .DS_Store
+*.bak.*
 bun.lockb.bak
 coverage/
 .bun/

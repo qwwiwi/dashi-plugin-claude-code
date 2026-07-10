@@ -339,7 +339,7 @@ export class MultichatRouter {
     //    so the null branch is unreachable here — but using the
     //    multichat-aware helper keeps a single source of truth for
     //    "is this chat configured?" across router, status-manager,
-    //    tmux-mirror, persona-manager. Legacy single-DM mode never
+    //    tmux-mirror. Legacy single-DM mode never
     //    runs through this router.
     const userAllowed = this.policy.allowlist.users.includes(input.user_id)
     const chatPolicy = getChatPolicyOrDeny(this.policy, input.chat_id)
@@ -1033,7 +1033,7 @@ export class MultichatRouter {
 // Re-export workspaceDir alias for callers that want to read this
 // router's view of the chats base path without importing fs internals.
 // Keeps the field private while exposing a derived path consumers can
-// pass to `resolvePersona`.
+// pass to the session-start.sh persona hook.
 export function chatsBasePath(workspaceDir: string): string {
   return `${workspaceDir}/chats`
 }
