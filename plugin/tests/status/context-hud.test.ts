@@ -212,6 +212,13 @@ describe('renderHud', () => {
     expect(escaped).toContain('<i>a&lt;b&gt;&amp;c</i>')
   })
 
+  test('1M window: denominator renders «1M», pct against 1M', () => {
+    // 151k of a 1M window ≈ 15% (was mis-reported as 76% against a 200k cap).
+    const { text } = renderHud({ usedTokens: 151_000 }, 1_000_000, 'claude-fable-5')
+    expect(text).toContain('15% (151k / 1M)')
+    expect(filledCount(text)).toBe(2) // round(15/10) = 2 segments
+  })
+
   test('keyboard shape: single Сжать row, no Новый диалог button', () => {
     const { keyboard } = renderHud({ usedTokens: 0 }, WINDOW)
     expect(keyboard).toEqual(buildHudKeyboard())
@@ -1078,5 +1085,84 @@ describe('HUD #2v2 rollback guard + persisted epochs', () => {
     const last =
       api2.edited.length > 0 ? api2.edited[api2.edited.length - 1]!.text : api2.sent[0]!.text
     expect(last).toContain('новая работа')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Model-aware context window (the pin follows the session model)
+// ─────────────────────────────────────────────────────────────────────
+
+describe('ContextHud — model-aware window', () => {
+  // A session view whose model can change between turns (mid-session switch).
+  function mutableSession(initial: {
+    transcriptPath?: string
+    model?: string
+  }): { reader: SessionInfoReader; set(model: string): void } {
+    const info: { transcriptPath?: string; model?: string } = { ...initial }
+    return {
+      reader: { get: () => info },
+      set(model: string) {
+        info.model = model
+      },
+    }
+  }
+
+  function hudWith(
+    api: HudTelegramApi,
+    session: SessionInfoReader,
+    override?: number,
+  ): ContextHud {
+    return new ContextHud({
+      api,
+      log,
+      sessionInfo: session,
+      windowTokens: WINDOW, // 200k fallback default
+      windowOverride: override,
+      ownerChatIds: [OWNER],
+      stateDir: stateDir(),
+      enabled: true,
+      // Fixed numerator — the resolver only changes the DENOMINATOR.
+      readContextUsage: async () => ({ usedTokens: 100_000, pct: 0.5 }),
+    })
+  }
+
+  test('Fable-5 session reports its 1M window, not the 200k default', async () => {
+    const api = new FakeApi()
+    const s = mutableSession({ transcriptPath: '/t/a.jsonl', model: 'claude-fable-5' })
+    const hud = hudWith(api, s.reader)
+    await hud.onSessionStart(OWNER)
+    // 100k / 1M = 10%.
+    expect(api.sent[0]!.text).toContain("10% (100k / 1M)")
+  })
+
+  test("mid-session model switch (Opus → Fable) moves the denominator", async () => {
+    const api = new FakeApi()
+    const s = mutableSession({ transcriptPath: "/t/a.jsonl", model: "claude-opus-4-8" })
+    const hud = hudWith(api, s.reader)
+    await hud.onSessionStart(OWNER)
+    // 100k / 200k = 50%.
+    expect(api.sent[0]!.text).toContain("50% (100k / 200k)")
+
+    s.set("claude-fable-5")
+    await hud.onStop(OWNER)
+    // Same used tokens, now against 1M → 10%.
+    expect(api.edited[api.edited.length - 1]!.text).toContain("10% (100k / 1M)")
+  })
+
+  test("unknown model falls back to the 200k default", async () => {
+    const api = new FakeApi()
+    const s = mutableSession({ transcriptPath: "/t/a.jsonl", model: "gpt-5" })
+    const hud = hudWith(api, s.reader)
+    await hud.onSessionStart(OWNER)
+    expect(api.sent[0]!.text).toContain("50% (100k / 200k)")
+  })
+
+  test("explicit override wins over the model table", async () => {
+    const api = new FakeApi()
+    const s = mutableSession({ transcriptPath: "/t/a.jsonl", model: "claude-fable-5" })
+    const hud = hudWith(api, s.reader, 500_000)
+    await hud.onSessionStart(OWNER)
+    // Override 500k beats Fable 1M: 100k / 500k = 20%.
+    expect(api.sent[0]!.text).toContain("20% (100k / 500k)")
   })
 })
