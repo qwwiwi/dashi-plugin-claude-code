@@ -100,6 +100,10 @@ export interface AskSettleEvent {
   totalQuestions: number
   // Text of the currently-open question (for the closed-card re-render).
   questionText: string | undefined
+  // Whether the currently-open question is multiSelect (autonomy M2): a
+  // multiSelect card is NEVER grant-capable, so the closed-card renderer
+  // must not present its lease marker as a mandate block either.
+  questionMultiSelect: boolean | undefined
   reason: string | undefined
 }
 
@@ -307,6 +311,7 @@ export function createAskUserQuestionRelay(
           currentIndex: req.currentIndex,
           totalQuestions: req.questions.length,
           questionText: currentQuestion?.question,
+          questionMultiSelect: currentQuestion?.multiSelect,
           reason: result.reason,
         })
       } catch (err) {

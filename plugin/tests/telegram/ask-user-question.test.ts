@@ -957,6 +957,7 @@ describe('handleSettle — timeout closes the open card (relay onSettle seam)', 
       currentIndex: 0,
       totalQuestions: 1,
       questionText: 'Q',
+      questionMultiSelect: undefined,
       reason: undefined,
     })
     expect(send.editCalls.length).toBe(0)
@@ -974,6 +975,7 @@ describe('handleSettle — timeout closes the open card (relay onSettle seam)', 
         currentIndex: 0,
         totalQuestions: 1,
         questionText: 'Q',
+        questionMultiSelect: undefined,
         reason: 'ask_user_question timed out',
       }),
     ).resolves.toBeUndefined()

@@ -10,7 +10,7 @@
 //   * timeout → open question auto-registered (marker-stripped summary)
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -174,12 +174,89 @@ describe('ask-card lease grant', () => {
     expect(Math.round(ttlH)).toBe(48)
   })
 
-  test('marker is stripped from the rendered Telegram card', async () => {
+  test('OPEN card shows the mandate block built from parsed fields (fix-loop #1 CRITICAL)', async () => {
     const h = mkHarness()
-    await submitAndRender(h, '[LEASE: deploy] Разрешаешь?', [{ label: 'Да' }, { label: 'Нет' }])
+    await submitAndRender(
+      h,
+      '[LEASE: полный прод-доступ; ttl=72h; supersede] Разрешаешь проверить staging?',
+      [{ label: 'Да' }, { label: 'Нет' }],
+    )
     const body = h.send.sendCalls[0]!.text
+    // The raw marker is stripped…
     expect(body).not.toContain('[LEASE')
-    expect(body).toContain('Разрешаешь?')
+    // …but the GRANTED scope is explicitly visible — the exploit (hidden
+    // scope behind an innocuous question) is dead.
+    expect(body).toContain('Мандат автономии')
+    expect(body).toContain('полный прод-доступ')
+    expect(body).toContain('ttl 72ч')
+    expect(body).toContain('заменит действующий мандат')
+    expect(body).toContain('Тап «Да» выдаст этот мандат')
+    expect(body).toContain('Разрешаешь проверить staging?')
+  })
+
+  test('CLOSED card (after tap) still shows the granted scope', async () => {
+    const h = mkHarness()
+    const { requestId, messageId } = await submitAndRender(
+      h,
+      '[LEASE: деплой стейджинга] Разрешаешь?',
+      [{ label: 'Да' }, { label: 'Нет' }],
+    )
+    await h.ui.handleAskCallback(tap(requestId, 0, messageId))
+    const closed = h.send.editCalls.find((e) => e.messageId === messageId)
+    expect(closed).toBeDefined()
+    expect(closed!.text).toContain('Мандат автономии')
+    expect(closed!.text).toContain('деплой стейджинга')
+    expect(closed!.text).not.toContain('[LEASE')
+  })
+
+  test('tap grants EXACTLY the rendered snapshot scope', async () => {
+    const h = mkHarness()
+    const { requestId, messageId } = await submitAndRender(
+      h,
+      '[LEASE: аудит платежей] Разрешаешь?',
+      [{ label: 'Да' }, { label: 'Нет' }],
+    )
+    const rendered = h.send.sendCalls[0]!.text
+    await h.ui.handleAskCallback(tap(requestId, 0, messageId))
+    const lease = activeLeases(loadAutonomyState({ root }, CHAT), Date.now())[0]!
+    // The granted scope is byte-identical to the parsed intent the card showed.
+    expect(lease.scope).toBe('аудит платежей')
+    expect(rendered).toContain(`«${lease.scope}»`)
+  })
+
+  test('INVALID marker (bad ttl / unknown segment) → normal question: raw text shown, tap grants NOTHING', async () => {
+    const h = mkHarness()
+    for (const [i, q] of [
+      '[LEASE: deploy; ttl=200h] Разрешаешь?', // ttl over cap — invalid, not clamped
+      '[LEASE: аудит; production] Разрешаешь?', // unknown segment — invalid
+    ].entries()) {
+      const { requestId, messageId } = await submitAndRender(h, q, [{ label: 'Да' }, { label: 'Нет' }])
+      const body = h.send.sendCalls.at(-1)!.text
+      // Honest raw render — the owner SEES the malformed marker, no block.
+      expect(body).toContain('[LEASE')
+      expect(body).not.toContain('Мандат автономии')
+      await h.ui.handleAskCallback(tap(requestId, 0, messageId))
+      expect(loadAutonomyState({ root }, CHAT).leases.length).toBe(0)
+      void i
+    }
+  })
+
+  test('multiSelect card with a marker is NEVER grant-capable (fail-closed)', async () => {
+    const h = mkHarness()
+    const q: AskQuestion = {
+      question: '[LEASE: deploy] Что разрешаешь?',
+      multiSelect: true,
+      options: [{ label: 'Да' }, { label: 'Нет' }],
+    }
+    const { requestId } = h.relay.submit({ toolUseId: 't-ms', sessionId: 's', questions: [q], chatId: CHAT })
+    await h.ui.startQuestion(requestId!)
+    const body = h.send.sendCalls.at(-1)!.text
+    expect(body).toContain('[LEASE') // raw — not grant-capable
+    expect(body).not.toContain('Мандат автономии')
+    const messageId = h.relay.getPending(requestId!)!.telegramMessageId!
+    // A `choose` tap on a multiSelect question is a toggle — must not grant.
+    await h.ui.handleAskCallback(tap(requestId!, 0, messageId))
+    expect(loadAutonomyState({ root }, CHAT).leases.length).toBe(0)
   })
 
   test('non-affirmative tap → no lease', async () => {
@@ -221,6 +298,42 @@ describe('ask-card lease grant', () => {
   })
 })
 
+describe('grant outcome feedback (fix-loop #7 — never silent)', () => {
+  test('successful grant → owner gets «Мандат L-… выдан до …»', async () => {
+    const h = mkHarness()
+    const { requestId, messageId } = await submitAndRender(
+      h,
+      '[LEASE: deploy] Разрешаешь?',
+      [{ label: 'Да' }, { label: 'Нет' }],
+    )
+    await h.ui.handleAskCallback(tap(requestId, 0, messageId))
+    const lease = loadAutonomyState({ root }, CHAT).leases[0]!
+    const feedback = h.send.sendCalls.map((c) => c.text).find((t) => t.includes('выдан до'))
+    expect(feedback).toBeDefined()
+    expect(feedback!).toContain(`Мандат ${lease.id} выдан до `)
+    expect(feedback!).toContain('UTC')
+  })
+
+  test('registry failure → owner gets «Мандат НЕ выдан: …»', async () => {
+    const h = mkHarness()
+    const { requestId, messageId } = await submitAndRender(
+      h,
+      '[LEASE: deploy] Разрешаешь?',
+      [{ label: 'Да' }, { label: 'Нет' }],
+    )
+    // Make the registry read-only AFTER the card is up: unsupported version.
+    writeFileSync(
+      join(root, `autonomy-${CHAT}.json`),
+      JSON.stringify({ version: 2, revision: 1, leases: [], questions: [] }),
+      'utf8',
+    )
+    await h.ui.handleAskCallback(tap(requestId, 0, messageId))
+    const feedback = h.send.sendCalls.map((c) => c.text).find((t) => t.includes('Мандат НЕ выдан'))
+    expect(feedback).toBeDefined()
+    expect(feedback!).toContain('version_unsupported')
+  })
+})
+
 describe('ask-card timeout → open question registered', () => {
   test('a timed-out question is registered with a marker-stripped summary', async () => {
     const h = mkHarness()
@@ -241,5 +354,27 @@ describe('ask-card timeout → open question registered', () => {
     expect(qs[0]!.summary).not.toContain('[LEASE')
     expect(qs[0]!.sticky).not.toBe(true)
     expect(qs[0]!.defaultAction).toBeUndefined()
+  })
+
+  test('IDEMPOTENT: a duplicate settle registers exactly one question (fix-loop #4)', async () => {
+    const h = mkHarness()
+    const event = {
+      requestId: 'abcde',
+      toolUseId: 't-1',
+      status: 'timeout' as const,
+      chatId: CHAT,
+      telegramMessageId: undefined,
+      currentIndex: 0,
+      totalQuestions: 1,
+      questionText: 'Вопрос без ответа?',
+      questionMultiSelect: undefined,
+      reason: 'test',
+    }
+    await h.ui.handleSettle(event)
+    await h.ui.handleSettle(event) // replayed settle → no-op
+    const qs = openQuestions(loadAutonomyState({ root }, CHAT))
+    expect(qs.length).toBe(1)
+    // Deterministic id derived from the settle identity.
+    expect(qs[0]!.id).toBe('Q-ask-abcde-0')
   })
 })
