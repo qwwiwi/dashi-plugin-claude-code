@@ -38,6 +38,13 @@ const TAIL_BYTES = 256 * 1024
 export interface ContextUsage {
   usedTokens: number
   pct: number
+  // The `message.model` id carried by the assistant turn we sourced the usage
+  // from (e.g. "claude-fable-5"), or undefined when that line has no usable
+  // model field. Claude Code hook payloads carry NO model field, but the
+  // transcript assistant lines DO — so this is the HUD's only path to the true
+  // context window (Fable = 1M). Only the SAME line the usage came from is
+  // consulted; we never scan other lines for a model.
+  model?: string
 }
 
 // Coerce an unknown usage field to a non-negative finite integer, or null if
@@ -46,6 +53,21 @@ export interface ContextUsage {
 // line is not a real billing turn and should be skipped.
 function toNonNegNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
+// Sanitize a transcript `message.model` value into a usable model id, or
+// undefined when it is not one. Accept only a non-empty string; trim it; cap
+// the length. A real model id is ~20 chars — a value past MODEL_ID_MAX_LEN (or
+// one that trims to empty) is a malformed/garbage line (e.g. a multi-KB blob
+// from a corrupt JSONL record), NOT a model, so it is DROPPED whole rather than
+// truncated-and-used. Never scan other lines: only THIS turn's field is read.
+const MODEL_ID_MAX_LEN = 100
+
+function sanitizeModelId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  if (trimmed.length === 0 || trimmed.length > MODEL_ID_MAX_LEN) return undefined
+  return trimmed
 }
 
 /**
@@ -85,7 +107,7 @@ export function computeContextUsage(
 
     const message = record.message
     if (typeof message !== 'object' || message === null) continue
-    const msg = message as { role?: unknown; usage?: unknown }
+    const msg = message as { role?: unknown; usage?: unknown; model?: unknown }
     if (msg.role !== 'assistant') continue
 
     const usage = msg.usage
@@ -110,7 +132,15 @@ export function computeContextUsage(
     // last genuine one.
     if (usedTokens === 0) continue
     const pct = windowTokens > 0 ? usedTokens / windowTokens : 0
-    return { usedTokens, pct }
+    // Capture the model from THIS same turn (the one the usage came from). Hook
+    // payloads omit the model entirely, so the transcript is the only source.
+    // Absent / empty / non-string → leave undefined; never scan other lines.
+    const result: ContextUsage = { usedTokens, pct }
+    const model = sanitizeModelId(msg.model)
+    if (model !== undefined) {
+      result.model = model
+    }
+    return result
   }
   return null
 }

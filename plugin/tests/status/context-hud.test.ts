@@ -135,8 +135,9 @@ function makeHud(
   opts: {
     dir?: string
     enabled?: boolean
-    usage?: { usedTokens: number; pct: number } | null
+    usage?: { usedTokens: number; pct: number; model?: string } | null
     session?: SessionInfoReader
+    windowOverride?: number
   } = {},
 ): ContextHud {
   return new ContextHud({
@@ -144,6 +145,7 @@ function makeHud(
     log,
     sessionInfo: opts.session ?? fakeSession({ transcriptPath: '/t/a.jsonl', model: 'opus' }),
     windowTokens: WINDOW,
+    windowOverride: opts.windowOverride,
     ownerChatIds: [OWNER],
     stateDir: opts.dir ?? stateDir(),
     enabled: opts.enabled ?? true,
@@ -432,6 +434,73 @@ function makeCards(): {
   }
   return { cards, send }
 }
+
+// The core of this PR: hook payloads carry NO model field, so the HUD must
+// derive the window from the transcript-provided model (readContextUsage →
+// usage.model). Precedence: override > transcript model (usage.model, per-turn
+// FRESH) > hook model (info.model) > fallback.
+describe('ContextHud model-from-transcript window', () => {
+  test('hook model absent + transcript model "claude-fable-5" → 1M window + model line', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api, {
+      session: fakeSession({ transcriptPath: '/t/a.jsonl' }), // NO model on the hook
+      usage: { usedTokens: 151_000, pct: 0.15, model: 'claude-fable-5' },
+    })
+    await hud.onSessionStart(OWNER)
+    const text = api.sent[0]!.text
+    expect(text).toContain('/ 1M)') // denominator is the 1M window, not 200k
+    expect(text).toContain('15% (151k / 1M)')
+    expect(text).toContain('<i>claude-fable-5</i>') // model line rendered
+  })
+
+  test('transcript model wins over hook model (per-turn fresh is authoritative)', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api, {
+      // Stale hook says opus, but the transcript's fresh turn says Fable —
+      // e.g. after a mid-session /model switch. Transcript must win.
+      session: fakeSession({ transcriptPath: '/t/a.jsonl', model: 'claude-opus-4-8' }),
+      usage: { usedTokens: 100_000, pct: 0.5, model: 'claude-fable-5' },
+    })
+    await hud.onSessionStart(OWNER)
+    const text = api.sent[0]!.text
+    expect(text).toContain('/ 1M)') // Fable (transcript) → 1M, not opus 200k
+    expect(text).toContain('<i>claude-fable-5</i>')
+  })
+
+  test('hook model used when the transcript carries none', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api, {
+      session: fakeSession({ transcriptPath: '/t/a.jsonl', model: 'claude-fable-5' }),
+      usage: { usedTokens: 100_000, pct: 0.5 }, // no transcript model
+    })
+    await hud.onSessionStart(OWNER)
+    const text = api.sent[0]!.text
+    expect(text).toContain('/ 1M)') // hook Fable → 1M when transcript is silent
+    expect(text).toContain('<i>claude-fable-5</i>')
+  })
+
+  test('explicit windowOverride still wins over the transcript model', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api, {
+      session: fakeSession({ transcriptPath: '/t/a.jsonl' }), // no hook model
+      usage: { usedTokens: 150_000, pct: 0.5, model: 'claude-fable-5' },
+      windowOverride: 300_000,
+    })
+    await hud.onSessionStart(OWNER)
+    const text = api.sent[0]!.text
+    expect(text).toContain('50% (150k / 300k)') // override 300k beats Fable 1M
+  })
+
+  test('no model anywhere → 200k fallback', async () => {
+    const api = new FakeApi()
+    const hud = makeHud(api, {
+      session: fakeSession({ transcriptPath: '/t/a.jsonl' }), // no hook model
+      usage: { usedTokens: 100_000, pct: 0.5 }, // no transcript model
+    })
+    await hud.onSessionStart(OWNER)
+    expect(api.sent[0]!.text).toContain('50% (100k / 200k)')
+  })
+})
 
 describe('parseHudCallback', () => {
   test('accepts compact / new; rejects the rest', () => {

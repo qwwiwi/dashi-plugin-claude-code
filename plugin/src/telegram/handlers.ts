@@ -19,6 +19,7 @@ import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 
 import type { AppConfig, StatePaths } from '../config.js'
 import {
+  resolveContextWindowOverride,
   resolveContextWindowTokens,
   resolveGuestModeAllowedUserIds,
   resolveGuestModeEnabled,
@@ -1273,6 +1274,9 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
       // learned from hook events (per chat when multichat). Snapshot at
       // command time — /status is itself a snapshot.
       const session = deps.sessionInfo?.get(chatId)
+      // Operator override resolved once — passed SEPARATELY so /status can
+      // resolve the window model-aware (transcript model → 1M) like the HUD.
+      const windowOverride = resolveContextWindowOverride(deps.config)
       const oobCtx: OobContext = {
         chatId,
         senderId,
@@ -1283,6 +1287,7 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
         stateDir: deps.statePaths.root,
         contextWindowTokens: resolveContextWindowTokens(deps.config),
         uptimeSeconds: process.uptime(),
+        ...(windowOverride !== undefined ? { contextWindowOverride: windowOverride } : {}),
         ...(session?.transcriptPath ? { transcriptPath: session.transcriptPath } : {}),
         ...(session?.model ? { modelName: session.model } : {}),
         ...(deps.statusManager

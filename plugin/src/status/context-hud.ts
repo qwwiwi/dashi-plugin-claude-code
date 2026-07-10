@@ -676,24 +676,40 @@ export class ContextHud {
     chatId: string,
   ): Promise<{ text: string; keyboard: InlineKeyboardLike }> {
     const info = this.sessionInfo.get(chatId)
-    // Model-aware window: an explicit operator override wins; otherwise the
-    // session model id (SessionStart/Stop hook) drives the denominator so a
-    // Fable-5 session reports its 1M window instead of the 200k default. An
-    // unknown/absent model falls back to the configured default (windowTokens).
-    // Recomputed each render so a mid-session model switch is picked up.
-    const windowTokens = resolveContextWindowForModel(info.model, {
-      override: this.windowOverride,
-      fallback: this.windowTokens,
-    })
+    // Read the transcript FIRST — it carries the true `message.model` id that
+    // Claude Code hook payloads do NOT (empirically verified 2026-07-10: no
+    // `model` key on SessionStart/Stop hooks). The window passed here only
+    // affects usage.pct, which renderHud recomputes from usedTokens and never
+    // consumes — so a provisional fallback window is safe.
     let usage: ContextUsage | null = null
     if (info.transcriptPath !== undefined && info.transcriptPath.length > 0) {
       try {
-        usage = await this.readUsage(info.transcriptPath, windowTokens)
+        usage = await this.readUsage(info.transcriptPath, this.windowTokens)
       } catch {
         // readContextUsage already swallows I/O; guard the injected fn too.
         usage = null
       }
     }
+    // Model-aware window. Precedence: explicit operator override >
+    // transcript-derived model (message.model — per-turn FRESH and authoritative,
+    // it is the id the API actually served this turn) > hook-provided model
+    // (info.model, honored only as a fallback if a future harness adds one) >
+    // configured default. Transcript-first because (a) a hook model unknown to
+    // the table must not block a valid transcript model, and (b) SessionInfoStore
+    // MERGES hook facts, so a stale hook model would otherwise stick past a
+    // mid-session /model switch and beat the fresh transcript value. Empty-string
+    // guards defend against an alternative SessionInfoReader implementation.
+    // Recomputed each render so a mid-session model switch is picked up.
+    const transcriptModel = usage?.model
+    const hookModel = info.model
+    const model = (transcriptModel !== undefined && transcriptModel.length > 0
+      ? transcriptModel
+      : undefined)
+      ?? (hookModel !== undefined && hookModel.length > 0 ? hookModel : undefined)
+    const windowTokens = resolveContextWindowForModel(model, {
+      override: this.windowOverride,
+      fallback: this.windowTokens,
+    })
     // M3: the reconciled (pane-verified) view wins over the event-only snapshot.
     const rv = this.reconciled.get(chatId)
     const permissionMode =
@@ -703,7 +719,7 @@ export class ContextHud {
     const work: HudWorkView = rv !== undefined
       ? { todos: rv.todos, freshness: rv.freshness, ...permissionMode }
       : { todos: this.work.get(chatId)?.todos ?? [], ...permissionMode }
-    return renderHud(usage, windowTokens, info.model, work)
+    return renderHud(usage, windowTokens, model, work)
   }
 
   // Resolve the HUD message id for a chat: in-memory cache → persisted file →

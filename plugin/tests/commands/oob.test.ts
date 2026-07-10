@@ -398,6 +398,69 @@ describe('/status context line', () => {
     const result = await handleOobCommand(parsed, makeCtx())
     expect(result.replyToTelegram!.text).toContain('контекст: <code>—</code>')
   })
+
+  // Parity with the pinned HUD: a Fable transcript resolves the 1M window
+  // model-aware, not the 200k default fallback carried in contextWindowTokens.
+  test('Fable transcript → model-aware 1M window (HUD parity)', async () => {
+    const { writeFileSync, mkdtempSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const { tmpdir } = await import('node:os')
+    const dir = mkdtempSync(join(tmpdir(), 'oob-status-fable-'))
+    const transcript = join(dir, 's.jsonl')
+    // input 100000 + cache_read 51000 = 151000 tokens, model claude-fable-5.
+    writeFileSync(
+      transcript,
+      JSON.stringify({
+        isSidechain: false,
+        message: {
+          role: 'assistant',
+          model: 'claude-fable-5',
+          usage: { input_tokens: 100000, cache_read_input_tokens: 51000 },
+        },
+      }) + '\n',
+    )
+    const parsed = parseOobCommand('/status')!
+    const result = await handleOobCommand(
+      parsed,
+      // contextWindowTokens = 200k default (no operator override) → the Fable
+      // model must lift the denominator to 1M, matching the HUD.
+      makeCtx({ transcriptPath: transcript, contextWindowTokens: 200000 }),
+    )
+    const text = result.replyToTelegram!.text
+    expect(text).toContain('151k / 1M (15%)')
+    expect(text).not.toContain('/ 200k')
+  })
+
+  // The explicit operator override still wins over the transcript model.
+  test('operator override wins over the transcript model', async () => {
+    const { writeFileSync, mkdtempSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const { tmpdir } = await import('node:os')
+    const dir = mkdtempSync(join(tmpdir(), 'oob-status-ovr-'))
+    const transcript = join(dir, 's.jsonl')
+    writeFileSync(
+      transcript,
+      JSON.stringify({
+        isSidechain: false,
+        message: {
+          role: 'assistant',
+          model: 'claude-fable-5',
+          usage: { input_tokens: 150000 },
+        },
+      }) + '\n',
+    )
+    const parsed = parseOobCommand('/status')!
+    const result = await handleOobCommand(
+      parsed,
+      makeCtx({
+        transcriptPath: transcript,
+        contextWindowTokens: 300000,
+        contextWindowOverride: 300000,
+      }),
+    )
+    const text = result.replyToTelegram!.text
+    expect(text).toContain('150k / 300k (50%)') // override 300k beats Fable 1M
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────

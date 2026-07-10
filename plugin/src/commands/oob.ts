@@ -47,7 +47,7 @@ import { buildCcKeyboard, CC_PANEL_HEADER } from '../telegram/cc-panel-ui.js'
 import { buildNewConfirmCard } from '../telegram/newq-confirm-ui.js'
 import { controlFailureMessage } from '../telegram/control-result.js'
 import { readContextUsage, formatContextUsage } from '../status/context-usage.js'
-import { DEFAULT_CONTEXT_WINDOW_TOKENS } from '../config.js'
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, resolveContextWindowForModel } from '../config.js'
 
 export type OobCommandName = 'help' | 'status' | 'stop' | 'compact' | 'new' | 'mirror' | 'keys' | 'cc'
 
@@ -174,11 +174,18 @@ export interface OobContext {
   stateDir?: string
   // Context-usage bits for /status (task 5). transcriptPath comes from the
   // SessionInfoStore (latest hook event); modelName from a SessionStart hook;
-  // contextWindowTokens from config (resolveContextWindowTokens). All optional
-  // — when transcriptPath is absent /status shows «контекст: —».
+  // contextWindowTokens from config (resolveContextWindowTokens — the resolved
+  // override-or-default, used as the FALLBACK denominator). All optional — when
+  // transcriptPath is absent /status shows «контекст: —».
   transcriptPath?: string
   modelName?: string
   contextWindowTokens?: number
+  // The EXPLICIT operator override (resolveContextWindowOverride), passed
+  // SEPARATELY from contextWindowTokens so /status can resolve the window
+  // model-aware (transcript model → 1M for Fable) exactly like the pinned HUD:
+  // override wins, else the transcript model's table window, else the fallback.
+  // Undefined when no operator override is configured.
+  contextWindowOverride?: number
   // Process uptime in seconds (process.uptime()); rendered when present.
   uptimeSeconds?: number
 }
@@ -279,12 +286,24 @@ async function statusText(ctx: OobContext): Promise<string> {
   }
 
   // Context usage — read the transcript tail when we have a path. `usage` is
-  // null on any read failure / no usable turn → render «—».
-  const windowTokens = ctx.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS
+  // null on any read failure / no usable turn → render «—». The window passed
+  // to readContextUsage only seeds usage.pct (which formatContextUsage
+  // recomputes), so a provisional fallback here is safe — the DISPLAYED
+  // denominator is resolved model-aware below, matching the pinned HUD.
+  const fallbackWindow = ctx.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS
   let contextLine = '—'
   if (ctx.transcriptPath) {
-    const usage = await readContextUsage(ctx.transcriptPath, windowTokens)
-    if (usage) contextLine = formatContextUsage(usage, windowTokens)
+    const usage = await readContextUsage(ctx.transcriptPath, fallbackWindow)
+    if (usage) {
+      // Same precedence as ContextHud: explicit override > transcript model
+      // (usage.model) > fallback. So a Fable session reports its 1M window here
+      // instead of the 200k default — /status and the HUD agree.
+      const windowTokens = resolveContextWindowForModel(usage.model, {
+        override: ctx.contextWindowOverride,
+        fallback: fallbackWindow,
+      })
+      contextLine = formatContextUsage(usage, windowTokens)
+    }
   }
   lines.push(`контекст: <code>${escapeHtml(contextLine)}</code>`)
 
