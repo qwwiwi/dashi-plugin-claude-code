@@ -20,7 +20,7 @@ It replaces the deprecated `claude -p` gateway pattern (a Python daemon that spa
 
 One plugin process = one Telegram bot = one agent. By default it serves **a single DM chat** (legacy single-session mode). With `multichat.enabled` turned on, the same bot fans incoming messages out across several per-chat tmux sessions of one identity — see section [3](#3-multichat--how-it-works-and-why).
 
-> **Status:** in production across a multi-agent fleet. Current release — **[v1.1.0](CHANGELOG.md)** (2026-07-04): rich messages, Guest Mode, context HUD + pinned status card — see section [15](#15-whats-new-in-v110--rich-messages-guest-mode-context-hud--status-pin). Versioning and release process: [CHANGELOG.md](CHANGELOG.md) · [docs/RELEASING.md](docs/RELEASING.md). CI: `bun test` + `bun run typecheck` must pass clean before merge.
+> **Status:** in production across a multi-agent fleet. Current release — **[v1.2.0](CHANGELOG.md)** (2026-07-10): model-aware context HUD, task pin reality mirror, output formatting polish — see section [15](#15-whats-new). Versioning and release process: [CHANGELOG.md](CHANGELOG.md) · [docs/RELEASING.md](docs/RELEASING.md). CI: `bun test` + `bun run typecheck` must pass clean before merge.
 
 ---
 
@@ -40,7 +40,7 @@ One plugin process = one Telegram bot = one agent. By default it serves **a sing
 12. [Quick start and documentation](#12-quick-start-and-documentation)
 13. [Why migrate — the 2026-06-15 deadline](#13-why-migrate--the-2026-06-15-deadline)
 14. [Multi-agent — a fleet of agents under one subscription](#14-multi-agent--a-fleet-of-agents-under-one-subscription)
-15. [What's new in v1.1.0 — rich messages, Guest Mode, context HUD + status pin](#15-whats-new-in-v110--rich-messages-guest-mode-context-hud--status-pin)
+15. [What's new](#15-whats-new)
 
 ---
 
@@ -158,7 +158,7 @@ chats:
     system_reminder: "Public group. No internal logs or mirrors."
 ```
 
-`PersonaManager` overlays a per-chat persona file on top of the single identity — no separate `CLAUDE.md` per chat is needed. Logs: `{state_dir}/chats/<chat_id>/{inbox,outbox,processing,dead-letter}/*.json`.
+The per-chat persona overlay is applied by the SessionStart hook `chats/hooks/session-start.sh`: it reads the chat's persona file (resolved relative to `multichat.workspace_dir`) inside the tmux session and injects it on top of the single identity via `additionalContext` — no separate `CLAUDE.md` per chat is needed. Logs: `{state_dir}/chats/<chat_id>/{inbox,outbox,processing,dead-letter}/*.json`.
 
 **Failure mode:** an invalid `policy.yaml` → the plugin logs the error and degrades to multichat-OFF (legacy single-DM). Better to work with one chat than to crash entirely.
 
@@ -797,11 +797,41 @@ For migration context see `docs/04-migration-from-gateway.md` and section 13.
 
 ---
 
-## 15. What's new in v1.1.0 — rich messages, Guest Mode, context HUD + status pin
+## 15. What's new
 
-Everything shipped in early July 2026 (PRs #86, #94–#97). Full history: [CHANGELOG.md](CHANGELOG.md); how releases are cut: [docs/RELEASING.md](docs/RELEASING.md).
+Release highlights, newest first. Full history: [CHANGELOG.md](CHANGELOG.md); how releases are cut: [docs/RELEASING.md](docs/RELEASING.md).
 
-### Rich messages (Bot API 10.1)
+### v1.2.0 (2026-07-10) — model-aware HUD, task pin reality mirror, output polish
+
+Shipped 2026-07-10 (PRs #100–#108).
+
+#### Model-aware context HUD (PRs #106, #107)
+
+The context-% denominator is no longer a fixed default — it is resolved from the **session model**. A Fable-class model reports its true **1M-token** window (so the pin reads `… / 1M` instead of pretending it is a 200k session), and the session model is read from the **transcript**, so the correct window is picked automatically with no manual step.
+
+- **Override still available and always wins:** set the window explicitly with config `context_window_tokens` or env **`JARVIS_CONTEXT_WINDOW`**. Precedence is config `context_window_tokens` > env `JARVIS_CONTEXT_WINDOW` > per-model table — an explicit operator value beats the table, so a wrong table guess is fixable at runtime.
+- A model id carrying an explicit `[1m]` / `1m` window marker (e.g. `claude-opus-4-8[1m]`) is honored as 1M regardless of family.
+
+#### Task pin: expandable list + tmux reality mirror (PRs #100, #104)
+
+The single pinned status card can **expand** to show the full current task list, and the task snapshot is **reset on session start** so a fresh session no longer inherits the previous one's tasks. A tmux-pane **reality mirror** reconciles the pinned task list with the state detected in the tmux pane, so what you see in the pin matches the session's actual tasks rather than only hook-derived events.
+
+#### Telegram output formatting (PR #105)
+
+Newline preservation in the rich message path, a heading-affinity chunker (a heading stays with the block it introduces when a long message is split), and a documented tone-of-voice contract ([plugin/docs/TOV.md](plugin/docs/TOV.md)).
+
+#### Fixes and hygiene (PRs #101, #102, #103, #108)
+
+- **v2.1.201 pane classifier:** `classifyPane` recognizes the Claude Code v2.1.201 busy spinner, so a working session isn't misread as idle.
+- **Zoom join links:** the `pwd=` parameter on a recognized `zoom.us` join URL is intentionally preserved so shared meeting links stay usable; the exemption is scoped by a query-param allowlist (`pwd`, `uname`, `omn`), with a raw-NUL strip on input to mitigate placeholder spoofing.
+- **Precise permission gate:** the git-exec-surface detector no longer raises false confirmation cards for benign git usage while keeping RCE protection.
+- **Repo refactor:** `webhook/server.ts` split into route modules, the unused `persona-manager.ts` removed (the persona overlay is applied by the SessionStart hook `chats/hooks/session-start.sh`), tracked junk purged, `.gitignore` hardened.
+
+### v1.1.0 (2026-07-04) — rich messages, Guest Mode, context HUD + status pin
+
+Shipped in early July 2026 (PRs #86, #94–#97).
+
+#### Rich messages (Bot API 10.1)
 
 DM replies auto-upgrade to `sendRichMessage`: Telegram renders **raw markdown server-side** — native headings, tables, task-lists, math, `<details>` collapsibles, footnotes — and the body cap is **32 768 bytes** (vs 4 096 for a normal message), so a long structured answer ships as ONE message instead of being chunked and lossily HTML-converted.
 
@@ -811,7 +841,7 @@ DM replies auto-upgrade to `sendRichMessage`: Telegram renders **raw markdown se
 - **Controls:** kill switch — env `TELEGRAM_RICH_MESSAGES=0` or config `richMessages.enabled=false`; per-chat opt-out — config `richMessages.perChatOptOut` or env `TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT` (CSV of chat ids).
 - **Scope:** DMs only for now. Group/multichat replies and Guest Mode answers keep the HTML path.
 
-### Guest Mode (one-shot @-mentions)
+#### Guest Mode (one-shot @-mentions)
 
 @-mention the bot in **any chat it is NOT a member of** and the agent receives a one-shot query: the inbound message carries `guest="1"` and a `guest_query_id`, and the answer is delivered into that foreign chat via `answerGuestQuery` — visible to everyone there.
 
@@ -819,9 +849,9 @@ DM replies auto-upgrade to `sendRichMessage`: Telegram renders **raw markdown se
 - **One-shot contract:** exactly one answer per query, ≤4096 chars, no attachments, no threading; the query expires ~15 minutes after arrival.
 - **Enabling requires both switches:** the Guest Mode toggle in BotFather AND `guest_mode.enabled=true` in config (a missing block means OFF).
 
-### Context HUD + a single pinned status card
+#### Context HUD + a single pinned status card
 
-The owner's DM keeps exactly **one pinned service message**: context-window %, session mode, and current tasks, re-anchored above the terminal mirror on every inbound message. Service bubbles are auto-deleted; the command menu is owner-scoped; `/compact`, `/new`, `/status` are state-aware (driven through the live TUI). `AskUserQuestion` dialogs are relayed as Telegram **inline buttons** — answer the agent's multiple-choice questions with one tap.
+The owner's DM keeps exactly **one pinned service message**: context-window %, session mode, and current tasks, re-anchored above the terminal mirror on every inbound message. Service bubbles are auto-deleted; the command menu is owner-scoped; `/compact`, `/new`, `/status` are state-aware (driven through the live TUI). `AskUserQuestion` dialogs are relayed as Telegram **inline buttons** — answer the agent's multiple-choice questions with one tap. (In v1.2.0 the context-% denominator became model-aware — see above.)
 
 Config: `hud.enabled` (optional block; a missing block means ON). Owner chats come from the owner allowlist — the HUD and its buttons never appear in groups.
 
