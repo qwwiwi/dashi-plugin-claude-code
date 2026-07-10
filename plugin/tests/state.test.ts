@@ -47,6 +47,7 @@ describe('ensureStateDirs', () => {
     expect(existsSync(paths.sessionIds)).toBe(true)
     expect(existsSync(paths.deadLetterUpdates)).toBe(true)
     expect(existsSync(paths.deadLetterWebhook)).toBe(true)
+    expect(existsSync(paths.deadLetterOutbound)).toBe(true)
   })
 })
 
@@ -120,6 +121,10 @@ describe('writeDeadLetter', () => {
 
     const webhookPath = writeDeadLetter(paths, 'webhook', { foo: 'bar' })
     expect(webhookPath.startsWith(paths.deadLetterWebhook)).toBe(true)
+
+    const outboundPath = writeDeadLetter(paths, 'outbound', { method: 'sendMessage' })
+    expect(outboundPath.startsWith(paths.deadLetterOutbound)).toBe(true)
+    expect(existsSync(outboundPath)).toBe(true)
   })
 
   test('file content has wrapper with ts/bucket/value', () => {

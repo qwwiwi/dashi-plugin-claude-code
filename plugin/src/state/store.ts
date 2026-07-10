@@ -46,6 +46,7 @@ export function ensureStateDirs(paths: StatePaths): void {
   mkdirSync(paths.sessionIds, { recursive: true })
   mkdirSync(paths.deadLetterUpdates, { recursive: true })
   mkdirSync(paths.deadLetterWebhook, { recursive: true })
+  mkdirSync(paths.deadLetterOutbound, { recursive: true })
   // logs/ — server.log etc. live here; create parent so first log write succeeds.
   mkdirSync(dirname(paths.logs.server), { recursive: true })
 }
@@ -115,7 +116,7 @@ export function migrateLegacyAllowlist(paths: StatePaths): boolean {
 // writeDeadLetter — quarantine bucket for un-processable inputs
 // ─────────────────────────────────────────────────────────────────────
 
-export type DeadLetterBucket = 'updates' | 'webhook'
+export type DeadLetterBucket = 'updates' | 'webhook' | 'outbound'
 
 /**
  * Wrap a value as `{ ts, bucket, value }` and write it to the bucket's
@@ -131,7 +132,12 @@ export function writeDeadLetter(
   value: unknown,
 ): string {
   const ts = new Date().toISOString()
-  const dir = bucket === 'updates' ? paths.deadLetterUpdates : paths.deadLetterWebhook
+  const dir =
+    bucket === 'updates'
+      ? paths.deadLetterUpdates
+      : bucket === 'webhook'
+        ? paths.deadLetterWebhook
+        : paths.deadLetterOutbound
   const safeTs = ts.replace(/[:.]/g, '-')
   const rand = Math.random().toString(36).slice(2, 8)
   const file = join(dir, `${safeTs}-${process.pid}-${rand}.json`)

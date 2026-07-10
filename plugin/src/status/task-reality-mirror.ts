@@ -63,6 +63,7 @@ import {
   type ToolTaskEvent,
 } from './task-reconciler.js'
 import { formatUtcHm, type TaskFreshness } from './task-freshness.js'
+import type { LivenessMonitor } from './heartbeat-monitor.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // Sink contract — the surfaces the reconciled view is pushed into.
@@ -101,6 +102,11 @@ export interface TaskRealityMirrorOptions {
   ttlMs?: number
   /** Owner-chat gate — the reconciler acts ONLY for owner DM chats. */
   isOwnerChat?: (chatId: string) => boolean
+  /** M4 mechanical liveness (heartbeat + dead-man + open-question reminders).
+   *  Optional and best-effort: when omitted the reconciler behaves exactly as
+   *  before. Fed the pane captures (its dead-man diffs the SAME capture this
+   *  file already runs — no second capture path) and evaluated once per tick. */
+  liveness?: LivenessMonitor
   /** Plugin state dir. When set, the session-epoch state (active + retired
    *  tombstones) is persisted per chat (`task-reality-epoch-<chat>.json`) so a
    *  plugin restart cannot be rolled back by late lifecycle stragglers
@@ -161,6 +167,7 @@ export class TaskRealityMirror {
   private readonly coalesceWindowMs: number
   private readonly ttlMs: number
   private readonly isOwnerChat: (chatId: string) => boolean
+  private readonly liveness: LivenessMonitor | undefined
   private readonly now: () => number
   private readonly setTimer: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>
   private readonly clearTimer: (handle: ReturnType<typeof setTimeout>) => void
@@ -187,6 +194,7 @@ export class TaskRealityMirror {
     this.coalesceWindowMs = opts.coalesceWindowMs ?? DEFAULT_COALESCE_WINDOW_MS
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS
     this.isOwnerChat = opts.isOwnerChat ?? ((): boolean => true)
+    this.liveness = opts.liveness
     this.stateDir = opts.stateDir
     this.now = opts.now ?? ((): number => Date.now())
     this.setTimer = opts.setTimer ?? ((cb, ms): ReturnType<typeof setTimeout> => setTimeout(cb, ms))
@@ -261,6 +269,9 @@ export class TaskRealityMirror {
       rec.turnActive = false
       rec.lastActivityMs = this.now()
       this.pushView(rec)
+      // M4: the turn ended — clear the heartbeat pin suffix and reset the
+      // per-turn heartbeat/dead-man budget. Best-effort (the monitor swallows).
+      this.liveness?.onTurnEnd(chatId)
     } catch (err) {
       this.warn('onStop', chatId, err)
     }
@@ -413,6 +424,10 @@ export class TaskRealityMirror {
     this.disarm(rec)
     rec.revision += 1
     if (this.recs.get(rec.chatId) === rec) this.recs.delete(rec.chatId)
+    // M4: the session is gone (SessionEnd / hard TTL / shutdown) — drop the
+    // liveness state for this chat so no heartbeat/dead-man fires for a dead
+    // session. Best-effort.
+    this.liveness?.onChatGone(rec.chatId)
   }
 
   // ─── tombstones ──────────────────────────────────────────────────────
@@ -550,6 +565,14 @@ export class TaskRealityMirror {
     // Advance the freshness indicator (minute buckets) even if the capture is
     // async / a no-op; the sinks dedup identical renders.
     this.pushView(rec)
+    // M4: per-tick heartbeat + open-question reminder evaluation. Dead-man is
+    // driven separately from doCapture (it needs the fresh pane hash). Passes
+    // the reconciled in-progress task so a heartbeat names what we're doing.
+    this.liveness?.evaluate(rec.chatId, {
+      turnActive: rec.turnActive,
+      inProgressTask: currentInProgressTask(rec.state),
+      nowMs: this.now(),
+    })
     this.scheduleTick(rec)
   }
 
@@ -585,6 +608,12 @@ export class TaskRealityMirror {
     try {
       const cap = await capturePaneText(this.exec, this.capture)
       if (rec.revision !== rev || rec.ended) return
+      // M4 dead-man: feed the SAME capture to the liveness monitor (no second
+      // capture path). Only meaningful when the pane was actually read (ok);
+      // a failed capture yields no hash to diff. Best-effort.
+      if (this.liveness !== undefined && cap.ok) {
+        this.liveness.observePane(rec.chatId, cap.text, this.now(), rec.turnActive)
+      }
       // Stamp capturedAt NOW — the moment capture-pane returned — so an event
       // landing during the cwd resolution below can never be out-ranked by
       // this (older) pane text (review 2026-07-10 #3).
@@ -754,6 +783,16 @@ export function applyEventToEventMap(map: Map<string, TodoItem>, event: TaskMuta
       applyTaskUpdateToMap(map, event)
       return
   }
+}
+
+/**
+ * The description of the FIRST in-progress reconciled task (what the heartbeat
+ * names as «работаю: …»), or null when nothing is marked in-progress. Uses the
+ * same projection the surfaces render so the label matches the pin exactly.
+ */
+export function currentInProgressTask(state: ReconciledState): string | null {
+  const hit = reconciledToTodos(state).find((t) => t.status === 'in_progress')
+  return hit !== undefined ? hit.content : null
 }
 
 /** Project the reconciled state into the TodoItem list the surfaces render. */

@@ -37,7 +37,7 @@ import {
   type StatePaths,
 } from './config.js'
 import { createLogger } from './log.js'
-import { ensureStateDirs, migrateLegacyAllowlist } from './state/store.js'
+import { ensureStateDirs, migrateLegacyAllowlist, writeDeadLetter } from './state/store.js'
 import {
   callTool,
   createTelegramApi,
@@ -46,6 +46,9 @@ import {
 } from './channel/tools.js'
 import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
 import { createRateLimitedTelegramApi } from './safety/rate-limited-telegram-api.js'
+import { createReliableTelegramApi } from './safety/reliable-telegram-api.js'
+import { OutboundActivityTracker } from './status/outbound-activity.js'
+import { HeartbeatMonitor } from './status/heartbeat-monitor.js'
 import { createRichLatch } from './safety/rich-latch.js'
 import { redactSecrets } from './safety/redact.js'
 import { StatusManager } from './status/status-manager.js'
@@ -454,7 +457,20 @@ const apiSecrets: string[] = [...logSecrets, env.TELEGRAM_BOT_TOKEN]
 // restart re-probes capability, which is correct — Telegram may roll the
 // method out between restarts.
 const richLatch = createRichLatch()
-const telegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSecrets, richLatch)
+const safeTelegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSecrets, richLatch)
+// M4 (2026-07-10): OUTERMOST reliability layer. Every caller send passes
+// through here first — it retries transient failures (network / 5xx / 429),
+// dead-letters a transient exhaustion under the `outbound` bucket, and stamps
+// the outbound-activity clock on every successful NEW-message send. That clock
+// is what the mechanical heartbeat/dead-man read to know when the owner last
+// heard from us. editMessageText is retried but NOT stamped (pin edits don't
+// ping — see the wrapper header). Composition:
+//   caller → reliable → safe(redact/validate) → rateLimited(queue+429) → raw.
+const outboundTracker = new OutboundActivityTracker()
+const telegramApi = createReliableTelegramApi(safeTelegramApi, log, {
+  deadLetter: (record) => writeDeadLetter(statePaths, 'outbound', record),
+  recordOutbound: (chatId, atMs) => outboundTracker.record(chatId, atMs),
+})
 
 const mcp = new Server(
   // Single version source: package.json (kept in lockstep with the repo-root
@@ -638,6 +654,29 @@ let taskRealityMirror: TaskRealityMirror | undefined
 if (resolveTaskReconcilerEnabled()) {
   const paneTarget = config.tmux_mirror.pane_target || resolveDefaultPaneTarget()
   const ownerSet = new Set(hudOwnerChatIds.map(String))
+  // Owner DM only (positive numeric chat id in the owner set) — the pane is the
+  // single global DM session; a group chat must never be reconciled or nudged.
+  const isReconcilerOwnerChat = (chatId: string): boolean => {
+    if (!ownerSet.has(chatId)) return false
+    const n = Number(chatId)
+    return Number.isInteger(n) && n > 0
+  }
+  // M4 mechanical liveness. Runs inside the reality-mirror loop (fed pane
+  // captures for the dead-man, evaluated each ~20s tick for heartbeat +
+  // open-question reminders). Reads the outbound clock + the autonomy registry
+  // (open questions ONLY, read-only — never lease TTLs); sends via the reliable
+  // api and edits the context pin via the HUD's heartbeat suffix.
+  const heartbeatMonitor = new HeartbeatMonitor({
+    log,
+    send: (chatId: string, text: string): Promise<void> =>
+      telegramApi.sendMessage(chatId, text, {}).then(() => undefined),
+    pinHeartbeat: (chatId: string, suffix: string | null): Promise<void> =>
+      contextHud.setHeartbeatSuffix(chatId, suffix),
+    autonomyPaths: { root: statePaths.root },
+    lastOutboundAt: (chatId: string): number | undefined =>
+      outboundTracker.lastOutboundAt(chatId),
+    isOwnerChat: isReconcilerOwnerChat,
+  })
   taskRealityMirror = new TaskRealityMirror({
     exec: defaultTmuxExec,
     capture: {
@@ -650,13 +689,8 @@ if (resolveTaskReconcilerEnabled()) {
     // Session-epoch persistence (active + tombstones) — survives restarts so
     // late lifecycle stragglers can't roll the epoch back (review r3 #1).
     stateDir: statePaths.root,
-    // Owner DM only (positive numeric chat id in the owner set) — the pane is
-    // the single global DM session; a group chat must never be reconciled.
-    isOwnerChat: (chatId: string): boolean => {
-      if (!ownerSet.has(chatId)) return false
-      const n = Number(chatId)
-      return Number.isInteger(n) && n > 0
-    },
+    isOwnerChat: isReconcilerOwnerChat,
+    liveness: heartbeatMonitor,
   })
   log.info('task reality mirror configured', { pane_target: paneTarget })
   const shutdownReality = (): void => taskRealityMirror?.stop()
