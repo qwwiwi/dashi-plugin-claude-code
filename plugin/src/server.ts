@@ -37,7 +37,7 @@ import {
   type StatePaths,
 } from './config.js'
 import { createLogger } from './log.js'
-import { ensureStateDirs, migrateLegacyAllowlist } from './state/store.js'
+import { ensureStateDirs, migrateLegacyAllowlist, writeDeadLetter } from './state/store.js'
 import {
   callTool,
   createTelegramApi,
@@ -46,6 +46,9 @@ import {
 } from './channel/tools.js'
 import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
 import { createRateLimitedTelegramApi } from './safety/rate-limited-telegram-api.js'
+import { createReliableTelegramApi } from './safety/reliable-telegram-api.js'
+import { OutboundActivityTracker } from './status/outbound-activity.js'
+import { HeartbeatMonitor } from './status/heartbeat-monitor.js'
 import { createRichLatch } from './safety/rich-latch.js'
 import { redactSecrets } from './safety/redact.js'
 import { StatusManager } from './status/status-manager.js'
@@ -428,21 +431,18 @@ if (!tokenLock.acquire(statePaths)) {
 // ─────────────────────────────────────────────────────────────────────
 
 const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
-// Raw API talks to grammy. Safe wrapper sits in front of every downstream
-// consumer (StatusManager, oob, handlers, poller, webhook). The wrapper:
-//   1. redactSecrets(text, logSecrets) before delegating to raw API.
-//   2. validateTelegramHtml(text) when parse_mode=='HTML'; downgrade on
-//      invalid markup (strip parse_mode, ship escaped plain).
-// No call site can bypass — the raw `telegramApi` reference is shadowed
-// after this line. Anything that imports TelegramApi from channel/tools
-// receives the wrapped instance via toolDeps / handlerDeps / StatusManager.
+// Raw API talks to grammy. Every downstream consumer (StatusManager, oob,
+// handlers, poller, webhook) receives the fully layered instance built below.
+// Composition (fix-loop-1 #9 — this comment is the canonical map):
+//   caller → reliableTelegramApi (bounded retry + dead-letter + outbound clock)
+//          → safeTelegramApi     (redactSecrets + validateTelegramHtml downgrade)
+//          → rateLimitedTelegramApi (per-chat FIFO + token buckets + 429 retry)
+//          → rawTelegramApi      (grammY).
+// Sanitize runs before the queue so it holds already-redacted/validated
+// payloads (no secret leak if a queued op gets logged); the reliable layer is
+// OUTERMOST so its verdict reflects the final outcome of the whole stack.
+// No call site can bypass — the raw reference is shadowed below.
 const rawTelegramApi = createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN)
-// Composition: caller → safeTelegramApi (sanitize) → rateLimitedTelegramApi
-// (queue + 429 retry) → rawTelegramApi (grammY). Sanitize runs FIRST so the
-// queue holds already-redacted/validated payloads (no secret leak if a
-// queued op gets logged; no time wasted enqueueing text that would later be
-// downgraded). A burst of replies now paces itself instead of surfacing as
-// a 429 to the agent.
 const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log)
 // The bot token itself is included in extraSecrets so any code path that
 // accidentally tries to ship the token (e.g. error message including a
@@ -454,7 +454,28 @@ const apiSecrets: string[] = [...logSecrets, env.TELEGRAM_BOT_TOKEN]
 // restart re-probes capability, which is correct — Telegram may roll the
 // method out between restarts.
 const richLatch = createRichLatch()
-const telegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSecrets, richLatch)
+const safeTelegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSecrets, richLatch)
+// M4 (2026-07-10): OUTERMOST reliability layer. Every caller send passes
+// through here first — it retries provably-undelivered transient failures
+// (pre_send; ambiguous ones dead-letter without retry — see the wrapper's
+// loss-vs-duplicate header), dead-letters non-retried/exhausted transients
+// under the `outbound` bucket, and stamps the outbound-activity clock on every
+// successful NEW-message send (unless the call opts out via skipOutboundStamp
+// — internal HUD/heartbeat sends). That clock is what the mechanical
+// heartbeat/dead-man read to know when the owner last heard from us.
+// editMessageText is retried but NOT stamped (pin edits don't ping).
+// The dead-letter error text is redacted (fix-loop-1 #7a) — a transport error
+// can embed the api.telegram.org/bot<token>/ URL, and the quarantine files,
+// while 0600, must never store the token.
+const outboundTracker = new OutboundActivityTracker()
+const telegramApi = createReliableTelegramApi(safeTelegramApi, log, {
+  deadLetter: (record) =>
+    writeDeadLetter(statePaths, 'outbound', {
+      ...record,
+      error: redactSecrets(record.error, apiSecrets),
+    }),
+  recordOutbound: (chatId, atMs) => outboundTracker.record(chatId, atMs),
+})
 
 const mcp = new Server(
   // Single version source: package.json (kept in lockstep with the repo-root
@@ -522,7 +543,11 @@ const sessionInfoStore = new SessionInfoStore()
 // DM pane.
 const hudOwnerChatIds: ReadonlyArray<number | string> = resolveOwnerChatIds(config)
 const hudApi: HudTelegramApi = {
-  sendMessage: (chatId, text, opts) => telegramApi.sendMessage(chatId, text, opts),
+  // skipOutboundStamp (fix-loop-1 #6): a HUD pin (re)creation is an INTERNAL
+  // surface, not a report to the owner — it must never reset the heartbeat
+  // silence window, or a pin self-heal would silently starve the heartbeat.
+  sendMessage: (chatId, text, opts) =>
+    telegramApi.sendMessage(chatId, text, { ...opts, skipOutboundStamp: true }),
   editMessageText: (chatId, messageId, text, opts) =>
     telegramApi.editMessageText(chatId, messageId, text, opts),
   pinChatMessage: (chatId, messageId, opts) =>
@@ -638,6 +663,32 @@ let taskRealityMirror: TaskRealityMirror | undefined
 if (resolveTaskReconcilerEnabled()) {
   const paneTarget = config.tmux_mirror.pane_target || resolveDefaultPaneTarget()
   const ownerSet = new Set(hudOwnerChatIds.map(String))
+  // Owner DM only (positive numeric chat id in the owner set) — the pane is the
+  // single global DM session; a group chat must never be reconciled or nudged.
+  const isReconcilerOwnerChat = (chatId: string): boolean => {
+    if (!ownerSet.has(chatId)) return false
+    const n = Number(chatId)
+    return Number.isInteger(n) && n > 0
+  }
+  // M4 mechanical liveness. Runs inside the reality-mirror loop (fed pane
+  // captures for the dead-man, evaluated each ~20s tick for heartbeat +
+  // open-question reminders). Reads the outbound clock + the autonomy registry
+  // (open questions ONLY, read-only — never lease TTLs); sends via the reliable
+  // api and edits the context pin via the HUD's heartbeat suffix.
+  const heartbeatMonitor = new HeartbeatMonitor({
+    log,
+    // skipOutboundStamp (fix-loop-1 #6): a heartbeat nudge / dead-man alert /
+    // question reminder is not a real report — it must not reset the very
+    // silence window it measures (the monitor rate-limits itself instead).
+    send: (chatId: string, text: string): Promise<void> =>
+      telegramApi.sendMessage(chatId, text, { skipOutboundStamp: true }).then(() => undefined),
+    pinHeartbeat: (chatId: string, suffix: string | null): Promise<void> =>
+      contextHud.setHeartbeatSuffix(chatId, suffix),
+    autonomyPaths: { root: statePaths.root },
+    lastOutboundAt: (chatId: string): number | undefined =>
+      outboundTracker.lastOutboundAt(chatId),
+    isOwnerChat: isReconcilerOwnerChat,
+  })
   taskRealityMirror = new TaskRealityMirror({
     exec: defaultTmuxExec,
     capture: {
@@ -650,13 +701,8 @@ if (resolveTaskReconcilerEnabled()) {
     // Session-epoch persistence (active + tombstones) — survives restarts so
     // late lifecycle stragglers can't roll the epoch back (review r3 #1).
     stateDir: statePaths.root,
-    // Owner DM only (positive numeric chat id in the owner set) — the pane is
-    // the single global DM session; a group chat must never be reconciled.
-    isOwnerChat: (chatId: string): boolean => {
-      if (!ownerSet.has(chatId)) return false
-      const n = Number(chatId)
-      return Number.isInteger(n) && n > 0
-    },
+    isOwnerChat: isReconcilerOwnerChat,
+    liveness: heartbeatMonitor,
   })
   log.info('task reality mirror configured', { pane_target: paneTarget })
   const shutdownReality = (): void => taskRealityMirror?.stop()

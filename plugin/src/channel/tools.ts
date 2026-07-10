@@ -102,6 +102,13 @@ export interface SendMessageOpts {
   reply_to_message_id?: number
   parse_mode?: 'MarkdownV2' | 'HTML'
   reply_markup?: InlineKeyboardLike
+  // M4 fix-loop-1 #6: opt OUT of the reliable layer's outbound-activity stamp.
+  // Set by INTERNAL status surfaces (context-HUD sends, heartbeat nudges)
+  // whose messages must not count as «the owner heard a real report» —
+  // otherwise a pin self-heal would silently reset the heartbeat silence
+  // window. Consumed and STRIPPED by createReliableTelegramApi; never reaches
+  // the wire.
+  skipOutboundStamp?: boolean
 }
 
 export interface EditOpts {

@@ -658,6 +658,11 @@ export type StatePaths = {
   sessionIds: string
   deadLetterUpdates: string
   deadLetterWebhook: string
+  // M4 (2026-07-10): quarantine bucket for OUTBOUND Telegram sends that failed
+  // after the bounded retry policy exhausted (network / 5xx / 429). Distinct
+  // from the inbound `updates`/`webhook` buckets so operators can triage
+  // delivery failures separately.
+  deadLetterOutbound: string
   logs: {
     server: string
     telegram: string
@@ -696,6 +701,7 @@ export function getStatePaths(_config: AppConfig, env: RuntimeEnv): StatePaths {
     sessionIds: join(root, 'session-ids'),
     deadLetterUpdates: join(root, 'dead-letter', 'updates'),
     deadLetterWebhook: join(root, 'dead-letter', 'webhook'),
+    deadLetterOutbound: join(root, 'dead-letter', 'outbound'),
     logs: {
       server: join(root, 'logs', 'server.log'),
       telegram: join(root, 'logs', 'telegram.log'),
