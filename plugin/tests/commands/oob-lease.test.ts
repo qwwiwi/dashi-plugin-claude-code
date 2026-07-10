@@ -157,6 +157,12 @@ describe('/lease fail-closed grammar (fix-loop #3/#6)', () => {
     expect(res.replyToTelegram!.text).toContain('400')
     expect(loadAutonomyState({ root }, CHAT).leases.length).toBe(0)
   })
+
+  test('scope with bidi/control chars → usage error, NO lease (fix-loop-2 #6)', async () => {
+    const res = await handleOobCommand(parse('/lease deploy \u202Egnigats'), mkCtx())
+    expect(res.replyToTelegram!.text).toContain('управляющие')
+    expect(loadAutonomyState({ root }, CHAT).leases.length).toBe(0)
+  })
 })
 
 describe('/lease duplicate against a TERMINAL lease states the real status (fix-loop #8)', () => {

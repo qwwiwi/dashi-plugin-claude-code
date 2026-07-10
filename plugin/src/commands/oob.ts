@@ -387,8 +387,10 @@ async function handleLeaseCommand(
   // granted, nothing is silently defaulted or truncated.
   if (cmd.kind === 'invalid') {
     const reason = cmd.reason === 'ttl'
-      ? 'некорректный ttl — допустимо целое 1..72 в форме <code>ttl=48h</code>'
-      : 'scope длиннее 400 символов — сократи формулировку'
+      ? 'некорректный ttl — допустимо целое 1..72 в форме <code>ttl=48h</code> (строго строчными)'
+      : cmd.reason === 'scope_charset'
+        ? 'scope содержит управляющие/форматирующие символы (перенос строки, bidi) — недопустимо'
+        : 'scope длиннее 400 символов — сократи формулировку'
     return {
       handled: true,
       command: 'lease',

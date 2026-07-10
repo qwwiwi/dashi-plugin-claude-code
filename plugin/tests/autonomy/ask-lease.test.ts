@@ -10,11 +10,13 @@
 //   * timeout → open question auto-registered (marker-stripped summary)
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  MAX_BODY_CHARS,
+  renderClosedQuestionBody,
   createAskUserQuestionUi,
   type AskCallbackContext,
   type AskUserQuestionUi,
@@ -24,7 +26,7 @@ import {
   type AskQuestion,
   type AskUserQuestionRelay,
 } from '../../src/channel/ask-user-question.js'
-import { activeLeases, loadAutonomyState, openQuestions } from '../../src/autonomy/store.js'
+import { activeLeases, computeScopeDigest, loadAutonomyState, openQuestions } from '../../src/autonomy/store.js'
 import type { AppConfig } from '../../src/config.js'
 import type { Logger } from '../../src/log.js'
 import type {
@@ -103,7 +105,7 @@ interface Harness {
   send: Sends
 }
 
-function mkHarness(): Harness {
+function mkHarness(opts: { withAutonomy?: boolean } = {}): Harness {
   const send: Sends = { sendCalls: [], editCalls: [], nextMessageId: 5000 }
   const api = fakeTelegram(send)
   let uiRef: AskUserQuestionUi | undefined
@@ -118,10 +120,26 @@ function mkHarness(): Harness {
     log: silentLog(),
     telegramApi: api,
     relay,
-    autonomyPaths: { root },
+    ...(opts.withAutonomy === false ? {} : { autonomyPaths: { root } }),
   })
   uiRef = ui
   return { ui, relay, send }
+}
+
+// Simulated RESTART of the UI layer (fix-loop-2 #1): a FRESH factory (empty
+// in-memory cache) over the SAME relay and the SAME state root — the durable
+// ask-intents file is the only carrier of the grant intent across it.
+function restartUi(h: Harness): Harness {
+  const send: Sends = { sendCalls: [], editCalls: [], nextMessageId: 9000 }
+  const api = fakeTelegram(send)
+  const ui = createAskUserQuestionUi({
+    config: mkConfig(),
+    log: silentLog(),
+    telegramApi: api,
+    relay: h.relay,
+    autonomyPaths: { root },
+  })
+  return { ui, relay: h.relay, send }
 }
 
 // Submit a question and render it; returns the requestId + the sent message id.
@@ -376,5 +394,143 @@ describe('ask-card timeout → open question registered', () => {
     expect(qs.length).toBe(1)
     // Deterministic id derived from the settle identity.
     expect(qs[0]!.id).toBe('Q-ask-abcde-0')
+  })
+})
+
+describe('durable intent — restart survival (fix-loop-2 #1 CRITICAL)', () => {
+  test('after a UI restart the tap grants EXACTLY the persisted scope and the closed card shows it', async () => {
+    const h = mkHarness()
+    const { requestId, messageId } = await submitAndRender(
+      h,
+      '[LEASE: деплой стейджинга; ttl=48h] Разрешаешь?',
+      [{ label: 'Да' }, { label: 'Нет' }],
+    )
+    // RESTART: fresh factory, empty in-memory cache, same state root.
+    const h2 = restartUi(h)
+    await h2.ui.handleAskCallback(tap(requestId, 0, messageId))
+    const leases = activeLeases(loadAutonomyState({ root }, CHAT), Date.now())
+    expect(leases.length).toBe(1)
+    expect(leases[0]!.scope).toBe('деплой стейджинга')
+    // Closed card rendered by the restarted UI still shows the same scope.
+    const closed = h2.send.editCalls.find((e) => e.messageId === messageId)
+    expect(closed).toBeDefined()
+    expect(closed!.text).toContain('деплой стейджинга')
+  })
+
+  test('the DISK record is the only grant source — an edited record wins over the question text', async () => {
+    const h = mkHarness()
+    const { requestId, messageId } = await submitAndRender(
+      h,
+      '[LEASE: original scope] Разрешаешь?',
+      [{ label: 'Да' }, { label: 'Нет' }],
+    )
+    // Simulate a parser/deploy divergence: rewrite the persisted intent.
+    const file = join(root, `ask-lease-intents-${CHAT}.json`)
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
+      intents: Record<string, { scope: string; scopeDigest: string }>
+    }
+    const key = `${requestId}:0`
+    parsed.intents[key]!.scope = 'edited scope'
+    parsed.intents[key]!.scopeDigest = computeScopeDigest('edited scope')
+    writeFileSync(file, JSON.stringify(parsed), 'utf8')
+    const h2 = restartUi(h)
+    await h2.ui.handleAskCallback(tap(requestId, 0, messageId))
+    const leases = activeLeases(loadAutonomyState({ root }, CHAT), Date.now())
+    // Granted from the persisted record, NOT from re-parsing the question.
+    expect(leases.map((l) => l.scope)).toEqual(['edited scope'])
+  })
+
+  test('legacy/lost intent → fail-closed: no grant, «intent утерян» on closed card and as feedback', async () => {
+    const h = mkHarness()
+    const { requestId, messageId } = await submitAndRender(
+      h,
+      '[LEASE: deploy] Разрешаешь?',
+      [{ label: 'Да' }, { label: 'Нет' }],
+    )
+    // Lose the durable record (restart happened before/without persist).
+    rmSync(join(root, `ask-lease-intents-${CHAT}.json`), { force: true })
+    const h2 = restartUi(h)
+    await h2.ui.handleAskCallback(tap(requestId, 0, messageId))
+    expect(loadAutonomyState({ root }, CHAT).leases.length).toBe(0)
+    const closed = h2.send.editCalls.find((e) => e.messageId === messageId)
+    expect(closed).toBeDefined()
+    expect(closed!.text).toContain('Мандат НЕ выдан: intent утерян (рестарт)')
+    const feedback = h2.send.sendCalls.map((c) => c.text).find((t) => t.includes('intent утерян'))
+    expect(feedback).toBeDefined()
+  })
+})
+
+describe('no silent grant-capable cards (fix-loop-2 #3)', () => {
+  test('factory WITHOUT autonomyPaths → card is a normal question (no block), tap grants nothing', async () => {
+    const h = mkHarness({ withAutonomy: false })
+    const { requestId, messageId } = await submitAndRender(
+      h,
+      '[LEASE: deploy] Разрешаешь?',
+      [{ label: 'Да' }, { label: 'Нет' }],
+    )
+    const body = h.send.sendCalls[0]!.text
+    expect(body).not.toContain('Мандат автономии') // NOT grant-capable
+    expect(body).toContain('[LEASE') // honest raw render
+    expect(body).toContain('тап мандат НЕ выдаст')
+    await h.ui.handleAskCallback(tap(requestId, 0, messageId))
+    expect(loadAutonomyState({ root }, CHAT).leases.length).toBe(0)
+  })
+})
+
+describe('runtime registry failure on tap (fix-loop-2 #3)', () => {
+  test('grant-capable card + registry gone at tap → «Мандат НЕ выдан: реестр недоступен»', async () => {
+    // Build a UI whose deps object we keep, so autonomyPaths can vanish
+    // AFTER card creation (runtime-only failure — impossible via config, but
+    // must still be visible, never silent).
+    const send: Sends = { sendCalls: [], editCalls: [], nextMessageId: 7000 }
+    const api = fakeTelegram(send)
+    const relay = createAskUserQuestionRelay({ log: silentLog() })
+    const deps = {
+      config: mkConfig(),
+      log: silentLog(),
+      telegramApi: api,
+      relay,
+      autonomyPaths: { root } as { root: string } | undefined,
+    }
+    const ui = createAskUserQuestionUi(deps as Parameters<typeof createAskUserQuestionUi>[0])
+    const q: AskQuestion = { question: '[LEASE: deploy] Разрешаешь?', options: [{ label: 'Да' }, { label: 'Нет' }] }
+    const { requestId } = relay.submit({ toolUseId: 't-rt', sessionId: 's', questions: [q], chatId: CHAT })
+    await ui.startQuestion(requestId!)
+    const body = send.sendCalls[0]!.text
+    expect(body).toContain('Мандат автономии') // card WAS grant-capable
+    const messageId = relay.getPending(requestId!)!.telegramMessageId!
+    // Registry vanishes at runtime.
+    deps.autonomyPaths = undefined
+    await ui.handleAskCallback(tap(requestId!, 0, messageId))
+    expect(loadAutonomyState({ root }, CHAT).leases.length).toBe(0)
+    const feedback = send.sendCalls.map((c) => c.text).find((t) => t.includes('реестр недоступен'))
+    expect(feedback).toBeDefined()
+    expect(feedback!).toContain('Мандат НЕ выдан')
+  })
+})
+
+describe('closed-card body budget (fix-loop-2 #2)', () => {
+  test('maximally-escaping 400cp scope: closed body stays under MAX_BODY_CHARS', () => {
+    const scope = '&'.repeat(400) // escapes 5x → 2000 chars
+    const intent = {
+      scope,
+      ttlHours: 24,
+      supersede: false,
+      displayText: '&'.repeat(900), // question text also expands hard
+    }
+    const outcome = `✅ Ответ: <b>${'&amp;'.repeat(100)}</b>`
+    const body = renderClosedQuestionBody('raw?', 0, 1, outcome, { leaseIntent: intent })
+    expect(body.length).toBeLessThanOrEqual(MAX_BODY_CHARS)
+    // The mandate scope is NEVER the truncated part.
+    expect(body).toContain('&amp;'.repeat(400))
+    expect(body).toContain('ttl 24ч')
+  })
+
+  test('quote-heavy scope (6x escape expansion) also fits', () => {
+    const scope = '"'.repeat(400) // &quot; → 2400 chars
+    const intent = { scope, ttlHours: 24, supersede: false, displayText: 'q?' }
+    const body = renderClosedQuestionBody('raw?', 0, 1, '✅ Ответ: <b>Да</b>', { leaseIntent: intent })
+    expect(body.length).toBeLessThanOrEqual(MAX_BODY_CHARS)
+    expect(body).toContain('&quot;'.repeat(400))
   })
 })
