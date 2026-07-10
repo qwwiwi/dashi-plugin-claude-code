@@ -188,3 +188,90 @@ describe('composeReminder', () => {
     expect(added).toBeLessThanOrEqual(10)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Autonomy block injection (PR-1). The reminder appends a per-turn block
+// listing active mandates + open owner questions, read from the durable
+// registry. Fail-open: any error → no block, never gate the turn.
+// ─────────────────────────────────────────────────────────────────────
+
+import { mkdtempSync, rmSync as rmSyncNode, writeFileSync as writeFileSyncNode } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join as joinNode } from 'node:path'
+
+import { autonomyReminder } from '../../scripts/channel-reminder.js'
+import {
+  addLease,
+  emptyAutonomyState,
+  saveAutonomyState,
+} from '../../src/autonomy/store.js'
+
+describe('autonomyReminder (registry injection)', () => {
+  test('no state dir → undefined (block omitted)', () => {
+    expect(autonomyReminder({ CHAT_ID: '164795011' })).toBeUndefined()
+  })
+
+  test('no chat id → undefined', () => {
+    const dir = mkdtempSync(joinNode(tmpdir(), 'reminder-autonomy-'))
+    expect(autonomyReminder({ TELEGRAM_STATE_DIR: dir })).toBeUndefined()
+    rmSyncNode(dir, { recursive: true, force: true })
+  })
+
+  test('empty registry → undefined', () => {
+    const dir = mkdtempSync(joinNode(tmpdir(), 'reminder-autonomy-'))
+    saveAutonomyState({ root: dir }, '164795011', emptyAutonomyState())
+    expect(autonomyReminder({ CHAT_ID: '164795011', TELEGRAM_STATE_DIR: dir })).toBeUndefined()
+    rmSyncNode(dir, { recursive: true, force: true })
+  })
+
+  test('active mandate → block with Act-with-veto guidance', () => {
+    const dir = mkdtempSync(joinNode(tmpdir(), 'reminder-autonomy-'))
+    const state = addLease(
+      emptyAutonomyState(),
+      { id: 'L-1', scope: 'ship the wave', expiresAtMs: Date.now() + 3 * 3_600_000, source: 'ask_card' },
+      Date.now(),
+    ).state
+    saveAutonomyState({ root: dir }, '164795011', state)
+    const block = autonomyReminder({ CHAT_ID: '164795011', TELEGRAM_STATE_DIR: dir }) as string
+    expect(block).toContain('Активный мандат L-1')
+    expect(block).toContain('Act-with-veto')
+    rmSyncNode(dir, { recursive: true, force: true })
+  })
+
+  test('MULTICHAT_STATE_DIR is honored as a fallback state root', () => {
+    const dir = mkdtempSync(joinNode(tmpdir(), 'reminder-autonomy-'))
+    const state = addLease(
+      emptyAutonomyState(),
+      { id: 'L-mc', scope: 's', expiresAtMs: Date.now() + 3_600_000, source: 'manual' },
+      Date.now(),
+    ).state
+    saveAutonomyState({ root: dir }, '-100999', state)
+    const block = autonomyReminder({ CHAT_ID: '-100999', MULTICHAT_STATE_DIR: dir }) as string
+    expect(block).toContain('L-mc')
+    rmSyncNode(dir, { recursive: true, force: true })
+  })
+
+  test('corrupt registry file → fail-open (undefined, no throw)', () => {
+    const dir = mkdtempSync(joinNode(tmpdir(), 'reminder-autonomy-'))
+    writeFileSyncNode(joinNode(dir, 'autonomy-164795011.json'), '{broken', 'utf8')
+    expect(autonomyReminder({ CHAT_ID: '164795011', TELEGRAM_STATE_DIR: dir })).toBeUndefined()
+    rmSyncNode(dir, { recursive: true, force: true })
+  })
+
+  test('composeReminder places the autonomy block between channel and TOV', () => {
+    const dir = mkdtempSync(joinNode(tmpdir(), 'reminder-autonomy-'))
+    const state = addLease(
+      emptyAutonomyState(),
+      { id: 'L-z', scope: 's', expiresAtMs: Date.now() + 3_600_000, source: 'manual' },
+      Date.now(),
+    ).state
+    saveAutonomyState({ root: dir }, '164795011', state)
+    const r = composeReminder({ CHAT_ID: '164795011', TELEGRAM_STATE_DIR: dir })
+    const iChannel = r.indexOf('mcp__dashi-channel__reply')
+    const iAutonomy = r.indexOf('Активный мандат L-z')
+    const iTov = r.indexOf('по-русски')
+    expect(iChannel).toBeLessThan(iAutonomy)
+    expect(iAutonomy).toBeLessThan(iTov)
+    rmSyncNode(dir, { recursive: true, force: true })
+  })
+})

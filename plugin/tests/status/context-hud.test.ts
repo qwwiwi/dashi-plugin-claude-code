@@ -1235,3 +1235,66 @@ describe('ContextHud — model-aware window', () => {
     expect(api.sent[0]!.text).toContain("20% (100k / 500k)")
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Autonomy pin line (PR-1). renderHud takes an optional escaped line; the
+// manager reads the per-chat registry and injects it best-effort.
+// ─────────────────────────────────────────────────────────────────────
+
+import {
+  addLease as addLeaseStore,
+  emptyAutonomyState as emptyAutonomyStateStore,
+  saveAutonomyState as saveAutonomyStateStore,
+} from '../../src/autonomy/store.js'
+
+describe('renderHud autonomy line', () => {
+  test('appends the autonomy line when provided', () => {
+    const { text } = renderHud({ usedTokens: 0 }, WINDOW, undefined, undefined, 'Мандат: L-1 (x, ещё 3ч)')
+    expect(text).toContain('\nМандат: L-1 (x, ещё 3ч)')
+  })
+
+  test('no autonomy line when omitted', () => {
+    const { text } = renderHud({ usedTokens: 0 }, WINDOW)
+    expect(text).not.toContain('Мандат:')
+  })
+})
+
+describe('ContextHud autonomy integration', () => {
+  test('renders the mandate line from the registry file', async () => {
+    const api = new FakeApi()
+    const dir = stateDir()
+    const state = addLeaseStore(
+      emptyAutonomyStateStore(),
+      { id: 'L-hud', scope: 'ship it', expiresAtMs: Date.now() + 3 * 3_600_000, source: 'ask_card' },
+      Date.now(),
+    ).state
+    saveAutonomyStateStore({ root: dir }, OWNER, state)
+
+    const hud = makeHud(api, { dir })
+    await hud.onSessionStart(OWNER)
+    expect(api.sent[0]!.text).toContain('Мандат: L-hud')
+    expect(api.sent[0]!.text).toContain('ship it')
+  })
+
+  test('no line when the registry is empty', async () => {
+    const api = new FakeApi()
+    const dir = stateDir()
+    const hud = makeHud(api, { dir })
+    await hud.onSessionStart(OWNER)
+    expect(api.sent[0]!.text).not.toContain('Мандат:')
+  })
+
+  test('a corrupt registry file never breaks HUD rendering', async () => {
+    const api = new FakeApi()
+    const dir = stateDir()
+    // Write a broken registry file, then confirm the HUD still sends its card.
+    saveAutonomyStateStore({ root: dir }, OWNER, emptyAutonomyStateStore())
+    const { writeFileSync } = await import('node:fs')
+    writeFileSync(join(dir, `autonomy-${OWNER}.json`), '{broken', 'utf8')
+    const hud = makeHud(api, { dir })
+    await hud.onSessionStart(OWNER)
+    expect(api.sent.length).toBe(1)
+    expect(api.sent[0]!.text).toContain('🧠 <b>Контекст</b>:')
+    expect(api.sent[0]!.text).not.toContain('Мандат:')
+  })
+})
