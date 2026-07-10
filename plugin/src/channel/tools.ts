@@ -40,7 +40,7 @@ import {
   updateAutonomyState,
   type UpdateResult,
 } from '../autonomy/store.js'
-import { analyzeAsk, askGuardAdvisoryHint, askGuardBlockMessage } from '../safety/ask-guard.js'
+import { analyzeAskDetailed, askGuardAdvisoryHint, askGuardBlockMessage } from '../safety/ask-guard.js'
 import { assertAllowedChat } from '../telegram/gate.js'
 import type { GuestQueryRegistry } from '../telegram/guest-queries.js'
 import {
@@ -636,10 +636,10 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         }
 
         // ── Ask-guard (autonomy M3) ──────────────────────────────────────
-        // The single choke point that enforces owner-granted autonomy
-        // mandates on the OWNER-egress reply path. When an ACTIVE lease
-        // exists for this chat AND the outgoing body is a self-gating
-        // permission-ask («жду го / дай добро»), intercept:
+        // Enforces owner-granted autonomy mandates on the OWNER-egress
+        // `reply`-tool path. When an ACTIVE lease exists for this chat AND the
+        // outgoing body is a self-gating permission-ask («жду го / дай добро»),
+        // intercept:
         //   * block mode  → refuse the send (isError, nothing shipped). NO
         //                   resend-valve — an identical re-send is analyzed
         //                   the same way and blocked again (analyzeAsk is
@@ -647,18 +647,33 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         //   * advisory    → the reply still ships; a hint is appended to the
         //                   tool result (computed here, attached near the
         //                   result below) nudging act-with-veto.
-        // Never touches the guest path (handled above, returns before here),
-        // edit_message (a separate case) or the AskUserQuestion relay (a
-        // different tool). Fail-open on ANY error — a guard fault must never
-        // gate a real reply.
+        // SCOPE (fix-loop #9 — honest coverage): this guards ONLY the `reply`
+        // tool. The guest path returns above; `edit_message` is UNGUARDED BY
+        // DESIGN (interim progress edits are not owner-egress go-questions); the
+        // AskUserQuestion relay is a different tool (the legitimate escape). The
+        // DM Stop-hook fallback route (POST /hooks/fallback-reply) runs the SAME
+        // analyzeAsk guard so a turn's final text cannot bypass this via the
+        // fallback. Fail-open on ANY error — a guard fault must never gate a
+        // real reply.
         let askGuardHint = ''
         try {
-          const askGuardMode = resolveAskGuardMode(config)
+          const askGuardMode = resolveAskGuardMode(config, log)
           if (askGuardMode !== 'off') {
             const autonomyState = loadAutonomyState(statePaths, args.chat_id, log)
             const leases = activeLeases(autonomyState, Date.now())
             if (leases.length > 0) {
-              const finding = analyzeAsk(args.text, { hasActiveLease: true })[0]
+              const analysis = analyzeAskDetailed(args.text, { hasActiveLease: true })
+              // fix-loop #2: a hard-gate marker that survives ONLY inside a
+              // fenced/quoted zone still exempts (fail-safe) but is a distinct
+              // audit class for calibration week.
+              if (analysis.exemptReason === 'hard_gate_protected_only') {
+                log.info('ask_guard exempt — hard-gate marker only in a protected zone', {
+                  code: 'ask_guard_exempt_protected_only',
+                  chat_id: args.chat_id,
+                  lease_id: leases[0]!.id,
+                })
+              }
+              const finding = analysis.findings[0]
               if (finding !== undefined) {
                 const lease = leases[0]! // soonest-expiry first
                 if (askGuardMode === 'block') {
@@ -668,8 +683,11 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
                     lease_id: lease.id,
                     pattern: finding.code,
                   })
+                  // fix-loop #3: list ALL active lease scopes so the model can
+                  // self-check its intended action; never claim authorization.
+                  const scopes = leases.map((l) => l.scope)
                   return {
-                    content: [{ type: 'text', text: askGuardBlockMessage(lease.id, lease.scope) }],
+                    content: [{ type: 'text', text: askGuardBlockMessage(lease.id, scopes) }],
                     isError: true,
                   }
                 }
@@ -685,12 +703,18 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
             }
           }
         } catch (err) {
-          // Fail-open: a guard fault must never block a real reply.
-          log.warn('ask_guard evaluation failed — failing open (reply sent unguarded)', {
-            code: 'ask_guard_error',
-            chat_id: args.chat_id,
-            error: err instanceof Error ? err.message : String(err),
-          })
+          // Fail-open: a guard fault must never block a real reply. fix-loop #5
+          // (Codex MED-5): the log call itself is wrapped so a THROWING logger
+          // can never abort delivery from the catch path.
+          try {
+            log.warn('ask_guard evaluation failed — failing open (reply sent unguarded)', {
+              code: 'ask_guard_error',
+              chat_id: args.chat_id,
+              error: err instanceof Error ? err.message : String(err),
+            })
+          } catch {
+            /* a logger fault must not gate a real reply */
+          }
         }
 
         const files = args.files ?? []

@@ -31,8 +31,10 @@ import { createLogger } from '../../src/log.js'
 import {
   addLease,
   emptyAutonomyState,
+  revokeLease,
   saveAutonomyState,
 } from '../../src/autonomy/store.js'
+import type { Logger } from '../../src/log.js'
 
 const silentLog = createLogger('test', { stream: { write: () => true } as unknown as NodeJS.WritableStream })
 
@@ -145,8 +147,47 @@ function seedActiveLease(paths: StatePaths, chatId: string, nowMs: number): void
   saveAutonomyState(paths, chatId, state)
 }
 
+// Seed an EXPIRED lease (expiresAtMs already in the past).
+function seedExpiredLease(paths: StatePaths, chatId: string, nowMs: number): void {
+  const { state } = addLease(
+    emptyAutonomyState(),
+    { scope: 'истёкший мандат', expiresAtMs: nowMs - HOUR, source: 'owner_cmd', chatId },
+    nowMs - 2 * HOUR,
+  )
+  saveAutonomyState(paths, chatId, state)
+}
+
+// Seed a REVOKED (but not-yet-expired) lease.
+function seedRevokedLease(paths: StatePaths, chatId: string, nowMs: number): void {
+  const added = addLease(
+    emptyAutonomyState(),
+    { scope: 'отозванный мандат', expiresAtMs: nowMs + 4 * HOUR, source: 'owner_cmd', chatId },
+    nowMs,
+  )
+  const leaseId = added.state.leases[0]!.id
+  const { state } = revokeLease(added.state, leaseId, nowMs, 'вождь', 'test')
+  saveAutonomyState(paths, chatId, state)
+}
+
 function replyReq(text: string): CallToolRequest {
   return { params: { name: 'reply', arguments: { chat_id: CHAT, text } } }
+}
+
+function replyReqChat(chatId: string, text: string): CallToolRequest {
+  return { params: { name: 'reply', arguments: { chat_id: chatId, text } } }
+}
+
+// A logger whose `info` ALWAYS throws — used to prove the fail-open path
+// (fix-loop #5): a throwing logger must never abort a real reply.
+function makeThrowingInfoLogger(): Logger {
+  return {
+    debug: () => {},
+    info: () => {
+      throw new Error('logger boom')
+    },
+    warn: () => {},
+    error: () => {},
+  } as unknown as Logger
 }
 
 let statePaths: StatePaths
@@ -264,6 +305,62 @@ describe('ask-guard reply choke point — kill-switch', () => {
     expect(res.isError).toBeUndefined()
     expect(sent.length).toBe(1)
     expect(resultText(res)).not.toContain('ask_guard_hint')
+  })
+})
+
+// fix-loop #8 (Fable LOW-6) — integration coverage at the chokepoint for the
+// lease-inactive cases and a fail-open throw after loadAutonomyState.
+describe('ask-guard reply choke point — inactive-lease cases (fix-loop #8)', () => {
+  test('(a) EXPIRED lease → guard does not fire, reply ships', async () => {
+    process.env.ASK_GUARD_MODE = 'block'
+    seedExpiredLease(statePaths, CHAT, Date.now())
+    const res = await callTool(replyReq('жду го'), deps)
+    expect(res.isError).toBeUndefined()
+    expect(sent.length).toBe(1)
+  })
+
+  test('(b) REVOKED lease → guard does not fire, reply ships', async () => {
+    process.env.ASK_GUARD_MODE = 'block'
+    seedRevokedLease(statePaths, CHAT, Date.now())
+    const res = await callTool(replyReq('жду го'), deps)
+    expect(res.isError).toBeUndefined()
+    expect(sent.length).toBe(1)
+  })
+
+  test('(c) lease active ONLY in a different chat → no fire for THIS chat', async () => {
+    process.env.ASK_GUARD_MODE = 'block'
+    // Lease seeded in a different chat's per-chat registry; THIS chat has none.
+    const OTHER = '999999999'
+    seedActiveLease(statePaths, OTHER, Date.now())
+    const res = await callTool(replyReqChat(CHAT, 'жду го'), deps)
+    expect(res.isError).toBeUndefined()
+    expect(sent.length).toBe(1)
+  })
+})
+
+describe('ask-guard reply choke point — fail-open (fix-loop #5 / #8d)', () => {
+  test('(d) a throwing logger after loadAutonomyState never aborts delivery', async () => {
+    // advisory (default) + active lease + self-gate → the guard reaches the
+    // advisory log.info, which THROWS. The nested-guarded catch must swallow it
+    // and the reply must still ship (without the hint, since the throw preempts
+    // it). Proves the guard can never gate a real reply on a logger fault.
+    seedActiveLease(statePaths, CHAT, Date.now())
+    const throwingDeps: ToolDeps = { ...deps, log: makeThrowingInfoLogger() }
+    const res = await callTool(replyReq('жду го'), throwingDeps)
+    expect(res.isError).toBeUndefined()
+    expect(sent.length).toBe(1)
+    expect(resultText(res)).not.toContain('ask_guard_hint')
+  })
+
+  test('a throwing logger in BLOCK mode also fails open (reply ships)', async () => {
+    process.env.ASK_GUARD_MODE = 'block'
+    seedActiveLease(statePaths, CHAT, Date.now())
+    const throwingDeps: ToolDeps = { ...deps, log: makeThrowingInfoLogger() }
+    const res = await callTool(replyReq('жду го'), throwingDeps)
+    // The block-path log.info throws before the isError return → caught →
+    // fail-open → the reply ships rather than the delivery being aborted.
+    expect(res.isError).toBeUndefined()
+    expect(sent.length).toBe(1)
   })
 })
 
