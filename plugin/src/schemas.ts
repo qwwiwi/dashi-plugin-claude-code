@@ -124,6 +124,41 @@ export const StatusArgsSchema = z.object({
 })
 export type StatusArgs = z.infer<typeof StatusArgsSchema>
 
+// Tool args - autonomy (PR-1, 2026-07-10). A READ + resolve surface over the
+// per-chat autonomy registry (leases + open questions). It can NEVER grant a
+// lease — granting arrives in PR-2 via the authenticated button relay.
+//   status            → compact human-readable dump of active leases + open Qs.
+//   consume           → mark a lease consumed (requires lease_id).
+//   revoke            → withdraw a lease's authority (requires lease_id,
+//                       optional reason; revokedBy='agent'). Self-revoke only
+//                       SHRINKS authority, so the tool may do it — it still
+//                       can never GRANT.
+//   resolve_question  → set a question answered/bypassed (requires question_id
+//                       + resolution).
+export const AutonomyArgsSchema = z
+  .object({
+    chat_id: z.union([z.number(), z.string()]).transform((v) => String(v)),
+    action: z.enum(['status', 'consume', 'revoke', 'resolve_question']),
+    lease_id: z.string().min(1).optional(),
+    question_id: z.string().min(1).optional(),
+    resolution: z.enum(['answered', 'bypassed']).optional(),
+    reason: z.string().min(1).max(1000).optional(),
+  })
+  .superRefine((a, ctx) => {
+    if ((a.action === 'consume' || a.action === 'revoke') && a.lease_id === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `action="${a.action}" requires lease_id`, path: ['lease_id'] })
+    }
+    if (a.action === 'resolve_question') {
+      if (a.question_id === undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'action="resolve_question" requires question_id', path: ['question_id'] })
+      }
+      if (a.resolution === undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'action="resolve_question" requires resolution', path: ['resolution'] })
+      }
+    }
+  })
+export type AutonomyArgs = z.infer<typeof AutonomyArgsSchema>
+
 // Webhook payload for /hooks/agent — message variant.
 // Today's `/hooks/agent` callers post `{ message, chatId, agentId? }` and the
 // server forwards content as a channel notification (gateway.py:3531-3589 path).

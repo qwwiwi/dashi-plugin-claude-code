@@ -94,6 +94,13 @@ export interface PatchOptions {
   /** When set, register the channel-reminder UserPromptSubmit hook pointing at
    *  this helper (scripts/channel-reminder.ts). Defaulted by the CLI. */
   readonly reminderHelperPath?: string
+  /** The RESOLVED plugin state root, baked into the reminder hook command as
+   *  inline TELEGRAM_STATE_DIR (review 2026-07-10 fix-loop #5). Without it the
+   *  hook process often has no TELEGRAM_* env at all (default installs don't
+   *  export it; multichat sessions strip it) and would silently never find
+   *  the autonomy registry the MCP tool writes. Defaulted by the CLI from
+   *  env.TELEGRAM_STATE_DIR ?? ~/.claude/channels/dashi-telegram-canary. */
+  readonly reminderStateDir?: string
 }
 
 interface HookEntry {
@@ -172,10 +179,19 @@ function buildGateEntry(opts: PatchOptions): HookEntry {
 }
 
 // UserPromptSubmit command for the channel-reminder hook. The hook reads
-// CHAT_ID from env to pick the DM vs group reminder. No token, no webhook —
-// it emits additionalContext to stdout and never makes a network call.
+// CHAT_ID from env to pick the DM vs group reminder, and TELEGRAM_STATE_DIR
+// to locate the autonomy registry (autonomy-<chat>.json) for the per-turn
+// mandate/question block. The state dir is BAKED into the command (fix-loop
+// #5): the hook's process env carries no TELEGRAM_* on default installs, and
+// multichat sessions strip it — an inline shell assignment survives both.
+// No token, no webhook — the hook emits additionalContext to stdout and
+// never makes a network call.
 function buildReminderCommand(opts: PatchOptions): string {
-  return `CHAT_ID=${sq(opts.chatId)} bun ${sq(opts.reminderHelperPath!)}`
+  const envParts: string[] = [`CHAT_ID=${sq(opts.chatId)}`]
+  if (opts.reminderStateDir !== undefined && opts.reminderStateDir.length > 0) {
+    envParts.push(`TELEGRAM_STATE_DIR=${sq(opts.reminderStateDir)}`)
+  }
+  return `${envParts.join(' ')} bun ${sq(opts.reminderHelperPath!)}`
 }
 
 function buildReminderEntry(opts: PatchOptions): HookEntry {
@@ -289,6 +305,11 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
   if (!noReminder && !reminderHelperPath) {
     reminderHelperPath = pathResolve(scriptDir, 'channel-reminder.ts')
   }
+  // Resolve the state root the same way loadConfig does (fix-loop #5) so the
+  // reminder hook reads the SAME registry files the running server writes.
+  const reminderStateDir =
+    process.env.TELEGRAM_STATE_DIR ??
+    join(homedir(), '.claude', 'channels', 'dashi-telegram-canary')
   const opts: PatchOptions = {
     settingsPath,
     chatId,
@@ -297,7 +318,7 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
     ...(agentId ? { agentId } : {}),
     ...(permissionGateHelperPath ? { permissionGateHelperPath } : {}),
     ...(policyPath ? { policyPath } : {}),
-    ...(reminderHelperPath ? { reminderHelperPath } : {}),
+    ...(reminderHelperPath ? { reminderHelperPath, reminderStateDir } : {}),
   }
   return opts
 }

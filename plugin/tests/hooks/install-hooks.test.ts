@@ -408,6 +408,37 @@ describe('applyPatch (pure) — channel reminder', () => {
     expect((out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')).toBeUndefined()
   })
 
+  test('bakes the resolved state root into the reminder command (fix-loop #5)', () => {
+    const out = applyPatch({}, {
+      settingsPath: '/tmp/x',
+      chatId: '164795011',
+      webhookUrl: 'http://127.0.0.1:8093/hooks/agent',
+      helperPath: '/p/scripts/post-hook.ts',
+      reminderHelperPath: '/p/scripts/channel-reminder.ts',
+      reminderStateDir: '/home/u/.claude/channels/dashi-telegram-canary',
+    }) as { hooks: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }
+    const reminder = (out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')
+    const cmd = reminder!.hooks?.[0]?.command ?? ''
+    // Inline env assignment survives env -i multichat spawns and default
+    // installs where TELEGRAM_STATE_DIR is never exported.
+    expect(cmd).toContain("TELEGRAM_STATE_DIR='/home/u/.claude/channels/dashi-telegram-canary'")
+    // CHAT_ID stays first; the command still points at the helper.
+    expect(cmd.indexOf('CHAT_ID=')).toBeLessThan(cmd.indexOf('TELEGRAM_STATE_DIR='))
+    expect(cmd).toContain('channel-reminder.ts')
+  })
+
+  test('absent reminderStateDir → command has no TELEGRAM_STATE_DIR (back-compat)', () => {
+    const out = applyPatch({}, {
+      settingsPath: '/tmp/x',
+      chatId: '1',
+      webhookUrl: 'http://x',
+      helperPath: '/p/post-hook.ts',
+      reminderHelperPath: '/p/channel-reminder.ts',
+    }) as { hooks: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }
+    const reminder = (out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')
+    expect(reminder!.hooks?.[0]?.command).not.toContain('TELEGRAM_STATE_DIR=')
+  })
+
   test('re-run replaces the reminder entry rather than duplicating', () => {
     const opts = {
       settingsPath: '/tmp/x', chatId: '1', webhookUrl: 'http://x',

@@ -27,14 +27,30 @@
 //     missing reminder must never gate the turn.
 //   * stdout carries ONLY the JSON envelope (no logs, no secrets) — anything
 //     else on stdout becomes additional model context.
-//   * The only file read is the OPTIONAL, best-effort TOV reminder file; a
-//     read failure silently falls back to the embedded constant and never
-//     gates the turn. Everything else is env-only.
+//   * File reads are OPTIONAL and best-effort: the TOV reminder file (falls
+//     back to the embedded constant) and the per-chat autonomy registry
+//     (autonomy-<chat>.json; unreadable/corrupt → the block is omitted).
+//     Neither can ever gate the turn. Everything else is env-only.
+//   * The autonomy store module is loaded LAZILY inside a try (fix-loop #6):
+//     a module-load failure (partial deploy, syntax error in src/) degrades
+//     to «no autonomy block» — it can never kill the hook and lose the
+//     channel-discipline reminder itself.
 //
 // Env:
 //   CHAT_ID              the Telegram chat id this session serves. Negative
 //                        ids are groups/supergroups (multichat); anything
-//                        else is a direct chat. Absent → DM-safe generic.
+//                        else is a direct chat. Absent → DM-safe generic. Also
+//                        keys the autonomy-registry lookup below.
+//   TELEGRAM_STATE_DIR   the plugin state root, BAKED into the hook command by
+//                        patch-claude-settings (fix-loop #5) so the hook reads
+//                        the same registry the server writes. The per-turn
+//                        autonomy block (active mandates + open owner
+//                        questions) is read from
+//                        <state-dir>/autonomy-<chat>.json and appended.
+//                        MULTICHAT_STATE_DIR is a documented last-resort
+//                        fallback for legacy per-chat sessions. Absent or
+//                        unreadable → the block is silently omitted
+//                        (fail-open; a broken registry never gates the turn).
 //   TOV_REMINDER_ENABLED falsy (0/false/no/off, case-insensitive) disables
 //                        the TOV block. Default: enabled.
 //   TOV_REMINDER_PATH    per-agent override file for the TOV block. MUST live
@@ -141,12 +157,51 @@ export function tovReminder(env: NodeJS.ProcessEnv = process.env): string | unde
   return EMBEDDED_TOV_REMINDER
 }
 
+/**
+ * Resolve the per-turn AUTONOMY block from the durable registry, or undefined
+ * when there is nothing active / the state can't be located. FAIL-OPEN: any
+ * error returns undefined so the reminder still ships without the block — a
+ * broken registry must never gate the turn.
+ *
+ * State dir resolution: the CANONICAL source is the inline TELEGRAM_STATE_DIR
+ * that patch-claude-settings bakes into the hook command (fix-loop #5) — that
+ * is the SAME resolved root the running server writes its registry into.
+ * MULTICHAT_STATE_DIR is honored only as a documented last-resort fallback
+ * for legacy per-chat sessions whose command predates the baked var. When
+ * neither a state dir nor a chat id is available, the block is simply omitted.
+ *
+ * The store module is imported LAZILY inside the try (fix-loop #6): a static
+ * top-level import from ../src/ would make a module-load failure (partial
+ * deploy, syntax error) kill the WHOLE hook — losing the channel-discipline
+ * reminder too. A failed dynamic import degrades to «no autonomy block».
+ */
+export async function autonomyReminder(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | undefined> {
+  try {
+    const chatId = (env.CHAT_ID ?? '').trim()
+    if (chatId === '') return undefined
+    const stateDir = env.TELEGRAM_STATE_DIR ?? env.MULTICHAT_STATE_DIR
+    if (!stateDir || stateDir.trim() === '') return undefined
+    const { buildAutonomyReminderBlock, loadAutonomyState } = await import(
+      '../src/autonomy/store.js'
+    )
+    const state = loadAutonomyState({ root: stateDir }, chatId)
+    return buildAutonomyReminderBlock(state, Date.now())
+  } catch {
+    // Never gate the turn on an autonomy-state / module-load failure.
+    return undefined
+  }
+}
+
 /** Compose the full additionalContext string: channel discipline first, then
- *  the optional TOV block separated by a blank line. */
-export function composeReminder(env: NodeJS.ProcessEnv = process.env): string {
+ *  the optional autonomy block, then the optional TOV block — each separated by
+ *  a blank line. Async because the autonomy block loads its module lazily. */
+export async function composeReminder(env: NodeJS.ProcessEnv = process.env): Promise<string> {
   const channel = reminderForChat(env.CHAT_ID)
+  const autonomy = await autonomyReminder(env)
   const tov = tovReminder(env)
-  return tov ? `${channel}\n\n${tov}` : channel
+  return [channel, autonomy, tov].filter((s): s is string => s !== undefined && s.length > 0).join('\n\n')
 }
 
 /** The exact stdout envelope Claude Code reads for UserPromptSubmit context. */
@@ -168,9 +223,16 @@ if (import.meta.main) {
   // payload before the stream flushes (Codex review). The payload is one
   // short line, but natural termination is the safe pattern.
   try {
-    process.stdout.write(renderContext(composeReminder(process.env)))
+    const text = await composeReminder(process.env)
+    process.stdout.write(renderContext(text))
   } catch {
-    // Never gate the turn on a reminder failure.
+    // Never gate the turn on a reminder failure. Emit the bare channel
+    // reminder as the floor so the discipline text still reaches the turn.
+    try {
+      process.stdout.write(renderContext(reminderForChat(process.env.CHAT_ID)))
+    } catch {
+      // truly nothing to do
+    }
   }
   process.exitCode = 0
 }
