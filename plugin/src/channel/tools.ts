@@ -919,6 +919,14 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
             'autonomy registry is write-locked by another live writer process — mutation refused (writer_conflict), retry later',
           )
 
+        // A file from a NEWER schema (version > 1) is read-only — refuse the
+        // mutation rather than downgrade + clobber it (PR-1 leftover 4b).
+        const versionUnsupported = (): CallToolResult =>
+          toolError(
+            name,
+            'autonomy registry was written by a newer plugin version — it is read-only, mutation refused (version_unsupported); upgrade the plugin',
+          )
+
         if (args.action === 'consume') {
           // lease_id presence is enforced by the schema's superRefine. The
           // mutation routes through updateAutonomyState — the serialized
@@ -933,8 +941,10 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
               return { state: r.state, result: r.outcome }
             },
             log,
+            now,
           )
           if (upd.kind === 'writer_conflict') return writerConflict()
+          if (upd.kind === 'version_unsupported') return versionUnsupported()
           switch (upd.result) {
             case 'not_found':
               return toolError(name, `lease not found: ${leaseId}`)
@@ -965,8 +975,10 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
               return { state: r.state, result: r.outcome }
             },
             log,
+            now,
           )
           if (upd.kind === 'writer_conflict') return writerConflict()
+          if (upd.kind === 'version_unsupported') return versionUnsupported()
           switch (upd.result) {
             case 'not_found':
               return toolError(name, `lease not found: ${leaseId}`)
@@ -992,8 +1004,10 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
             return { state: r.state, result: r.outcome }
           },
           log,
+          now,
         )
         if (upd.kind === 'writer_conflict') return writerConflict()
+        if (upd.kind === 'version_unsupported') return versionUnsupported()
         switch (upd.result) {
           case 'not_found':
             return toolError(name, `question not found: ${questionId}`)
