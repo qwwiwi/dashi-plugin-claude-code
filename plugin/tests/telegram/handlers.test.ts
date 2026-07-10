@@ -25,6 +25,7 @@ import {
   type ProgressReporterForWatcher,
 } from '../../src/telegram/watcher.js'
 import type { AppConfig, StatePaths } from '../../src/config.js'
+import { activeLeases, loadAutonomyState } from '../../src/autonomy/store.js'
 import { createLogger } from '../../src/log.js'
 import type {
   PendingPermission,
@@ -395,6 +396,50 @@ describe('handleInboundText — OOB allowed_chat_ids gate (Fix 6)', () => {
 
     // OOB handled inline — no channel notify for /help.
     expect(serverSpy.calls.length).toBe(0)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  // Autonomy M2: /lease is one of only two authenticated lease-grant surfaces.
+  // The OOB gate is its authorization boundary — a non-allowed chat must mint
+  // NO lease, an allowed chat must.
+  test('/lease from a chat NOT in allowed_chat_ids: NO lease minted', async () => {
+    const config = makeConfig({ allowed_user_ids: [164795011], allowed_chat_ids: [164795011] })
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({ config, server: serverSpy.server })
+    const ctx = makeCtx({ text: '/lease деплой', chatId: 99999, chatType: 'private', fromId: 164795011 })
+
+    await handleInboundText(ctx, deps)
+
+    // Gate rejected the OOB command → no grant happened for chat 99999.
+    expect(loadAutonomyState({ root: statePaths.root }, '99999').leases.length).toBe(0)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  test('/lease from the allowed owner chat mints a lease and replies', async () => {
+    const config = makeConfig()
+    const serverSpy = makeServerSpy()
+    const sends: string[] = []
+    const tg = makeTelegramApi()
+    const api: TelegramApi = {
+      ...tg.api,
+      sendMessage: async (_c, text) => {
+        sends.push(text)
+        return { message_id: 100 }
+      },
+    }
+    const { deps, statePaths } = makeDeps({ config, server: serverSpy.server, telegramApi: api })
+    const ctx = makeCtx({ text: '/lease деплой стейджинга; ttl=48h', chatId: 164795011, chatType: 'private', fromId: 164795011 })
+
+    await handleInboundText(ctx, deps)
+
+    const leases = activeLeases(loadAutonomyState({ root: statePaths.root }, '164795011'), Date.now())
+    expect(leases.length).toBe(1)
+    expect(leases[0]!.scope).toBe('деплой стейджинга')
+    expect(leases[0]!.source).toBe('owner_cmd')
+    // Control command is swallowed — no channel notification to the session.
+    expect(serverSpy.calls.length).toBe(0)
+    // The owner got a confirmation reply.
+    expect(sends.some((t) => t.includes('мандат выдан'))).toBe(true)
     rmSync(statePaths.root, { recursive: true, force: true })
   })
 })
