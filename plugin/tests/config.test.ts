@@ -6,6 +6,7 @@ import {
   getStatePaths,
   loadConfig,
   redactToken,
+  resolveAskGuardMode,
   resolveAskUserQuestionAllowedUserIds,
   RuntimeEnvSchema,
 } from '../src/config.js'
@@ -539,5 +540,96 @@ describe('single progress surface defaults (2026-06-09 duplicate-windows fix)', 
     const cfg = loadConfig(env())
     expect(cfg.status.enabled).toBe(true)
     expect(cfg.progress.enabled).toBe(true)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveAskGuardMode (autonomy M3). The `ask_guard` config block is
+// optional; the helper applies the 'advisory' default and the two direct-env
+// overrides (kill-switch ASK_GUARD_ENABLED, ASK_GUARD_MODE) in one place. The
+// two env vars are read from process.env DIRECTLY, so these tests set/restore
+// process.env rather than passing an env object.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('resolveAskGuardMode', () => {
+  let savedEnabled: string | undefined
+  let savedMode: string | undefined
+
+  beforeEach(() => {
+    savedEnabled = process.env.ASK_GUARD_ENABLED
+    savedMode = process.env.ASK_GUARD_MODE
+    delete process.env.ASK_GUARD_ENABLED
+    delete process.env.ASK_GUARD_MODE
+  })
+
+  afterEach(() => {
+    if (savedEnabled === undefined) delete process.env.ASK_GUARD_ENABLED
+    else process.env.ASK_GUARD_ENABLED = savedEnabled
+    if (savedMode === undefined) delete process.env.ASK_GUARD_MODE
+    else process.env.ASK_GUARD_MODE = savedMode
+  })
+
+  test('defaults to advisory when nothing is configured', () => {
+    const cfg = loadConfig(env())
+    expect(resolveAskGuardMode(cfg)).toBe('advisory')
+  })
+
+  test('config.json ask_guard.mode = block is honored', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ ask_guard: { mode: 'block' } }))
+    const cfg = loadConfig(env())
+    expect(resolveAskGuardMode(cfg)).toBe('block')
+  })
+
+  test('config.json ask_guard.mode = off is honored', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ ask_guard: { mode: 'off' } }))
+    const cfg = loadConfig(env())
+    expect(resolveAskGuardMode(cfg)).toBe('off')
+  })
+
+  test('ASK_GUARD_MODE env overrides config.json', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ ask_guard: { mode: 'advisory' } }))
+    const cfg = loadConfig(env())
+    process.env.ASK_GUARD_MODE = 'block'
+    expect(resolveAskGuardMode(cfg)).toBe('block')
+  })
+
+  test('ASK_GUARD_MODE env is case-insensitive and trimmed', () => {
+    const cfg = loadConfig(env())
+    process.env.ASK_GUARD_MODE = '  BLOCK '
+    expect(resolveAskGuardMode(cfg)).toBe('block')
+  })
+
+  test('an invalid ASK_GUARD_MODE falls through to the config/default', () => {
+    const cfg = loadConfig(env())
+    process.env.ASK_GUARD_MODE = 'nonsense'
+    expect(resolveAskGuardMode(cfg)).toBe('advisory')
+  })
+
+  test('kill-switch ASK_GUARD_ENABLED=0 forces off, beating a configured block', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ ask_guard: { mode: 'block' } }))
+    const cfg = loadConfig(env())
+    process.env.ASK_GUARD_ENABLED = '0'
+    expect(resolveAskGuardMode(cfg)).toBe('off')
+  })
+
+  test('kill-switch ASK_GUARD_ENABLED=false beats ASK_GUARD_MODE=block', () => {
+    const cfg = loadConfig(env())
+    process.env.ASK_GUARD_ENABLED = 'false'
+    process.env.ASK_GUARD_MODE = 'block'
+    expect(resolveAskGuardMode(cfg)).toBe('off')
+  })
+
+  test('kill-switch accepts no/off variants (case-insensitive)', () => {
+    const cfg = loadConfig(env())
+    for (const v of ['no', 'OFF', 'No']) {
+      process.env.ASK_GUARD_ENABLED = v
+      expect(resolveAskGuardMode(cfg)).toBe('off')
+    }
+  })
+
+  test('ASK_GUARD_ENABLED with a truthy value does NOT force off (default applies)', () => {
+    const cfg = loadConfig(env())
+    process.env.ASK_GUARD_ENABLED = '1'
+    expect(resolveAskGuardMode(cfg)).toBe('advisory')
   })
 })
