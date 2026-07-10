@@ -11,15 +11,25 @@
 // Enforcement hooks and lease-GRANTING arrive in later PRs — this module never
 // grants a lease on its own; leases are added only through the store API.
 //
-// Persistence: one JSON file per chat, `autonomy-<chatId>.json`, in the same
+// Persistence: one JSON file per chat, `autonomy-<chatKey>.json`, in the same
 // state root the other per-chat persisters use (StatePaths.root — see
 // context-hud.ts `context-hud-<chatId>.json` and task-reality-mirror.ts
-// `task-reality-epoch-<chatId>.json`). Atomic tmp+fsync+rename, 0o600, exactly
-// like state/store.ts writeUpdateOffset. A corrupt/missing file loads as empty
-// state and NEVER throws — a broken registry must never break message delivery.
+// `task-reality-epoch-<chatId>.json`). Atomic tmp('wx')+fchmod+fsync+rename
+// (+ best-effort directory fsync), 0o600. A corrupt/missing file loads as
+// empty state and NEVER throws — a broken registry must never break delivery.
+//
+// SINGLE-WRITER ASSUMPTION (review 2026-07-10 fix-loop #1): the MCP/webhook
+// server process is the ONLY writer of these files. The hooks
+// (channel-reminder, HUD render path) are strictly READ-ONLY consumers.
+// Within the server process, ALL mutations MUST go through
+// `updateAutonomyState`, which serializes load→mutate→save per chat via an
+// in-process promise chain — two concurrent `consume` calls can never both
+// observe the pre-consume state. Cross-PROCESS locking is deliberately out of
+// scope: there is no second writer process by design.
 
 import {
   closeSync,
+  fchmodSync,
   fsyncSync,
   mkdirSync,
   openSync,
@@ -28,6 +38,7 @@ import {
   unlinkSync,
   writeSync,
 } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 
 import type { StatePaths } from '../config.js'
@@ -121,9 +132,11 @@ export function questionAgeMs(question: OpenQuestion, nowMs: number): number {
   return Math.max(0, nowMs - question.askedAtMs)
 }
 
-// Short random suffix for generated ids. Filename-safe (base36).
+// Short crypto-random suffix for generated ids (8 hex chars, filename-safe).
+// Crypto-sourced so regenerated-on-collision ids can't cycle through the same
+// PRNG sequence (review 2026-07-10 fix-loop #4).
 function randSuffix(): string {
-  return Math.random().toString(36).slice(2, 6).padEnd(4, '0')
+  return randomBytes(4).toString('hex')
 }
 
 // `YYYYMMDD` from an epoch-ms clock (UTC — stable across the fleet).
@@ -153,18 +166,40 @@ export interface NewLeaseInput {
   notes?: string
 }
 
+// Outcome of an add: `duplicate` is returned ONLY for an EXPLICIT id that
+// already exists (the state is returned unchanged so a colliding grant can
+// never create two consumable leases with one id). Auto-generated ids
+// regenerate on collision instead — they never report duplicate.
+export type AddOutcome = 'ok' | 'duplicate'
+
+// Generate an id guaranteed unique within `existing`, regenerating on the
+// (astronomically unlikely) crypto-random collision.
+function uniqueId(gen: () => string, existing: ReadonlySet<string>): string {
+  let id = gen()
+  while (existing.has(id)) id = gen()
+  return id
+}
+
 /**
  * Add a lease and return the NEW state plus the created lease. Pure: the input
  * `state` is not mutated (a fresh `leases` array is returned). Granting still
  * only happens through this API — the MCP tool never reaches it.
+ *
+ * ID uniqueness (fix-loop #4): an explicit `input.id` colliding with an
+ * existing lease → `outcome: 'duplicate'`, state unchanged, no lease. An
+ * omitted id is generated and regenerated until unique.
  */
 export function addLease(
   state: AutonomyState,
   input: NewLeaseInput,
   nowMs: number = Date.now(),
-): { state: AutonomyState; lease: AutonomyLease } {
+): { state: AutonomyState; lease?: AutonomyLease; outcome: AddOutcome } {
+  const existing = new Set(state.leases.map((l) => l.id))
+  if (input.id !== undefined && existing.has(input.id)) {
+    return { state, outcome: 'duplicate' }
+  }
   const lease: AutonomyLease = {
-    id: input.id ?? newLeaseId(nowMs),
+    id: input.id ?? uniqueId(() => newLeaseId(nowMs), existing),
     scope: input.scope,
     grantedAtMs: input.grantedAtMs ?? nowMs,
     expiresAtMs: input.expiresAtMs,
@@ -173,16 +208,19 @@ export function addLease(
     ...(input.grantorMessageId !== undefined ? { grantorMessageId: input.grantorMessageId } : {}),
     ...(input.notes !== undefined ? { notes: input.notes } : {}),
   }
-  return { state: { ...state, leases: [...state.leases, lease] }, lease }
+  return { state: { ...state, leases: [...state.leases, lease] }, lease, outcome: 'ok' }
 }
 
-export type ConsumeOutcome = 'ok' | 'not_found' | 'already_consumed'
+export type ConsumeOutcome = 'ok' | 'not_found' | 'already_consumed' | 'expired'
 
 /**
  * Mark a lease consumed. Returns the new state and an outcome the caller turns
- * into user-facing text. `already_consumed` is reported for an id that exists
- * but is already consumed (an expired-but-unconsumed lease still consumes ok —
- * expiry is a render concern, not a consume concern).
+ * into user-facing text:
+ *   `not_found`         — unknown id.
+ *   `already_consumed`  — the id exists but was consumed earlier.
+ *   `expired`           — the mandate's window has passed (fix-loop #8): the
+ *                         consume is refused honestly instead of reporting a
+ *                         success on a dead mandate.
  */
 export function consumeLease(
   state: AutonomyState,
@@ -194,6 +232,9 @@ export function consumeLease(
   const lease = state.leases[idx] as AutonomyLease
   if (lease.consumedAtMs !== undefined && lease.consumedAtMs !== null) {
     return { state, outcome: 'already_consumed' }
+  }
+  if (lease.expiresAtMs <= nowMs) {
+    return { state, outcome: 'expired' }
   }
   const leases = state.leases.slice()
   leases[idx] = { ...lease, consumedAtMs: nowMs }
@@ -210,14 +251,22 @@ export interface NewQuestionInput {
   status?: QuestionStatus
 }
 
-/** Add an open question and return the NEW state plus the created question. */
+/**
+ * Add an open question and return the NEW state plus the created question.
+ * Same ID-uniqueness contract as addLease: explicit colliding id →
+ * `outcome: 'duplicate'` (state unchanged); omitted id regenerates to unique.
+ */
 export function addQuestion(
   state: AutonomyState,
   input: NewQuestionInput,
   nowMs: number = Date.now(),
-): { state: AutonomyState; question: OpenQuestion } {
+): { state: AutonomyState; question?: OpenQuestion; outcome: AddOutcome } {
+  const existing = new Set(state.questions.map((q) => q.id))
+  if (input.id !== undefined && existing.has(input.id)) {
+    return { state, outcome: 'duplicate' }
+  }
   const question: OpenQuestion = {
-    id: input.id ?? newQuestionId(nowMs),
+    id: input.id ?? uniqueId(() => newQuestionId(nowMs), existing),
     summary: input.summary,
     askedAtMs: input.askedAtMs ?? nowMs,
     status: input.status ?? 'open',
@@ -225,15 +274,19 @@ export function addQuestion(
     ...(input.defaultAction !== undefined ? { defaultAction: input.defaultAction } : {}),
     ...(input.sticky !== undefined ? { sticky: input.sticky } : {}),
   }
-  return { state: { ...state, questions: [...state.questions, question] }, question }
+  return { state: { ...state, questions: [...state.questions, question] }, question, outcome: 'ok' }
 }
 
-export type ResolveOutcome = 'ok' | 'not_found'
+export type ResolveOutcome = 'ok' | 'not_found' | 'sticky_forbidden' | 'already_resolved'
 
 /**
  * Resolve a question to `answered` or `bypassed`, stamping resolvedAtMs.
- * `not_found` when the id is unknown. Re-resolving an already-resolved question
- * is allowed (idempotent-ish) — the status/timestamp are simply overwritten.
+ * Invariants live HERE, in the store, not in prose (fix-loop #2):
+ *   `not_found`        — unknown id.
+ *   `sticky_forbidden` — a sticky (security) question can NEVER be bypassed;
+ *                        only `answered` is accepted for it.
+ *   `already_resolved` — the question is no longer open; resolution is final
+ *                        and cannot be rewritten.
  */
 export function resolveQuestion(
   state: AutonomyState,
@@ -244,6 +297,10 @@ export function resolveQuestion(
   const idx = state.questions.findIndex((q) => q.id === id)
   if (idx === -1) return { state, outcome: 'not_found' }
   const q = state.questions[idx] as OpenQuestion
+  if (q.status !== 'open') return { state, outcome: 'already_resolved' }
+  if (q.sticky === true && status === 'bypassed') {
+    return { state, outcome: 'sticky_forbidden' }
+  }
   const questions = state.questions.slice()
   questions[idx] = { ...q, status, resolvedAtMs: nowMs }
   return { state: { ...state, questions }, outcome: 'ok' }
@@ -386,12 +443,36 @@ export function buildAutonomyHudLine(
 // Persistence (I/O). Never throws on load; atomic write like state/store.ts.
 // ─────────────────────────────────────────────────────────────────────
 
-// Filename-safe per-chat path. chatId is a numeric string (possibly negative
-// for supergroups); sanitize defensively so a surprising value can never
-// escape the state dir — identical convention to context-hud.persistPath.
+// ONE canonicalizer for the per-chat file key, used by path building, the
+// tmp-file naming AND the write-serialization map — so "00123" and "123" can
+// never address two different files/locks (fix-loop #3).
+//   * Numeric strings (the normal Telegram case, incl. negative supergroup
+//     ids) normalize via BigInt: leading zeros / "-0" collapse to the
+//     canonical integer form.
+//   * Non-numeric strings encode INJECTIVELY: [0-9A-Za-z-] pass through,
+//     every other code point (including `_`, the escape char itself) becomes
+//     `_<hex>_` — two distinct inputs can never collide, unlike a lossy
+//     replace-with-`_`.
+export function canonicalChatKey(chatId: string): string {
+  const trimmed = chatId.trim()
+  if (/^-?\d+$/.test(trimmed)) {
+    try {
+      return BigInt(trimmed).toString()
+    } catch {
+      // unreachable for the regex above; fall through defensively
+    }
+  }
+  let out = ''
+  for (const ch of trimmed) {
+    if (/[0-9A-Za-z-]/.test(ch)) out += ch
+    else out += `_${(ch.codePointAt(0) as number).toString(16)}_`
+  }
+  return out
+}
+
+// Filename-safe per-chat path, keyed by the canonical chat key.
 export function autonomyStatePath(paths: AutonomyPaths, chatId: string): string {
-  const safe = chatId.replace(/[^0-9A-Za-z_-]/g, '_')
-  return join(paths.root, `autonomy-${safe}.json`)
+  return join(paths.root, `autonomy-${canonicalChatKey(chatId)}.json`)
 }
 
 // Narrow an unknown parsed blob into a valid AutonomyState, dropping anything
@@ -485,12 +566,14 @@ export function loadAutonomyState(
   }
   try {
     return coerceState(JSON.parse(raw))
-  } catch (err) {
+  } catch {
     // File existed but held invalid JSON — worth a warning, but never fatal.
+    // Log ONLY a stable error code: the JSON.parse message can embed file
+    // content, which must never reach the logs (fix-loop #9).
     if (log) {
       log.warn('autonomy state parse failed, using empty state', {
         chat_id: chatId,
-        error: err instanceof Error ? err.message : String(err),
+        code: 'autonomy_state_parse_error',
       })
     }
     return emptyAutonomyState()
@@ -498,9 +581,14 @@ export function loadAutonomyState(
 }
 
 /**
- * Persist the per-chat autonomy state atomically (tmp + fsync + rename, 0o600).
- * On rename failure the tmp file is removed so no partial-write stray remains —
- * same contract as state/store.ts writeUpdateOffset.
+ * Persist the per-chat autonomy state atomically. Durability hardening
+ * (fix-loop #7, upgrades over state/store.ts writeUpdateOffset):
+ *   * tmp opened with 'wx' (exclusive — a name collision fails loud instead
+ *     of clobbering a concurrent writer's staging file);
+ *   * fchmod 0600 right after open (mode arg is umask-masked; fchmod is not);
+ *   * tmp cleaned up on ANY failure of the write path, not just rename;
+ *   * best-effort directory fsync after rename so the rename itself is
+ *     durable across a crash.
  */
 export function saveAutonomyState(
   paths: AutonomyPaths,
@@ -508,29 +596,99 @@ export function saveAutonomyState(
   state: AutonomyState,
 ): void {
   mkdirSync(paths.root, { recursive: true, mode: 0o700 })
+  const key = canonicalChatKey(chatId)
   const target = autonomyStatePath(paths, chatId)
-  const tmp = join(paths.root, `autonomy-${chatId.replace(/[^0-9A-Za-z_-]/g, '_')}.tmp.${process.pid}.${Date.now()}`)
+  const rand = randomBytes(3).toString('hex')
+  const tmp = join(paths.root, `autonomy-${key}.tmp.${process.pid}.${Date.now()}.${rand}`)
   // Normalize on write: always stamp the current schema version.
   const body = JSON.stringify(
     { version: AUTONOMY_STATE_VERSION, leases: state.leases, questions: state.questions },
     null,
     2,
   )
-  const fd = openSync(tmp, 'w', 0o600)
+  let fd: number | undefined
+  let renamed = false
   try {
+    fd = openSync(tmp, 'wx', 0o600)
+    fchmodSync(fd, 0o600)
     writeSync(fd, body)
     fsyncSync(fd)
-  } finally {
     closeSync(fd)
-  }
-  try {
+    fd = undefined
     renameSync(tmp, target)
-  } catch (err) {
-    try {
-      unlinkSync(tmp)
-    } catch {
-      // best-effort cleanup
+    renamed = true
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd)
+      } catch {
+        // best-effort
+      }
     }
-    throw err
+    if (!renamed) {
+      try {
+        unlinkSync(tmp)
+      } catch {
+        // best-effort cleanup — tmp may never have been created
+      }
+    }
   }
+  // Directory fsync: makes the rename durable. Best-effort — some platforms
+  // refuse O_RDONLY fsync on directories; a failure never breaks the save.
+  try {
+    const dirFd = openSync(paths.root, 'r')
+    try {
+      fsyncSync(dirFd)
+    } finally {
+      closeSync(dirFd)
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Serialized read-modify-write (fix-loop #1). ALL mutations of the per-chat
+// file MUST route through here — a bare load→mutate→save in a caller races
+// (two concurrent consumes both observing the pre-consume state).
+// ─────────────────────────────────────────────────────────────────────
+
+// Per-(root, chatKey) promise chain. Keyed by root TOO so two test dirs with
+// the same chat id never share a lock. In-process only — see the
+// single-writer assumption in the module header.
+const updateChains = new Map<string, Promise<void>>()
+
+/**
+ * Atomically (within this process) apply `mutator` to the chat's state:
+ * load → mutate → save, serialized per chat via a promise chain. The mutator
+ * is pure/synchronous and returns the next state plus a result; when it
+ * returns the SAME state reference (a failed/no-op mutation), the save is
+ * skipped. Returns the mutator's result.
+ */
+export function updateAutonomyState<T>(
+  paths: AutonomyPaths,
+  chatId: string,
+  mutator: (state: AutonomyState) => { state: AutonomyState; result: T },
+  log?: Logger,
+): Promise<T> {
+  const key = `${paths.root}|${canonicalChatKey(chatId)}`
+  const step = (): T => {
+    const state = loadAutonomyState(paths, chatId, log)
+    const { state: next, result } = mutator(state)
+    if (next !== state) saveAutonomyState(paths, chatId, next)
+    return result
+  }
+  const prior = updateChains.get(key) ?? Promise.resolve()
+  // Run after the prior op regardless of its outcome (the chain must never
+  // poison). Errors from THIS op propagate to the caller.
+  const run = prior.then(step, step)
+  const settled: Promise<void> = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  updateChains.set(key, settled)
+  void settled.then(() => {
+    if (updateChains.get(key) === settled) updateChains.delete(key)
+  })
+  return run
 }

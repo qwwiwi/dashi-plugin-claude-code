@@ -34,7 +34,7 @@ import {
   loadAutonomyState,
   renderAutonomyStatus,
   resolveQuestion,
-  saveAutonomyState,
+  updateAutonomyState,
 } from '../autonomy/store.js'
 import { assertAllowedChat } from '../telegram/gate.js'
 import type { GuestQueryRegistry } from '../telegram/guest-queries.js'
@@ -898,29 +898,66 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         }
 
         const now = Date.now()
-        const state = loadAutonomyState(statePaths, args.chat_id, log)
 
         if (args.action === 'status') {
+          // Read-only — no serialization needed.
+          const state = loadAutonomyState(statePaths, args.chat_id, log)
           return { content: [{ type: 'text', text: renderAutonomyStatus(state, now) }] }
         }
 
         if (args.action === 'consume') {
-          // lease_id presence is enforced by the schema's superRefine.
+          // lease_id presence is enforced by the schema's superRefine. The
+          // mutation routes through updateAutonomyState — the serialized
+          // read-modify-write — so two concurrent consumes can never both
+          // succeed (fix-loop #1).
           const leaseId = args.lease_id as string
-          const { state: next, outcome } = consumeLease(state, leaseId, now)
-          if (outcome === 'not_found') return toolError(name, `lease not found: ${leaseId}`)
-          if (outcome === 'already_consumed') return toolError(name, `lease already consumed: ${leaseId}`)
-          saveAutonomyState(statePaths, args.chat_id, next)
-          return { content: [{ type: 'text', text: `lease consumed: ${leaseId}` }] }
+          const outcome = await updateAutonomyState(
+            statePaths,
+            args.chat_id,
+            (state) => {
+              const r = consumeLease(state, leaseId, now)
+              return { state: r.state, result: r.outcome }
+            },
+            log,
+          )
+          switch (outcome) {
+            case 'not_found':
+              return toolError(name, `lease not found: ${leaseId}`)
+            case 'already_consumed':
+              return toolError(name, `lease already consumed: ${leaseId}`)
+            case 'expired':
+              // Honest refusal (fix-loop #8): the mandate's window has
+              // passed — do not report success on a dead mandate.
+              return toolError(name, `lease expired: ${leaseId} — the mandate window has passed, it cannot be consumed`)
+            case 'ok':
+              return { content: [{ type: 'text', text: `lease consumed: ${leaseId}` }] }
+          }
         }
 
         // action === 'resolve_question' (question_id + resolution enforced by schema).
         const questionId = args.question_id as string
         const resolution = args.resolution as 'answered' | 'bypassed'
-        const { state: next, outcome } = resolveQuestion(state, questionId, resolution, now)
-        if (outcome === 'not_found') return toolError(name, `question not found: ${questionId}`)
-        saveAutonomyState(statePaths, args.chat_id, next)
-        return { content: [{ type: 'text', text: `question ${questionId} resolved: ${resolution}` }] }
+        const outcome = await updateAutonomyState(
+          statePaths,
+          args.chat_id,
+          (state) => {
+            const r = resolveQuestion(state, questionId, resolution, now)
+            return { state: r.state, result: r.outcome }
+          },
+          log,
+        )
+        switch (outcome) {
+          case 'not_found':
+            return toolError(name, `question not found: ${questionId}`)
+          case 'sticky_forbidden':
+            // Store-enforced invariant (fix-loop #2): security questions can
+            // never be bypassed — only an owner answer resolves them.
+            return toolError(name, `question ${questionId} is sticky (security) — bypass is forbidden, it requires the owner's answer`)
+          case 'already_resolved':
+            return toolError(name, `question already resolved: ${questionId}`)
+          case 'ok':
+            return { content: [{ type: 'text', text: `question ${questionId} resolved: ${resolution}` }] }
+        }
       }
 
       default:

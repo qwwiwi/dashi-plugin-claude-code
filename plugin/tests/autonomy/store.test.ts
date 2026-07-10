@@ -11,6 +11,7 @@ import {
   autonomyStatePath,
   buildAutonomyHudLine,
   buildAutonomyReminderBlock,
+  canonicalChatKey,
   consumeLease,
   emptyAutonomyState,
   humanizeDurationMs,
@@ -22,6 +23,7 @@ import {
   renderAutonomyStatus,
   resolveQuestion,
   saveAutonomyState,
+  updateAutonomyState,
   type AutonomyState,
 } from '../../src/autonomy/store.js'
 
@@ -138,23 +140,48 @@ describe('loadAutonomyState — corrupt / missing → empty', () => {
   })
 })
 
-describe('id generation', () => {
-  test('lease id: L-YYYYMMDD-xxxx', () => {
-    expect(newLeaseId(NOW)).toMatch(/^L-\d{8}-[0-9a-z]{4}$/)
+describe('id generation + uniqueness', () => {
+  test('lease id: L-YYYYMMDD-<8 hex crypto chars>', () => {
+    expect(newLeaseId(NOW)).toMatch(/^L-\d{8}-[0-9a-f]{8}$/)
   })
-  test('question id: Q-YYYYMMDD-xxxx', () => {
-    expect(newQuestionId(NOW)).toMatch(/^Q-\d{8}-[0-9a-z]{4}$/)
+  test('question id: Q-YYYYMMDD-<8 hex crypto chars>', () => {
+    expect(newQuestionId(NOW)).toMatch(/^Q-\d{8}-[0-9a-f]{8}$/)
   })
-  test('addLease/addQuestion generate ids when omitted', () => {
+  test('addLease/addQuestion generate ids when omitted (outcome ok)', () => {
     const l = addLease(emptyAutonomyState(), { scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW)
-    expect(l.lease.id).toMatch(/^L-/)
+    expect(l.outcome).toBe('ok')
+    expect(l.lease?.id).toMatch(/^L-/)
     const q = addQuestion(emptyAutonomyState(), { summary: 's' }, NOW)
-    expect(q.question.id).toMatch(/^Q-/)
+    expect(q.outcome).toBe('ok')
+    expect(q.question?.id).toMatch(/^Q-/)
   })
   test('addLease is pure — input state is not mutated', () => {
     const s0 = emptyAutonomyState()
     addLease(s0, { scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW)
     expect(s0.leases).toEqual([])
+  })
+
+  test('colliding EXPLICIT lease id → duplicate, state unchanged, consume stays unambiguous', () => {
+    let state = emptyAutonomyState()
+    state = addLease(state, { id: 'L-dup', scope: 'first', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW).state
+    const second = addLease(state, { id: 'L-dup', scope: 'second', expiresAtMs: NOW + 9 * HOUR, source: 'manual' }, NOW)
+    expect(second.outcome).toBe('duplicate')
+    expect(second.lease).toBeUndefined()
+    expect(second.state).toBe(state) // unchanged reference
+    // Exactly ONE lease with the id exists → consume is unambiguous.
+    expect(second.state.leases.filter((l) => l.id === 'L-dup').length).toBe(1)
+    const consumed = consumeLease(second.state, 'L-dup', NOW)
+    expect(consumed.outcome).toBe('ok')
+    expect(consumed.state.leases.filter((l) => l.id === 'L-dup' && l.consumedAtMs === NOW).length).toBe(1)
+  })
+
+  test('colliding EXPLICIT question id → duplicate, state unchanged', () => {
+    let state = emptyAutonomyState()
+    state = addQuestion(state, { id: 'Q-dup', summary: 'first', askedAtMs: NOW }, NOW).state
+    const second = addQuestion(state, { id: 'Q-dup', summary: 'second', askedAtMs: NOW }, NOW)
+    expect(second.outcome).toBe('duplicate')
+    expect(second.question).toBeUndefined()
+    expect(second.state.questions.length).toBe(1)
   })
 })
 
@@ -207,7 +234,7 @@ describe('questions — age + resolve', () => {
   })
 
   test('questionAgeMs clamps a future askedAtMs to 0', () => {
-    const q = addQuestion(emptyAutonomyState(), { summary: 's', askedAtMs: NOW + HOUR }, NOW).question
+    const q = addQuestion(emptyAutonomyState(), { summary: 's', askedAtMs: NOW + HOUR }, NOW).question!
     expect(questionAgeMs(q, NOW)).toBe(0)
   })
 
@@ -221,6 +248,109 @@ describe('questions — age + resolve', () => {
     expect(r.outcome).toBe('ok')
     expect(r.state.questions[0]?.status).toBe('bypassed')
     expect(r.state.questions[0]?.resolvedAtMs).toBe(NOW + HOUR)
+  })
+
+  test('sticky question can NEVER be bypassed (store-enforced)', () => {
+    let state = emptyAutonomyState()
+    state = addQuestion(state, { id: 'Q-s', summary: 'wipe db?', askedAtMs: NOW, sticky: true }, NOW).state
+    const bypass = resolveQuestion(state, 'Q-s', 'bypassed', NOW)
+    expect(bypass.outcome).toBe('sticky_forbidden')
+    expect(bypass.state.questions[0]?.status).toBe('open') // untouched
+    // `answered` is still allowed for a sticky question.
+    const answered = resolveQuestion(state, 'Q-s', 'answered', NOW)
+    expect(answered.outcome).toBe('ok')
+  })
+
+  test('already-resolved question cannot be re-resolved', () => {
+    let state = emptyAutonomyState()
+    state = addQuestion(state, { id: 'Q-1', summary: 's', askedAtMs: NOW }, NOW).state
+    state = resolveQuestion(state, 'Q-1', 'answered', NOW).state
+    const again = resolveQuestion(state, 'Q-1', 'bypassed', NOW + HOUR)
+    expect(again.outcome).toBe('already_resolved')
+    expect(again.state.questions[0]?.status).toBe('answered') // final
+  })
+})
+
+describe('consumeLease — expired honesty', () => {
+  test('expired unconsumed lease → outcome expired, state untouched', () => {
+    let state = emptyAutonomyState()
+    state = addLease(state, { id: 'L-old', scope: 's', expiresAtMs: NOW - 1, source: 'manual' }, NOW - HOUR).state
+    const r = consumeLease(state, 'L-old', NOW)
+    expect(r.outcome).toBe('expired')
+    expect(r.state.leases[0]?.consumedAtMs).toBe(null)
+  })
+
+  test('consumed beats expired in reporting (already_consumed wins)', () => {
+    let state = emptyAutonomyState()
+    state = addLease(state, { id: 'L-1', scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW).state
+    state = consumeLease(state, 'L-1', NOW).state
+    // Later, after expiry:
+    const r = consumeLease(state, 'L-1', NOW + 2 * HOUR)
+    expect(r.outcome).toBe('already_consumed')
+  })
+})
+
+describe('canonicalChatKey', () => {
+  test('numeric strings normalize via BigInt — "00123" and "123" share one file', () => {
+    expect(canonicalChatKey('00123')).toBe('123')
+    expect(canonicalChatKey('123')).toBe('123')
+    expect(autonomyStatePath(paths(), '00123')).toBe(autonomyStatePath(paths(), '123'))
+  })
+
+  test('negative supergroup ids keep the canonical minus form', () => {
+    expect(canonicalChatKey('-1001234567890')).toBe('-1001234567890')
+    expect(canonicalChatKey('-0')).toBe('0')
+  })
+
+  test('non-numeric strings encode injectively (no lossy collisions)', () => {
+    // Underscore and space must map to DIFFERENT keys (the old lossy `_`
+    // replacement collided them).
+    expect(canonicalChatKey('a b')).not.toBe(canonicalChatKey('a_b'))
+    // Encoded output is filename-safe.
+    expect(canonicalChatKey('a b')).toMatch(/^[0-9A-Za-z_-]+$/)
+    expect(canonicalChatKey('@chan/x')).toMatch(/^[0-9A-Za-z_-]+$/)
+  })
+})
+
+describe('updateAutonomyState — serialized read-modify-write', () => {
+  test('two parallel consumes → exactly one ok, one already_consumed', async () => {
+    saveAutonomyState(
+      paths(),
+      '1',
+      addLease(emptyAutonomyState(), { id: 'L-race', scope: 's', expiresAtMs: NOW + 24 * HOUR, source: 'manual' }, NOW).state,
+    )
+    const consume = () =>
+      updateAutonomyState(paths(), '1', (state) => {
+        const r = consumeLease(state, 'L-race', NOW)
+        return { state: r.state, result: r.outcome }
+      })
+    const [a, b] = await Promise.all([consume(), consume()])
+    expect([a, b].sort()).toEqual(['already_consumed', 'ok'])
+    // On disk: consumed exactly once.
+    const final = loadAutonomyState(paths(), '1')
+    expect(final.leases[0]?.consumedAtMs).toBe(NOW)
+  })
+
+  test('N parallel writers → no lost updates', async () => {
+    await Promise.all(
+      Array.from({ length: 10 }, (_, i) =>
+        updateAutonomyState(paths(), '2', (state) => {
+          const r = addLease(state, { id: `L-${i}`, scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW)
+          return { state: r.state, result: r.outcome }
+        }),
+      ),
+    )
+    expect(loadAutonomyState(paths(), '2').leases.length).toBe(10)
+  })
+
+  test('no-op mutation (same state reference) skips the save', async () => {
+    // No file exists; a not_found consume returns the same state → no write.
+    const outcome = await updateAutonomyState(paths(), '3', (state) => {
+      const r = consumeLease(state, 'L-none', NOW)
+      return { state: r.state, result: r.outcome }
+    })
+    expect(outcome).toBe('not_found')
+    expect(readdirSync(root)).not.toContain('autonomy-3.json')
   })
 })
 

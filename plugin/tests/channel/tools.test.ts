@@ -701,3 +701,81 @@ describe('autonomy tool', () => {
     rmSync(deps.statePaths.root, { recursive: true, force: true })
   })
 })
+
+// Fix-loop 2026-07-10: serialization, expired honesty, sticky/final invariants.
+describe('autonomy tool — fix-loop invariants', () => {
+  test('two PARALLEL consume calls → exactly one ok, one already_consumed', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addLease(emptyAutonomyState(), { id: 'L-par', scope: 's', expiresAtMs: Date.now() + HOUR, source: 'manual' }, Date.now()).state,
+    )
+    const call = () =>
+      callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-par' }), deps)
+    const [a, b] = await Promise.all([call(), call()])
+    const oks = [a, b].filter((r) => r.isError === undefined)
+    const errs = [a, b].filter((r) => r.isError === true)
+    expect(oks.length).toBe(1)
+    expect(errs.length).toBe(1)
+    expect(errs[0]?.content[0]?.text).toContain('already consumed')
+    // Disk agrees: consumed exactly once.
+    const final = loadAutonomyState(deps.statePaths, OWNER_CHAT)
+    expect(final.leases.filter((l) => l.consumedAtMs != null).length).toBe(1)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('consume of an EXPIRED lease → honest error, not success', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addLease(emptyAutonomyState(), { id: 'L-exp', scope: 's', expiresAtMs: Date.now() - 1, source: 'manual' }, Date.now() - HOUR).state,
+    )
+    const res = await callTool(callReq('autonomy', { chat_id: OWNER_CHAT, action: 'consume', lease_id: 'L-exp' }), deps)
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('lease expired')
+    // Not marked consumed on disk.
+    expect(loadAutonomyState(deps.statePaths, OWNER_CHAT).leases[0]?.consumedAtMs).toBe(null)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('bypassing a STICKY question → refused with sticky error', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addQuestion(emptyAutonomyState(), { id: 'Q-st', summary: 'wipe db?', askedAtMs: Date.now(), sticky: true }, Date.now()).state,
+    )
+    const res = await callTool(
+      callReq('autonomy', { chat_id: OWNER_CHAT, action: 'resolve_question', question_id: 'Q-st', resolution: 'bypassed' }),
+      deps,
+    )
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('sticky')
+    expect(loadAutonomyState(deps.statePaths, OWNER_CHAT).questions[0]?.status).toBe('open')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+
+  test('re-resolving an already-resolved question → error', async () => {
+    const deps = makeDeps()
+    saveAutonomyState(
+      deps.statePaths,
+      OWNER_CHAT,
+      addQuestion(emptyAutonomyState(), { id: 'Q-f', summary: 's', askedAtMs: Date.now() }, Date.now()).state,
+    )
+    const first = await callTool(
+      callReq('autonomy', { chat_id: OWNER_CHAT, action: 'resolve_question', question_id: 'Q-f', resolution: 'answered' }),
+      deps,
+    )
+    expect(first.isError).toBeUndefined()
+    const second = await callTool(
+      callReq('autonomy', { chat_id: OWNER_CHAT, action: 'resolve_question', question_id: 'Q-f', resolution: 'bypassed' }),
+      deps,
+    )
+    expect(second.isError).toBe(true)
+    expect(second.content[0]?.text).toContain('already resolved')
+    expect(loadAutonomyState(deps.statePaths, OWNER_CHAT).questions[0]?.status).toBe('answered')
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+})
