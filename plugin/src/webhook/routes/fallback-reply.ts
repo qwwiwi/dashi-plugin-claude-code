@@ -3,7 +3,9 @@
 
 import type { IncomingMessage, ServerResponse } from 'http'
 
-import { redactToken } from '../../config.js'
+import { redactToken, resolveAskGuardMode } from '../../config.js'
+import { activeLeases, loadAutonomyState } from '../../autonomy/store.js'
+import { analyzeAskDetailed } from '../../safety/ask-guard.js'
 import { FallbackReplyRouteRequestSchema } from '../../schemas.js'
 import type { WebhookDeps } from '../server.js'
 import { authGate, chatIdAllowed, readJsonBody, reply } from './shared.js'
@@ -27,7 +29,7 @@ export async function handleFallbackReply(
   deps: WebhookDeps,
   webhookToken: string | undefined,
 ): Promise<void> {
-  const { config, log, sendMessage } = deps
+  const { config, log, sendMessage, statePaths } = deps
 
   if (!authGate(req, res, webhookToken)) return
 
@@ -54,6 +56,68 @@ export async function handleFallbackReply(
     log.warn('fallback-reply chatId not in allowlist', { chat_id: payload.chat_id })
     reply(res, 403, { error: 'chatId not in allowlist' })
     return
+  }
+
+  // ── Ask-guard (autonomy M3, fix-loop #7) ────────────────────────────────
+  // The DM Stop-hook forwards a turn's FINAL assistant text here when the turn
+  // ended without an MCP reply — including when the `reply` tool was BLOCKED by
+  // the choke point (the hook no longer counts an isError reply as delivered).
+  // Without a guard here, a self-gating go-question would slip out through the
+  // fallback, bypassing the reply-tool guard. So we run the SAME analysis:
+  //   * block   → do NOT forward; log + answer 200 {status:'ask_guard_blocked'}
+  //               (the hook does not dedup a non-'sent' status → no owner send).
+  //   * advisory → forward unchanged + log (calibration-week observe-only).
+  // Fail-open on ANY error — a guard fault must never drop a real fallback.
+  try {
+    const mode = resolveAskGuardMode(config, log)
+    if (mode !== 'off') {
+      const state = loadAutonomyState(statePaths, payload.chat_id, log)
+      const leases = activeLeases(state, Date.now())
+      if (leases.length > 0) {
+        const analysis = analyzeAskDetailed(payload.text, { hasActiveLease: true })
+        if (analysis.exemptReason === 'hard_gate_protected_only') {
+          log.info('ask_guard exempt — hard-gate marker only in a protected zone', {
+            code: 'hard_gate_protected_only',
+            variant: 'fallback',
+            chat_id: payload.chat_id,
+            lease_id: leases[0]!.id,
+          })
+        }
+        const finding = analysis.findings[0]
+        if (finding !== undefined && mode === 'block') {
+          log.info('ask_guard blocked a self-gating fallback reply (mandate active)', {
+            code: 'ask_guard_block',
+            variant: 'fallback',
+            chat_id: payload.chat_id,
+            lease_id: leases[0]!.id,
+            pattern: finding.code,
+          })
+          reply(res, 200, { status: 'ask_guard_blocked' })
+          return
+        }
+        if (finding !== undefined) {
+          // advisory — the fallback still forwards; observe-only log.
+          log.info('ask_guard advisory on a self-gating fallback reply (mandate active)', {
+            code: 'ask_guard_advisory',
+            variant: 'fallback',
+            chat_id: payload.chat_id,
+            lease_id: leases[0]!.id,
+            pattern: finding.code,
+          })
+        }
+      }
+    }
+  } catch (err) {
+    try {
+      log.warn('ask_guard (fallback) evaluation failed — failing open (forwarded unguarded)', {
+        code: 'ask_guard_error',
+        variant: 'fallback',
+        chat_id: payload.chat_id,
+        error: err instanceof Error ? redactToken(err.message) : String(err),
+      })
+    } catch {
+      /* a logger fault must not drop a real fallback */
+    }
   }
 
   try {

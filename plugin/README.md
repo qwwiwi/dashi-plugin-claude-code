@@ -134,6 +134,8 @@ bash plugin/scripts/install-hooks.sh \
 | `FALLBACK_REPLY_RETRY_ATTEMPTS` / `FALLBACK_REPLY_RETRY_DELAY_MS` | Ограниченный retry на пустую экстракцию (гонка extended-thinking: [thinking] и [text] в двух строках). Defaults 4 / 120ms, оба клампятся сверху. |
 | `TELEGRAM_MEMORY_*` | Memory hook config (см. секцию ниже). |
 | `TELEGRAM_MULTICHAT_*` | Multichat router config (см. секцию ниже). |
+| `ASK_GUARD_MODE` | Ask-guard (autonomy M3): `off` \| `advisory` \| `block`. Перекрывает `config.json` → `ask_guard.mode` (default `advisory`). При активном мандате перехватывает self-gating «жду го / дай добро»: `advisory` — шлёт ответ + hint, `block` — отказывает в отправке (агент действует сам или спрашивает карточкой AskUserQuestion). |
+| `ASK_GUARD_ENABLED` | Kill-switch ask-guard: `0`/`false`/`no`/`off` → полностью `off` (бьёт любой режим). |
 | `GROQ_API_KEY` | Whisper transcription для голосовых (опционально). |
 
 ## Memory hooks (опционально)

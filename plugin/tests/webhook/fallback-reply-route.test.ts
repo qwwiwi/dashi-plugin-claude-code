@@ -14,6 +14,7 @@ import { join } from 'path'
 import { getStatePaths, loadConfig, type AppConfig, type StatePaths } from '../../src/config.js'
 import { createLogger } from '../../src/log.js'
 import { ensureStateDirs } from '../../src/state/store.js'
+import { addLease, emptyAutonomyState, saveAutonomyState } from '../../src/autonomy/store.js'
 import { startWebhookServer, type WebhookDeps, type WebhookServerHandle } from '../../src/webhook/server.js'
 
 const FAKE_TOKEN = '123456789:AAH-fake_test_token_with_at_least_thirty_chars'
@@ -25,6 +26,20 @@ let stateDir: string
 let paths: StatePaths
 let baseConfig: AppConfig
 let handle: WebhookServerHandle | null
+let savedAskMode: string | undefined
+
+const HOUR = 3_600_000
+
+// Seed an ACTIVE lease into the per-chat autonomy registry used by the route
+// (deps.statePaths = paths). chatId is the fallback body's chat_id.
+function seedActiveLease(chatId: string): void {
+  const { state } = addLease(
+    emptyAutonomyState(),
+    { scope: 'реализуй фичу по порядку', expiresAtMs: Date.now() + 4 * HOUR, source: 'owner_cmd', chatId },
+    Date.now(),
+  )
+  saveAutonomyState(paths, chatId, state)
+}
 
 interface StubMcp {
   server: { notification: () => Promise<void> }
@@ -45,6 +60,8 @@ beforeEach(() => {
   paths = getStatePaths(baseConfig, { TELEGRAM_BOT_TOKEN: FAKE_TOKEN, TELEGRAM_STATE_DIR: stateDir })
   ensureStateDirs(paths)
   handle = null
+  savedAskMode = process.env.ASK_GUARD_MODE
+  delete process.env.ASK_GUARD_MODE
 })
 
 afterEach(async () => {
@@ -53,6 +70,8 @@ afterEach(async () => {
     handle = null
   }
   delete process.env.TELEGRAM_WEBHOOK_TOKEN
+  if (savedAskMode === undefined) delete process.env.ASK_GUARD_MODE
+  else process.env.ASK_GUARD_MODE = savedAskMode
   rmSync(stateDir, { recursive: true, force: true })
 })
 
@@ -195,5 +214,94 @@ describe('POST /hooks/fallback-reply', () => {
     expect(resp.status).toBe(200)
     expect(await resp.json()).toEqual({ status: 'sent' })
     expect(calls).toEqual([{ chatId: WARCHIEF_ID, text: cjk }])
+  })
+})
+
+// fix-loop #7 (Fable MED-3) — the fallback route runs the SAME ask-guard so a
+// blocked reply's final text cannot bypass the choke point through the DM
+// fallback path.
+describe('POST /hooks/fallback-reply — ask-guard', () => {
+  test('block mode + active lease + self-gate → NOT forwarded, status ask_guard_blocked', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    process.env.ASK_GUARD_MODE = 'block'
+    seedActiveLease(WARCHIEF_ID)
+    const { h, calls } = await start()
+    const resp = await post(h, { chat_id: WARCHIEF_ID, text: 'жду го, мой вождь' })
+    expect(resp.status).toBe(200)
+    expect(await resp.json()).toEqual({ status: 'ask_guard_blocked' })
+    expect(calls).toEqual([]) // nothing sent to the owner
+  })
+
+  test('block mode + active lease + BENIGN status text → forwarded (rephrased status goes out)', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    process.env.ASK_GUARD_MODE = 'block'
+    seedActiveLease(WARCHIEF_ID)
+    const { h, calls } = await start()
+    const resp = await post(h, { chat_id: WARCHIEF_ID, text: 'Готово, мой вождь. Задеплоил.' })
+    expect(resp.status).toBe(200)
+    expect(await resp.json()).toEqual({ status: 'sent' })
+    expect(calls).toEqual([{ chatId: WARCHIEF_ID, text: 'Готово, мой вождь. Задеплоил.' }])
+  })
+
+  test('block mode + active lease + hard-gate self-gate → forwarded (hard-gate exempt)', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    process.env.ASK_GUARD_MODE = 'block'
+    seedActiveLease(WARCHIEF_ID)
+    const { h, calls } = await start()
+    const resp = await post(h, { chat_id: WARCHIEF_ID, text: 'жду го на списание денег' })
+    expect(resp.status).toBe(200)
+    expect(await resp.json()).toEqual({ status: 'sent' })
+    expect(calls.length).toBe(1)
+  })
+
+  // fix-loop-2 (Codex round-2): a comma-continued STATUS wait must NOT be
+  // discarded by the guard — «жду подтверждения, что CI завершился» is a status
+  // report, not a self-gate, so the fallback forwards it (regression guard for
+  // the narrowed «жду подтверждения» comma branch).
+  test('block mode + active lease + CI-status wait → forwarded (not discarded)', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    process.env.ASK_GUARD_MODE = 'block'
+    seedActiveLease(WARCHIEF_ID)
+    const { h, calls } = await start()
+    const resp = await post(h, {
+      chat_id: WARCHIEF_ID,
+      text: 'жду подтверждения, что CI завершился',
+    })
+    expect(resp.status).toBe(200)
+    expect(await resp.json()).toEqual({ status: 'sent' })
+    expect(calls).toEqual([{ chatId: WARCHIEF_ID, text: 'жду подтверждения, что CI завершился' }])
+  })
+
+  test('advisory mode + active lease + self-gate → forwarded unchanged', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    process.env.ASK_GUARD_MODE = 'advisory'
+    seedActiveLease(WARCHIEF_ID)
+    const { h, calls } = await start()
+    const resp = await post(h, { chat_id: WARCHIEF_ID, text: 'жду го' })
+    expect(resp.status).toBe(200)
+    expect(await resp.json()).toEqual({ status: 'sent' })
+    expect(calls).toEqual([{ chatId: WARCHIEF_ID, text: 'жду го' }])
+  })
+
+  test('block mode but NO active lease → forwarded (guard inert)', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    process.env.ASK_GUARD_MODE = 'block'
+    // no lease seeded
+    const { h, calls } = await start()
+    const resp = await post(h, { chat_id: WARCHIEF_ID, text: 'жду го' })
+    expect(resp.status).toBe(200)
+    expect(await resp.json()).toEqual({ status: 'sent' })
+    expect(calls.length).toBe(1)
+  })
+
+  test('kill-switch off + active lease + self-gate → forwarded (guard disabled)', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    process.env.ASK_GUARD_MODE = 'off'
+    seedActiveLease(WARCHIEF_ID)
+    const { h, calls } = await start()
+    const resp = await post(h, { chat_id: WARCHIEF_ID, text: 'жду го' })
+    expect(resp.status).toBe(200)
+    expect(await resp.json()).toEqual({ status: 'sent' })
+    expect(calls.length).toBe(1)
   })
 })

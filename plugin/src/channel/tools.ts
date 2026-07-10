@@ -18,6 +18,7 @@ import type { ReactionTypeEmoji } from 'grammy/types'
 import { z } from 'zod'
 
 import type { AppConfig, StatePaths } from '../config.js'
+import { resolveAskGuardMode } from '../config.js'
 import type { Logger } from '../log.js'
 import type { MultichatPolicy } from '../chats/policy-loader.js'
 import type { StatusManager, StatusState } from '../status/status-manager.js'
@@ -30,6 +31,7 @@ import {
   StatusArgsSchema,
 } from '../schemas.js'
 import {
+  activeLeases,
   consumeLease,
   loadAutonomyState,
   renderAutonomyStatus,
@@ -38,6 +40,7 @@ import {
   updateAutonomyState,
   type UpdateResult,
 } from '../autonomy/store.js'
+import { analyzeAskDetailed, askGuardAdvisoryHint, askGuardBlockMessage } from '../safety/ask-guard.js'
 import { assertAllowedChat } from '../telegram/gate.js'
 import type { GuestQueryRegistry } from '../telegram/guest-queries.js'
 import {
@@ -631,6 +634,89 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         } catch (err) {
           return toolError(name, err instanceof Error ? err.message : String(err))
         }
+
+        // ── Ask-guard (autonomy M3) ──────────────────────────────────────
+        // Enforces owner-granted autonomy mandates on the OWNER-egress
+        // `reply`-tool path. When an ACTIVE lease exists for this chat AND the
+        // outgoing body is a self-gating permission-ask («жду го / дай добро»),
+        // intercept:
+        //   * block mode  → refuse the send (isError, nothing shipped). NO
+        //                   resend-valve — an identical re-send is analyzed
+        //                   the same way and blocked again (analyzeAsk is
+        //                   pure/stateless).
+        //   * advisory    → the reply still ships; a hint is appended to the
+        //                   tool result (computed here, attached near the
+        //                   result below) nudging act-with-veto.
+        // SCOPE (fix-loop #9 — honest coverage): this guards ONLY the `reply`
+        // tool. The guest path returns above; `edit_message` is UNGUARDED BY
+        // DESIGN (interim progress edits are not owner-egress go-questions); the
+        // AskUserQuestion relay is a different tool (the legitimate escape). The
+        // DM Stop-hook fallback route (POST /hooks/fallback-reply) runs the SAME
+        // analyzeAsk guard so a turn's final text cannot bypass this via the
+        // fallback. Fail-open on ANY error — a guard fault must never gate a
+        // real reply.
+        let askGuardHint = ''
+        try {
+          const askGuardMode = resolveAskGuardMode(config, log)
+          if (askGuardMode !== 'off') {
+            const autonomyState = loadAutonomyState(statePaths, args.chat_id, log)
+            const leases = activeLeases(autonomyState, Date.now())
+            if (leases.length > 0) {
+              const analysis = analyzeAskDetailed(args.text, { hasActiveLease: true })
+              // fix-loop #2: a hard-gate marker that survives ONLY inside a
+              // fenced/quoted zone still exempts (fail-safe) but is a distinct
+              // audit class for calibration week.
+              if (analysis.exemptReason === 'hard_gate_protected_only') {
+                log.info('ask_guard exempt — hard-gate marker only in a protected zone', {
+                  code: 'hard_gate_protected_only',
+                  chat_id: args.chat_id,
+                  lease_id: leases[0]!.id,
+                })
+              }
+              const finding = analysis.findings[0]
+              if (finding !== undefined) {
+                const lease = leases[0]! // soonest-expiry first
+                if (askGuardMode === 'block') {
+                  log.info('ask_guard blocked a self-gating permission-ask (mandate active)', {
+                    code: 'ask_guard_block',
+                    chat_id: args.chat_id,
+                    lease_id: lease.id,
+                    pattern: finding.code,
+                  })
+                  // fix-loop #3: list ALL active lease scopes so the model can
+                  // self-check its intended action; never claim authorization.
+                  const scopes = leases.map((l) => l.scope)
+                  return {
+                    content: [{ type: 'text', text: askGuardBlockMessage(lease.id, scopes) }],
+                    isError: true,
+                  }
+                }
+                // advisory — message still ships; attach the hint below.
+                log.info('ask_guard advisory on a self-gating permission-ask (mandate active)', {
+                  code: 'ask_guard_advisory',
+                  chat_id: args.chat_id,
+                  lease_id: lease.id,
+                  pattern: finding.code,
+                })
+                askGuardHint = askGuardAdvisoryHint(lease.id)
+              }
+            }
+          }
+        } catch (err) {
+          // Fail-open: a guard fault must never block a real reply. fix-loop #5
+          // (Codex MED-5): the log call itself is wrapped so a THROWING logger
+          // can never abort delivery from the catch path.
+          try {
+            log.warn('ask_guard evaluation failed — failing open (reply sent unguarded)', {
+              code: 'ask_guard_error',
+              chat_id: args.chat_id,
+              error: err instanceof Error ? err.message : String(err),
+            })
+          } catch {
+            /* a logger fault must not gate a real reply */
+          }
+        }
+
         const files = args.files ?? []
 
         // Resolve every attachment through the workspace gate up front, so a
@@ -807,7 +893,13 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
             error: err instanceof Error ? err.message : String(err),
           })
         }
-        const resultText = hint ? `${result}\n${hint}` : result
+        // Assemble the tool result: base «sent …» line, plus the ask-guard
+        // advisory hint (M3) when a mandate is active and the body self-gated,
+        // plus the observe-only format hint. Each is optional and independent.
+        const resultParts = [result]
+        if (askGuardHint) resultParts.push(askGuardHint)
+        if (hint) resultParts.push(hint)
+        const resultText = resultParts.join('\n')
         return { content: [{ type: 'text', text: resultText }] }
       }
 
