@@ -48,8 +48,16 @@ import { buildNewConfirmCard } from '../telegram/newq-confirm-ui.js'
 import { controlFailureMessage } from '../telegram/control-result.js'
 import { readContextUsage, formatContextUsage } from '../status/context-usage.js'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, resolveContextWindowForModel } from '../config.js'
+import {
+  activeLeases,
+  humanizeDurationMs,
+  loadAutonomyState,
+  type AutonomyPaths,
+} from '../autonomy/store.js'
+import { grantLease, parseLeaseCommandArgs } from '../autonomy/grant.js'
 
-export type OobCommandName = 'help' | 'status' | 'stop' | 'compact' | 'new' | 'mirror' | 'keys' | 'cc'
+export type OobCommandName =
+  | 'help' | 'status' | 'stop' | 'compact' | 'new' | 'mirror' | 'keys' | 'cc' | 'lease'
 
 const KNOWN_COMMANDS = new Set<OobCommandName>([
   'help',
@@ -60,6 +68,7 @@ const KNOWN_COMMANDS = new Set<OobCommandName>([
   'mirror',
   'keys',
   'cc',
+  'lease',
 ])
 
 // Sub-actions for /mirror. We accept the bare command (= same as `status`),
@@ -188,6 +197,10 @@ export interface OobContext {
   contextWindowOverride?: number
   // Process uptime in seconds (process.uptime()); rendered when present.
   uptimeSeconds?: number
+  // Autonomy M2: inbound message id, used to build the idempotent grantSourceId
+  // (`cmd:<chatId>:<messageId>`) for /lease so a replayed command mints one
+  // lease. Undefined → the grant falls back to a time-based source id.
+  messageId?: number
 }
 
 export interface OobResult {
@@ -215,7 +228,8 @@ function helpText(): string {
     + '<code>/new</code> — начать новый диалог (очистит контекст — спросит подтверждение)\n'
     + '<code>/mirror on|off|status</code> — управлять зеркалом терминала (tmux, обновляется в реальном времени)\n'
     + '<code>/keys</code> — панель кнопок: тап = нажатие в сессии (ответить на нативный диалог Claude Code; есть ⌫ backspace и 🧹 clear)\n'
-    + '<code>/cc</code> — панель команд Claude Code (тап = выполнить); либо <code>/cc &lt;команда&gt;</code>: <code>/cc model opus</code>\n\n'
+    + '<code>/cc</code> — панель команд Claude Code (тап = выполнить); либо <code>/cc &lt;команда&gt;</code>: <code>/cc model opus</code>\n'
+    + '<code>/lease &lt;scope&gt;</code> — выдать мандат автономии (напр. <code>/lease деплой стейджинга; ttl=48h</code>); без аргумента — список активных\n\n'
     + '<i>примечание: /stop — best-effort: посылает Escape в сессию, но не может '
     + 'гарантировать прерывание посреди вызова инструмента.</i>'
   )
@@ -236,6 +250,7 @@ export const BOT_COMMANDS: ReadonlyArray<BotCommandSpec> = [
   { command: 'mirror', description: 'зеркало терминала: on | off | status' },
   { command: 'keys', description: 'панель кнопок для подтверждений (нажатия в сессию)' },
   { command: 'cc', description: 'панель команд Claude Code (тап) или /cc <команда>' },
+  { command: 'lease', description: 'выдать мандат автономии: /lease <scope>[; ttl=48h]' },
 ]
 
 // Format process uptime seconds as a compact human string (e.g. `2h 15m`).
@@ -322,6 +337,174 @@ function escapeHtml(s: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// /lease — autonomy M2 owner command. Grants a lease (or lists active ones
+// on a bare command). The store write happens HERE (async side effect),
+// then the confirmation is returned as a normal replyToTelegram. The message
+// is NOT forwarded to the agent session (OOB commands are swallowed in
+// handlers.ts) — it is a control command, not conversation.
+// ─────────────────────────────────────────────────────────────────────
+
+async function handleLeaseCommand(
+  parsed: ParsedOobCommand,
+  ctx: OobContext,
+): Promise<OobResult> {
+  if (ctx.stateDir === undefined) {
+    return {
+      handled: true,
+      command: 'lease',
+      replyToTelegram: {
+        text: '<b>/lease</b> — недоступно: не сконфигурирован каталог состояния.',
+        parseMode: 'HTML',
+      },
+    }
+  }
+  const paths: AutonomyPaths = { root: ctx.stateDir }
+  const cmd = parseLeaseCommandArgs(parsed.args)
+
+  if (cmd.kind === 'bare') {
+    // No scope → list active leases + usage hint, grant nothing.
+    const state = loadAutonomyState(paths, ctx.chatId, ctx.log)
+    const leases = activeLeases(state, Date.now())
+    const lines: string[] = ['<b>активные мандаты</b>']
+    if (leases.length === 0) {
+      lines.push('нет активных мандатов.')
+    } else {
+      for (const l of leases) {
+        const left = humanizeDurationMs(l.expiresAtMs - Date.now())
+        lines.push(`<code>${escapeHtml(l.id)}</code> — «${escapeHtml(l.scope)}» (ещё ${escapeHtml(left)})`)
+      }
+    }
+    lines.push('', '<i>usage: /lease &lt;scope&gt;[; ttl=48h]</i>')
+    return {
+      handled: true,
+      command: 'lease',
+      replyToTelegram: { text: lines.join('\n'), parseMode: 'HTML' },
+    }
+  }
+
+  // Fail-closed grammar errors (fix-loop #3/#6/#8): a present-but-malformed
+  // trailing ttl option or an over-long scope is a USAGE ERROR — nothing is
+  // granted, nothing is silently defaulted or truncated.
+  if (cmd.kind === 'invalid') {
+    const reason = cmd.reason === 'ttl'
+      ? 'некорректный ttl — допустимо целое 1..72 в форме <code>ttl=48h</code> (строго строчными)'
+      : cmd.reason === 'scope_charset'
+        ? 'scope содержит управляющие/форматирующие символы (перенос строки, bidi) — недопустимо'
+        : 'scope длиннее 400 символов — сократи формулировку'
+    return {
+      handled: true,
+      command: 'lease',
+      replyToTelegram: {
+        text: `<b>/lease</b> — ${reason}.\n<i>usage: /lease &lt;scope&gt;[; ttl=48h]</i>`,
+        parseMode: 'HTML',
+      },
+    }
+  }
+
+  // Grant. Idempotency key ties a replayed /lease command to one lease.
+  const grantSourceId = `cmd:${ctx.chatId}:${ctx.messageId ?? Date.now()}`
+  const res = await grantLease(
+    paths,
+    ctx.chatId,
+    {
+      scope: cmd.scope,
+      ttlHours: cmd.ttlHours,
+      source: 'owner_cmd',
+      grantSourceId,
+    },
+    ctx.log,
+  )
+
+  if (res.kind === 'writer_conflict') {
+    return {
+      handled: true,
+      command: 'lease',
+      replyToTelegram: {
+        text: '<b>/lease</b> — реестр занят другим процессом, попробуй ещё раз.',
+        parseMode: 'HTML',
+      },
+    }
+  }
+  if (res.kind === 'version_unsupported') {
+    return {
+      handled: true,
+      command: 'lease',
+      replyToTelegram: {
+        text: '<b>/lease</b> — реестр новее этой версии плагина (только чтение). Обнови плагин.',
+        parseMode: 'HTML',
+      },
+    }
+  }
+
+  const lease = res.lease
+  ctx.log.info('oob /lease grant', {
+    chat_id: ctx.chatId,
+    outcome: res.outcome,
+    lease_id: lease?.id,
+  })
+
+  // Honest refusal on a source-id collision with a DIFFERENT scope
+  // (fix-loop #2, Fable): never silently swallow a legit grant.
+  if (res.outcome === 'source_conflict') {
+    return {
+      handled: true,
+      command: 'lease',
+      replyToTelegram: {
+        text: '<b>мандат НЕ выдан</b> — этот запрос уже обрабатывался с ДРУГИМ scope (source_conflict). Отправь команду новым сообщением.',
+        parseMode: 'HTML',
+      },
+    }
+  }
+
+  if (lease === undefined) {
+    // duplicate_source whose lease tombstone was already pruned — the ledger
+    // still remembers the grant. Honest report, no re-mint.
+    if (res.outcome === 'duplicate_source') {
+      return {
+        handled: true,
+        command: 'lease',
+        replyToTelegram: {
+          text: '<b>мандат не выдан повторно</b> — этот грант уже был обработан ранее (запись мандата уже удалена ротацией).',
+          parseMode: 'HTML',
+        },
+      }
+    }
+    return {
+      handled: true,
+      command: 'lease',
+      replyToTelegram: {
+        text: '<b>/lease</b> — не удалось выдать мандат.',
+        parseMode: 'HTML',
+      },
+    }
+  }
+
+  // Heading states the REAL status (fix-loop #8): a duplicate against a
+  // TERMINAL lease must not claim «уже активен».
+  const now = Date.now()
+  let heading: string
+  if (res.outcome === 'duplicate_source' || res.outcome === 'duplicate_scope') {
+    if (lease.revokedAtMs !== undefined) heading = 'мандат по этому гранту был ОТОЗВАН — новый не выдан'
+    else if (lease.consumedAtMs !== undefined && lease.consumedAtMs !== null) heading = 'мандат по этому гранту уже ИСПОЛЬЗОВАН — новый не выдан'
+    else if (lease.expiresAtMs <= now) heading = 'мандат по этому гранту ИСТЁК — новый не выдан'
+    else heading = 'мандат уже активен'
+  } else {
+    heading = 'мандат выдан'
+  }
+  const left = humanizeDurationMs(lease.expiresAtMs - now)
+  const text =
+    `<b>${heading}</b>\n`
+    + `<code>${escapeHtml(lease.id)}</code>\n`
+    + `scope: «${escapeHtml(lease.scope)}»\n`
+    + (lease.expiresAtMs > now ? `истекает через ${escapeHtml(left)}` : 'без остатка действия')
+  return {
+    handled: true,
+    command: 'lease',
+    replyToTelegram: { text, parseMode: 'HTML' },
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Main dispatcher. Pure data — caller actually issues sendMessage and
 // channel notification calls based on the OobResult. This keeps the
 // function trivially testable.
@@ -356,6 +539,14 @@ export async function handleOobCommand(
         command: 'status',
         replyToTelegram: { text: await statusText(ctx), parseMode: 'HTML' },
       }
+    }
+
+    case 'lease': {
+      // Autonomy M2 — one of only TWO authenticated lease-grant surfaces. The
+      // handlers.ts OOB gate already enforced: private chat + sender in
+      // config.allowed_user_ids + chat in allowed_chat_ids. No agent-callable
+      // path reaches here.
+      return await handleLeaseCommand(parsed, ctx)
     }
 
     case 'stop': {

@@ -1287,6 +1287,7 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
         stateDir: deps.statePaths.root,
         contextWindowTokens: resolveContextWindowTokens(deps.config),
         uptimeSeconds: process.uptime(),
+        ...(ctx.message?.message_id !== undefined ? { messageId: ctx.message.message_id } : {}),
         ...(windowOverride !== undefined ? { contextWindowOverride: windowOverride } : {}),
         ...(session?.transcriptPath ? { transcriptPath: session.transcriptPath } : {}),
         ...(session?.model ? { modelName: session.model } : {}),

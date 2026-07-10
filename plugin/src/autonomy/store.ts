@@ -81,6 +81,16 @@ export interface AutonomyLease {
   source: LeaseSource
   // The Telegram message id of the grant, when known (PR-2 button relay).
   grantorMessageId?: number
+  // Idempotency anchor (M2): a stable per-grant-intent key
+  // (`ask:<reqId>:<qIdx>` from the tap card, `cmd:<chatId>:<msgId>` from the
+  // `/lease` command). A replay carrying the SAME key mints no second lease —
+  // applyLeaseGrant returns the existing one. Distinct from `id` (a fresh
+  // random per lease) so a genuine re-grant of the same intent dedupes.
+  grantSourceId?: string
+  // The chat the lease was granted in (binding field, M2). The file is
+  // already per-chat, but stamping the id on the record lets an audit tie a
+  // lease to its origin chat without inferring it from the filename.
+  chatId?: string
   // Set to a timestamp when the lease is consumed; null/undefined while active.
   consumedAtMs?: number | null
   // Revocation is a TERMINAL state distinct from consumption (fix-loop-2 #4):
@@ -108,6 +118,22 @@ export interface OpenQuestion {
   resolvedAtMs?: number
 }
 
+// Durable replay ledger entry (M2 fix-loop #2, Codex HIGH). EVERY grant
+// attempt that was accepted OR deduped records its grantSourceId here — the
+// dedup check consults this ledger FIRST, so a replayed /lease command or
+// Telegram callback can never mint a fresh lease after the original lease
+// expired / was revoked / was pruned. Ledger entries out-live lease
+// tombstones: prune keeps them for 90 days (GRANT_SOURCE_LEDGER_MAX_AGE_MS),
+// not the 14-day lease retention.
+export interface UsedGrantSource {
+  sourceId: string
+  // Digest of the scope that was granted/deduped for this source. Dedup key
+  // is sourceId AND scopeDigest (Fable): a colliding sourceId with a
+  // DIFFERENT scope is a `source_conflict`, never a silent swallow.
+  scopeDigest: string
+  atMs: number
+}
+
 export interface AutonomyState {
   version: typeof AUTONOMY_STATE_VERSION
   // Monotonic save counter (fix-loop-2 #1): every successful save writes
@@ -116,6 +142,15 @@ export interface AutonomyState {
   revision: number
   leases: AutonomyLease[]
   questions: OpenQuestion[]
+  // Replay ledger — see UsedGrantSource above.
+  usedGrantSources: UsedGrantSource[]
+  // Set by coerceState when the on-disk `version` value is present and is NOT
+  // exactly the integer AUTONOMY_STATE_VERSION (M2 fix-loop #5: `1.9`, `"2"`,
+  // `"abc"` all land here — the raw value is compared BEFORE any coercion).
+  // Presence marks the registry READ-ONLY: updateAutonomyState refuses every
+  // mutation with `version_unsupported` and the file is never overwritten.
+  // Never persisted — saveAutonomyState writes explicit fields only.
+  unsupportedVersion?: number | string
 }
 
 // The subset of StatePaths the store needs — just the state root. Full
@@ -129,7 +164,7 @@ export type AutonomyPaths = Pick<StatePaths, 'root'>
 // ─────────────────────────────────────────────────────────────────────
 
 export function emptyAutonomyState(): AutonomyState {
-  return { version: AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [] }
+  return { version: AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [], usedGrantSources: [] }
 }
 
 // A lease is active when it has NOT been consumed, NOT been revoked and has
@@ -190,6 +225,8 @@ export interface NewLeaseInput {
   id?: string
   grantedAtMs?: number
   grantorMessageId?: number
+  grantSourceId?: string
+  chatId?: string
   notes?: string
 }
 
@@ -235,9 +272,152 @@ export function addLease(
     source: input.source,
     consumedAtMs: null,
     ...(input.grantorMessageId !== undefined ? { grantorMessageId: input.grantorMessageId } : {}),
+    ...(input.grantSourceId !== undefined ? { grantSourceId: input.grantSourceId } : {}),
+    ...(input.chatId !== undefined ? { chatId: input.chatId } : {}),
     ...(input.notes !== undefined ? { notes: input.notes } : {}),
   }
   return { state: { ...state, leases: [...state.leases, lease] }, lease, outcome: 'ok' }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Lease GRANT (M2). applyLeaseGrant is the pure core of the two
+// authenticated grant paths (ask-card tap + `/lease` command — see
+// autonomy/grant.ts). It is NEVER reachable from an agent-callable surface.
+//
+// Idempotency + supersede rules (Sol M2 security + fix-loop #2):
+//   1. The durable replay ledger (`usedGrantSources`) is consulted FIRST:
+//      a sourceId hit with the SAME scopeDigest → idempotent no-op
+//      (`duplicate_source`); a sourceId hit with a DIFFERENT scopeDigest →
+//      `source_conflict` (no grant — a colliding short id across restarts
+//      must never silently swallow a legit grant NOR replay the wrong scope).
+//   2. Legacy lease-record check (pre-ledger files): same rules keyed off the
+//      lease's grantSourceId; a same-scope dedup back-fills the ledger.
+//   3. An ACTIVE lease with the SAME scopeDigest exists → idempotent no-op,
+//      return it (`duplicate_scope`) — and the NEW sourceId is recorded in
+//      the ledger so its replay after the lease dies cannot re-mint.
+//   4. `supersede` set AND active lease(s) with a DIFFERENT scope exist →
+//      revoke them (revokedBy caller, reason 'superseded') then grant
+//      (`superseded`).
+//   5. Otherwise grant a fresh lease (`granted`). Multiple active leases with
+//      DIFFERENT scopes coexist by design.
+// Every accepted-or-deduped attempt (outcomes granted / superseded /
+// duplicate_scope, plus the legacy duplicate_source back-fill) records its
+// sourceId+scopeDigest in the ledger.
+// ─────────────────────────────────────────────────────────────────────
+
+export type LeaseGrantOutcome =
+  | 'granted'
+  | 'duplicate_source'
+  | 'duplicate_scope'
+  | 'superseded'
+  | 'source_conflict'
+
+export interface LeaseGrantInput {
+  scope: string
+  expiresAtMs: number
+  source: LeaseSource
+  grantSourceId: string
+  chatId?: string
+  grantorMessageId?: number
+  supersede?: boolean
+  // Label recorded on a superseded lease's revokedBy. Defaults to 'owner_card'.
+  revokedBy?: string
+}
+
+// Append a ledger entry unless the sourceId is already recorded.
+function recordGrantSource(
+  state: AutonomyState,
+  sourceId: string,
+  scopeDigest: string,
+  nowMs: number,
+): AutonomyState {
+  if (state.usedGrantSources.some((u) => u.sourceId === sourceId)) return state
+  return {
+    ...state,
+    usedGrantSources: [...state.usedGrantSources, { sourceId, scopeDigest, atMs: nowMs }],
+  }
+}
+
+export function applyLeaseGrant(
+  state: AutonomyState,
+  input: LeaseGrantInput,
+  nowMs: number = Date.now(),
+): { state: AutonomyState; lease?: AutonomyLease; outcome: LeaseGrantOutcome } {
+  const digest = computeScopeDigest(input.scope)
+
+  // 1. Durable replay ledger — checked FIRST (fix-loop #2). Survives lease
+  //    tombstone pruning for 90 days.
+  const ledgerHit = state.usedGrantSources.find((u) => u.sourceId === input.grantSourceId)
+  if (ledgerHit !== undefined) {
+    if (ledgerHit.scopeDigest === digest) {
+      const existing = state.leases.find((l) => l.grantSourceId === input.grantSourceId)
+      return {
+        state,
+        ...(existing !== undefined ? { lease: existing } : {}),
+        outcome: 'duplicate_source',
+      }
+    }
+    // Same sourceId, DIFFERENT scope — honest refusal, no grant.
+    return { state, outcome: 'source_conflict' }
+  }
+
+  // 2. Legacy lease-record dedup (files written before the ledger existed).
+  const bySource = state.leases.find((l) => l.grantSourceId === input.grantSourceId)
+  if (bySource !== undefined) {
+    if (bySource.scopeDigest === digest) {
+      // Back-fill the ledger so the dedup survives the lease's pruning.
+      return {
+        state: recordGrantSource(state, input.grantSourceId, digest, nowMs),
+        lease: bySource,
+        outcome: 'duplicate_source',
+      }
+    }
+    return { state, outcome: 'source_conflict' }
+  }
+
+  // 3. Identical-scope active lease → idempotent no-op, but the NEW sourceId
+  //    is still recorded (its later replay must not re-mint).
+  const activeSameScope = activeLeases(state, nowMs).find((l) => l.scopeDigest === digest)
+  if (activeSameScope !== undefined) {
+    return {
+      state: recordGrantSource(state, input.grantSourceId, digest, nowMs),
+      lease: activeSameScope,
+      outcome: 'duplicate_scope',
+    }
+  }
+
+  // 4. supersede: revoke differing active leases first.
+  let working = state
+  let supersededAny = false
+  if (input.supersede === true) {
+    const toRevoke = activeLeases(working, nowMs).filter((l) => l.scopeDigest !== digest)
+    for (const l of toRevoke) {
+      const r = revokeLease(working, l.id, nowMs, input.revokedBy ?? 'owner_card', 'superseded')
+      if (r.outcome === 'ok') {
+        working = r.state
+        supersededAny = true
+      }
+    }
+  }
+
+  // 5. Grant + record in the ledger.
+  const added = addLease(
+    working,
+    {
+      scope: input.scope,
+      expiresAtMs: input.expiresAtMs,
+      source: input.source,
+      grantSourceId: input.grantSourceId,
+      ...(input.chatId !== undefined ? { chatId: input.chatId } : {}),
+      ...(input.grantorMessageId !== undefined ? { grantorMessageId: input.grantorMessageId } : {}),
+    },
+    nowMs,
+  )
+  return {
+    state: recordGrantSource(added.state, input.grantSourceId, digest, nowMs),
+    ...(added.lease !== undefined ? { lease: added.lease } : {}),
+    outcome: supersededAny ? 'superseded' : 'granted',
+  }
 }
 
 // Scope-digest scheme v1: sha256 over the RAW utf8 bytes of the verbatim
@@ -381,6 +561,82 @@ export function resolveQuestion(
   const questions = state.questions.slice()
   questions[idx] = { ...q, status, resolvedAtMs: nowMs }
   return { state: { ...state, questions }, outcome: 'ok' }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Retention prune (PR-1 leftover 4a). Applied on the save path so a chat's
+// file never grows without bound: TERMINAL leases (consumed / revoked /
+// expired) and RESOLVED questions older than 14 days are dropped. Active
+// leases and open questions are always kept, whatever their age. Pure — no
+// I/O, no clock unless nowMs passed.
+// ─────────────────────────────────────────────────────────────────────
+
+export const PRUNE_MAX_AGE_MS = 14 * 24 * 3_600_000
+
+// The replay ledger out-lives lease tombstones by design (fix-loop #2): a
+// replayed grant source must stay recognisable long after the 14-day lease
+// retention has dropped the lease record itself.
+export const GRANT_SOURCE_LEDGER_MAX_AGE_MS = 90 * 24 * 3_600_000
+
+// Hard size cap for the replay ledger (fix-loop-2 #4): a SAFETY VALVE, not a
+// working limit. Realistic grant volume is a few per day; 90 days of that is
+// well under 500, so eviction ~never happens in practice and the replay
+// protection is effectively never weakened. The cap only guards the
+// pathological case (a runaway grant loop) from growing the JSON and its
+// linear lookups without bound. Overflow evicts oldest-first with a warn.
+export const GRANT_SOURCE_LEDGER_MAX_ENTRIES = 500
+
+// The timestamp at which a lease became terminal, or undefined while it is
+// still active. Revoked wins over consumed (a lease can only be one), and an
+// un-consumed/un-revoked lease past its expiry counts from expiresAtMs.
+function leaseTerminalAtMs(lease: AutonomyLease, nowMs: number): number | undefined {
+  if (lease.revokedAtMs !== undefined) return lease.revokedAtMs
+  if (lease.consumedAtMs !== undefined && lease.consumedAtMs !== null) return lease.consumedAtMs
+  if (lease.expiresAtMs <= nowMs) return lease.expiresAtMs
+  return undefined
+}
+
+export function pruneAutonomyState(
+  state: AutonomyState,
+  nowMs: number = Date.now(),
+  log?: Logger,
+): AutonomyState {
+  const leases = state.leases.filter((l) => {
+    const terminalAt = leaseTerminalAtMs(l, nowMs)
+    if (terminalAt === undefined) return true // still active — keep
+    return nowMs - terminalAt <= PRUNE_MAX_AGE_MS
+  })
+  const questions = state.questions.filter((q) => {
+    if (q.status === 'open') return true // still open — keep
+    if (q.resolvedAtMs === undefined) return true // defensive — no age to judge
+    return nowMs - q.resolvedAtMs <= PRUNE_MAX_AGE_MS
+  })
+  // The replay ledger is kept 90 days (fix-loop #2) — deliberately LONGER
+  // than the lease tombstones it protects against re-minting.
+  const sources = state.usedGrantSources ?? []
+  let usedGrantSources = sources.filter((u) => nowMs - u.atMs <= GRANT_SOURCE_LEDGER_MAX_AGE_MS)
+  // Hard cap (fix-loop-2 #4): evict oldest beyond GRANT_SOURCE_LEDGER_MAX_ENTRIES.
+  if (usedGrantSources.length > GRANT_SOURCE_LEDGER_MAX_ENTRIES) {
+    const evicted = usedGrantSources.length - GRANT_SOURCE_LEDGER_MAX_ENTRIES
+    usedGrantSources = [...usedGrantSources]
+      .sort((a, b) => a.atMs - b.atMs)
+      .slice(evicted)
+    if (log) {
+      log.warn('autonomy grant ledger over hard cap — oldest entries evicted', {
+        code: 'grant_ledger_evicted',
+        evicted,
+        cap: GRANT_SOURCE_LEDGER_MAX_ENTRIES,
+      })
+    }
+  }
+  if (
+    leases.length === state.leases.length
+    && questions.length === state.questions.length
+    && usedGrantSources.length === sources.length
+  ) {
+    return state // nothing pruned — preserve reference (skip a needless copy)
+  }
+  return { ...state, leases, questions, usedGrantSources }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -562,6 +818,22 @@ function coerceState(parsed: unknown): AutonomyState {
   const out = emptyAutonomyState()
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return out
   const obj = parsed as Record<string, unknown>
+  // Version check on the RAW loaded value BEFORE any coercion (M2 fix-loop
+  // #5): a file written by a different schema must be DETECTABLE so
+  // updateAutonomyState can treat the registry as read-only rather than
+  // silently downgrading + clobbering it. Anything that is not EXACTLY the
+  // integer AUTONOMY_STATE_VERSION — `1.9`, `"2"`, `"abc"`, `2` — marks the
+  // state unsupported (loads stay best-effort; mutations are refused). An
+  // absent version field is treated as current: every file this store ever
+  // wrote carries the stamp, and a hand-restored legacy file must not brick
+  // the registry.
+  const rawVersion = obj.version
+  if (rawVersion !== undefined && rawVersion !== AUTONOMY_STATE_VERSION) {
+    out.unsupportedVersion =
+      typeof rawVersion === 'number' || typeof rawVersion === 'string'
+        ? rawVersion
+        : String(rawVersion)
+  }
   if (typeof obj.revision === 'number' && Number.isFinite(obj.revision) && obj.revision >= 0) {
     out.revision = Math.floor(obj.revision)
   }
@@ -575,6 +847,16 @@ function coerceState(parsed: unknown): AutonomyState {
     for (const raw of obj.questions) {
       const q = coerceQuestion(raw)
       if (q !== undefined) out.questions.push(q)
+    }
+  }
+  if (Array.isArray(obj.usedGrantSources)) {
+    for (const raw of obj.usedGrantSources) {
+      if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) continue
+      const o = raw as Record<string, unknown>
+      if (typeof o.sourceId !== 'string' || o.sourceId.length === 0) continue
+      if (typeof o.scopeDigest !== 'string' || o.scopeDigest.length === 0) continue
+      if (typeof o.atMs !== 'number' || !Number.isFinite(o.atMs)) continue
+      out.usedGrantSources.push({ sourceId: o.sourceId, scopeDigest: o.scopeDigest, atMs: o.atMs })
     }
   }
   return out
@@ -601,6 +883,8 @@ function coerceLease(raw: unknown): AutonomyLease | undefined {
   if (typeof o.grantorMessageId === 'number' && Number.isFinite(o.grantorMessageId)) {
     lease.grantorMessageId = o.grantorMessageId
   }
+  if (typeof o.grantSourceId === 'string' && o.grantSourceId.length > 0) lease.grantSourceId = o.grantSourceId
+  if (typeof o.chatId === 'string' && o.chatId.length > 0) lease.chatId = o.chatId
   if (o.consumedAtMs === null) lease.consumedAtMs = null
   else if (typeof o.consumedAtMs === 'number' && Number.isFinite(o.consumedAtMs)) {
     lease.consumedAtMs = o.consumedAtMs
@@ -741,6 +1025,9 @@ export function saveAutonomyState(
       revision: nextRevision,
       leases: state.leases,
       questions: state.questions,
+      usedGrantSources: state.usedGrantSources ?? [],
+      // `unsupportedVersion` is a load-time flag, never persisted — and a
+      // flagged state never reaches this function (the writer refuses it).
     },
     null,
     2,
@@ -750,8 +1037,9 @@ export function saveAutonomyState(
 
 // Shared atomic writer for files in the state root (state files + the writer
 // lock). tmp('wx') + fchmod 0600 + fsync + rename + tmp cleanup on ANY
-// failure + best-effort directory fsync.
-function atomicWriteInRoot(paths: AutonomyPaths, filename: string, body: string): void {
+// failure + best-effort directory fsync. Exported for sibling autonomy
+// persisters (ask-intents.ts) so the write discipline never forks.
+export function atomicWriteInRoot(paths: AutonomyPaths, filename: string, body: string): void {
   mkdirSync(paths.root, { recursive: true, mode: 0o700 })
   const target = join(paths.root, filename)
   const rand = randomBytes(3).toString('hex')
@@ -911,7 +1199,13 @@ function peekRevision(paths: AutonomyPaths, chatId: string): number {
 
 // Result of a serialized update. `writer_conflict` = a FRESH writer lock is
 // held by another process — the mutation was refused entirely (fix-loop-2 #2).
-export type UpdateResult<T> = { kind: 'ok'; result: T } | { kind: 'writer_conflict' }
+// `version_unsupported` = the on-disk file was written by a NEWER schema
+// (version > 1); the registry is treated as READ-ONLY and the mutation is
+// refused so we never downgrade + clobber a future format (PR-1 leftover 4b).
+export type UpdateResult<T> =
+  | { kind: 'ok'; result: T }
+  | { kind: 'writer_conflict' }
+  | { kind: 'version_unsupported' }
 
 /**
  * Atomically (within this process) apply `mutator` to the chat's state:
@@ -934,6 +1228,13 @@ export function updateAutonomyState<T>(
   chatId: string,
   mutator: (state: AutonomyState) => { state: AutonomyState; result: T },
   log?: Logger,
+  // Clock for the retention prune ONLY (PR-1 leftover 4a). Defaults to
+  // Date.now(); callers that run the mutation on a fixed/injected clock pass
+  // the SAME clock so the prune's "older than 14 days" judgement matches the
+  // timestamps the mutator wrote (otherwise a synthetic past clock makes every
+  // fresh lease look ancient-expired). The writer-lock + revision checks
+  // deliberately stay on the real wall-clock (lock freshness is real-time).
+  nowMs: number = Date.now(),
 ): Promise<UpdateResult<T>> {
   const key = `${paths.root}|${canonicalChatKey(chatId)}`
   const step = (): UpdateResult<T> => {
@@ -941,6 +1242,21 @@ export function updateAutonomyState<T>(
       return { kind: 'writer_conflict' }
     }
     let state = loadAutonomyState(paths, chatId, log)
+    // Read-only guard (PR-1 leftover 4b + fix-loop #5): a file whose RAW
+    // on-disk `version` is not exactly the supported integer (1.9, "2",
+    // "abc", 2 — coerceState compares before any coercion) must not be
+    // mutated + saved (the save would stamp the current version and drop
+    // fields this build doesn't understand). Refuse the whole mutation.
+    if (state.unsupportedVersion !== undefined) {
+      if (log) {
+        log.warn('autonomy state version unsupported — registry read-only, mutation refused', {
+          chat_id: chatId,
+          code: 'autonomy_state_version_unsupported',
+          version: String(state.unsupportedVersion),
+        })
+      }
+      return { kind: 'version_unsupported' }
+    }
     let out = mutator(state)
     if (out.state === state) return { kind: 'ok', result: out.result }
     // Detect a cross-process write between our load and this write.
@@ -952,10 +1268,12 @@ export function updateAutonomyState<T>(
         })
       }
       state = loadAutonomyState(paths, chatId, log)
+      if (state.unsupportedVersion !== undefined) return { kind: 'version_unsupported' }
       out = mutator(state)
       if (out.state === state) return { kind: 'ok', result: out.result }
     }
-    saveAutonomyState(paths, chatId, out.state)
+    // Prune terminal/aged entries on the way to disk (PR-1 leftover 4a).
+    saveAutonomyState(paths, chatId, pruneAutonomyState(out.state, nowMs, log))
     return { kind: 'ok', result: out.result }
   }
   const prior = updateChains.get(key) ?? Promise.resolve()

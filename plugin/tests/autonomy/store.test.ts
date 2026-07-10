@@ -63,7 +63,7 @@ function seedState(): AutonomyState {
 
 describe('emptyAutonomyState', () => {
   test('is a versioned empty registry', () => {
-    expect(emptyAutonomyState()).toEqual({ version: AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [] })
+    expect(emptyAutonomyState()).toEqual({ version: AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [], usedGrantSources: [] })
   })
 })
 
@@ -98,7 +98,7 @@ describe('round-trip persistence', () => {
   })
 
   test('save always stamps the current schema version', () => {
-    const state = { version: 999 as unknown as typeof AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [] }
+    const state = { version: 999 as unknown as typeof AUTONOMY_STATE_VERSION, revision: 0, leases: [], questions: [], usedGrantSources: [] }
     saveAutonomyState(paths(), '1', state)
     expect(loadAutonomyState(paths(), '1').version).toBe(AUTONOMY_STATE_VERSION)
   })
@@ -330,7 +330,7 @@ describe('updateAutonomyState — serialized read-modify-write', () => {
       updateAutonomyState(paths(), '1', (state) => {
         const r = consumeLease(state, 'L-race', NOW)
         return { state: r.state, result: r.outcome }
-      })
+      }, undefined, NOW)
     const [ua, ub] = await Promise.all([consume(), consume()])
     expect(ua.kind).toBe('ok')
     expect(ub.kind).toBe('ok')
@@ -348,7 +348,7 @@ describe('updateAutonomyState — serialized read-modify-write', () => {
         updateAutonomyState(paths(), '2', (state) => {
           const r = addLease(state, { id: `L-${i}`, scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW)
           return { state: r.state, result: r.outcome }
-        }),
+        }, undefined, NOW),
       ),
     )
     expect(loadAutonomyState(paths(), '2').leases.length).toBe(10)
@@ -494,7 +494,7 @@ describe('revision counter (fix-loop-2 #1)', () => {
       }
       const r = addLease(state, { id: 'L-MINE', scope: 'm', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW)
       return { state: r.state, result: r.outcome }
-    })
+    }, undefined, NOW)
     expect(upd).toEqual({ kind: 'ok', result: 'ok' })
     // The mutator ran TWICE: stale apply detected, fresh re-apply persisted.
     expect(mutatorCalls).toBe(2)
@@ -513,7 +513,7 @@ describe('writer heartbeat lock (fix-loop-2 #2)', () => {
     const upd = await updateAutonomyState(paths(), '1', (state) => {
       const r = addLease(state, { id: 'L-x', scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW)
       return { state: r.state, result: r.outcome }
-    })
+    }, undefined, NOW)
     expect(upd).toEqual({ kind: 'writer_conflict' })
     // Nothing was written; the foreign lock still stands.
     expect(loadAutonomyState(paths(), '1').leases).toEqual([])
@@ -525,7 +525,7 @@ describe('writer heartbeat lock (fix-loop-2 #2)', () => {
     const upd = await updateAutonomyState(paths(), '1', (state) => {
       const r = addLease(state, { id: 'L-x', scope: 's', expiresAtMs: NOW + HOUR, source: 'manual' }, NOW)
       return { state: r.state, result: r.outcome }
-    })
+    }, undefined, NOW)
     expect(upd).toEqual({ kind: 'ok', result: 'ok' })
     expect((JSON.parse(rfs(lockPath(), 'utf8')) as { writerId: string }).writerId).toBe(AUTONOMY_WRITER_ID)
     expect(loadAutonomyState(paths(), '1').leases.length).toBe(1)

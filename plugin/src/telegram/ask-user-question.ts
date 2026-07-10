@@ -54,6 +54,85 @@ import type {
 import type { InlineKeyboardLike, TelegramApi } from '../channel/tools.js'
 import { escapeHtml } from '../format/html.js'
 import { classifyEditError } from '../safety/telegram-edit-classifier.js'
+import { addQuestion, computeScopeDigest, updateAutonomyState, type AutonomyPaths } from '../autonomy/store.js'
+import {
+  grantLease,
+  isAffirmativeLabel,
+  looksLikeLeaseMarker,
+  parseLeaseMarker,
+  stripLeaseMarkerForDisplay,
+  type ParsedLeaseMarker,
+} from '../autonomy/grant.js'
+import {
+  deleteLeaseIntent,
+  loadLeaseIntent,
+  saveLeaseIntent,
+  type PersistedLeaseIntent,
+} from '../autonomy/ask-intents.js'
+
+// ─────────────────────────────────────────────────────────────────────
+// Autonomy M2 — lease-card helpers (fix-loop #1, CRITICAL).
+//
+// The GRANT INTENT of a card is derived by ONE function from the question's
+// immutable text + multiSelect flag, and the rendered card must ALWAYS show
+// the intent built from the PARSED fields — never from agent free text. A
+// question whose intent cannot be parsed/validated (malformed marker, bad
+// ttl, over-long scope, multiSelect card) is a NORMAL question: nothing is
+// stripped (the owner sees the raw marker — honest), no mandate block is
+// rendered, and a tap grants NOTHING. «rendered ≠ granted» can never happen:
+// both the renderers and the tap handler consume the same intent.
+// ─────────────────────────────────────────────────────────────────────
+
+/** Parse the grant intent of a question at CARD CREATION — the ONE place a
+ *  marker parse is allowed to feed a grant, and only en route to the durable
+ *  persist (fix-loop-2 #1). multiSelect cards are NEVER grant-capable
+ *  (fail-closed — an accumulating toggle is not an explicit affirmative tap). */
+export function leaseIntentForQuestion(
+  questionText: string,
+  multiSelect: boolean | undefined,
+): ParsedLeaseMarker | null {
+  if (multiSelect === true) return null
+  return parseLeaseMarker(questionText)
+}
+
+// The subset of the persisted intent the renderers consume. Structural — a
+// PersistedLeaseIntent is assignable. The renderers take this as INPUT and
+// never parse question text themselves (fix-loop-2 #1: render and grant read
+// the same durable record).
+export interface LeaseIntentView {
+  scope: string
+  ttlHours: number
+  supersede: boolean
+  displayText: string
+}
+
+// The mandate block appended to an OPEN grant-capable card. Built ONLY from
+// the persisted intent fields; scope is escaped. The «Тап "Да"» line names
+// the exact action.
+function renderMandateBlockOpen(intent: LeaseIntentView): string {
+  const sup = intent.supersede ? '; заменит действующий мандат' : ''
+  return (
+    `\n\n⚡ Мандат автономии: «${escapeHtml(intent.scope)}» — ttl ${intent.ttlHours}ч${sup}`
+    + '\n<i>Тап «Да» выдаст этот мандат.</i>'
+  )
+}
+
+// The mandate line on a CLOSED card (no tap hint — the card is settled, but
+// the owner must still see exactly what scope the card was about).
+function renderMandateLineClosed(intent: LeaseIntentView): string {
+  const sup = intent.supersede ? '; заменит действующий мандат' : ''
+  return `\n⚡ Мандат автономии: «${escapeHtml(intent.scope)}» — ttl ${intent.ttlHours}ч${sup}`
+}
+
+// Honesty note on a card whose text LOOKS like a lease marker but which is
+// not grant-capable (invalid marker, registry unavailable, persist failure) —
+// fix-loop-2 #5. The raw marker stays visible; this line removes any illusion
+// that a tap would grant.
+const INVALID_MARKER_NOTE = '\n\n<i>Маркер мандата некорректен — тап мандат НЕ выдаст.</i>'
+// Closed-card line for a card that WAS grant-capable but whose persisted
+// intent is gone (restart before the durable record, file loss) — fix-loop-2
+// #1: the grant is refused and the owner is told, never a silent divergence.
+const INTENT_LOST_LINE = '\n⚠️ Мандат НЕ выдан: intent утерян (рестарт).'
 
 // ─────────────────────────────────────────────────────────────────────
 // Constants
@@ -80,7 +159,7 @@ const MULTISELECT_PREFIX_UNCHECKED = '[ ] '
 // but our chunker (format/chunk.ts) targets 4000 — staying under that
 // avoids any need to split a question card across two messages, which
 // would break the «one keyboard per question» invariant.
-const MAX_BODY_CHARS = 3800
+export const MAX_BODY_CHARS = 3800
 
 // FIX-T2 F2 — per-field raw caps applied BEFORE HTML rendering. The
 // pre-fix path sliced the rendered HTML at MAX_BODY_CHARS, which could
@@ -120,16 +199,45 @@ const COMPLETION_TEXT = 'Ответы принял, продолжаю ✅'
  * `outcomeLineHtml` is trusted HTML — callers build it via `formatChosenLine`
  * (escapes user content) or a static safe literal. Header + question are
  * escaped here. Exported for tests.
+ *
+ * Autonomy M2 (fix-loop #1): a grant-capable card keeps its mandate line on
+ * the CLOSED body too — the owner must be able to see exactly what scope the
+ * card carried after it settles. `opts.multiSelect` gates grant-capability
+ * (a multiSelect card never is); a non-grant-capable card renders the RAW
+ * question text, marker included.
  */
 export function renderClosedQuestionBody(
   questionRaw: string,
   currentIndex: number,
   totalQuestions: number,
   outcomeLineHtml: string,
+  opts: { leaseIntent?: LeaseIntentView; intentLost?: boolean } = {},
 ): string {
   const header = clipRaw(`Вопрос ${currentIndex + 1}/${totalQuestions}`, MAX_HEADER_CHARS)
-  const question = escapeHtml(clipRaw(questionRaw, MAX_QUESTION_CHARS))
-  return `<b>${escapeHtml(header)}</b>\n${question}\n\n${outcomeLineHtml}`
+  const headerHtml = `<b>${escapeHtml(header)}</b>`
+  // fix-loop-2 #1: the mandate line comes ONLY from the caller-provided
+  // persisted intent — this function never parses question text.
+  const intent = opts.leaseIntent
+  const mandateLine = intent
+    ? renderMandateLineClosed(intent)
+    : opts.intentLost === true
+      ? INTENT_LOST_LINE
+      : ''
+  const display = intent ? intent.displayText : questionRaw
+  // Shared body budget (fix-loop-2 #2): the mandate line + outcome are
+  // reserved UP-FRONT and never truncated; the question text shrinks to fit.
+  // Escape expansion (& → &amp; etc.) can blow a raw cap past the budget, so
+  // the raw cap halves until the ESCAPED text fits — never slicing escaped
+  // HTML. Reserved parts are bounded (scope ≤400cp → ≤2.4k escaped; outcome
+  // answer ≤100cp raw), so the fixed section always leaves question headroom.
+  const fixedLen = headerHtml.length + 1 + mandateLine.length + 2 + outcomeLineHtml.length
+  let rawCap = MAX_QUESTION_CHARS
+  let questionHtml = escapeHtml(clipRaw(display, rawCap))
+  while (fixedLen + questionHtml.length > MAX_BODY_CHARS && rawCap > 8) {
+    rawCap = Math.floor(rawCap / 2)
+    questionHtml = escapeHtml(clipRaw(display, rawCap))
+  }
+  return `${headerHtml}\n${questionHtml}${mandateLine}\n\n${outcomeLineHtml}`
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -143,6 +251,12 @@ export interface AskUserQuestionUiDeps {
   relay: AskUserQuestionRelay
   /** Override clock for tests. */
   now?: () => number
+  // Autonomy M2: state root for the durable lease/question registry. When set,
+  // an affirmative tap on a `[LEASE: …]` card mints a lease, and a timed-out
+  // question is auto-registered as an open question. Optional so pre-M2 wiring
+  // (and tests that don't exercise autonomy) still construct the UI. Every
+  // registry access is fail-open — a store error NEVER breaks the ask flow.
+  autonomyPaths?: AutonomyPaths
 }
 
 export interface AskUserQuestionUi {
@@ -310,6 +424,7 @@ function clipRaw(text: string, max: number): string {
 export function renderQuestionBody(
   pending: Readonly<PendingAskRequest>,
   maxPreviewChars: number,
+  renderOpts?: { leaseIntent?: LeaseIntentView },
 ): string {
   const q = pending.questions[pending.currentIndex]
   if (!q) return ''
@@ -320,14 +435,32 @@ export function renderQuestionBody(
     `Вопрос ${pending.currentIndex + 1}/${pending.questions.length}`,
     MAX_HEADER_CHARS,
   )
-  const questionRaw = clipRaw(q.question, MAX_QUESTION_CHARS)
+  // Autonomy M2 (fix-loop #1 CRITICAL + fix-loop-2 #1): a grant-capable card
+  // renders the MANDATE BLOCK built from the PERSISTED canonical intent the
+  // caller passes in — the owner must see the exact scope a «Да» tap will
+  // grant, never a hidden one, and this function NEVER re-parses question
+  // text. No intent passed (invalid marker, multiSelect, registry
+  // unavailable, persist failure, legacy record) → normal question: raw text
+  // shown (marker included — honest), no block, a tap grants nothing; if the
+  // text still LOOKS like a marker, an explicit «тап мандат НЕ выдаст» note
+  // is appended (fix-loop-2 #5).
+  const intent = renderOpts?.leaseIntent
+  const questionRaw = clipRaw(intent ? intent.displayText : q.question, MAX_QUESTION_CHARS)
+  const mandateBlock = intent
+    ? renderMandateBlockOpen(intent)
+    : looksLikeLeaseMarker(q.question)
+      ? INVALID_MARKER_NOTE
+      : ''
   const opts = q.options.slice(0, MAX_KEYBOARD_OPTIONS)
 
   // Assemble piecewise. `pieces` is the running list of fully-formed
   // HTML chunks (no half-open tags). `running` is the assembled length.
   // Budget = MAX_BODY_CHARS minus the overflow marker so we always have
-  // room to append it cleanly if we hit the cap.
-  const budget = MAX_BODY_CHARS - OVERFLOW_MARKER.length
+  // room to append it cleanly if we hit the cap. The mandate block's length
+  // is RESERVED up-front so the block is ALWAYS appended in full — the scope
+  // can never be the part that gets truncated (scope ≤400 code points ⇒
+  // escaped block ≤ ~2.1k chars, so the reserve always leaves headroom).
+  const budget = MAX_BODY_CHARS - OVERFLOW_MARKER.length - mandateBlock.length
   const pieces: string[] = []
   let running = 0
   let truncated = false
@@ -406,6 +539,9 @@ export function renderQuestionBody(
     // Self-contained marker — never sliced, never inside another tag.
     body += OVERFLOW_MARKER
   }
+  // The mandate block goes LAST and in full — its budget was reserved above,
+  // so it is never subject to truncation (fix-loop #1).
+  body += mandateBlock
   return body
 }
 
@@ -508,6 +644,30 @@ export function createAskUserQuestionUi(
   // of the relay (process restart clears).
   const recoveredOnce = new Set<string>()
 
+  // Autonomy M2 (fix-loop #1 + fix-loop-2 #1): per-question GRANT-INTENT,
+  // parsed ONCE at card creation (startQuestion), PERSISTED durably
+  // (ask-intents.ts) and keyed `<requestId>:<qIdx>`. This map is only a read
+  // CACHE over the durable record: open render, closed render and the tap
+  // grant all consume the persisted intent — never a re-parse — so the
+  // owner-visible scope and the granted scope cannot diverge across a
+  // restart or a parser change. `null` caches «known absent» (not
+  // grant-capable). Entries are dropped on settle and after a grant attempt.
+  const leaseIntents = new Map<string, PersistedLeaseIntent | null>()
+
+  // Resolve the persisted intent for a card question: cache → disk. Never
+  // creates (creation happens in startQuestion only), never parses.
+  function resolveLeaseIntent(key: string, chatId: string | undefined): PersistedLeaseIntent | null {
+    const cached = leaseIntents.get(key)
+    if (cached !== undefined) return cached
+    if (!deps.autonomyPaths || chatId === undefined) {
+      leaseIntents.set(key, null)
+      return null
+    }
+    const fromDisk = loadLeaseIntent(deps.autonomyPaths, chatId, key) ?? null
+    leaseIntents.set(key, fromDisk)
+    return fromDisk
+  }
+
   async function clearKeyboard(
     requestId: string | undefined,
     chatId: string,
@@ -593,6 +753,42 @@ export function createAskUserQuestionUi(
       log.warn('ask_user_question startQuestion missing chatId', { request_id: requestId })
       return
     }
+    // Autonomy M2 (fix-loop #1 + fix-loop-2 #1/#3): CARD CREATION is the one
+    // place the marker is parsed — and the card is grant-capable ONLY when
+    // the canonical intent was durably persisted. No autonomyPaths (factory
+    // wired without a registry), no chatId, parse-invalid, multiSelect, or a
+    // failed persist → NOT grant-capable: no mandate block, tap grants
+    // nothing. The persisted record is what render + tap consume from here on.
+    {
+      const q = pending.questions[pending.currentIndex]
+      const key = `${requestId}:${pending.currentIndex}`
+      if (q !== undefined && !leaseIntents.has(key)) {
+        let resolved: PersistedLeaseIntent | null = null
+        const existing = deps.autonomyPaths
+          ? loadLeaseIntent(deps.autonomyPaths, pending.chatId!, key)
+          : undefined
+        if (existing !== undefined) {
+          resolved = existing // recovery: durable record wins, no re-parse
+        } else if (deps.autonomyPaths) {
+          const parsed = leaseIntentForQuestion(q.question, q.multiSelect)
+          if (parsed !== null) {
+            const intent: PersistedLeaseIntent = {
+              scope: parsed.scope,
+              ttlHours: parsed.ttlHours,
+              supersede: parsed.supersede,
+              scopeDigest: computeScopeDigest(parsed.scope),
+              displayText: parsed.displayText,
+              createdAtMs: now(),
+            }
+            if (saveLeaseIntent(deps.autonomyPaths, pending.chatId!, key, intent, log)) {
+              resolved = intent
+            }
+            // persist failed → resolved stays null → card NOT grant-capable
+          }
+        }
+        leaseIntents.set(key, resolved)
+      }
+    }
     // Phase 5 FIX-T3 F3 (2026-05-27): replay protection. When the webhook
     // submits the same toolUseId twice in a tight window, the relay
     // returns the same requestId from both `.submit()` calls, and the
@@ -612,7 +808,10 @@ export function createAskUserQuestionUi(
       await rerenderCurrent(requestId)
       return
     }
-    const body = renderQuestionBody(pending, config.ask_user_question.max_preview_chars)
+    const startIntent = resolveLeaseIntent(`${requestId}:${pending.currentIndex}`, pending.chatId)
+    const body = renderQuestionBody(pending, config.ask_user_question.max_preview_chars, {
+      ...(startIntent !== null ? { leaseIntent: startIntent } : {}),
+    })
     const keyboard = buildQuestionKeyboard(pending)
     try {
       const sent = await telegramApi.sendMessage(pending.chatId, body, {
@@ -688,7 +887,13 @@ export function createAskUserQuestionUi(
       await startQuestion(requestId)
       return
     }
-    const body = renderQuestionBody(pending, config.ask_user_question.max_preview_chars)
+    const rerenderIntent = resolveLeaseIntent(
+      `${requestId}:${pending.currentIndex}`,
+      pending.chatId,
+    )
+    const body = renderQuestionBody(pending, config.ask_user_question.max_preview_chars, {
+      ...(rerenderIntent !== null ? { leaseIntent: rerenderIntent } : {}),
+    })
     const keyboard = buildQuestionKeyboard(pending)
     const chatId = pending.chatId
     const messageId = pending.telegramMessageId
@@ -820,6 +1025,14 @@ export function createAskUserQuestionUi(
     questionIndex: number
     questionText: string
     totalQuestions: number
+    // The persisted grant intent of the answered question (resolved cache→disk
+    // BEFORE the relay mutation) — the closed-card renderer shows exactly this
+    // scope, and the grant consumes exactly this record (fix-loop-2 #1).
+    leaseIntent?: PersistedLeaseIntent
+    // True when the question LOOKS like a lease card but the persisted intent
+    // is gone (restart before persist, file loss) — closed card then shows
+    // «Мандат НЕ выдан: intent утерян (рестарт)».
+    intentLost: boolean
     // Pre-built, HTML-safe outcome line («✅ Ответ: <label>»).
     outcomeLineHtml: string
   }
@@ -834,6 +1047,135 @@ export function createAskUserQuestionUi(
       log.debug('ask_user_question completion send failed', {
         chat_id: chatId,
         kind: cls.kind,
+      })
+    }
+  }
+
+  // Compact UTC stamp for the grant-feedback message.
+  function fmtLeaseUntil(ms: number): string {
+    return `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+  }
+
+  // Autonomy M2 — mint a lease when the OWNER taps an affirmative option on a
+  // `[LEASE: …]` card.
+  //
+  // SECURITY INVARIANT: this runs ONLY from handleAskCallback's `choose`
+  // branch, AFTER `isAuthorized(ctx.from.id)` has passed — i.e. behind the
+  // owner allowlist. It is one of exactly TWO lease-grant call sites in the
+  // whole plugin (the other is the `/lease` owner command); no agent-callable
+  // surface (MCP tool, hook) can reach a grant.
+  //
+  // FAIL-CLOSED BY DESIGN (fix-loop #8): multiSelect toggles/«Готово» commits
+  // and «Другое» free-text NEVER grant — the intent resolver returns null for
+  // multiSelect questions, and this helper is not wired into the toggle/done/
+  // other/answerOther paths at all. Only an exact affirmative single-select
+  // tap grants.
+  //
+  // Registry errors are fail-open for the ASK flow (the answer is never
+  // lost), but NEVER silent for the owner (fix-loop #7): every grant attempt
+  // ends in an explicit «выдан / НЕ выдан» feedback message.
+  async function maybeGrantLeaseFromTap(input: {
+    // The PERSISTED canonical intent resolved (cache → disk) before the relay
+    // mutation — exactly the record the card rendered (fix-loop-2 #1).
+    intent: PersistedLeaseIntent
+    chosenLabel: string
+    requestId: string
+    questionIndex: number
+    chatId: string | undefined
+    grantorMessageId: number | undefined
+    // A chat we can always reach for feedback (ctx.chatId) even when the
+    // pending record's chatId was lost — fix-loop-2 #3: never a silent
+    // failure on a grant-capable card.
+    feedbackChatId: string
+  }): Promise<void> {
+    if (!isAffirmativeLabel(input.chosenLabel)) return
+    if (!deps.autonomyPaths || input.chatId === undefined) {
+      // A grant-capable card reached the tap while the registry is not
+      // reachable in THIS process (runtime-only failure — creation-time
+      // gating makes this near-impossible). Fail-closed AND visible.
+      log.warn('autonomy lease grant impossible — registry unavailable at tap', {
+        request_id: input.requestId,
+        has_paths: deps.autonomyPaths !== undefined,
+      })
+      try {
+        await telegramApi.sendMessage(input.feedbackChatId, 'Мандат НЕ выдан: реестр недоступен', { parse_mode: 'HTML' })
+      } catch {
+        // feedback is best-effort
+      }
+      return
+    }
+    const intent = input.intent
+    let feedback: string
+    try {
+      const res = await grantLease(
+        deps.autonomyPaths,
+        input.chatId,
+        {
+          scope: intent.scope,
+          ttlHours: intent.ttlHours,
+          source: 'ask_card',
+          // Idempotency: a double-tap / replayed callback carrying the same
+          // requestId+questionIndex mints exactly one lease (durable ledger
+          // in the store survives lease pruning).
+          grantSourceId: `ask:${input.requestId}:${input.questionIndex}`,
+          supersede: intent.supersede,
+          ...(input.grantorMessageId !== undefined ? { grantorMessageId: input.grantorMessageId } : {}),
+        },
+        log,
+        now(),
+      )
+      if (res.kind === 'ok') {
+        log.info('autonomy lease grant from ask card', {
+          request_id: input.requestId,
+          chat_id: input.chatId,
+          outcome: res.outcome,
+          lease_id: res.lease?.id,
+        })
+        switch (res.outcome) {
+          case 'granted':
+          case 'superseded': {
+            const lease = res.lease
+            feedback = lease !== undefined
+              ? `Мандат ${lease.id} выдан до ${fmtLeaseUntil(lease.expiresAtMs)}`
+                + (res.outcome === 'superseded' ? ' (прежний мандат отозван)' : '')
+              : 'Мандат НЕ выдан: реестр не вернул запись мандата'
+            break
+          }
+          case 'duplicate_source':
+          case 'duplicate_scope':
+            feedback = res.lease !== undefined
+              ? `Мандат уже существует: ${res.lease.id} (повторный тап, новый не выдан)`
+              : 'Этот грант уже был обработан ранее — новый мандат не выдан'
+            break
+          case 'source_conflict':
+            feedback = 'Мандат НЕ выдан: конфликт источника гранта (source_conflict) — этот запрос уже обрабатывался с другим scope'
+            break
+        }
+      } else {
+        log.warn('autonomy lease grant from ask card refused', {
+          request_id: input.requestId,
+          chat_id: input.chatId,
+          reason: res.kind,
+        })
+        feedback = res.kind === 'writer_conflict'
+          ? 'Мандат НЕ выдан: реестр занят другим процессом (writer_conflict)'
+          : 'Мандат НЕ выдан: реестр записан более новой версией плагина (version_unsupported)'
+      }
+    } catch (err) {
+      log.warn('autonomy lease grant from ask card threw', {
+        request_id: input.requestId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      feedback = 'Мандат НЕ выдан: внутренняя ошибка реестра автономии'
+    }
+    // Owner feedback — best-effort send, but the attempt itself is mandatory
+    // (fix-loop #7: never silent).
+    try {
+      await telegramApi.sendMessage(input.chatId, feedback, { parse_mode: 'HTML' })
+    } catch (err) {
+      log.warn('autonomy lease grant feedback send failed', {
+        request_id: input.requestId,
+        error: err instanceof Error ? err.message : String(err),
       })
     }
   }
@@ -866,6 +1208,10 @@ export function createAskUserQuestionUi(
       snap.questionIndex,
       snap.totalQuestions,
       snap.outcomeLineHtml,
+      {
+        ...(snap.leaseIntent !== undefined ? { leaseIntent: snap.leaseIntent } : {}),
+        intentLost: snap.intentLost,
+      },
     )
 
     if (!outcome.final) {
@@ -897,20 +1243,96 @@ export function createAskUserQuestionUi(
     }
   }
 
+  // Autonomy M2 — register a timed-out question in the durable registry so an
+  // un-answered ask survives a compact/restart. summary = first 100 chars of
+  // the (marker-stripped) question. defaultAction is left undefined: the
+  // AskUserQuestion payload has no "recommended option" marker to read (the
+  // option schema is label+description+preview), so there is nothing to carry.
+  // sticky=false. Fail-open — a registry error never breaks settle handling.
+  //
+  // IDEMPOTENT (fix-loop #4, Codex MED): the question id is DERIVED from the
+  // settle identity (`Q-ask-<requestId>-<qIdx>`) via addQuestion's explicit-id
+  // path, so a duplicate settle (replayed event, double expire) is a clean
+  // `duplicate` no-op — exactly one open question per timed-out card.
+  const TIMED_OUT_SUMMARY_MAX = 100
+  async function maybeRegisterTimedOutQuestion(event: AskSettleEvent): Promise<void> {
+    if (!deps.autonomyPaths || !event.chatId) return
+    const clean = stripLeaseMarkerForDisplay(event.questionText ?? '')
+    const summary = Array.from(clean).slice(0, TIMED_OUT_SUMMARY_MAX).join('')
+    const deterministicId = `Q-ask-${event.requestId}-${event.currentIndex}`
+    try {
+      const upd = await updateAutonomyState(
+        deps.autonomyPaths,
+        event.chatId,
+        (state) => {
+          const r = addQuestion(
+            state,
+            {
+              id: deterministicId,
+              summary,
+              sticky: false,
+              ...(event.telegramMessageId !== undefined ? { messageId: event.telegramMessageId } : {}),
+            },
+            now(),
+          )
+          return { state: r.state, result: r.outcome }
+        },
+        log,
+        now(),
+      )
+      if (upd.kind === 'ok') {
+        log.info('autonomy open question registration on timeout', {
+          request_id: event.requestId,
+          chat_id: event.chatId,
+          outcome: upd.result,
+        })
+      }
+    } catch (err) {
+      log.warn('autonomy timeout question registration threw (ignored)', {
+        request_id: event.requestId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
   // Close the currently-open question card on a settle the UI did NOT drive
   // (internal timeout / external expire). Best-effort — never throws.
   async function handleSettle(event: AskSettleEvent): Promise<void> {
     try {
+      // Resolve the persisted intent BEFORE any cleanup — the timeout-closed
+      // card must show the same durable scope the open card showed.
+      const settleKey = `${event.requestId}:${event.currentIndex}`
+      const settleIntent = resolveLeaseIntent(settleKey, event.chatId)
+      const settleIntentLost = settleIntent === null
+        && event.questionMultiSelect !== true
+        && looksLikeLeaseMarker(event.questionText ?? '')
+      // Drop the request's grant-intent records on ANY terminal settle —
+      // the request is gone, cache and durable record must not linger.
+      for (const key of leaseIntents.keys()) {
+        if (key.startsWith(`${event.requestId}:`)) leaseIntents.delete(key)
+      }
+      if (deps.autonomyPaths && event.chatId) {
+        deleteLeaseIntent(deps.autonomyPaths, event.chatId, settleKey, log)
+      }
       // `answered` is fully handled by the driven callback path (per-question
       // close + completion message); acting here would double-post. Only the
       // timeout/expire family leaves a card open with a live keyboard.
       if (event.status !== 'timeout') return
+      // Autonomy M2: auto-register the un-answered question so it survives a
+      // compact/restart and surfaces in the reminder/HUD until resolved.
+      // Runs even when the card can't be closed (no chatId/messageId) — a
+      // registry write only needs the chat id. Fail-open (never throws).
+      await maybeRegisterTimedOutQuestion(event)
       if (!event.chatId || event.telegramMessageId === undefined) return
       const body = renderClosedQuestionBody(
         event.questionText ?? '',
         event.currentIndex,
         event.totalQuestions,
         TIMEOUT_OUTCOME_LINE,
+        {
+          ...(settleIntent !== null ? { leaseIntent: settleIntent } : {}),
+          intentLost: settleIntentLost,
+        },
       )
       // requestId undefined: relay already settled — nothing left to expire.
       await clearKeyboard(undefined, event.chatId, event.telegramMessageId, body)
@@ -1011,6 +1433,20 @@ export function createAskUserQuestionUi(
         // Capture the chosen label BEFORE the relay advances past this
         // question — afterwards currentIndex points at the next one.
         const chosenLabel = currentQuestion?.options[parsed.optionIndex]?.label ?? ''
+        const isMulti = currentQuestion?.multiSelect === true
+        // Autonomy M2 (fix-loop-2 #1): resolve the PERSISTED intent BEFORE
+        // the relay mutation — the final-question settle fires synchronously
+        // inside answerChoice and clears the cache. Cache → disk only; NEVER
+        // a re-parse of the question text (a parser change between deploys
+        // must not alter what an already-rendered card grants).
+        const intentKey = `${parsed.requestId}:${pendingBefore.currentIndex}`
+        const leaseIntent = resolveLeaseIntent(intentKey, prevChatId ?? ctx.chatId)
+        // «intent lost»: the text looks like a lease card (presentation-only
+        // prefix check) but the durable record is gone — restart before
+        // persist / file loss. Fail-closed + visible on the closed card.
+        const intentLost = leaseIntent === null && !isMulti
+          && looksLikeLeaseMarker(currentQuestion?.question ?? '')
+        leaseIntents.delete(intentKey)
         const snap: AnswerSnapshot = {
           requestId: parsed.requestId,
           chatId: prevChatId,
@@ -1018,6 +1454,8 @@ export function createAskUserQuestionUi(
           questionIndex: pendingBefore.currentIndex,
           questionText: currentQuestion?.question ?? '',
           totalQuestions,
+          ...(leaseIntent !== null ? { leaseIntent } : {}),
+          intentLost,
           outcomeLineHtml: formatChosenLine(chosenLabel),
         }
         const outcome = relay.answerChoice(parsed.requestId, parsed.questionIndex, parsed.optionIndex)
@@ -1025,6 +1463,45 @@ export function createAskUserQuestionUi(
         // trail, while any await placed between the mutation and the
         // follow-up render widens the timeout race window (Codex HIGH).
         await advanceAfterAnswer(snap, outcome)
+        // Autonomy M2: an affirmative single-select tap on a grant-capable
+        // `[LEASE: …]` card mints a lease. Fail-closed gates:
+        //   * `outcome.applied && outcome.advanced` — a stale/no-op tap or a
+        //     multiSelect toggle-accumulation grants nothing;
+        //   * `!isMulti` — multiSelect cards are NEVER grant-capable (their
+        //     `choose` is a toggle), and «Готово»/«Другое» paths never reach
+        //     a grant at all;
+        //   * `leaseIntent !== null` — the card must have rendered a valid
+        //     mandate block (the same snapshot is what gets granted).
+        if (outcome.applied && outcome.advanced && !isMulti) {
+          if (leaseIntent !== null) {
+            await maybeGrantLeaseFromTap({
+              intent: leaseIntent,
+              chosenLabel,
+              requestId: parsed.requestId,
+              questionIndex: snap.questionIndex,
+              chatId: snap.chatId ?? ctx.chatId,
+              grantorMessageId: snap.messageId,
+              feedbackChatId: ctx.chatId,
+            })
+            // The intent is consumed — drop the durable record (idempotency
+            // of the GRANT lives in the registry ledger, not here).
+            if (deps.autonomyPaths) {
+              deleteLeaseIntent(deps.autonomyPaths, snap.chatId ?? ctx.chatId, intentKey, log)
+            }
+          } else if (intentLost && isAffirmativeLabel(chosenLabel)) {
+            // The owner affirmed a card that USED to be grant-capable but
+            // whose durable intent is gone — refuse loudly (fix-loop-2 #1).
+            log.warn('autonomy lease intent lost — grant refused', {
+              request_id: parsed.requestId,
+              question_index: snap.questionIndex,
+            })
+            try {
+              await telegramApi.sendMessage(ctx.chatId, 'Мандат НЕ выдан: intent утерян (рестарт)', { parse_mode: 'HTML' })
+            } catch {
+              // best-effort
+            }
+          }
+        }
         await ctx.answerCallbackQuery().catch(() => {})
         return
       }
@@ -1045,6 +1522,9 @@ export function createAskUserQuestionUi(
           questionIndex: pendingBefore.currentIndex,
           questionText: currentQuestion?.question ?? '',
           totalQuestions,
+          // done() commits a multiSelect question — never grant-capable, so
+          // no intent and no lost-intent warning.
+          intentLost: false,
           outcomeLineHtml: formatChosenLine(committedLabels.join(', ')),
         }
         const outcome = relay.done(parsed.requestId, parsed.questionIndex)
@@ -1161,8 +1641,16 @@ export function createAskUserQuestionUi(
     // Consume — even on empty text (relay drops empty internally and
     // logs at debug). We still clear the awaiting marker so the user
     // is not silently swallowed forever.
+    //
+    // Autonomy M2 (fix-loop #8): the «Другое» free-text path NEVER grants a
+    // lease — no call into maybeGrantLeaseFromTap here, by design. Only an
+    // exact affirmative single-select TAP can grant.
     const pendingBefore = relay.getPending(entry.requestId)
     const currentQuestion = pendingBefore?.questions[pendingBefore.currentIndex]
+    const otherIntent = resolveLeaseIntent(
+      `${entry.requestId}:${pendingBefore?.currentIndex ?? entry.questionIndex}`,
+      pendingBefore?.chatId ?? input.chatId,
+    )
     const snap: AnswerSnapshot = {
       requestId: entry.requestId,
       chatId: pendingBefore?.chatId,
@@ -1170,6 +1658,10 @@ export function createAskUserQuestionUi(
       questionIndex: pendingBefore?.currentIndex ?? entry.questionIndex,
       questionText: currentQuestion?.question ?? '',
       totalQuestions: pendingBefore?.questions.length ?? 0,
+      // Closed card of a grant-capable question keeps its mandate line even
+      // though «Другое» free-text NEVER grants (fail-closed by design).
+      ...(otherIntent !== null ? { leaseIntent: otherIntent } : {}),
+      intentLost: false,
       // «Другое» free-text is the chosen answer (truncated in the echo).
       outcomeLineHtml: formatChosenLine(input.text.trim()),
     }

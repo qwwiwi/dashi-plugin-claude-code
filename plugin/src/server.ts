@@ -836,6 +836,11 @@ const askUserQuestionUi: AskUserQuestionUi = createAskUserQuestionUi({
   log,
   telegramApi,
   relay: askUserQuestionRelay,
+  // Autonomy M2: the state root for the lease/question registry. An affirmative
+  // tap on a `[LEASE: …]` card mints a lease here (behind the owner allowlist);
+  // a timed-out question is auto-registered. StatePaths is structurally an
+  // AutonomyPaths (both expose `root`).
+  autonomyPaths: statePaths,
 })
 askUserQuestionUiRef = askUserQuestionUi
 // Permission gate (2026-06-09): interactive Allow/Deny confirm relay for the
