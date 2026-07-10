@@ -71,11 +71,27 @@ describe('parseLeaseMarker', () => {
     expect(m!.displayText).toBe('catch up the wave')
   })
 
-  test('valid ttl values: integer 1..72', () => {
+  test('valid ttl values: integer 1..72, literal lowercase form only', () => {
     expect(parseLeaseMarker('[LEASE: x; ttl=48h] q')!.ttlHours).toBe(48)
     expect(parseLeaseMarker('[LEASE: x; ttl=1h] q')!.ttlHours).toBe(1)
     expect(parseLeaseMarker('[LEASE: x; ttl=72h] q')!.ttlHours).toBe(72)
-    expect(parseLeaseMarker('[LEASE: x; TTL=12H] q')!.ttlHours).toBe(12)
+  })
+
+  test('case variants are INVALID — contract is literal lowercase ttl=<int>h (fix-loop-2 #7)', () => {
+    expect(parseLeaseMarker('[LEASE: x; TTL=12H] q')).toBeNull()
+    expect(parseLeaseMarker('[LEASE: x; Ttl=12h] q')).toBeNull()
+    expect(parseLeaseMarker('[LEASE: x; ttl=12H] q')).toBeNull()
+    expect(parseLeaseCommandArgs('аудит; TTL=12H')).toEqual({ kind: 'invalid', reason: 'ttl' })
+  })
+
+  test('scope with control/format chars (newline, bidi RLO) → invalid (fix-loop-2 #6)', () => {
+    // U+202E RIGHT-TO-LEFT OVERRIDE — visual reordering attack on consent text.
+    expect(parseLeaseMarker('[LEASE: deploy \u202Egnigats] q')).toBeNull()
+    expect(parseLeaseMarker('[LEASE: a\u0000b] q')).toBeNull()
+    expect(parseLeaseCommandArgs('deploy \u202Egnigats')).toEqual({ kind: 'invalid', reason: 'scope_charset' })
+    expect(parseLeaseCommandArgs('строка1\nстрока2')).toEqual({ kind: 'invalid', reason: 'scope_charset' })
+    // Zero-width joiner (Cf) is rejected too.
+    expect(parseLeaseCommandArgs('a\u200Db')).toEqual({ kind: 'invalid', reason: 'scope_charset' })
   })
 
   test('FAIL-CLOSED ttl matrix — present but malformed → whole marker invalid (null)', () => {
@@ -473,6 +489,28 @@ describe('pruneAutonomyState', () => {
     let s = emptyAutonomyState()
     s = withLease(s, { id: 'L-edge', expiresAtMs: NOW - PRUNE_MAX_AGE_MS })
     expect(pruneAutonomyState(s, NOW).leases.map((l) => l.id)).toEqual(['L-edge'])
+  })
+
+  test('replay ledger hard cap 500: oldest evicted with grant_ledger_evicted warn (fix-loop-2 #4)', () => {
+    let s = emptyAutonomyState()
+    const sources = Array.from({ length: 520 }, (_, i) => ({
+      sourceId: `src-${i}`,
+      scopeDigest: 'sha256:x',
+      atMs: NOW - (520 - i) * 1000, // src-0 oldest … src-519 newest
+    }))
+    s = { ...s, usedGrantSources: sources }
+    const warns: string[] = []
+    const log = {
+      debug: () => {}, info: () => {},
+      warn: (_m: string, f?: Record<string, unknown>) => warns.push(String(f?.code ?? '')),
+      error: () => {},
+    }
+    const pruned = pruneAutonomyState(s, NOW, log)
+    expect(pruned.usedGrantSources.length).toBe(500)
+    // Oldest 20 evicted, newest kept.
+    expect(pruned.usedGrantSources[0]!.sourceId).toBe('src-20')
+    expect(pruned.usedGrantSources.at(-1)!.sourceId).toBe('src-519')
+    expect(warns).toContain('grant_ledger_evicted')
   })
 
   test('replay ledger kept 90 days — out-living the 14-day lease tombstones', () => {

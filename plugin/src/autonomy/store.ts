@@ -578,6 +578,14 @@ export const PRUNE_MAX_AGE_MS = 14 * 24 * 3_600_000
 // retention has dropped the lease record itself.
 export const GRANT_SOURCE_LEDGER_MAX_AGE_MS = 90 * 24 * 3_600_000
 
+// Hard size cap for the replay ledger (fix-loop-2 #4): a SAFETY VALVE, not a
+// working limit. Realistic grant volume is a few per day; 90 days of that is
+// well under 500, so eviction ~never happens in practice and the replay
+// protection is effectively never weakened. The cap only guards the
+// pathological case (a runaway grant loop) from growing the JSON and its
+// linear lookups without bound. Overflow evicts oldest-first with a warn.
+export const GRANT_SOURCE_LEDGER_MAX_ENTRIES = 500
+
 // The timestamp at which a lease became terminal, or undefined while it is
 // still active. Revoked wins over consumed (a lease can only be one), and an
 // un-consumed/un-revoked lease past its expiry counts from expiresAtMs.
@@ -588,7 +596,11 @@ function leaseTerminalAtMs(lease: AutonomyLease, nowMs: number): number | undefi
   return undefined
 }
 
-export function pruneAutonomyState(state: AutonomyState, nowMs: number = Date.now()): AutonomyState {
+export function pruneAutonomyState(
+  state: AutonomyState,
+  nowMs: number = Date.now(),
+  log?: Logger,
+): AutonomyState {
   const leases = state.leases.filter((l) => {
     const terminalAt = leaseTerminalAtMs(l, nowMs)
     if (terminalAt === undefined) return true // still active — keep
@@ -602,7 +614,21 @@ export function pruneAutonomyState(state: AutonomyState, nowMs: number = Date.no
   // The replay ledger is kept 90 days (fix-loop #2) — deliberately LONGER
   // than the lease tombstones it protects against re-minting.
   const sources = state.usedGrantSources ?? []
-  const usedGrantSources = sources.filter((u) => nowMs - u.atMs <= GRANT_SOURCE_LEDGER_MAX_AGE_MS)
+  let usedGrantSources = sources.filter((u) => nowMs - u.atMs <= GRANT_SOURCE_LEDGER_MAX_AGE_MS)
+  // Hard cap (fix-loop-2 #4): evict oldest beyond GRANT_SOURCE_LEDGER_MAX_ENTRIES.
+  if (usedGrantSources.length > GRANT_SOURCE_LEDGER_MAX_ENTRIES) {
+    const evicted = usedGrantSources.length - GRANT_SOURCE_LEDGER_MAX_ENTRIES
+    usedGrantSources = [...usedGrantSources]
+      .sort((a, b) => a.atMs - b.atMs)
+      .slice(evicted)
+    if (log) {
+      log.warn('autonomy grant ledger over hard cap — oldest entries evicted', {
+        code: 'grant_ledger_evicted',
+        evicted,
+        cap: GRANT_SOURCE_LEDGER_MAX_ENTRIES,
+      })
+    }
+  }
   if (
     leases.length === state.leases.length
     && questions.length === state.questions.length
@@ -1011,8 +1037,9 @@ export function saveAutonomyState(
 
 // Shared atomic writer for files in the state root (state files + the writer
 // lock). tmp('wx') + fchmod 0600 + fsync + rename + tmp cleanup on ANY
-// failure + best-effort directory fsync.
-function atomicWriteInRoot(paths: AutonomyPaths, filename: string, body: string): void {
+// failure + best-effort directory fsync. Exported for sibling autonomy
+// persisters (ask-intents.ts) so the write discipline never forks.
+export function atomicWriteInRoot(paths: AutonomyPaths, filename: string, body: string): void {
   mkdirSync(paths.root, { recursive: true, mode: 0o700 })
   const target = join(paths.root, filename)
   const rand = randomBytes(3).toString('hex')
@@ -1246,7 +1273,7 @@ export function updateAutonomyState<T>(
       if (out.state === state) return { kind: 'ok', result: out.result }
     }
     // Prune terminal/aged entries on the way to disk (PR-1 leftover 4a).
-    saveAutonomyState(paths, chatId, pruneAutonomyState(out.state, nowMs))
+    saveAutonomyState(paths, chatId, pruneAutonomyState(out.state, nowMs, log))
     return { kind: 'ok', result: out.result }
   }
   const prior = updateChains.get(key) ?? Promise.resolve()

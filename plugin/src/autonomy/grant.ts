@@ -50,8 +50,11 @@ const MS_PER_HOUR = 3_600_000
 // than validation: an option-like segment that fails the strict form must
 // fail the grant — never fall through as scope text, never be defaulted.
 const TTL_LOOKS_LIKE_RE = /^ttl\s*=/i
-// The strict accepted form: `ttl=<int>h`, 1-2 ASCII digits, no inner spaces.
-const TTL_STRICT_RE = /^ttl=([0-9]{1,2})h$/i
+// The strict accepted form: literal lowercase `ttl=<int>h`, 1-2 ASCII digits,
+// no inner spaces, no case variants (fix-loop-2 #7: `TTL=12H` is INVALID —
+// detection stays case-insensitive so the variant fails the grant instead of
+// silently becoming scope text).
+const TTL_STRICT_RE = /^ttl=([0-9]{1,2})h$/
 
 // Strict ttl segment parse: integer 1..72 → hours; anything else → null.
 function parseTtlSegment(segment: string): number | null {
@@ -66,6 +69,28 @@ function parseTtlSegment(segment: string): number | null {
 // UTF-16 unit counting).
 function codePointLength(s: string): number {
   return Array.from(s).length
+}
+
+// Charset fail-closed (fix-loop-2 #6): a scope containing control (Cc — incl.
+// newlines/tabs) or format (Cf — incl. bidi RLO/LRO/PDF, zero-width joiners)
+// code points is INVALID. Bidi controls can visually REORDER the rendered
+// consent text so what the owner reads differs from the granted bytes even
+// though the digest matches — reject the whole grant instead.
+const SCOPE_FORBIDDEN_RE = /[\p{Cc}\p{Cf}]/u
+
+function scopeCharsetInvalid(scope: string): boolean {
+  return SCOPE_FORBIDDEN_RE.test(scope)
+}
+
+/**
+ * Cheap PREFIX test: does this question text START with something that looks
+ * like a lease marker? Presentation-only helper for the honesty surfaces
+ * («маркер некорректен» note, «intent утерян» closed-card line). It NEVER
+ * influences granting — grants read only the persisted canonical intent
+ * (ask-intents.ts, fix-loop-2 #1).
+ */
+export function looksLikeLeaseMarker(questionText: string): boolean {
+  return /^\s*\[lease:/i.test(questionText)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -130,6 +155,7 @@ export function parseLeaseMarker(questionText: string): ParsedLeaseMarker | null
   const scope = (segments[0] ?? '').trim()
   if (scope.length === 0) return null
   if (codePointLength(scope) > LEASE_SCOPE_MAX_CODEPOINTS) return null
+  if (scopeCharsetInvalid(scope)) return null // Cc/Cf incl. bidi controls — fail-closed
 
   let ttl: number | undefined
   let supersede = false
@@ -178,7 +204,7 @@ export type ParsedLeaseCommand =
   | { kind: 'grant'; scope: string; ttlHours: number }
   // Present-but-malformed option / over-long scope → usage error, NO grant
   // (fail-closed, fix-loop #3/#6/#8).
-  | { kind: 'invalid'; reason: 'ttl' | 'scope_too_long' }
+  | { kind: 'invalid'; reason: 'ttl' | 'scope_too_long' | 'scope_charset' }
 
 /**
  * Parse the args of a `/lease` command (the text AFTER the command word).
@@ -211,6 +237,9 @@ export function parseLeaseCommandArgs(args: string): ParsedLeaseCommand {
   if (scope.length === 0) return { kind: 'bare' }
   if (codePointLength(scope) > LEASE_SCOPE_MAX_CODEPOINTS) {
     return { kind: 'invalid', reason: 'scope_too_long' }
+  }
+  if (scopeCharsetInvalid(scope)) {
+    return { kind: 'invalid', reason: 'scope_charset' }
   }
   return { kind: 'grant', scope, ttlHours: ttl ?? LEASE_DEFAULT_TTL_HOURS }
 }
