@@ -1,8 +1,10 @@
-// Tests for HeartbeatMonitor (M4): mechanical heartbeat (pin @25m / message
-// @60m), dead-man (pane frozen >10m), and open-question reminders (2h once /
-// sticky 6h cadence). Deterministic clock + injected send/pin callbacks; the
-// autonomy registry is a real on-disk file so we can also prove the heartbeat
-// path NEVER mutates it (byte-identical assertion — no lease field touched).
+// Tests for HeartbeatMonitor (M4, fix-loop 1): mechanical heartbeat (pin @25m
+// / message @60m, hourly budget PER CHAT persistent across turns, silence
+// window seeded when no outbound record exists), dead-man (pane frozen >10m),
+// and open-question reminders (2h once / sticky 6h cadence, restart-burst
+// seeding). Deterministic clock + injected send/pin callbacks; the autonomy
+// registry is a real on-disk file so we can also prove the heartbeat path
+// NEVER mutates it (byte-identical assertion — no lease field touched).
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -92,7 +94,7 @@ describe('heartbeat pin / message thresholds', () => {
     expect(h.pins[0]?.suffix).toContain('работаю: сборка воркера ·')
   })
 
-  test('real message at 60 min supersedes pin, once per hour per turn', () => {
+  test('real message at 60 min supersedes pin, at most once per hour per chat', () => {
     const h = make()
     h.outbound = h.now - 61 * MIN
     h.monitor.evaluate(CHAT, { turnActive: true, inProgressTask: 'миграция', nowMs: h.now })
@@ -114,12 +116,24 @@ describe('heartbeat pin / message thresholds', () => {
     expect(h.pins).toEqual([])
   })
 
-  test('no outbound baseline → no heartbeat', () => {
+  test('no outbound record → silence window SEEDED from first active evaluate (fix-loop-1 #4)', () => {
     const h = make()
     h.outbound = undefined
+    // First evaluate seeds the baseline — nothing fires immediately.
     h.monitor.evaluate(CHAT, { turnActive: true, inProgressTask: 'x', nowMs: h.now })
     expect(h.sends).toEqual([])
     expect(h.pins).toEqual([])
+    // 26 min later, still no outbound → the pin heartbeat DOES fire (pre-fix
+    // the heartbeat was disabled forever until the first real send).
+    h.now += 26 * MIN
+    h.monitor.evaluate(CHAT, { turnActive: true, inProgressTask: 'x', nowMs: h.now })
+    expect(h.pins.length).toBe(1)
+    expect(h.pins[0]?.suffix).toContain('работаю: x ·')
+    // 61 min after the seed → the real message fires.
+    h.now += 35 * MIN
+    h.monitor.evaluate(CHAT, { turnActive: true, inProgressTask: 'x', nowMs: h.now })
+    expect(h.sends.length).toBe(1)
+    expect(h.sends[0]?.text).toBe('Работаю дольше часа без отчёта: x. Продолжаю.')
   })
 
   test('pin cleared when silence drops back under 25m', () => {
@@ -142,13 +156,19 @@ describe('heartbeat pin / message thresholds', () => {
     expect(h.pins.at(-1)?.suffix).toBeNull()
   })
 
-  test('onTurnEnd resets the per-turn message budget', () => {
+  test('hourly message budget PERSISTS across turn ends (fix-loop-1 #3)', () => {
     const h = make()
     h.outbound = h.now - 61 * MIN
     h.monitor.evaluate(CHAT, { turnActive: true, inProgressTask: 't', nowMs: h.now })
     expect(h.sends.length).toBe(1)
+    // Turn ends; a new turn begins seconds later, still >60m silent — the
+    // budget must NOT reset (pre-fix: an immediate second message here).
     h.monitor.onTurnEnd(CHAT)
-    // new turn, still >60m silent → allowed to message again
+    h.now += 20 * 1000
+    h.monitor.evaluate(CHAT, { turnActive: true, inProgressTask: 't', nowMs: h.now })
+    expect(h.sends.length).toBe(1)
+    // A full hour after the first message the budget re-opens.
+    h.now += 61 * MIN
     h.monitor.evaluate(CHAT, { turnActive: true, inProgressTask: 't', nowMs: h.now })
     expect(h.sends.length).toBe(2)
   })
@@ -167,7 +187,9 @@ describe('dead-man alert', () => {
     h.now += 11 * MIN
     h.monitor.observePane(CHAT, 'frame-A', h.now, true)
     expect(h.sends.length).toBe(1)
-    expect(h.sends[0]?.text).toBe('Сессия молчит >10 мин при активном ходе — возможно OOM/зависание')
+    expect(h.sends[0]?.text).toBe(
+      'Сессия молчит >10 мин при активном ходе — возможно OOM/зависание или жду подтверждения (карточка/гейт)',
+    )
     // another observe, still frozen → NOT re-alerted
     h.now += 5 * MIN
     h.monitor.observePane(CHAT, 'frame-A', h.now, true)
@@ -208,9 +230,15 @@ function seed(mutate: (s: AutonomyState, now: number) => AutonomyState, now: num
 }
 
 describe('open-question reminders', () => {
+  // Normal (non-restart) flow: the monitor sees the question while it is
+  // FRESH (first evaluate seeds it at ~asked time), so the 2h window is
+  // effectively age-based.
   test('2h reminder fires once with default', () => {
     const h = make()
-    seed((s, now) => addQuestion(s, { summary: 'катить прод?', defaultAction: 'катить', askedAtMs: now - 3 * HOUR }, now).state, h.now)
+    seed((s, now) => addQuestion(s, { summary: 'катить прод?', defaultAction: 'катить', askedAtMs: now }, now).state, h.now)
+    h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
+    expect(h.sends).toEqual([]) // fresh question — nothing yet
+    h.now += 3 * HOUR
     h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
     expect(h.sends.length).toBe(1)
     expect(h.sends[0]?.text).toBe('Вопрос без ответа 2ч: "катить прод?". Беру дефолт: катить. Скажи стоп, если против.')
@@ -222,21 +250,40 @@ describe('open-question reminders', () => {
 
   test('2h reminder without default uses the fallback phrasing', () => {
     const h = make()
-    seed((s, now) => addQuestion(s, { summary: 'что дальше?', askedAtMs: now - 3 * HOUR }, now).state, h.now)
+    seed((s, now) => addQuestion(s, { summary: 'что дальше?', askedAtMs: now }, now).state, h.now)
+    h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
+    h.now += 3 * HOUR
     h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
     expect(h.sends[0]?.text).toBe('Вопрос без ответа 2ч: "что дальше?". Жду или беру безопасный дефолт по ситуации.')
   })
 
   test('question younger than 2h → no reminder', () => {
     const h = make()
-    seed((s, now) => addQuestion(s, { summary: 'x', askedAtMs: now - 1 * HOUR }, now).state, h.now)
+    seed((s, now) => addQuestion(s, { summary: 'x', askedAtMs: now }, now).state, h.now)
+    h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
+    h.now += 1 * HOUR
     h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
     expect(h.sends).toEqual([])
   })
 
+  test('question appearing AFTER the seed pass fires on its normal age threshold', () => {
+    const h = make()
+    // First evaluate on an EMPTY registry consumes the seed pass.
+    h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
+    // A question asked 3h ago materialises later (no seed entry for it).
+    seed((s, now) => addQuestion(s, { summary: 'late?', defaultAction: 'да', askedAtMs: now - 3 * HOUR }, now).state, h.now)
+    h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
+    expect(h.sends.length).toBe(1)
+    expect(h.sends[0]?.text).toContain('Вопрос без ответа 2ч: "late?"')
+  })
+
   test('sticky (security) question re-reminds at most every 6h', () => {
     const h = make()
-    seed((s, now) => addQuestion(s, { summary: 'дать доступ root?', sticky: true, askedAtMs: now - 7 * HOUR }, now).state, h.now)
+    seed((s, now) => addQuestion(s, { summary: 'дать доступ root?', sticky: true, askedAtMs: now }, now).state, h.now)
+    h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
+    expect(h.sends).toEqual([])
+    // 7h after the seed → first sticky reminder.
+    h.now += 7 * HOUR
     h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
     expect(h.sends.length).toBe(1)
     expect(h.sends[0]?.text).toBe('Security-вопрос всё ещё без ответа: "дать доступ root?"')
@@ -248,6 +295,34 @@ describe('open-question reminders', () => {
     h.now += 4 * HOUR
     h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
     expect(h.sends.length).toBe(2)
+  })
+
+  test('restart burst protection (fix-loop-1 #8): pre-existing questions re-arm a fresh window', () => {
+    const h = make()
+    // Simulated restart: BOTH questions were already long past their
+    // thresholds when this (fresh) monitor first sees them.
+    seed((s, now) => {
+      let st = addQuestion(s, { summary: 'старый?', defaultAction: 'д', askedAtMs: now - 5 * HOUR }, now).state
+      st = addQuestion(st, { summary: 'root?', sticky: true, askedAtMs: now - 9 * HOUR }, now).state
+      return st
+    }, h.now)
+    // First pass → NO burst.
+    h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
+    expect(h.sends).toEqual([])
+    // 20s later still nothing (window re-armed, not skipped by one tick).
+    h.now += 20 * 1000
+    h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
+    expect(h.sends).toEqual([])
+    // 2h after the seed → the 2h question reminds (its NEXT threshold crossing).
+    h.now += 2 * HOUR
+    h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
+    expect(h.sends.length).toBe(1)
+    expect(h.sends[0]?.text).toContain('старый?')
+    // 6h after the seed → the sticky question reminds too.
+    h.now += 4 * HOUR
+    h.monitor.evaluate(CHAT, { turnActive: false, inProgressTask: null, nowMs: h.now })
+    expect(h.sends.length).toBe(2)
+    expect(h.sends[1]?.text).toContain('root?')
   })
 
   test('reminder path NEVER mutates the registry (leases untouched, byte-identical)', () => {

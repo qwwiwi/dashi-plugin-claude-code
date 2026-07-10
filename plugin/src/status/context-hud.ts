@@ -592,14 +592,27 @@ export class ContextHud {
   }
 
   // M4 heartbeat pin suffix. Store (or clear with null) the ephemeral
-  // «работаю: <task> · HH:MM» line and refresh the pin in place. Pin edits do
+  // «работаю: <task> · HH:MM» line and refresh the pin IN PLACE. Pin edits do
   // NOT ping, so this reassures the owner during long silent work without a
   // message. Best-effort + serialized like every other HUD op; owner-gated.
-  // Idempotent: an unchanged suffix still calls updateNow, whose edit no-ops on
-  // Telegram's «not modified» (benign) — the HeartbeatMonitor only re-sets the
-  // suffix when the minute (HH:MM) changes, so real edits stay ~1/min.
+  //
+  // EDIT-ONLY (fix-loop-1 #6): the heartbeat may only EDIT an existing pin.
+  // When no pin message exists — or the edit reports message_gone — the
+  // heartbeat is SKIPPED entirely: it must never create (and thereby surface)
+  // a fresh message on its own, and it must never route through updateNow,
+  // whose self-heal would send one. Creation stays the exclusive job of the
+  // session-lifecycle paths (onSessionStart / updateNow / bump).
+  //
+  // Idempotent: an unchanged suffix short-circuits; the HeartbeatMonitor only
+  // re-sets the suffix when the minute (HH:MM) changes, so edits stay ~1/min.
   setHeartbeatSuffix(chatId: string, suffix: string | null): Promise<void> {
     if (!this.enabled || !this.isOwner(chatId)) return Promise.resolve()
+    // No pin to edit → skip (and drop any stale suffix so a later lifecycle
+    // render can't resurrect it).
+    if (this.messageIds.get(chatId) === undefined && this.loadPersisted(chatId) === undefined) {
+      this.heartbeatSuffix.delete(chatId)
+      return Promise.resolve()
+    }
     if (suffix === null || suffix.length === 0) {
       if (!this.heartbeatSuffix.has(chatId)) return Promise.resolve() // already clear — no churn
       this.heartbeatSuffix.delete(chatId)
@@ -607,7 +620,40 @@ export class ContextHud {
       if (this.heartbeatSuffix.get(chatId) === suffix) return Promise.resolve() // unchanged — no churn
       this.heartbeatSuffix.set(chatId, suffix)
     }
-    return this.updateNow(chatId)
+    return this.runSerialized(chatId, async () => {
+      try {
+        const id = this.messageIds.get(chatId) ?? this.loadPersisted(chatId)
+        if (id === undefined) return // raced away (bump deleted it) — skip
+        this.messageIds.set(chatId, id)
+        const { text, keyboard } = await this.renderCurrent(chatId)
+        try {
+          await this.api.editMessageText(chatId, id, text, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard,
+          })
+        } catch (err) {
+          const cls = classifyEditError(err)
+          if (cls.kind === 'benign') return
+          if (cls.kind === 'message_gone') {
+            // The pin was deleted. Unlike edit()'s self-heal, the heartbeat
+            // path must NOT recreate — drop the stale ids and stand down.
+            this.messageIds.delete(chatId)
+            this.clearPersisted(chatId)
+            this.heartbeatSuffix.delete(chatId)
+            return
+          }
+          this.log.warn('context hud heartbeat edit failed (ignored)', {
+            chat_id: chatId,
+            kind: cls.kind,
+          })
+        }
+      } catch (err) {
+        this.log.warn('context hud setHeartbeatSuffix failed (ignored)', {
+          chat_id: chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    })
   }
 
   // Re-anchor the pinned card at the BOTTOM of the chat (just above the tmux

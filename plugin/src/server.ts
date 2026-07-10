@@ -431,21 +431,18 @@ if (!tokenLock.acquire(statePaths)) {
 // ─────────────────────────────────────────────────────────────────────
 
 const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
-// Raw API talks to grammy. Safe wrapper sits in front of every downstream
-// consumer (StatusManager, oob, handlers, poller, webhook). The wrapper:
-//   1. redactSecrets(text, logSecrets) before delegating to raw API.
-//   2. validateTelegramHtml(text) when parse_mode=='HTML'; downgrade on
-//      invalid markup (strip parse_mode, ship escaped plain).
-// No call site can bypass — the raw `telegramApi` reference is shadowed
-// after this line. Anything that imports TelegramApi from channel/tools
-// receives the wrapped instance via toolDeps / handlerDeps / StatusManager.
+// Raw API talks to grammy. Every downstream consumer (StatusManager, oob,
+// handlers, poller, webhook) receives the fully layered instance built below.
+// Composition (fix-loop-1 #9 — this comment is the canonical map):
+//   caller → reliableTelegramApi (bounded retry + dead-letter + outbound clock)
+//          → safeTelegramApi     (redactSecrets + validateTelegramHtml downgrade)
+//          → rateLimitedTelegramApi (per-chat FIFO + token buckets + 429 retry)
+//          → rawTelegramApi      (grammY).
+// Sanitize runs before the queue so it holds already-redacted/validated
+// payloads (no secret leak if a queued op gets logged); the reliable layer is
+// OUTERMOST so its verdict reflects the final outcome of the whole stack.
+// No call site can bypass — the raw reference is shadowed below.
 const rawTelegramApi = createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN)
-// Composition: caller → safeTelegramApi (sanitize) → rateLimitedTelegramApi
-// (queue + 429 retry) → rawTelegramApi (grammY). Sanitize runs FIRST so the
-// queue holds already-redacted/validated payloads (no secret leak if a
-// queued op gets logged; no time wasted enqueueing text that would later be
-// downgraded). A burst of replies now paces itself instead of surfacing as
-// a 429 to the agent.
 const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log)
 // The bot token itself is included in extraSecrets so any code path that
 // accidentally tries to ship the token (e.g. error message including a
@@ -459,16 +456,24 @@ const apiSecrets: string[] = [...logSecrets, env.TELEGRAM_BOT_TOKEN]
 const richLatch = createRichLatch()
 const safeTelegramApi = createSafeTelegramApi(rateLimitedTelegramApi, log, apiSecrets, richLatch)
 // M4 (2026-07-10): OUTERMOST reliability layer. Every caller send passes
-// through here first — it retries transient failures (network / 5xx / 429),
-// dead-letters a transient exhaustion under the `outbound` bucket, and stamps
-// the outbound-activity clock on every successful NEW-message send. That clock
-// is what the mechanical heartbeat/dead-man read to know when the owner last
-// heard from us. editMessageText is retried but NOT stamped (pin edits don't
-// ping — see the wrapper header). Composition:
-//   caller → reliable → safe(redact/validate) → rateLimited(queue+429) → raw.
+// through here first — it retries provably-undelivered transient failures
+// (pre_send; ambiguous ones dead-letter without retry — see the wrapper's
+// loss-vs-duplicate header), dead-letters non-retried/exhausted transients
+// under the `outbound` bucket, and stamps the outbound-activity clock on every
+// successful NEW-message send (unless the call opts out via skipOutboundStamp
+// — internal HUD/heartbeat sends). That clock is what the mechanical
+// heartbeat/dead-man read to know when the owner last heard from us.
+// editMessageText is retried but NOT stamped (pin edits don't ping).
+// The dead-letter error text is redacted (fix-loop-1 #7a) — a transport error
+// can embed the api.telegram.org/bot<token>/ URL, and the quarantine files,
+// while 0600, must never store the token.
 const outboundTracker = new OutboundActivityTracker()
 const telegramApi = createReliableTelegramApi(safeTelegramApi, log, {
-  deadLetter: (record) => writeDeadLetter(statePaths, 'outbound', record),
+  deadLetter: (record) =>
+    writeDeadLetter(statePaths, 'outbound', {
+      ...record,
+      error: redactSecrets(record.error, apiSecrets),
+    }),
   recordOutbound: (chatId, atMs) => outboundTracker.record(chatId, atMs),
 })
 
@@ -538,7 +543,11 @@ const sessionInfoStore = new SessionInfoStore()
 // DM pane.
 const hudOwnerChatIds: ReadonlyArray<number | string> = resolveOwnerChatIds(config)
 const hudApi: HudTelegramApi = {
-  sendMessage: (chatId, text, opts) => telegramApi.sendMessage(chatId, text, opts),
+  // skipOutboundStamp (fix-loop-1 #6): a HUD pin (re)creation is an INTERNAL
+  // surface, not a report to the owner — it must never reset the heartbeat
+  // silence window, or a pin self-heal would silently starve the heartbeat.
+  sendMessage: (chatId, text, opts) =>
+    telegramApi.sendMessage(chatId, text, { ...opts, skipOutboundStamp: true }),
   editMessageText: (chatId, messageId, text, opts) =>
     telegramApi.editMessageText(chatId, messageId, text, opts),
   pinChatMessage: (chatId, messageId, opts) =>
@@ -668,8 +677,11 @@ if (resolveTaskReconcilerEnabled()) {
   // api and edits the context pin via the HUD's heartbeat suffix.
   const heartbeatMonitor = new HeartbeatMonitor({
     log,
+    // skipOutboundStamp (fix-loop-1 #6): a heartbeat nudge / dead-man alert /
+    // question reminder is not a real report — it must not reset the very
+    // silence window it measures (the monitor rate-limits itself instead).
     send: (chatId: string, text: string): Promise<void> =>
-      telegramApi.sendMessage(chatId, text, {}).then(() => undefined),
+      telegramApi.sendMessage(chatId, text, { skipOutboundStamp: true }).then(() => undefined),
     pinHeartbeat: (chatId: string, suffix: string | null): Promise<void> =>
       contextHud.setHeartbeatSuffix(chatId, suffix),
     autonomyPaths: { root: statePaths.root },

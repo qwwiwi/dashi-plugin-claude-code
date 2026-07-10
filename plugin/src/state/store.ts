@@ -20,6 +20,7 @@ import {
   fsyncSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -118,13 +119,29 @@ export function migrateLegacyAllowlist(paths: StatePaths): boolean {
 
 export type DeadLetterBucket = 'updates' | 'webhook' | 'outbound'
 
+// Cap for the `outbound` bucket (fix-loop-1 #7b): a persistent delivery
+// problem (bot blocked, network flap) would otherwise grow the quarantine
+// without bound. Newest 50 kept; older pruned on write (the pattern of the
+// autonomy store's corrupt-evidence prune). Inbound buckets are NOT capped —
+// their volume is operator-triaged and historically tiny.
+const MAX_OUTBOUND_DEAD_LETTERS = 50
+
+// Per-process monotonic sequence baked into dead-letter filenames so a
+// lexicographic sort is chronological even for several writes within the SAME
+// millisecond (mirrors the autonomy store's corrupt-evidence seq — a random
+// tie-breaker would let the prune delete the newest record of a same-ms burst).
+let deadLetterSeq = 0
+
 /**
  * Wrap a value as `{ ts, bucket, value }` and write it to the bucket's
  * directory under a timestamped filename. Returns the full file path.
  *
- * Filename format: `<isoTs>-<pid>-<rand>.json` — ISO timestamp first so
- * `ls` sorts chronologically; pid + rand for collision-resistance under
- * concurrent writes.
+ * Filename format: `<isoTs>-<pid>-<seq>-<rand>.json` — ISO timestamp first so
+ * `ls` sorts chronologically; the zero-padded per-process seq orders same-ms
+ * writes; pid + rand for collision-resistance across processes/restarts.
+ *
+ * The `outbound` bucket is capped at MAX_OUTBOUND_DEAD_LETTERS: after each
+ * write the oldest surplus records are pruned (best-effort).
  */
 export function writeDeadLetter(
   paths: StatePaths,
@@ -139,9 +156,33 @@ export function writeDeadLetter(
         ? paths.deadLetterWebhook
         : paths.deadLetterOutbound
   const safeTs = ts.replace(/[:.]/g, '-')
+  const seq = (deadLetterSeq++).toString(36).padStart(4, '0')
   const rand = Math.random().toString(36).slice(2, 8)
-  const file = join(dir, `${safeTs}-${process.pid}-${rand}.json`)
+  const file = join(dir, `${safeTs}-${process.pid}-${seq}-${rand}.json`)
   const payload = JSON.stringify({ ts, bucket, value }, null, 2)
   writeFileSync(file, payload, { mode: 0o600 })
+  if (bucket === 'outbound') pruneOutboundDeadLetters(dir)
   return file
+}
+
+// Best-effort oldest-first prune of the outbound bucket. Lexicographic sort of
+// the timestamp-seq filenames IS chronological (see writeDeadLetter docstring);
+// every step is allowed to fail — pruning must never break the write path.
+function pruneOutboundDeadLetters(dir: string): void {
+  try {
+    const files = readdirSync(dir)
+      .filter((f) => f.endsWith('.json'))
+      .sort()
+    while (files.length > MAX_OUTBOUND_DEAD_LETTERS) {
+      const oldest = files.shift()
+      if (oldest === undefined) break
+      try {
+        unlinkSync(join(dir, oldest))
+      } catch {
+        // best-effort
+      }
+    }
+  } catch {
+    // best-effort — a readdir failure must not fail the dead-letter write
+  }
 }
