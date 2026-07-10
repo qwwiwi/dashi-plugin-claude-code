@@ -47,6 +47,7 @@ describe('ensureStateDirs', () => {
     expect(existsSync(paths.sessionIds)).toBe(true)
     expect(existsSync(paths.deadLetterUpdates)).toBe(true)
     expect(existsSync(paths.deadLetterWebhook)).toBe(true)
+    expect(existsSync(paths.deadLetterOutbound)).toBe(true)
   })
 })
 
@@ -120,6 +121,10 @@ describe('writeDeadLetter', () => {
 
     const webhookPath = writeDeadLetter(paths, 'webhook', { foo: 'bar' })
     expect(webhookPath.startsWith(paths.deadLetterWebhook)).toBe(true)
+
+    const outboundPath = writeDeadLetter(paths, 'outbound', { method: 'sendMessage' })
+    expect(outboundPath.startsWith(paths.deadLetterOutbound)).toBe(true)
+    expect(existsSync(outboundPath)).toBe(true)
   })
 
   test('file content has wrapper with ts/bucket/value', () => {
@@ -130,5 +135,27 @@ describe('writeDeadLetter', () => {
     expect(parsed.value).toEqual({ kind: 'test', n: 7 })
     expect(typeof parsed.ts).toBe('string')
     expect(parsed.ts.length).toBeGreaterThan(10)
+  })
+
+  test('outbound bucket is capped at 50 — oldest pruned, newest kept (fix-loop-1 #7b)', () => {
+    const written: string[] = []
+    for (let i = 0; i < 55; i++) {
+      written.push(writeDeadLetter(paths, 'outbound', { i }))
+    }
+    const files = readdirSync(paths.deadLetterOutbound).filter((f) => f.endsWith('.json'))
+    expect(files.length).toBe(50)
+    // The per-process seq makes lexicographic order chronological even within
+    // one millisecond: the FIRST five writes are gone, the LAST one survives.
+    expect(existsSync(written[0] as string)).toBe(false)
+    expect(existsSync(written[4] as string)).toBe(false)
+    expect(existsSync(written[54] as string)).toBe(true)
+  })
+
+  test('inbound buckets are NOT capped', () => {
+    for (let i = 0; i < 55; i++) {
+      writeDeadLetter(paths, 'updates', { i })
+    }
+    const files = readdirSync(paths.deadLetterUpdates).filter((f) => f.endsWith('.json'))
+    expect(files.length).toBe(55)
   })
 })

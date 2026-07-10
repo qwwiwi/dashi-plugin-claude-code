@@ -1078,3 +1078,87 @@ describe('r3 #4 — descriptions duplicated in the SNAPSHOT do not participate',
     expect(next.tasks.some((t) => t.description === 'Задача X')).toBe(false)
   })
 })
+
+// ── M4: liveness monitor wiring ────────────────────────────────────────
+
+interface LivenessCall {
+  m: 'observePane' | 'evaluate' | 'onTurnEnd' | 'onChatGone'
+  chatId: string
+  turnActive?: boolean
+  inProgressTask?: string | null
+  paneText?: string
+}
+function makeLiveness(): {
+  spy: import('../../src/status/heartbeat-monitor.js').LivenessMonitor
+  calls: LivenessCall[]
+} {
+  const calls: LivenessCall[] = []
+  const spy = {
+    observePane: (chatId: string, paneText: string, _now: number, turnActive: boolean): void => {
+      calls.push({ m: 'observePane', chatId, paneText, turnActive })
+    },
+    evaluate: (
+      chatId: string,
+      ctx: { turnActive: boolean; inProgressTask: string | null; nowMs: number },
+    ): void => {
+      calls.push({
+        m: 'evaluate',
+        chatId,
+        turnActive: ctx.turnActive,
+        inProgressTask: ctx.inProgressTask,
+      })
+    },
+    onTurnEnd: (chatId: string): void => {
+      calls.push({ m: 'onTurnEnd', chatId })
+    },
+    onChatGone: (chatId: string): void => {
+      calls.push({ m: 'onChatGone', chatId })
+    },
+  }
+  return { spy, calls }
+}
+
+describe('liveness monitor wiring', () => {
+  test('drives observePane / evaluate / onTurnEnd / onChatGone across the lifecycle', async () => {
+    const clock = new FakeClock()
+    const fx = makeExec(() => VALID_PANE)
+    const { sink } = makeSink()
+    const { spy, calls } = makeLiveness()
+    const rm = new TaskRealityMirror({
+      exec: fx.exec,
+      capture: { paneTarget: 'p', lineCount: 200 },
+      log: nullLog,
+      sinks: [sink],
+      now: () => clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+      liveness: spy,
+    })
+
+    // A turn begins → immediate capture feeds observePane(turnActive=true).
+    rm.onUserPromptSubmit(CHAT, { sessionId: 's1', cwd: '/repo' })
+    await flush()
+    const obs = calls.filter((c) => c.m === 'observePane')
+    expect(obs.length).toBeGreaterThanOrEqual(1)
+    expect(obs.at(-1)?.turnActive).toBe(true)
+    expect(obs.at(-1)?.paneText).toContain('Написать тесты')
+
+    // A periodic tick evaluates the heartbeat with the reconciled in-progress task.
+    clock.advance(20_000)
+    await flush()
+    const evals = calls.filter((c) => c.m === 'evaluate')
+    expect(evals.length).toBeGreaterThanOrEqual(1)
+    expect(evals.at(-1)?.turnActive).toBe(true)
+    expect(evals.at(-1)?.inProgressTask).toBe('Написать тесты')
+
+    // Stop ends the turn.
+    rm.onStop(CHAT)
+    await flush()
+    expect(calls.some((c) => c.m === 'onTurnEnd' && c.chatId === CHAT)).toBe(true)
+
+    // SessionEnd evicts → the chat's liveness state is dropped.
+    rm.onSessionEnd(CHAT, { sessionId: 's1' })
+    await flush()
+    expect(calls.some((c) => c.m === 'onChatGone' && c.chatId === CHAT)).toBe(true)
+  })
+})
