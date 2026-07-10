@@ -147,16 +147,60 @@ describe('analyzeCurrentTurn', () => {
   })
 
   test('(a5) a BLOCKED reply followed by a later SUCCESSFUL reply → replied (delivered)', () => {
-    // Same turn: first reply blocked (tu1 isError), agent rephrases and the
-    // second reply (tu2) succeeds → the owner got an answer → suppress.
+    // Same turn: first reply ask-guard-blocked (tu1 isError + ASK_GUARD marker),
+    // agent rephrases and the second reply (tu2) succeeds → owner got an answer.
     const transcript = [
       line('user', TG_PROMPT('1', 10)),
       line('assistant', [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: {} }], 'u1'),
-      line('user', [{ type: 'tool_result', tool_use_id: 'tu1', is_error: true, content: 'blocked' }]),
+      line('user', [{ type: 'tool_result', tool_use_id: 'tu1', is_error: true, content: 'ASK_GUARD (мандат…): не отправлен' }]),
       line('assistant', [{ type: 'tool_use', id: 'tu2', name: 'mcp__dashi-channel__reply', input: {} }], 'u2'),
       line('user', [{ type: 'tool_result', tool_use_id: 'tu2', content: 'sent' }]),
     ].join('\n')
     expect(analyzeCurrentTurn(transcript).replied).toBe(true)
+  })
+
+  // fix-loop-2 (Codex round-2 HIGH): a GENERIC reply error (network/HTTP
+  // timeout, no ASK_GUARD marker) is AMBIGUOUS — the send may have reached
+  // Telegram before the client saw the error — so it must KEEP the suppression
+  // (replied=true), otherwise the Stop-hook forwards the final text and the
+  // owner gets a DUPLICATE. Only an explicit ask-guard block unsuppresses.
+  test('(a6) generic reply error (no ASK_GUARD marker) → replied=true (suppress, no duplicate)', () => {
+    const transcript = [
+      line('user', TG_PROMPT('164795011', 10)),
+      line('assistant', [{ type: 'text', text: 'вот ответ' }], 'u1'),
+      line(
+        'assistant',
+        [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'вот ответ' } }],
+        'u2',
+      ),
+      line('user', [{ type: 'tool_result', tool_use_id: 'tu1', is_error: true, content: 'fetch failed: ETIMEDOUT' }]),
+    ].join('\n')
+    expect(analyzeCurrentTurn(transcript).replied).toBe(true)
+  })
+
+  // Counterpart to (a6): an explicit ASK-GUARD block (isError + marker, content
+  // as an array of text blocks) DOES unsuppress → the final text forwards.
+  test('(a7) ask-guard-blocked reply (marker in array content) → replied=false (forward)', () => {
+    const transcript = [
+      line('user', TG_PROMPT('164795011', 10)),
+      line('assistant', [{ type: 'text', text: 'жду го' }], 'u1'),
+      line(
+        'assistant',
+        [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'жду го' } }],
+        'u2',
+      ),
+      line('user', [
+        {
+          type: 'tool_result',
+          tool_use_id: 'tu1',
+          is_error: true,
+          content: [{ type: 'text', text: 'ASK_GUARD (мандат L-1): НЕ отправлен' }],
+        },
+      ]),
+    ].join('\n')
+    const r = analyzeCurrentTurn(transcript)
+    expect(r.replied).toBe(false)
+    expect(r.text).toBe('жду го')
   })
 
   test('(b) no reply tool + final text + telegram chat_id → would forward', () => {

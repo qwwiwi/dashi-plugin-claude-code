@@ -77,7 +77,7 @@ export async function handleFallbackReply(
         const analysis = analyzeAskDetailed(payload.text, { hasActiveLease: true })
         if (analysis.exemptReason === 'hard_gate_protected_only') {
           log.info('ask_guard exempt — hard-gate marker only in a protected zone', {
-            code: 'ask_guard_exempt_protected_only',
+            code: 'hard_gate_protected_only',
             variant: 'fallback',
             chat_id: payload.chat_id,
             lease_id: leases[0]!.id,

@@ -21,10 +21,13 @@
 // Suppression invariants (no duplicate to the warchief):
 //   * If the turn called mcp__dashi-channel__reply OR
 //     mcp__dashi-channel__edit_message AND that call SUCCEEDED → a reply already
-//     reached him → silent. fix-loop #7: a reply whose tool_result came back
-//     isError (e.g. blocked by the ask-guard) did NOT reach him, so it does NOT
-//     suppress the fallback — the turn's final text is still forwarded, and the
-//     fallback route re-runs the same guard on it.
+//     reached him → silent. fix-loop #7 / fix-loop-2: ONLY a reply whose
+//     tool_result came back as an explicit ASK-GUARD BLOCK (isError + the
+//     ASK_GUARD marker) is treated as "did NOT reach him" — its final text is
+//     still forwarded and the fallback route re-runs the same guard on it. A
+//     GENERIC reply error (network/HTTP timeout) is ambiguous — the send may
+//     have reached Telegram before the client saw the error — so it KEEPS the
+//     suppression to avoid a duplicate delivery.
 //   * If the turn has no final assistant text (pure tool / pure thinking) →
 //     nothing to forward → silent.
 //   * If the turn was not answering a Telegram message (no `<channel
@@ -65,6 +68,14 @@ import {
   loadChannelEnvFile,
   parseEnvFile,
 } from './read-receipt-hook.js'
+
+// The machine-readable marker that leads every ask-guard block-mode refusal
+// (`askGuardBlockMessage`). It is the ONLY isError shape that unsuppresses the
+// fallback (owner NOT reached → forward the final text, re-guarded downstream);
+// every other reply error is ambiguous (the send may have reached Telegram
+// before the client saw the error) and KEEPS the old suppression to avoid a
+// duplicate delivery. Imported from the guard so the two stay in lockstep.
+import { ASK_GUARD_BLOCK_MARKER } from '../src/safety/ask-guard.js'
 
 // Re-export the borrowed helpers under this module too, so tests importing
 // from this hook get a single surface. (parseEnvFile is used transitively by
@@ -188,19 +199,42 @@ function replyToolUseIds(content: unknown): string[] {
   return ids
 }
 
+/** The joined text of a tool_result `content` (string, or `{type:'text'}` blocks). */
+function toolResultText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  const parts: string[] = []
+  for (const block of content) {
+    if (block === null || typeof block !== 'object') continue
+    const b = block as Record<string, unknown>
+    if (typeof b.text === 'string') parts.push(b.text)
+  }
+  return parts.join('\n')
+}
+
 /**
- * The `tool_use_id`s of tool_result blocks flagged `is_error: true` in a
- * user-role tool_result echo. fix-loop #7: a reply that the choke point BLOCKED
- * returns an isError tool_result — it did NOT reach the owner, so it must not
- * suppress the fallback.
+ * The `tool_use_id`s of reply tool_result blocks that came back as an
+ * ASK-GUARD BLOCK (`is_error: true` AND the result text carries
+ * `ASK_GUARD_BLOCK_MARKER`). fix-loop #7 first unsuppressed on ANY isError
+ * reply; fix-loop-2 (Codex round-2 HIGH) narrows that: an ask-guard block
+ * provably did NOT reach the owner, so its final text MUST still be forwarded,
+ * but a generic reply error (network/HTTP timeout) is AMBIGUOUS — the send may
+ * have reached Telegram before the client saw the error — so forwarding it too
+ * would DOUBLE-deliver. Only the explicit block marker unsuppresses; every
+ * other isError keeps the pre-fix suppression (reply counts as delivered).
  */
-function errorToolResultIds(content: unknown): string[] {
+function askGuardBlockedReplyIds(content: unknown): string[] {
   if (!Array.isArray(content)) return []
   const ids: string[] = []
   for (const block of content) {
     if (block === null || typeof block !== 'object') continue
     const b = block as Record<string, unknown>
-    if (b.type === 'tool_result' && b.is_error === true && typeof b.tool_use_id === 'string') {
+    if (
+      b.type === 'tool_result' &&
+      b.is_error === true &&
+      typeof b.tool_use_id === 'string' &&
+      toolResultText(b.content).includes(ASK_GUARD_BLOCK_MARKER)
+    ) {
       ids.push(b.tool_use_id)
     }
   }
@@ -277,11 +311,13 @@ export function analyzeCurrentTurn(transcript: string): TurnResult {
   let text: string | undefined
   let uuid: string | undefined
   let replied = false
-  // fix-loop #7: tool_use_ids of reply results that came back isError. We walk
-  // BACKWARD, so a tool_result echo (later in the transcript) is seen BEFORE
-  // its tool_use (earlier) — this set is populated by the time we reach the
-  // reply tool_use, so a BLOCKED reply never sets `replied`.
-  const erroredReplyIds = new Set<string>()
+  // fix-loop #7 / fix-loop-2: tool_use_ids of reply results that came back as an
+  // ASK-GUARD BLOCK (isError + marker). We walk BACKWARD, so a tool_result echo
+  // (later in the transcript) is seen BEFORE its tool_use (earlier) — this set
+  // is populated by the time we reach the reply tool_use, so a BLOCKED reply
+  // never sets `replied`. A generic reply error is NOT collected here, so it
+  // still sets `replied` (suppressed → no duplicate delivery).
+  const blockedReplyIds = new Set<string>()
   for (let i = lines.length - 1; i >= 0; i--) {
     let obj: unknown
     try {
@@ -309,17 +345,18 @@ export function analyzeCurrentTurn(transcript: string): TurnResult {
           promptText !== undefined ? extractLeadingTelegramChatId(promptText) : undefined
         return { text, uuid, replied, chatId, promptText }
       }
-      // tool_result echo — record any isError reply results before continuing.
-      for (const id of errorToolResultIds(content)) erroredReplyIds.add(id)
+      // tool_result echo — record any ask-guard-BLOCKED reply results before
+      // continuing (generic errors are deliberately NOT recorded: ambiguous).
+      for (const id of askGuardBlockedReplyIds(content)) blockedReplyIds.add(id)
       continue
     }
 
     if (role !== 'assistant') continue
-    // A reply counts as delivered ONLY if its result was NOT isError. A blocked
-    // reply (ask-guard isError) leaves the owner unanswered → the turn's final
-    // text must still be eligible for the fallback (which re-guards it).
+    // A reply counts as delivered UNLESS it was an ASK-GUARD BLOCK (proven
+    // undelivered). A generic reply error is ambiguous and still counts as
+    // delivered so the fallback does not double-send.
     for (const id of replyToolUseIds(content)) {
-      if (!erroredReplyIds.has(id)) replied = true
+      if (!blockedReplyIds.has(id)) replied = true
     }
     if (text === undefined) {
       const t = assistantText(content)

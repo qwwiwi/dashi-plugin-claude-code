@@ -80,19 +80,36 @@ const TIER1: ReadonlyArray<AskPattern> = [
     ),
   },
   // «жду подтверждени(е|я)» — fires ONLY when owner-directed (fix-loop #4,
-  // Codex MED-4 / Fable MED-4). A bare «жду подтверждения» that ENDS the clause
-  // (nothing meaningful after — end-of-line or punctuation) is an owner-wait;
-  // «жду подтверждения от тебя / твоего / вождь» is explicitly owner-directed.
-  // But «жду подтверждения <noun>» (оплаты / завершения workflow от GitHub /
-  // вебхука / CI / от провайдера) is a STATUS wait on an external system, not a
-  // self-gate — the trailing noun after «подтверждения» is not owner-ref/terminal,
-  // so the lookahead fails and it does NOT fire. Same ASK_WAIT_GO code as the
-  // generic wait so the finding taxonomy (and existing logs/tests) are stable.
+  // Codex MED-4 / Fable MED-4; narrowed again in fix-loop #6). Two shapes fire:
+  //   (A) owner-PREFIXED «жду тво[её]… подтверждения» — «твоего/твоё» before the
+  //       noun makes it unambiguously owner-directed regardless of what trails,
+  //       so it fires on the whole phrase (a money-flavoured trailer like
+  //       «оплаты» is caught by the whole-text hard-gate exemption anyway).
+  //   (B) no owner prefix «жду подтверждения …» + one of:
+  //         • TERMINAL: optional non-comma sentence punctuation then end-of-line
+  //           (a bare owner-wait that ENDS the clause), OR
+  //         • COMMA + owner ref («жду подтверждения, вождь / твоё / от тебя»), OR
+  //         • SPACE + owner ref («жду подтверждения от тебя / твоё / вождь»).
+  // fix-loop #6 (Codex round-2): the OLD terminal branch accepted ANY comma
+  // regardless of the following words, so a STATUS wait «жду подтверждения, что
+  // CI завершился» self-gated by mistake. The comma now only satisfies the
+  // lookahead when an owner ref follows it. «жду подтверждения <noun>» (оплаты /
+  // завершения workflow / вебхука / статуса CI / от провайдера) still does NOT
+  // fire. Same ASK_WAIT_GO code so the finding taxonomy stays stable.
   {
     code: 'ASK_WAIT_GO',
     re: new RegExp(
-      `${B}жду\\s+подтвержден(?:и[еяю]|ья)` +
-        `(?=\\s*(?:[.,!?…)]|$)|\\s+(?:от\\s+тебя|тво[её]${LETTER}*|вожд${LETTER}*)(?!${LETTER}))`,
+      `${B}жду\\s+(?:` +
+        // (A) owner-prefixed — always owner-directed
+        `тво[её]${LETTER}*\\s+подтвержден(?:и[еяю]|ья)${A}` +
+        `|` +
+        // (B) no prefix — needs a terminal-at-EOL / comma-owner / space-owner tail
+        `подтвержден(?:и[еяю]|ья)(?=` +
+          `\\s*[.!?…)]?\\s*$` +
+          `|\\s*,\\s*(?:от\\s+тебя|тво[её]${LETTER}*|вожд${LETTER}*)` +
+          `|\\s+(?:от\\s+тебя|тво[её]${LETTER}*|вожд${LETTER}*)(?!${LETTER})` +
+        `)` +
+      `)`,
       'i',
     ),
   },
@@ -290,6 +307,14 @@ export function analyzeAsk(text: string, opts: { hasActiveLease: boolean }): Ask
 
 const SCOPE_CLIP_CHARS = 80
 
+// Machine-readable marker that leads every block-mode refusal text
+// (`askGuardBlockMessage`). It is the ONLY signal the DM Stop-hook uses to tell
+// an ask-guard block (owner NOT reached → forward the fallback) apart from a
+// generic reply error (ambiguous — may have been delivered → suppress to avoid
+// a duplicate). Keep it stable and in sync with the hook that matches on it
+// (scripts/fallback-reply-hook.ts).
+export const ASK_GUARD_BLOCK_MARKER = 'ASK_GUARD'
+
 /**
  * The advisory tool-result hint appended when the message IS sent (advisory
  * mode). Codes/anchor only — never any message text. Mirrors format-check's
@@ -319,7 +344,7 @@ export function askGuardBlockMessage(leaseId: string, scopes: readonly string[])
       ? scopes.map((s) => `«${clip(s, SCOPE_CLIP_CHARS)}»`).join('; ')
       : '(scope не указан)'
   return (
-    `ASK_GUARD (мандат ${leaseId}): этот вопрос-разрешение НЕ отправлен. ` +
+    `${ASK_GUARD_BLOCK_MARKER} (мандат ${leaseId}): этот вопрос-разрешение НЕ отправлен. ` +
     '1) Если это деньги/prod-БД/деструктив/массовые отправки/конфиг модели или ' +
     'gateway — это hard-gate: отправь вопрос карточкой AskUserQuestion (кнопки), ' +
     'этот путь НЕ гейтится. ' +

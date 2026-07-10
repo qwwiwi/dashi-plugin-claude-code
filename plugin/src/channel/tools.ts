@@ -668,7 +668,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
               // audit class for calibration week.
               if (analysis.exemptReason === 'hard_gate_protected_only') {
                 log.info('ask_guard exempt — hard-gate marker only in a protected zone', {
-                  code: 'ask_guard_exempt_protected_only',
+                  code: 'hard_gate_protected_only',
                   chat_id: args.chat_id,
                   lease_id: leases[0]!.id,
                 })

@@ -354,6 +354,38 @@ describe('analyzeAsk — «жду подтверждения» false-positive na
   })
 })
 
+// fix-loop-2 (Codex round-2) — two residual regex defects in the «жду
+// подтверждения» pattern.
+describe('analyzeAsk — «жду подтверждения» fix-loop-2 defects', () => {
+  // (a) The OLD terminal branch accepted ANY comma regardless of what followed,
+  // so a comma-continued STATUS wait self-gated. It must now require an owner
+  // ref after the comma; a plain «, что …» is a status wait → does NOT fire.
+  test('«жду подтверждения, что CI завершился» does NOT fire (comma+non-owner)', () => {
+    expect(
+      analyzeAsk('жду подтверждения, что CI завершился', { hasActiveLease: LEASE }),
+    ).toEqual([])
+  })
+
+  // (b) «жду твоего подтверждения» (owner-PREFIXED) is unambiguously
+  // owner-directed but the old pattern only looked AFTER the noun, so it missed
+  // the prefix and did NOT fire. It must now fire.
+  test('«жду твоего подтверждения» fires (owner-prefixed)', () => {
+    const f = analyzeAsk('жду твоего подтверждения', { hasActiveLease: LEASE })
+    expect(f.map((x) => x.code)).toContain('ASK_WAIT_GO')
+  })
+
+  test('«жду твоё подтверждение» fires (owner-prefixed, other case ending)', () => {
+    const f = analyzeAsk('жду твоё подтверждение', { hasActiveLease: LEASE })
+    expect(f.map((x) => x.code)).toContain('ASK_WAIT_GO')
+  })
+
+  // «жду подтверждения, вождь» — comma+owner ref DOES still fire.
+  test('«жду подтверждения, вождь» fires (comma+owner)', () => {
+    const f = analyzeAsk('жду подтверждения, вождь', { hasActiveLease: LEASE })
+    expect(f.map((x) => x.code)).toContain('ASK_WAIT_GO')
+  })
+})
+
 describe('analyzeAsk — fenced-code exclusion', () => {
   test('an ask INSIDE a ``` fence never fires', () => {
     const body = '```\nжду го\n```'

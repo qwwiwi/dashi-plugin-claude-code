@@ -254,6 +254,24 @@ describe('POST /hooks/fallback-reply — ask-guard', () => {
     expect(calls.length).toBe(1)
   })
 
+  // fix-loop-2 (Codex round-2): a comma-continued STATUS wait must NOT be
+  // discarded by the guard — «жду подтверждения, что CI завершился» is a status
+  // report, not a self-gate, so the fallback forwards it (regression guard for
+  // the narrowed «жду подтверждения» comma branch).
+  test('block mode + active lease + CI-status wait → forwarded (not discarded)', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    process.env.ASK_GUARD_MODE = 'block'
+    seedActiveLease(WARCHIEF_ID)
+    const { h, calls } = await start()
+    const resp = await post(h, {
+      chat_id: WARCHIEF_ID,
+      text: 'жду подтверждения, что CI завершился',
+    })
+    expect(resp.status).toBe(200)
+    expect(await resp.json()).toEqual({ status: 'sent' })
+    expect(calls).toEqual([{ chatId: WARCHIEF_ID, text: 'жду подтверждения, что CI завершился' }])
+  })
+
   test('advisory mode + active lease + self-gate → forwarded unchanged', async () => {
     process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
     process.env.ASK_GUARD_MODE = 'advisory'
