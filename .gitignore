@@ -10,6 +10,10 @@ secrets/
 *.key
 *.pem
 .DS_Store
+*.bak.*
 bun.lockb.bak
 coverage/
 .bun/
+._*
+__pycache__/
+*.pyc
