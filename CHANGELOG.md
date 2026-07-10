@@ -13,6 +13,50 @@ Versions before 1.0.0 were not tracked — the project shipped ~60 merged PRs
 between 2026-05-14 and 2026-06-14 without a version discipline. 1.0.0
 retroactively marks the state of `main` on 2026-06-14.
 
+## [1.2.0] — 2026-07-10
+
+### Added
+- **Expandable task list in the pinned status card** (PR #100): the single
+  pinned card can expand to show the full current task list; the task snapshot
+  is reset on session start so a fresh session no longer inherits the previous
+  one's tasks.
+- **tmux-pane task reality mirror** (PR #104): a new `task-reality-mirror.ts`
+  reconciler reads the harness's real task list from the tmux pane and feeds
+  the pinned card that pane-verified view, so the pin reflects the session's
+  actual tasks rather than only hook-derived events. Ships alongside narrower
+  task feeders and task-lifecycle fixes.
+
+### Changed
+- **Telegram output formatting** (PR #105): newline preservation in the rich
+  message path, a heading-affinity chunker that keeps a heading with the block
+  it introduces, and a documented tone-of-voice contract
+  ([plugin/docs/TOV.md](plugin/docs/TOV.md)).
+- **Context HUD window is model-aware** (PRs #106, #107): the context-%
+  denominator is now resolved from the session model instead of a fixed
+  default — Fable-class models report their true 1M-token window, and the
+  session model is read from the transcript so no manual override is needed.
+  An explicit operator override is still available (config
+  `context_window_tokens` / env `JARVIS_CONTEXT_WINDOW`) and always wins.
+
+### Fixed
+- **`classifyPane` recognizes the Claude Code v2.1.201 busy spinner** (PR #101)
+  — the pane classifier no longer misreads a working session as idle on the
+  newer harness build.
+- **Zoom join-URL redaction exemption** (PR #102): a `pwd=` on a `zoom.us`
+  join link is a public join passcode, not a secret, and is left intact; the
+  exemption is tightened with a query-param allowlist (`pwd`, `uname`, `omn`)
+  and a raw-NUL strip on input so the placeholder mechanism can't be spoofed.
+- **Precise git-exec-surface gate detector** (PR #103): the permission gate
+  no longer raises false confirmation cards for benign git usage while keeping
+  its RCE protection intact.
+
+### Removed
+- **Repository hygiene and dead-code purge** (PR #108): `webhook/server.ts` is
+  split into focused route modules, the unused `persona-manager.ts` is removed
+  (per-chat persona overlay is applied by the `chats/hooks/session-start.sh`
+  SessionStart hook), tracked build/junk artifacts are purged, and `.gitignore`
+  is hardened.
+
 ## [1.1.0] — 2026-07-04
 
 ### Added
