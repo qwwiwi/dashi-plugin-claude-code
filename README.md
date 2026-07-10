@@ -20,7 +20,7 @@ It replaces the deprecated `claude -p` gateway pattern (a Python daemon that spa
 
 One plugin process = one Telegram bot = one agent. By default it serves **a single DM chat** (legacy single-session mode). With `multichat.enabled` turned on, the same bot fans incoming messages out across several per-chat tmux sessions of one identity — see section [3](#3-multichat--how-it-works-and-why).
 
-> **Status:** in production across a multi-agent fleet. Current release — **[v1.1.0](CHANGELOG.md)** (2026-07-04): rich messages, Guest Mode, context HUD + pinned status card — see section [15](#15-whats-new-in-v110--rich-messages-guest-mode-context-hud--status-pin). Versioning and release process: [CHANGELOG.md](CHANGELOG.md) · [docs/RELEASING.md](docs/RELEASING.md). CI: `bun test` + `bun run typecheck` must pass clean before merge.
+> **Status:** in production across a multi-agent fleet. Current release — **[v1.2.0](CHANGELOG.md)** (2026-07-10): model-aware context HUD, task pin reality mirror, output formatting polish — see section [15](#15-whats-new). Versioning and release process: [CHANGELOG.md](CHANGELOG.md) · [docs/RELEASING.md](docs/RELEASING.md). CI: `bun test` + `bun run typecheck` must pass clean before merge.
 
 ---
 
@@ -803,18 +803,18 @@ Release highlights, newest first. Full history: [CHANGELOG.md](CHANGELOG.md); ho
 
 ### v1.2.0 (2026-07-10) — model-aware HUD, task pin reality mirror, output polish
 
-Shipped mid-July 2026 (PRs #100–#108).
+Shipped 2026-07-10 (PRs #100–#108).
 
 #### Model-aware context HUD (PRs #106, #107)
 
 The context-% denominator is no longer a fixed default — it is resolved from the **session model**. A Fable-class model reports its true **1M-token** window (so the pin reads `… / 1M` instead of pretending it is a 200k session), and the session model is read from the **transcript**, so the correct window is picked automatically with no manual step.
 
-- **Override still available and always wins:** set the window explicitly with config `context_window_tokens` or env **`JARVIS_CONTEXT_WINDOW`** — an explicit operator value beats the per-model table, so a wrong table guess is fixable at runtime.
+- **Override still available and always wins:** set the window explicitly with config `context_window_tokens` or env **`JARVIS_CONTEXT_WINDOW`**. Precedence is config `context_window_tokens` > env `JARVIS_CONTEXT_WINDOW` > per-model table — an explicit operator value beats the table, so a wrong table guess is fixable at runtime.
 - A model id carrying an explicit `[1m]` / `1m` window marker (e.g. `claude-opus-4-8[1m]`) is honored as 1M regardless of family.
 
 #### Task pin: expandable list + tmux reality mirror (PRs #100, #104)
 
-The single pinned status card can **expand** to show the full current task list, and the task snapshot is **reset on session start** so a fresh session no longer inherits the previous one's tasks. A tmux-pane **reality mirror** reads the harness's real task list from the pane and feeds the pin that pane-verified view, so what you see in the pin matches the session's actual tasks rather than only hook-derived events.
+The single pinned status card can **expand** to show the full current task list, and the task snapshot is **reset on session start** so a fresh session no longer inherits the previous one's tasks. A tmux-pane **reality mirror** reconciles the pinned task list with the state detected in the tmux pane, so what you see in the pin matches the session's actual tasks rather than only hook-derived events.
 
 #### Telegram output formatting (PR #105)
 
@@ -823,7 +823,7 @@ Newline preservation in the rich message path, a heading-affinity chunker (a hea
 #### Fixes and hygiene (PRs #101, #102, #103, #108)
 
 - **v2.1.201 pane classifier:** `classifyPane` recognizes the Claude Code v2.1.201 busy spinner, so a working session isn't misread as idle.
-- **Zoom join links:** a `pwd=` on a `zoom.us` join URL is a public join passcode, not a secret — it is left intact; the exemption is tightened with a query-param allowlist (`pwd`, `uname`, `omn`) and a raw-NUL strip.
+- **Zoom join links:** the `pwd=` parameter on a recognized `zoom.us` join URL is intentionally preserved so shared meeting links stay usable; the exemption is scoped by a query-param allowlist (`pwd`, `uname`, `omn`), with a raw-NUL strip on input to mitigate placeholder spoofing.
 - **Precise permission gate:** the git-exec-surface detector no longer raises false confirmation cards for benign git usage while keeping RCE protection.
 - **Repo refactor:** `webhook/server.ts` split into route modules, the unused `persona-manager.ts` removed (the persona overlay is applied by the SessionStart hook `chats/hooks/session-start.sh`), tracked junk purged, `.gitignore` hardened.
 
