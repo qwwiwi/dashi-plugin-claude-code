@@ -1957,6 +1957,145 @@ function matchAllBashRules(rules: readonly string[], commandLower: string): stri
   return hits
 }
 
+// ── command-position awareness for the built-in confirm tier ─────────────
+//
+// BUILTIN_CONFIRM_BASH rules are command names (optionally + subcommand/flag):
+// `sudo `, `docker `, `kill `, `git push`, `rm -rf `, … . Plain substring /
+// token-start matching (bashMatch) fires whenever the WORD appears anywhere —
+// including as an ARGUMENT or a mention, not an invocation. Live FP 2026-06-16:
+// `for c in rsync docker psql pm2; do command -v "$c"; done` (an install check)
+// and `command -v docker` raised a confirm card because the bare word "docker"
+// appears in the for-list / as a `command -v` argument. This mirrors the
+// already-fixed systemctl (verb-aware) and git (segment-aware) mention FPs.
+//
+// We therefore confirm a built-in rule only when its command name is in COMMAND
+// POSITION — the head of a shell stage, after stripping leading shell keywords
+// (for/while/do/if/…), `VAR=val` assignments, and command wrappers (sudo/env/
+// nice/timeout/…). Wrappers that THEMSELVES run the next program (sudo, env,
+// exec, nice, nohup, timeout, …) are descended so `sudo docker ps` still
+// matches BOTH `sudo ` and `docker `. `command`/`builtin` are intentionally NOT
+// descended — `command -v docker` is a read-only lookup, not a docker run.
+//
+// Accepted residuals (consistent with systemctl/git matchers): a risky command
+// fed through `xargs` (`… | xargs docker rmi`) or via `command <cmd>` is not
+// carded — the catastrophic hard-deny (rm -rf /, mkfs, dd-to-disk) is a separate
+// matcher that still fires, and the threat model here is agent mistakes, not an
+// adversarial operator. Unparseable quoting falls back to substring matching
+// (fail-safe: never DROP a confirm because the structure was unclear).
+
+const CONFIRM_DESCEND_WRAPPERS = new Set<string>([
+  'sudo', 'doas', 'env', 'nice', 'nohup', 'exec', 'setsid', 'stdbuf', 'ionice',
+])
+const SHELL_LEAD_KEYWORDS = new Set<string>([
+  'for', 'while', 'until', 'if', 'then', 'else', 'elif', 'do', 'done', 'fi',
+  'case', 'esac', 'select', 'time', 'function', '{', '}', '!', '[[', ']]',
+])
+
+/** Append the command-head-onward strings (lowercased, one per wrapper level) of
+ *  one shell stage to `heads`. Skips leading keywords / `VAR=val`, descends
+ *  through wrappers (emitting a head string at each level so `sudo docker ps`
+ *  yields both `sudo docker ps` and `docker ps`). */
+function collectStageHeads(st: BashStage, heads: string[]): void {
+  const toks = tokenizeStage(st)
+  let k = 0
+  while (k < toks.length) {
+    const w = toks[k] as BashWord
+    if (ASSIGN_RE.test(w.masked)) { k += 1; continue }
+    if (SHELL_LEAD_KEYWORDS.has(dequoteWord(w.raw).toLowerCase())) { k += 1; continue }
+    break
+  }
+  for (let guard = 0; guard < 8 && k < toks.length; guard += 1) {
+    heads.push(toks.slice(k).map((t) => dequoteWord(t.raw)).join(' ').toLowerCase())
+    const name = dequoteWord((toks[k] as BashWord).raw).replace(/^.*\//, '').toLowerCase()
+    if (CONFIRM_DESCEND_WRAPPERS.has(name)) {
+      k += 1
+      while (k < toks.length && (/^-/.test((toks[k] as BashWord).masked) || ASSIGN_RE.test((toks[k] as BashWord).masked))) {
+        const takesValue = WRAPPER_VALUE_FLAG_RE.test((toks[k] as BashWord).masked)
+        k += 1
+        if (takesValue && k < toks.length) k += 1
+      }
+      continue
+    }
+    if (DURATION_WRAPPERS.has(name)) {
+      k += 1
+      while (k < toks.length && /^-/.test((toks[k] as BashWord).masked)) {
+        const takesValue = WRAPPER_VALUE_FLAG_RE.test((toks[k] as BashWord).masked)
+        k += 1
+        if (takesValue && k < toks.length) k += 1
+      }
+      if (k < toks.length && /^[0-9.]+[smhd]?$/i.test(dequoteWord((toks[k] as BashWord).raw))) k += 1
+      continue
+    }
+    break
+  }
+}
+
+/** Lowercased command-head-onward strings across every stage of `rawCommand`,
+ *  or null when the structure could HIDE a command head from this top-level scan
+ *  (caller then falls back to substring matching — fail-safe to confirm, never a
+ *  miss). We bail on:
+ *   - unbalanced quoting (mask returns null);
+ *   - command substitutions / subshells — `$(docker …)`, `` `docker …` ``,
+ *     `(cd x && docker build)`: splitPipelines treats these as opaque, so a real
+ *     invocation inside them would not appear as a head. A bare `(`/backtick in
+ *     the MASKED command (quoted text already blanked) signals such a construct. */
+function bashInvocationHeads(rawCommand: string): string[] | null {
+  const masked = maskQuotedLiterals(maskHeredocBodies(rawCommand))
+  if (masked === null) return null
+  if (masked.includes('(') || masked.includes('`')) return null
+  const heads: string[] = []
+  for (const stages of splitPipelines(rawCommand, masked)) {
+    for (const st of stages) collectStageHeads(st, heads)
+  }
+  return heads
+}
+
+/** Built-in confirm hits that are actually INVOKED (command-position), not mere
+ *  mentions. Falls back to substring matching on unparseable quoting so a
+ *  confirm is never silently dropped. */
+function matchAllBashConfirmRules(rawCommand: string, commandLower: string): string[] {
+  const heads = bashInvocationHeads(rawCommand)
+  if (heads === null) return matchAllBashRules(BUILTIN_CONFIRM_BASH, commandLower)
+  const hits: string[] = []
+  for (const rule of BUILTIN_CONFIRM_BASH) {
+    const pat = rule.toLowerCase()
+    if (heads.some((h) => h.startsWith(pat))) hits.push(rule)
+  }
+  return hits
+}
+
+/** Operator bash_patterns, command-position aware for command-NAME patterns
+ *  (`psql`, `rsync`, `pm2 restart`) while keeping plain substring for path /
+ *  script patterns (`deploy.sh`, `infra/deploy`) and glob patterns. Same FP class
+ *  as the built-in fix: a mere MENTION of `psql`/`rsync` in a `command -v`
+ *  argument or a for-list must not raise a card (live FP 2026-06-16). Used for
+ *  the operator CONFIRM tier only — deny stays substring (fail-safe broad) and
+ *  allow stays substring (changing it could only widen auto-allow, never desired
+ *  here). Falls back to substring on unparseable structure (never DROP a match). */
+function matchBashInvocationPatterns(
+  patterns: readonly string[] | undefined,
+  rawCommand: string,
+  commandLower: string,
+): string | undefined {
+  if (!patterns) return undefined
+  const heads = bashInvocationHeads(rawCommand)
+  for (const rule of patterns) {
+    if (typeof rule !== 'string') continue
+    const p = rule.toLowerCase()
+    // Path / script / glob patterns are not command-name shaped — a script runs
+    // path-qualified (`./scripts/deploy.sh`) or behind an interpreter, so the
+    // pattern is not at a head position. Keep substring for those and when the
+    // structure could hide a head (heads === null).
+    const substringy = heads === null || p.includes('/') || p.includes('.') || p.includes('*') || p.includes('?')
+    if (substringy) {
+      if (bashMatch(rule, commandLower)) return rule
+    } else if (heads.some((h) => h.startsWith(p))) {
+      return rule
+    }
+  }
+  return undefined
+}
+
 /** Merge global + scope rules for one tier (scope rules are additive). */
 function mergeRules(global: PolicyRules | undefined, scope: PolicyRules | undefined): PolicyRules {
   return {
@@ -1977,6 +2116,10 @@ function rulesMatch(
   toolName: string,
   pathCands: string[] | undefined,
   commandLower: string | undefined,
+  // When set (operator CONFIRM tier), bash_patterns are matched command-position
+  // aware via rawCommand instead of plain substring — so `psql`/`rsync` mentions
+  // don't card. Omitted for deny/allow, which keep substring semantics.
+  rawCommand?: string,
 ): string | undefined {
   const tool = matchToolRules(rules.tools, toolName)
   if (tool) return `tools:${tool}`
@@ -1993,7 +2136,9 @@ function rulesMatch(
   }
 
   if (commandLower !== undefined) {
-    const bp = matchBashRules(rules.bash_patterns, commandLower)
+    const bp = rawCommand !== undefined
+      ? matchBashInvocationPatterns(rules.bash_patterns, rawCommand, commandLower)
+      : matchBashRules(rules.bash_patterns, commandLower)
     if (bp) return `bash_patterns:${bp}`
   }
   return undefined
@@ -2125,7 +2270,10 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   // still confirms. The evasion detector below is never overridable.
   if (commandLower !== undefined) {
     const overridden = policy.confirm_overrides?.builtin_rules ?? []
-    const hits = matchAllBashRules(BUILTIN_CONFIRM_BASH, commandLower)
+    // Command-position aware (rawCommand !== undefined ⇒ commandLower defined):
+    // a built-in rule confirms only when its command name is actually invoked,
+    // not merely mentioned as an argument / in a for-list (live FP 2026-06-16).
+    const hits = matchAllBashConfirmRules(rawCommand!, commandLower)
     const standing = hits.filter((h) => !overridden.includes(h))
     if (standing.length > 0) {
       return { tier: 'confirm', reason: `risky command needs confirmation: ${standing[0]}`, matchedRule: `builtin:confirm_bash:${standing[0]}` }
@@ -2148,8 +2296,9 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // pass above so a co-located confirm builtin can't downgrade it — Codex HIGH.)
   }
 
-  // 5. Operator confirm.
-  const confirmHit = rulesMatch(confirmRules, toolName, pathCands, commandLower)
+  // 5. Operator confirm. bash_patterns are command-position aware (rawCommand)
+  // so a mention of e.g. `psql`/`rsync` does not card — mirrors the built-in fix.
+  const confirmHit = rulesMatch(confirmRules, toolName, pathCands, commandLower, rawCommand)
   if (confirmHit) {
     return { tier: 'confirm', reason: `policy confirm (${confirmHit})`, matchedRule: `confirm:${confirmHit}` }
   }
