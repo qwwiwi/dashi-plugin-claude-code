@@ -161,6 +161,20 @@ describe('classifyPane', () => {
     expect(
       classifyPane('⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage'),
     ).toBe('idle')
+    // the bare structural tail (both affordances + glyphs, in order) also matches
+    expect(classifyPane('← for agents · ↓ to manage')).toBe('idle')
+  })
+
+  // Codex fix-loop (2026-07-14): the tail is matched STRUCTURALLY (one regex over
+  // both ordered affordances + their glyphs) rather than by loose `for agents` /
+  // `to manage` substrings. Generic bottom-chrome text that merely CONTAINS those
+  // words — help/error/partial-render — must NOT read as idle, or the reliable
+  // compact path would blind-Enter a non-idle pane. These two cases returned
+  // 'idle' against the pre-fix-loop loose-substring HEAD (a proven regression);
+  // they must now be 'unknown'.
+  test('generic "for agents" / "to manage" text without the structural tail is not idle', () => {
+    expect(classifyPane('Use /agents for agents to collaborate')).toBe('unknown')
+    expect(classifyPane('Press ↓ to manage settings')).toBe('unknown')
   })
 
   test('multi-agent footer WITH interrupt hint stays busy (busy wins)', () => {

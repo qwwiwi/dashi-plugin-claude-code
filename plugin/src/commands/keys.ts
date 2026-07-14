@@ -403,14 +403,19 @@ function bottomChrome(text: string): string {
 // mode shows `? for shortcuts`; bypass / accept-edits / plan modes show
 // `⏵⏵ … (shift+tab to cycle)` — which PERSISTS on line 1 even while the slash
 // autocomplete popup is open. The newest multi-agent composer build drops BOTH
-// of those markers for a composer-affordance footer that ends in
-// `… · ← for agents · ↓ to manage` (e.g.
+// of those markers for a composer-affordance footer whose tail is the ordered
+// pair `← for agents · ↓ to manage` (e.g.
 // `⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage`); its busy
-// variant only inserts ` · esc to interrupt ·`. Without the `to manage` /
-// `for agents` tail markers that idle pane read as 'unknown' and the compact
-// button refused ("не удалось определить состояние сессии"). We OR all four
-// markers so idle is recognised in every mode; the busy guard below still wins
-// when the interrupt hint is present.
+// variant only inserts ` · esc to interrupt ·`. Without a marker for that tail
+// the idle pane read as 'unknown' and the compact button refused ("не удалось
+// определить состояние сессии"). We match the STRUCTURAL footer tail
+// (both affordances + their glyphs, in order) with one regex rather than loose
+// `for agents` / `to manage` substrings — generic bottom-chrome text like
+// `Use /agents for agents` or `Press ↓ to manage settings` (help / error /
+// partial render) merely CONTAINS those words and would otherwise falsely
+// classify as idle, letting the compact path blind-Enter a non-idle pane. We OR
+// the structural tail with the two mode markers so idle is recognised in every
+// mode; the busy guard below still wins when the interrupt hint is present.
 //
 // Ordering is load-bearing: DIALOG is checked BEFORE BUSY, because a native
 // permission dialog can ALSO render an "esc to interrupt" hint while a tool runs
@@ -446,8 +451,7 @@ export function classifyPane(text: string): PaneState {
   if (
     (chrome.includes('shift+tab to cycle') ||
       chrome.includes('? for shortcuts') ||
-      chrome.includes('to manage') ||
-      chrome.includes('for agents')) &&
+      /←\s+for agents\s+·\s+↓\s+to manage/i.test(chrome)) &&
     !chrome.includes('esc to interrupt')
   ) {
     return 'idle'
