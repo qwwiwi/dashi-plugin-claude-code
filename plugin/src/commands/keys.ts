@@ -402,8 +402,15 @@ function bottomChrome(text: string): string {
 // Idle footer is MODE-DEPENDENT (verified on the live pane, v2.1.200): Manual
 // mode shows `? for shortcuts`; bypass / accept-edits / plan modes show
 // `⏵⏵ … (shift+tab to cycle)` — which PERSISTS on line 1 even while the slash
-// autocomplete popup is open. We OR both markers so idle is recognised in every
-// mode.
+// autocomplete popup is open. The newest multi-agent composer build drops BOTH
+// of those markers for a composer-affordance footer that ends in
+// `… · ← for agents · ↓ to manage` (e.g.
+// `⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage`); its busy
+// variant only inserts ` · esc to interrupt ·`. Without the `to manage` /
+// `for agents` tail markers that idle pane read as 'unknown' and the compact
+// button refused ("не удалось определить состояние сессии"). We OR all four
+// markers so idle is recognised in every mode; the busy guard below still wins
+// when the interrupt hint is present.
 //
 // Ordering is load-bearing: DIALOG is checked BEFORE BUSY, because a native
 // permission dialog can ALSO render an "esc to interrupt" hint while a tool runs
@@ -437,7 +444,10 @@ export function classifyPane(text: string): PaneState {
     return 'busy'
   }
   if (
-    (chrome.includes('shift+tab to cycle') || chrome.includes('? for shortcuts')) &&
+    (chrome.includes('shift+tab to cycle') ||
+      chrome.includes('? for shortcuts') ||
+      chrome.includes('to manage') ||
+      chrome.includes('for agents')) &&
     !chrome.includes('esc to interrupt')
   ) {
     return 'idle'

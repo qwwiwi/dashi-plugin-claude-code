@@ -152,6 +152,50 @@ describe('classifyPane', () => {
     expect(classifyPane('⏵⏵ bypass permissions on (shift+tab to cycle)')).toBe('idle')
   })
 
+  // Multi-agent composer (newest Claude Code build): the idle footer dropped
+  // both "shift+tab to cycle" and "? for shortcuts" in favour of a composer
+  // affordance line ending in "… · ← for agents · ↓ to manage". Without matching
+  // its stable tail markers the idle pane classified as 'unknown' and the compact
+  // button refused ("не удалось определить состояние сессии").
+  test('multi-agent composer footer (no shift+tab / ? for shortcuts) is idle', () => {
+    expect(
+      classifyPane('⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage'),
+    ).toBe('idle')
+  })
+
+  test('multi-agent footer WITH interrupt hint stays busy (busy wins)', () => {
+    expect(
+      classifyPane(
+        '⏵⏵ bypass permissions on · 2 shells · esc to interrupt · ← for agents · ↓ to manage',
+      ),
+    ).toBe('busy')
+  })
+
+  // The new markers are still bottom-chrome anchored: a scrolled-up transcript
+  // merely QUOTING "to manage" / "for agents" must not override a clean idle
+  // composer sitting at the bottom of the capture.
+  test('multi-agent markers quoted far above do not override bottom chrome', () => {
+    const geom = [
+      'note: the composer says "← for agents" and "↓ to manage" now',
+      'filler line 2',
+      'filler line 3',
+      'filler line 4',
+      'filler line 5',
+      'filler line 6',
+      'filler line 7',
+      'filler line 8',
+      'filler line 9',
+      'filler line 10',
+      'filler line 11',
+      'filler line 12',
+      '╭────────────────────────────────╮',
+      '│ >                              │',
+      '╰────────────────────────────────╯',
+      '  ? for shortcuts',
+    ].join('\n')
+    expect(classifyPane(geom)).toBe('idle')
+  })
+
   // FIX-5 (Fable M3): markers are anchored to the BOTTOM UI chrome, so the
   // agent's own transcript quoting "Do you want to proceed?" / "esc to
   // interrupt" (this very plugin discusses these strings) far above the
