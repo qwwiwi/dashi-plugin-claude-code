@@ -442,16 +442,27 @@ export function classifyPane(text: string): PaneState {
   // so a busy pane classified as 'unknown' and compact refused (regression
   // 2026-07-06, foreshadowed by the radar's claude-code v2.1.201 bump). Detect
   // BOTH markers; the spinner's "· ↓/↑ … tokens)" tail never appears idle/dialog.
+  // The multi-agent build renders the SAME idle footer tail
+  // (`← for agents · ↓ to manage`, no `esc to interrupt`) while the MAIN turn is
+  // still running but blocked waiting on a background subagent; the spinner-token
+  // regex misses because the agent-list line `· ↓ 134.0k tokens` has no closing
+  // `)`. The transient `Waiting for N background agent(s) to finish` line appears
+  // ONLY while the main turn is actively blocked and disappears when the turn
+  // ends — the correct busy discriminator (Fable, live-proven). Do NOT relax the
+  // spinner regex to a paren-less form: the `◯ <agent> … Nk tokens` list line
+  // PERSISTS while the composer is genuinely idle with a background agent still
+  // running, so matching it would false-busy the exact idle case this PR fixes.
   if (
     chrome.includes('esc to interrupt') ||
-    /·\s*[↓↑][\s\d.,]*k?\s*tokens?\)/i.test(chrome)
+    /·\s*[↓↑][\s\d.,]*k?\s*tokens?\)/i.test(chrome) ||
+    /Waiting for \d+ background agents? to finish/i.test(chrome)
   ) {
     return 'busy'
   }
   if (
     (chrome.includes('shift+tab to cycle') ||
       chrome.includes('? for shortcuts') ||
-      /←\s+for agents\s+·\s+↓\s+to manage/i.test(chrome)) &&
+      /←[^\S\n]+for agents[^\S\n]+·[^\S\n]+↓[^\S\n]+to manage/i.test(chrome)) &&
     !chrome.includes('esc to interrupt')
   ) {
     return 'idle'

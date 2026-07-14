@@ -185,29 +185,71 @@ describe('classifyPane', () => {
     ).toBe('busy')
   })
 
-  // The new markers are still bottom-chrome anchored: a scrolled-up transcript
-  // merely QUOTING "to manage" / "for agents" must not override a clean idle
-  // composer sitting at the bottom of the capture.
-  test('multi-agent markers quoted far above do not override bottom chrome', () => {
-    const geom = [
-      'note: the composer says "← for agents" and "↓ to manage" now',
-      'filler line 2',
-      'filler line 3',
-      'filler line 4',
-      'filler line 5',
-      'filler line 6',
-      'filler line 7',
-      'filler line 8',
-      'filler line 9',
-      'filler line 10',
-      'filler line 11',
-      'filler line 12',
-      '╭────────────────────────────────╮',
-      '│ >                              │',
-      '╰────────────────────────────────╯',
-      '  ? for shortcuts',
+  // Fable fix-loop 2 (2026-07-14, live-proven BLOCK): the multi-agent build
+  // renders the IDENTICAL idle footer tail `← for agents · ↓ to manage` (NO
+  // `esc to interrupt`) while the MAIN turn is still running but BLOCKED waiting
+  // on a background subagent. The busy spinner-token regex misses because the
+  // agent-list line `· ↓ 134.0k tokens` has no closing `)`, and the structural
+  // footer tail matches → this pane classified as IDLE, so compact would
+  // blind-send `/compact` + Enter into a running turn (a frequent state — bg
+  // subagents run constantly). The transient `Waiting for N background agent(s)
+  // to finish` line only appears while the main turn is actively blocked and
+  // disappears when the turn ends → the correct busy discriminator. This canned
+  // snapshot reproduces the exact bottom chrome from a real captured pane in
+  // that state (scratchpad/live-capture.txt) faithfully, same glyphs.
+  const BACKGROUND_WAIT = [
+    '✻ Waiting for 1 background agent to finish',
+    '',
+    '──────────────────────────────────────────────────────────────────────',
+    '❯ Делегируй рестарт после мержа',
+    '──────────────────────────────────────────────────────────────────────',
+    '  ⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage',
+    '',
+    '  ● main',
+    '  ◯ general-purpose  Fable review classifyPane fix                                        4m 48s · ↓ 134.0k tokens',
+  ].join('\n')
+
+  test('background-wait pane (main turn blocked on a subagent) is busy, not idle', () => {
+    // RED against HEAD 83af4bf: no `esc to interrupt`, the token line has no
+    // closing `)` so the spinner regex misses, and the footer tail matches → the
+    // pre-fix classifyPane returned 'idle'. The `Waiting for N background
+    // agent(s) to finish` busy marker (checked before idle) now makes it busy.
+    expect(classifyPane(BACKGROUND_WAIT)).toBe('busy')
+    // plural form of the wait line also reads busy
+    expect(classifyPane('✻ Waiting for 3 background agents to finish')).toBe('busy')
+  })
+
+  // The OPPOSITE state must stay idle: once the main turn ends the wait line is
+  // gone, but the `◯ <agent> … Nk tokens` list line PERSISTS while a background
+  // agent keeps running and the composer is genuinely idle. This is the exact
+  // idle case this PR fixes — the token-list line (no closing `)`) must NOT
+  // false-busy it, which is why we did NOT relax the spinner regex to a
+  // paren-less form.
+  test('genuinely-idle composer with a background agent still running is idle', () => {
+    const idleWithBgAgent = [
+      '  ⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage',
+      '',
+      '  ● main',
+      '  ◯ general-purpose  some task label                                                     4m 48s · ↓ 134.0k tokens',
     ].join('\n')
-    expect(classifyPane(geom)).toBe('idle')
+    expect(classifyPane(idleWithBgAgent)).toBe('idle')
+  })
+
+  // Codex fix-loop 2 (2026-07-14): the structural footer regex uses
+  // horizontal-whitespace-only separators (`[^\S\n]+`, not `\s+`), so the tail
+  // cannot be ASSEMBLED across two adjacent chrome lines. Here the two
+  // affordances render on SEPARATE lines INSIDE the bottom-12 window with NO
+  // real single-line idle composer footer. This is a meaningful negative: the
+  // pre-fix `\s+` regex spanned the newline between `·` and `↓` and falsely read
+  // this as idle (the reason the guard exists); the `[^\S\n]+` regex must NOT
+  // match across the line break → unknown (refuse, never blind-Enter).
+  test('footer tail split across two adjacent chrome lines is not idle (unknown)', () => {
+    const split = [
+      'assistant said something useful',
+      '  ← for agents ·',
+      '  ↓ to manage',
+    ].join('\n')
+    expect(classifyPane(split)).toBe('unknown')
   })
 
   // FIX-5 (Fable M3): markers are anchored to the BOTTOM UI chrome, so the
