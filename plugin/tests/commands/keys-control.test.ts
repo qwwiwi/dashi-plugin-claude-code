@@ -152,6 +152,106 @@ describe('classifyPane', () => {
     expect(classifyPane('⏵⏵ bypass permissions on (shift+tab to cycle)')).toBe('idle')
   })
 
+  // Multi-agent composer (newest Claude Code build): the idle footer dropped
+  // both "shift+tab to cycle" and "? for shortcuts" in favour of a composer
+  // affordance line ending in "… · ← for agents · ↓ to manage". Without matching
+  // its stable tail markers the idle pane classified as 'unknown' and the compact
+  // button refused ("не удалось определить состояние сессии").
+  test('multi-agent composer footer (no shift+tab / ? for shortcuts) is idle', () => {
+    expect(
+      classifyPane('⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage'),
+    ).toBe('idle')
+    // the bare structural tail (both affordances + glyphs, in order) also matches
+    expect(classifyPane('← for agents · ↓ to manage')).toBe('idle')
+  })
+
+  // Codex fix-loop (2026-07-14): the tail is matched STRUCTURALLY (one regex over
+  // both ordered affordances + their glyphs) rather than by loose `for agents` /
+  // `to manage` substrings. Generic bottom-chrome text that merely CONTAINS those
+  // words — help/error/partial-render — must NOT read as idle, or the reliable
+  // compact path would blind-Enter a non-idle pane. These two cases returned
+  // 'idle' against the pre-fix-loop loose-substring HEAD (a proven regression);
+  // they must now be 'unknown'.
+  test('generic "for agents" / "to manage" text without the structural tail is not idle', () => {
+    expect(classifyPane('Use /agents for agents to collaborate')).toBe('unknown')
+    expect(classifyPane('Press ↓ to manage settings')).toBe('unknown')
+  })
+
+  test('multi-agent footer WITH interrupt hint stays busy (busy wins)', () => {
+    expect(
+      classifyPane(
+        '⏵⏵ bypass permissions on · 2 shells · esc to interrupt · ← for agents · ↓ to manage',
+      ),
+    ).toBe('busy')
+  })
+
+  // Fable fix-loop 2 (2026-07-14, live-proven BLOCK): the multi-agent build
+  // renders the IDENTICAL idle footer tail `← for agents · ↓ to manage` (NO
+  // `esc to interrupt`) while the MAIN turn is still running but BLOCKED waiting
+  // on a background subagent. The busy spinner-token regex misses because the
+  // agent-list line `· ↓ 134.0k tokens` has no closing `)`, and the structural
+  // footer tail matches → this pane classified as IDLE, so compact would
+  // blind-send `/compact` + Enter into a running turn (a frequent state — bg
+  // subagents run constantly). The transient `Waiting for N background agent(s)
+  // to finish` line only appears while the main turn is actively blocked and
+  // disappears when the turn ends → the correct busy discriminator. This canned
+  // snapshot reproduces the exact bottom chrome from a real captured pane in
+  // that state (scratchpad/live-capture.txt) faithfully, same glyphs.
+  const BACKGROUND_WAIT = [
+    '✻ Waiting for 1 background agent to finish',
+    '',
+    '──────────────────────────────────────────────────────────────────────',
+    '❯ Делегируй рестарт после мержа',
+    '──────────────────────────────────────────────────────────────────────',
+    '  ⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage',
+    '',
+    '  ● main',
+    '  ◯ general-purpose  Fable review classifyPane fix                                        4m 48s · ↓ 134.0k tokens',
+  ].join('\n')
+
+  test('background-wait pane (main turn blocked on a subagent) is busy, not idle', () => {
+    // RED against HEAD 83af4bf: no `esc to interrupt`, the token line has no
+    // closing `)` so the spinner regex misses, and the footer tail matches → the
+    // pre-fix classifyPane returned 'idle'. The `Waiting for N background
+    // agent(s) to finish` busy marker (checked before idle) now makes it busy.
+    expect(classifyPane(BACKGROUND_WAIT)).toBe('busy')
+    // plural form of the wait line also reads busy
+    expect(classifyPane('✻ Waiting for 3 background agents to finish')).toBe('busy')
+  })
+
+  // The OPPOSITE state must stay idle: once the main turn ends the wait line is
+  // gone, but the `◯ <agent> … Nk tokens` list line PERSISTS while a background
+  // agent keeps running and the composer is genuinely idle. This is the exact
+  // idle case this PR fixes — the token-list line (no closing `)`) must NOT
+  // false-busy it, which is why we did NOT relax the spinner regex to a
+  // paren-less form.
+  test('genuinely-idle composer with a background agent still running is idle', () => {
+    const idleWithBgAgent = [
+      '  ⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage',
+      '',
+      '  ● main',
+      '  ◯ general-purpose  some task label                                                     4m 48s · ↓ 134.0k tokens',
+    ].join('\n')
+    expect(classifyPane(idleWithBgAgent)).toBe('idle')
+  })
+
+  // Codex fix-loop 2 (2026-07-14): the structural footer regex uses
+  // horizontal-whitespace-only separators (`[^\S\n]+`, not `\s+`), so the tail
+  // cannot be ASSEMBLED across two adjacent chrome lines. Here the two
+  // affordances render on SEPARATE lines INSIDE the bottom-12 window with NO
+  // real single-line idle composer footer. This is a meaningful negative: the
+  // pre-fix `\s+` regex spanned the newline between `·` and `↓` and falsely read
+  // this as idle (the reason the guard exists); the `[^\S\n]+` regex must NOT
+  // match across the line break → unknown (refuse, never blind-Enter).
+  test('footer tail split across two adjacent chrome lines is not idle (unknown)', () => {
+    const split = [
+      'assistant said something useful',
+      '  ← for agents ·',
+      '  ↓ to manage',
+    ].join('\n')
+    expect(classifyPane(split)).toBe('unknown')
+  })
+
   // FIX-5 (Fable M3): markers are anchored to the BOTTOM UI chrome, so the
   // agent's own transcript quoting "Do you want to proceed?" / "esc to
   // interrupt" (this very plugin discusses these strings) far above the
