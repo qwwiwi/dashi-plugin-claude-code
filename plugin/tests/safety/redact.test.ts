@@ -81,14 +81,55 @@ describe('redactSecrets — Bearer + query-string', () => {
 })
 
 describe('redactSecrets — IPv4 masking', () => {
-  test('masks middle octets of public IPv4, keeps first+last', () => {
+  test('masks private ranges, shows public IPs in full', () => {
+    // Private ranges — masked (keep first + last octet).
     expect(redactSecrets('connect 10.2.3.44 done')).toBe('connect 10.***.***.44 done')
-    expect(redactSecrets('host 8.8.8.8')).toBe('host 8.***.***.8')
+    expect(redactSecrets('lan 192.168.1.1')).toBe('lan 192.***.***.1')
+    expect(redactSecrets('cgn 100.64.5.9')).toBe('cgn 100.***.***.9')
+    expect(redactSecrets('vpc 172.20.5.9')).toBe('vpc 172.***.***.9')
+    // Public IPs — shown in full (DNS records people must read).
+    // Examples use RFC 5737 documentation ranges; a real CDN / static-host
+    // A-record (the motivating case) is public and must stay readable.
+    expect(redactSecrets('host 192.0.2.1')).toBe('host 192.0.2.1')
+    expect(redactSecrets('A 192.0.2.153')).toBe('A 192.0.2.153')
+    // 172.x outside 16-31 is public — shown.
+    expect(redactSecrets('pub 172.15.0.1')).toBe('pub 172.15.0.1')
+    expect(redactSecrets('pub 172.32.0.1')).toBe('pub 172.32.0.1')
+  })
+
+  test('masks IPs configured via DASHI_OWN_HOST_IPS, shows others', () => {
+    const saved = process.env.DASHI_OWN_HOST_IPS
+    try {
+      // TEST-NET-3 / TEST-NET-2 documentation addresses (RFC 5737).
+      process.env.DASHI_OWN_HOST_IPS = '203.0.113.7, 198.51.100.4'
+      expect(redactSecrets('srv 203.0.113.7')).toBe('srv 203.***.***.7')
+      expect(redactSecrets('alt 198.51.100.4')).toBe('alt 198.***.***.4')
+      // A public IP not in the list is still shown.
+      expect(redactSecrets('cdn 192.0.2.1')).toBe('cdn 192.0.2.1')
+    } finally {
+      if (saved === undefined) delete process.env.DASHI_OWN_HOST_IPS
+      else process.env.DASHI_OWN_HOST_IPS = saved
+    }
+  })
+
+  test('with no DASHI_OWN_HOST_IPS set, all public IPs pass through', () => {
+    const saved = process.env.DASHI_OWN_HOST_IPS
+    try {
+      delete process.env.DASHI_OWN_HOST_IPS
+      expect(redactSecrets('srv 203.0.113.7')).toBe('srv 203.0.113.7')
+    } finally {
+      if (saved !== undefined) process.env.DASHI_OWN_HOST_IPS = saved
+    }
   })
 
   test('leaves loopback 127.* and 0.* untouched', () => {
     expect(redactSecrets('curl 127.0.0.1:8080')).toBe('curl 127.0.0.1:8080')
     expect(redactSecrets('bind 0.0.0.0:80')).toBe('bind 0.0.0.0:80')
+  })
+
+  test('idempotent on masked IPv4', () => {
+    const once = redactSecrets('lan 192.168.1.1 wan 10.0.0.5')
+    expect(redactSecrets(once)).toBe(once)
   })
 })
 
@@ -345,7 +386,7 @@ describe('redactSecrets — idempotency', () => {
       'token=8507713167:AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRR',
       'GROQ=gsk_' + 'X'.repeat(45),
       'Authorization: Bearer abcdefghijklmnopqrstuvwxyz1234',
-      'ip 8.8.8.8',
+      'ip 192.0.2.1',
       'host abcdefghij1234567890.supabase.co',
       '"private_key":"deadbeef"',
     ].join(' ')
