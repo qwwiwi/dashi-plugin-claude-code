@@ -1,7 +1,7 @@
 # Jarvis Channel Runtime — how you reach the user
 
 This Claude Code session is **not** a normal terminal. It runs inside a tmux
-session bridged to **Telegram** by the `dashi-channel` MCP server. Inbound
+session bridged to **Telegram** by the `agent47-channel` MCP server. Inbound
 Telegram messages are injected into this session; that is how the user talks to
 you.
 
@@ -16,7 +16,7 @@ final answer meant for the user MUST be sent with the reply tool before you end
 the turn:
 
 ```
-mcp__dashi-channel__reply({ chat_id, text })   // chat_id comes from the inbound <channel> tag
+mcp__agent47-channel__reply({ chat_id, text })   // chat_id comes from the inbound <channel> tag
 ```
 
 Never end a turn that owes the user a response without calling `reply`. A Stop

@@ -92,7 +92,7 @@ Multiple agents on one host → distinct `TELEGRAM_WEBHOOK_PORT`.
 
 ## 5. Supervisor unit with the correct CWD
 
-The bypass flag in both is `--dangerously-load-development-channels server:dashi-channel`.
+The bypass flag in both is `--dangerously-load-development-channels server:agent47-channel`.
 
 **Linux** `/etc/systemd/system/channel-<agent>.service` (from
 `examples/systemd-unit.service.example`):
@@ -105,7 +105,7 @@ Environment=HOME=/home/<service-user>
 Environment=PATH=/home/<service-user>/.bun/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=/home/<service-user>/.claude-lab/<agent>/.claude/dashi-plugin-claude-code/plugin
 ExecStart=/usr/bin/tmux new-session -d -s channel-<agent> \
-  claude --dangerously-load-development-channels server:dashi-channel
+  claude --dangerously-load-development-channels server:agent47-channel
 ExecStartPost=/bin/sh -c 'sleep 6 && /usr/bin/tmux send-keys -t channel-<agent> Enter && sleep 2 && /usr/bin/tmux send-keys -t channel-<agent> Enter'
 ExecStop=/usr/bin/tmux kill-session -t channel-<agent>
 Restart=on-failure
@@ -137,7 +137,7 @@ launchctl kickstart gui/$(id -u)/com.dashi-plugin.channel-<agent>
 ```bash
 tmux attach -t channel-<agent>     # Linux: sudo -u <service-user> tmux attach ...
 ```
-Success line: `Listening for channel messages from: server:dashi-channel`.
+Success line: `Listening for channel messages from: server:agent47-channel`.
 
 Persistent fix (Claude Code `2.1.140+`) — capture the exact accepted keys from
 `~/.claude/settings.json` after passing the prompts once, rather than guessing.
@@ -169,7 +169,7 @@ bash <plugin>/scripts/install-hooks.sh \
   --agent-id <agent>
 # then restart the channel (externally — never self-restart)
 ```
-This registers five hook events with marker `dashi-channel-hook`. The webhook
+This registers five hook events with marker `agent47-channel-hook`. The webhook
 token is read from runtime env and is **never** written to settings.json.
 
 ## 10. Remove the gateway — after 7–14 days, not immediately

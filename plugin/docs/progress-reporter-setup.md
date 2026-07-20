@@ -11,7 +11,7 @@
 | # | Фича | Где смотреть |
 |---|---|---|
 | 1 | Webhook сервер плагина слушает локально на `127.0.0.1:<port>/hooks/agent` | `/health` GET → `{"status":"ok"}` |
-| 2 | Claude Code шлёт каждое событие `PreToolUse`/`PostToolUse`/`Stop` на этот endpoint | hooks в `settings.json` с marker `dashi-channel-hook` |
+| 2 | Claude Code шлёт каждое событие `PreToolUse`/`PostToolUse`/`Stop` на этот endpoint | hooks в `settings.json` с marker `agent47-channel-hook` |
 | 3 | `ProgressReporter` редактирует одно Telegram-сообщение per chat по мере событий | визуально в чате с ботом |
 | 4 | `Stop` финализирует сообщение строкой `done -- Ns` | визуально |
 | 5 | Бэкенд игнорирует ошибки и не блокирует агента | хук всегда выходит с `0`, агент продолжает работу даже если webhook упал |
@@ -25,7 +25,7 @@
 ## Зависимости
 
 - `bun >= 1.0`
-- Запущенный экземпляр dashi-channel плагина (например через `channel-thrall.service` systemd unit)
+- Запущенный экземпляр agent47-channel плагина (например через `channel-thrall.service` systemd unit)
 - `TELEGRAM_WEBHOOK_TOKEN`, `TELEGRAM_WEBHOOK_HOST`, `TELEGRAM_WEBHOOK_PORT`, `TELEGRAM_BOT_TOKEN` в env плагина (обычно в `channel.env`)
 - В конфиге плагина (`<state_dir>/config.json`) — блок `"webhook": { "enabled": true, "host": "127.0.0.1", "port": <port> }`
 
@@ -55,10 +55,10 @@ bash plugin/scripts/install-hooks.sh \
   --settings ~/.claude-lab/<agent>/.claude/settings.json \
   --chat-id $CHAT_ID \
   --webhook-url $URL \
-  --agent-id dashi-channel
+  --agent-id agent47-channel
 ```
 
-Результат: в settings.json появятся entries с `"marker": "dashi-channel-hook"`. Прогон скрипта повторно — заменит существующие entries, не задублирует.
+Результат: в settings.json появятся entries с `"marker": "agent47-channel-hook"`. Прогон скрипта повторно — заменит существующие entries, не задублирует.
 
 ### 3. Рестартнуть агента
 
@@ -87,7 +87,7 @@ bash plugin/scripts/smoke-test-progress.sh --bot-id <expected_bot_id>
 - `/health` отвечает
 - `bot_id` соответствует ожидаемому (опционально)
 - post-hook.ts успешно отправляет PreToolUse Bash, PostToolUse Bash, PreToolUse Edit, PostToolUse Edit, Stop
-- в settings.json присутствует marker `dashi-channel-hook` минимум 5 раз
+- в settings.json присутствует marker `agent47-channel-hook` минимум 5 раз
 
 Выход:
 - `0` — все проверки прошли
@@ -122,7 +122,7 @@ done -- Ns</pre>
 | **`permissions.jsonl`** (JSONL аудит каждого permission-решения, ретранслированного через Telegram) | `${TELEGRAM_STATE_DIR}/logs/permissions.jsonl` | то же |
 | **`dead-letter/`** (forensics — payload, который плагин не смог обработать) | `${TELEGRAM_STATE_DIR}/dead-letter/<bucket>/<timestamp>.json` (bucket = `webhook`, `updates`, …) | то же |
 
-`TELEGRAM_STATE_DIR` определяется в `channel.env`. Если не задан — default `/tmp/dashi-channel-state/<agent>/`, зачищается при reboot.
+`TELEGRAM_STATE_DIR` определяется в `channel.env`. Если не задан — default `/tmp/agent47-channel-state/<agent>/`, зачищается при reboot.
 
 > **Migration note (для тех, кто пришёл от предыдущей версии):** старая редакция этого гайда советовала смотреть файл лога сервера внутри state-каталога (`<state_dir>/logs/…`) — такого файла плагин **никогда не создавал**, ссылка была фантомной. Реальный supervisor-лог живёт в journald (Linux) или `~/Library/Logs/dashi-plugin/` (macOS). Permission-аудит и dead-letter лежат рядом со state в `${TELEGRAM_STATE_DIR}`.
 
@@ -137,8 +137,8 @@ done -- Ns</pre>
 | `webhook responded 403` | chat_id не в allowlist | добавь `chat_id` в `config.json` плагина → `allowed_chat_ids` |
 | Сообщение в TG не приходит | `config.progress.enabled = false` | поставь `true` в `<state_dir>/config.json` → `progress: { enabled: true }` |
 | Сообщение приходит, но всегда новое (не редактируется) | session_ttl_ms экспайрил | events отправляются с разрывом > `session_ttl_ms` (default 10m) — это by design |
-| Все события для одного tool сливаются в одну карточку, новая сессия их не сбрасывает | `Stop` hook не доходит до webhook | проверь что Stop hook есть в settings.json с marker `dashi-channel-hook` |
-| Webhook ничего не отвечает, supervisor лог чист | hook реально не отправил запрос (например, `dashi-channel-hook` marker сломан) | `tmux capture-pane -p -t channel-<agent>` покажет вывод post-hook.ts до того, как Claude Code продолжит; параллельно `tail -F ${TELEGRAM_STATE_DIR}/dead-letter/webhook/` — если payload отбракован, он попадёт сюда |
+| Все события для одного tool сливаются в одну карточку, новая сессия их не сбрасывает | `Stop` hook не доходит до webhook | проверь что Stop hook есть в settings.json с marker `agent47-channel-hook` |
+| Webhook ничего не отвечает, supervisor лог чист | hook реально не отправил запрос (например, `agent47-channel-hook` marker сломан) | `tmux capture-pane -p -t channel-<agent>` покажет вывод post-hook.ts до того, как Claude Code продолжит; параллельно `tail -F ${TELEGRAM_STATE_DIR}/dead-letter/webhook/` — если payload отбракован, он попадёт сюда |
 
 ---
 
@@ -154,7 +154,7 @@ hooks (settings.json)  ──[stdin envelope]──>  post-hook.ts
                                        POST /hooks/agent (Bearer + JSON)
                                                   |
                                                   v
-                                       dashi-channel plugin (bun)
+                                       agent47-channel plugin (bun)
                                               |       |        |
                                               v       v        v
                                         Memory  Status  ProgressReporter

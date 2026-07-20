@@ -44,7 +44,7 @@ import { handleReact } from './routes/react.js'
 import { ASK_SOCKET_TIMEOUT_MARGIN_MS, bearerEquals, chatIdAllowed, reply } from './routes/shared.js'
 
 const BODY_LIMIT_BYTES = 256 * 1024
-const DEFAULT_AGENT_ID = 'dashi-channel'
+const DEFAULT_AGENT_ID = 'agent47-channel'
 
 // Structural surface for the hook branch. Avoids importing the full
 // StatusManager type so test stubs can pass a minimal object. The webhook
@@ -190,7 +190,7 @@ export interface WebhookDeps {
   // answers 503 and the hook degrades to a no-op (no read receipt, no crash).
   reactToMessage?: (chatId: string, messageId: number, emoji: string) => Promise<void>
   // 2026-06-03: DM fallback-reply capability. The warchief's DM session
-  // normally answers through the `mcp__dashi-channel__reply` MCP tool. When a
+  // normally answers through the `mcp__agent47-channel__reply` MCP tool. When a
   // turn ends WITHOUT having sent such a reply, the fallback-reply Stop hook
   // posts the turn's final assistant text to POST /hooks/fallback-reply and we
   // send it via this capability — a fire-and-forget plain-text Telegram

@@ -99,12 +99,12 @@ Welcome-промты Claude Code (external imports + `--dangerously-load-develop
 
 | Слой | Linux (systemd) | macOS (launchd) |
 |---|---|---|
-| **Supervisor stderr/stdout** | `journalctl -u channel-<agent>` (или `journalctl -u dashi-channel-<agent>` если такой alias) | `~/Library/Logs/dashi-plugin/channel-<agent>.out.log` + `.err.log` |
-| **Plugin state dir** (`TELEGRAM_STATE_DIR`, default `/tmp/dashi-channel-state/<agent>/`) | `bot.pid`, `access.json`, `update-offset`, `dead-letter/`, `permissions.jsonl` | то же |
+| **Supervisor stderr/stdout** | `journalctl -u channel-<agent>` (или `journalctl -u agent47-channel-<agent>` если такой alias) | `~/Library/Logs/dashi-plugin/channel-<agent>.out.log` + `.err.log` |
+| **Plugin state dir** (`TELEGRAM_STATE_DIR`, default `/tmp/agent47-channel-state/<agent>/`) | `bot.pid`, `access.json`, `update-offset`, `dead-letter/`, `permissions.jsonl` | то же |
 | **Tmux pane history** | `tmux capture-pane -p -t channel-<agent>` (под service-user) | `tmux capture-pane -p -t channel-<agent>` |
 | **Workspace memory** (если включены memory hooks) | `<workspace>/core/hot/recent.md` + `<workspace>/../logs/verbose-YYYY-MM-DD.jsonl` | то же |
 
-`TELEGRAM_STATE_DIR` определяется в `channel.env` (рекомендуется `<shared>/state/<agent>/telegram/`). Если не задан — плагин падает на дефолт `/tmp/dashi-channel-state/`, который зачищается при reboot — **в production задавайте явно**.
+`TELEGRAM_STATE_DIR` определяется в `channel.env` (рекомендуется `<shared>/state/<agent>/telegram/`). Если не задан — плагин падает на дефолт `/tmp/agent47-channel-state/`, который зачищается при reboot — **в production задавайте явно**.
 
 Канонические таблицы и команды просмотра — в OS-specific документах:
 

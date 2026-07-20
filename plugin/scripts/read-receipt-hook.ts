@@ -57,7 +57,7 @@ export function parseChannelRefs(text: string): ReadReceiptRef[] {
   while ((match = CHANNEL_TAG_RE.exec(text)) !== null) {
     const attrs = match[1] ?? ''
     // Only Telegram blocks get a read receipt. The inbound format carries
-    // both `source="dashi-channel"` and `source="telegram"`, so a substring
+    // both `source="agent47-channel"` and `source="telegram"`, so a substring
     // test is enough.
     if (!/source\s*=\s*\\?"telegram\\?"/.test(attrs)) continue
     // chat_id is negative for groups/supergroups (multichat), so allow `-`.

@@ -154,7 +154,7 @@ USER_HOME="/Users/<you>"
 ENV_FILE="${USER_HOME}/.claude-lab/${AGENT}/secrets/channel.env"
 TMUX_SESSION="channel-${AGENT}"
 TMUX_BIN="/opt/homebrew/bin/tmux"
-CLAUDE_CMD="claude --dangerously-load-development-channels server:dashi-channel"
+CLAUDE_CMD="claude --dangerously-load-development-channels server:agent47-channel"
 
 log() { printf '[%s] launchd-wrapper: %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
@@ -334,7 +334,7 @@ tmux attach -t channel-myagent
 # detach: Ctrl-B затем D
 ```
 
-Должны увидеть строку `Listening for channel messages from: server:dashi-channel`.
+Должны увидеть строку `Listening for channel messages from: server:agent47-channel`.
 
 ### Persistent welcome approvals
 
@@ -448,7 +448,7 @@ launchd, плагин и Claude Code пишут в три разных мест�
 | Tmux attach (интерактивно) | tmux session | `tmux attach -t channel-myagent` (detach Ctrl-B D) |
 | Workspace memory (если memory hooks включены) | `<workspace>/core/hot/recent.md` + `<workspace>/../logs/verbose-YYYY-MM-DD.jsonl` | `tail -100 ~/.claude-lab/myagent/.claude/core/hot/recent.md` |
 
-`TELEGRAM_STATE_DIR` определяется в `channel.env` (Шаг 5). Если не задан — плагин падает на дефолт `/tmp/dashi-channel-state/<agent>/`, который **зачищается при reboot** — в production задавайте явно (рекомендуется `~/.claude-lab/shared/state/<agent>/telegram/`).
+`TELEGRAM_STATE_DIR` определяется в `channel.env` (Шаг 5). Если не задан — плагин падает на дефолт `/tmp/agent47-channel-state/<agent>/`, который **зачищается при reboot** — в production задавайте явно (рекомендуется `~/.claude-lab/shared/state/<agent>/telegram/`).
 
 > **Не путайте supervisor stdout и tmux pane:** `.out.log` хранит то, что Bun / Claude Code напечатали в stderr/stdout процесса (логи плагина + сообщения wrapper-скрипта `log()`). Tmux pane — это **сам интерактивный terminal Claude Code** с его UI (welcome-промты, спиннеры, ответы модели). Bug в плагине ищите в `.out.log` / `.err.log`, identity / welcome / context drift — в tmux pane.
 

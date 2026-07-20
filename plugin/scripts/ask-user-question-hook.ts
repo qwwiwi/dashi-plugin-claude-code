@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // ask-user-question-hook.ts — PreToolUse hook that intercepts the built-in
-// `AskUserQuestion` tool and routes the prompt through the dashi-channel
+// `AskUserQuestion` tool and routes the prompt through the agent47-channel
 // plugin so the warchief can answer from Telegram instead of an in-terminal
 // menu.
 //

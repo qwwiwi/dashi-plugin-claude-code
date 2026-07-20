@@ -173,7 +173,7 @@ Environment=HOME=/home/agentctl
 Environment=PATH=/home/agentctl/.bun/bin:/home/agentctl/.local/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=/home/agentctl/.claude-lab/myagent/.claude/dashi-plugin-claude-code/plugin
 ExecStart=/usr/bin/tmux new-session -d -s channel-myagent \
-  claude --dangerously-load-development-channels server:dashi-channel
+  claude --dangerously-load-development-channels server:agent47-channel
 ExecStartPost=/bin/sh -c 'sleep 6 && /usr/bin/tmux send-keys -t channel-myagent Enter'
 ExecStop=/usr/bin/tmux kill-session -t channel-myagent
 Restart=on-failure
@@ -259,7 +259,7 @@ sudo systemctl status channel-myagent
 
 # 2. tmux показывает Claude Code на главном экране (не на welcome-промтах)
 sudo -u agentctl tmux capture-pane -t channel-myagent -p -S -50 | tail -30
-# должны увидеть "Listening for channel messages from: server:dashi-channel"
+# должны увидеть "Listening for channel messages from: server:agent47-channel"
 
 # 3. Telegram pending updates
 TOKEN=$(grep TELEGRAM_BOT_TOKEN /etc/dashi-plugin/myagent/channel.env | cut -d= -f2-)
@@ -313,7 +313,7 @@ sudo -u agentctl bash /home/agentctl/.claude-lab/myagent/.claude/dashi-plugin-cl
 | Tmux attach (интерактивно) | tmux session | `sudo -u agentctl tmux attach -t channel-myagent` (detach Ctrl-B D) |
 | Workspace memory (если memory hooks включены) | `<workspace>/core/hot/recent.md` + `<workspace>/../logs/verbose-YYYY-MM-DD.jsonl` | `tail -100 /home/agentctl/.claude-lab/myagent/.claude/core/hot/recent.md` |
 
-`TELEGRAM_STATE_DIR` определяется в `channel.env` (Шаг 5). Если не задан — плагин падает на дефолт `/tmp/dashi-channel-state/<agent>/`, который **зачищается при reboot** — в production задавайте явно (рекомендуется `<shared>/state/<agent>/telegram/`).
+`TELEGRAM_STATE_DIR` определяется в `channel.env` (Шаг 5). Если не задан — плагин падает на дефолт `/tmp/agent47-channel-state/<agent>/`, который **зачищается при reboot** — в production задавайте явно (рекомендуется `<shared>/state/<agent>/telegram/`).
 
 > **Не путайте supervisor stdout и tmux pane:** journald хранит то, что Bun/Claude Code напечатали в stderr/stdout процесса (логи плагина). Tmux pane — это **сам интерактивный terminal Claude Code** с его UI (welcome-промты, спиннеры, ответы модели). Bug в плагине ищите в journald, identity / welcome / context drift — в tmux pane.
 

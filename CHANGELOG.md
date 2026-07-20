@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the dashi-channel plugin are documented here.
+All notable changes to the agent47-channel plugin are documented here.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning:
 [Semantic Versioning](https://semver.org). The single source of truth for the
@@ -12,6 +12,51 @@ server identity reads `package.json` at runtime. Release process:
 Versions before 1.0.0 were not tracked — the project shipped ~60 merged PRs
 between 2026-05-14 and 2026-06-14 without a version discipline. 1.0.0
 retroactively marks the state of `main` on 2026-06-14.
+
+## Fork notes — divergence from upstream
+
+This is Maximus's fork of
+[qwwiwi/dashi-plugin-claude-code](https://github.com/qwwiwi/dashi-plugin-claude-code)
+(`origin` = `Maxidromus-projects/dashi-plugin-claude-code`, `upstream` =
+`qwwiwi/dashi-plugin-claude-code`, read-only). On 2026-07-20 the MCP server /
+plugin identity was renamed from `dashi-channel` to `agent47-channel` (PR #2)
+so the Claude Code UI no longer showed "Called dashi-channel" — that was the
+upstream project's own internal branding, not third-party code, but it read as
+confusing/foreign in this fork.
+
+**Renamed** (upstream literal `dashi-channel` → fork literal `agent47-channel`):
+- MCP server key: `.mcp.json`, `.claude-plugin/plugin.json` (`name`,
+  `displayName`), `plugin/package.json` (`name`)
+- `plugin/src/server.ts`: `McpServer` name + logger name
+- `plugin/src/webhook/server.ts`: `DEFAULT_AGENT_ID`
+- Hook markers: `plugin/scripts/patch-claude-settings.ts` (`MARKER`,
+  `REMINDER_MARKER`) and the fallback-reply marker written by
+  `plugin/scripts/install-hooks.sh`
+- `plugin/scripts/fallback-reply-hook.ts`: `REPLY_TOOL_NAMES`
+  (`mcp__dashi-channel__*` → `mcp__agent47-channel__*`)
+- `plugin/src/status/progress-reporter.ts`: `NOISY_TOOL_PREFIXES`
+- `skills/doctor-dashi-plugin/scripts/doctor.ts`: `HOOK_MARKER`,
+  `FALLBACK_MARKER`, `LIVE_MARKER` (kept in lockstep with the markers above so
+  the doctor skill still diagnoses a live agent correctly)
+- All docs, READMEs (`en`/`ru`), code comments, and test fixtures referencing
+  the old name
+
+**Deliberately NOT renamed** (separate identity, out of scope for this rename):
+- The canary-only dev scaffold: `scripts/dashi-channel-supervisor`,
+  `DASHI_CHANNEL_RUNTIME_ROOT`, `dashi-telegram-canary-bot` (see
+  `docs/dev/08-dashi-channel-supervisor-spec.md`) — a different tool's own name
+- `dashi-permission-gate-hook` / `dashi-ask-user-question-hook` hook markers —
+  a separate feature's naming, unrelated to the channel/MCP-server identity
+- The repo/project name itself, `dashi-plugin-claude-code` — this fork keeps
+  upstream's project name so remote URLs and existing instructions still line
+  up; only the *channel plugin's own branding inside the project* was renamed
+- The `skills/doctor-dashi-plugin/` directory name — same reasoning as above
+
+**Reconciling future upstream changes:** if `upstream` ships new commits that
+introduce more occurrences of the literal string `dashi-channel`, they are,
+functionally, the same identity this fork now calls `agent47-channel` — a
+mechanical find-and-replace (respecting the exclusion list above) reconciles
+them with this fork's naming before merging.
 
 ## [1.2.0] — 2026-07-10
 

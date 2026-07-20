@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "dashi-channel": {
+    "agent47-channel": {
       "command": "bun",
       "args": [
         "./src/server.ts"

@@ -3,7 +3,7 @@
 // bridge invariant on EVERY warchief turn.
 //
 // Why this exists (2026-06-12): agents run as long-lived `claude … server:
-// dashi-channel` sessions. The dashi-channel MCP server states the reply
+// agent47-channel` sessions. The agent47-channel MCP server states the reply
 // discipline once at session start ("the sender reads Telegram, not this
 // terminal"), and plugin/CLAUDE.md repeats it as a durable invariant — but
 // over a long session both fade, and agents end turns with terminal-only
@@ -67,7 +67,7 @@ import { fileURLToPath } from 'node:url'
 const DM_REMINDER =
   'Telegram bridge: the sender reads Telegram, not this terminal — terminal/transcript text never reaches them. ' +
   'Every reply, question, confirmation, status update, or final answer for this chat MUST go through the ' +
-  'mcp__dashi-channel__reply tool (pass chat_id) before you end the turn. Do not end a turn that owes the sender ' +
+  'mcp__agent47-channel__reply tool (pass chat_id) before you end the turn. Do not end a turn that owes the sender ' +
   'a response without calling reply.'
 
 const GROUP_REMINDER =
@@ -79,7 +79,7 @@ const GROUP_REMINDER =
 // the invariant without asserting a specific delivery path.
 const GENERIC_REMINDER =
   'Telegram bridge: the sender reads Telegram, not this terminal. Anything meant for them must be delivered through ' +
-  'the channel (the mcp__dashi-channel__reply tool in a direct chat); terminal-only text is not visible to the sender.'
+  'the channel (the mcp__agent47-channel__reply tool in a direct chat); terminal-only text is not visible to the sender.'
 
 /**
  * Pick the reminder for a chat id. Negative id → group; a present non-negative

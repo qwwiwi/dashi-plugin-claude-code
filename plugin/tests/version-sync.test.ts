@@ -33,7 +33,7 @@ describe('version sync', () => {
   test('manifest name matches the package name', async () => {
     const manifest = await readJson(join(REPO_ROOT, '.claude-plugin', 'plugin.json'))
     const pkg = await readJson(join(PLUGIN_DIR, 'package.json'))
-    expect(manifest.name).toBe('dashi-channel')
+    expect(manifest.name).toBe('agent47-channel')
     expect(pkg.name).toBe(manifest.name)
   })
 
@@ -42,6 +42,6 @@ describe('version sync', () => {
     // that is what keeps the third declaration site from drifting.
     const src = await Bun.file(join(PLUGIN_DIR, 'src', 'server.ts')).text()
     expect(src).toMatch(/version:\s*pkg\.version/)
-    expect(src).not.toMatch(/name: 'dashi-channel',\s*version:\s*'/)
+    expect(src).not.toMatch(/name: 'agent47-channel',\s*version:\s*'/)
   })
 })

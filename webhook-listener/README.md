@@ -4,13 +4,13 @@ A small Python aiohttp service that accepts swarm webhooks from
 [dashi-gbrain](https://github.com/qwwiwi/dashi-gbrain) and spawns a
 headless `claude -p` invocation against the configured agent workspace.
 
-It is the inter-agent ingress that complements the dashi-channel plugin
+It is the inter-agent ingress that complements the agent47-channel plugin
 (Telegram ingress). The plugin handles human-driven chat sessions; this
 listener handles agent-to-agent task delivery.
 
 ## Why it exists
 
-The dashi-channel plugin has no inbox-poll loop. When another agent
+The agent47-channel plugin has no inbox-poll loop. When another agent
 publishes a swarm delivery for this agent, the gbrain worker calls the
 webhook below, which:
 

@@ -39,14 +39,14 @@ describe('buildHookRequest', () => {
     const result = buildHookRequest({
       env: {
         TELEGRAM_HOOK_CHAT_ID: '1',
-        TELEGRAM_HOOK_AGENT_ID: 'dashi-channel',
+        TELEGRAM_HOOK_AGENT_ID: 'agent47-channel',
         TELEGRAM_WEBHOOK_URL: 'http://x',
         TELEGRAM_WEBHOOK_TOKEN: TOKEN,
       },
       hook: baseHook(),
     })
     if ('kind' in result) throw new Error('unreachable')
-    expect(result.body).toContain('"agentId":"dashi-channel"')
+    expect(result.body).toContain('"agentId":"agent47-channel"')
   })
 
   test('omits agentId when env unset', () => {

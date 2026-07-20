@@ -1,6 +1,6 @@
 # Canary smoke runbook
 
-Live verification of the Dashi Channel plugin against a dedicated test bot you own (referred to below as `<test-bot-id>`).
+Live verification of the Agent47 Channel plugin against a dedicated test bot you own (referred to below as `<test-bot-id>`).
 
 This runbook is for the human operator at the keyboard. The plugin runs as a Claude Code development channel; tests rely on real Telegram messages sent from your own user account, referred to below as `<your-telegram-user-id>` (your numeric Telegram user id — find it via [@userinfobot](https://t.me/userinfobot)).
 
@@ -45,8 +45,8 @@ tmux new-session -d -s channel-canary-test \
   -c ~/path/to/your/.claude-lab/dashi-plugin-claude-code/plugin \
   'TELEGRAM_BOT_TOKEN=$(cat ~/.claude-lab/shared/channel-runtime/canary/secrets/telegram-bot-token) \
    TELEGRAM_STATE_DIR=~/path/to/your/.claude-lab/shared/channel-runtime/canary/telegram \
-   TELEGRAM_WORKSPACE_ROOT=/tmp/dashi-channel-canary-workspace \
-   claude --dangerously-load-development-channels server:dashi-channel'
+   TELEGRAM_WORKSPACE_ROOT=/tmp/agent47-channel-canary-workspace \
+   claude --dangerously-load-development-channels server:agent47-channel'
 ```
 
 Verify the session is alive:

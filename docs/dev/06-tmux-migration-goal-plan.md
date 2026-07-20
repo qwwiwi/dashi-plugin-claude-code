@@ -23,7 +23,7 @@
 
 ## Primary Decision
 
-Primary path: **launchd starts a supervisor; supervisor creates/reuses tmux; tmux runs `claude --channels ...`; Dashi Channel plugin handles Telegram events through Claude Code Channels.**
+Primary path: **launchd starts a supervisor; supervisor creates/reuses tmux; tmux runs `claude --channels ...`; Agent47 Channel plugin handles Telegram events through Claude Code Channels.**
 
 This is stronger than the previous direct launchd plan:
 
@@ -39,7 +39,7 @@ This is stronger than the previous direct launchd plan:
 Telegram Bot API
       |
       v
-Dashi Channel Plugin
+Agent47 Channel Plugin
   - getUpdates consumer
   - allowlist/group/topic routing
   - media/voice/document handling
@@ -68,7 +68,7 @@ launchd
   -> dashi-channel-supervisor
       -> tmux has-session -t orgrimmar-silvana
       -> tmux new-session -d -s orgrimmar-silvana
-      -> claude --dangerously-load-development-channels plugin:dashi-channel@local --channels dashi-telegram
+      -> claude --dangerously-load-development-channels plugin:agent47-channel@local --channels dashi-telegram
 ```
 
 Important boundary: the plugin does not call Claude programmatically. It only delivers channel events to the running interactive Claude Code session.
@@ -174,7 +174,7 @@ Goal: one production-like agent path with minimal features, still on a test toke
 
 Build:
 
-- TypeScript/Bun Dashi Channel plugin;
+- TypeScript/Bun Agent47 Channel plugin;
 - Telegram long-poll consumer;
 - owner allowlist;
 - durable inbound queue;
@@ -279,7 +279,7 @@ Do not run old and new consumers on the same token.
 
 Allowed shadow methods:
 
-- replay sanitized gateway JSONL updates into Dashi Channel;
+- replay sanitized gateway JSONL updates into Agent47 Channel;
 - use a separate test token in the same test group;
 - temporarily pause old gateway for a single low-risk token during a supervised window.
 

@@ -94,7 +94,7 @@ interface ChatProgressEntry {
 const HTML_OPTS = { parse_mode: 'HTML' as const }
 
 // Tools that should never appear in the rolling activity card. Reads, greps,
-// globs, and deferred-tool lookups are bookkeeping; the dashi-channel MCP
+// globs, and deferred-tool lookups are bookkeeping; the agent47-channel MCP
 // reply tools are the channel itself (mirroring them would recurse), and
 // gbrain-recall is background context fetching the warchief does not need to
 // see. Bash/Edit/Write/WebFetch/WebSearch/Agent and gbrain mutations
@@ -106,7 +106,7 @@ const NOISY_TOOL_NAMES: ReadonlySet<string> = new Set([
   'ToolSearch',
 ])
 const NOISY_TOOL_PREFIXES: ReadonlyArray<string> = [
-  'mcp__dashi-channel__',
+  'mcp__agent47-channel__',
   'mcp__dashi-gbrain-recall__',
 ]
 
@@ -271,7 +271,7 @@ export class ProgressReporter {
    * non-Stop events are render-only (move the elapsed counter forward).
    *
    * Noise-filter: tool names in `NOISY_TOOLS` (Read/Grep/Glob/ToolSearch and
-   * the dashi-channel + recall MCP prefixes) update `lastActivityMs` upstream
+   * the agent47-channel + recall MCP prefixes) update `lastActivityMs` upstream
    * but never enter `entry.calls`, so the rolling card stays focused on
    * meaningful actions (Bash, Edit, Write, WebFetch, Agent, gbrain mutations).
    */

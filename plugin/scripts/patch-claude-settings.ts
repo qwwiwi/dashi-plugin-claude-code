@@ -6,7 +6,7 @@
 //   * Never write the bearer token. The hook command pulls
 //     TELEGRAM_WEBHOOK_TOKEN from the agent's process env at runtime.
 //   * Preserve unrelated keys and existing hook entries.
-//   * Stable marker — `hooks[event][].marker = "dashi-channel-hook"` — lets
+//   * Stable marker — `hooks[event][].marker = "agent47-channel-hook"` — lets
 //     re-runs replace the previous entry instead of duplicating.
 //   * Atomic write through a temp file in the same dir so a partial write
 //     cannot corrupt settings.json.
@@ -16,7 +16,7 @@
 //     --settings /path/to/settings.json \
 //     --chat-id 164795011 \
 //     --webhook-url http://127.0.0.1:8089/hooks/agent \
-//     [--agent-id dashi-channel] \
+//     [--agent-id agent47-channel] \
 //     [--helper /abs/path/to/post-hook.ts]
 
 import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 'fs'
@@ -24,7 +24,7 @@ import { homedir } from 'os'
 import { dirname, join, resolve as pathResolve } from 'path'
 import { fileURLToPath } from 'url'
 
-const MARKER = 'dashi-channel-hook'
+const MARKER = 'agent47-channel-hook'
 // Permission-gate PreToolUse hook (2026-06-09). Distinct marker so it
 // installs/updates alongside the notification-mirror hook without either
 // clobbering the other. Only added when --permission-gate-helper is given.
@@ -35,7 +35,7 @@ const GATE_MARKER = 'dashi-permission-gate-hook'
 // only once at session start; agents forget over a long session). On-by-
 // default: parseArgs defaults --reminder-helper to the sibling script, so a
 // plain install wires it without an opt-in flag.
-const REMINDER_MARKER = 'dashi-channel-reminder-hook'
+const REMINDER_MARKER = 'agent47-channel-reminder-hook'
 // Substring of the dashi helper script path used to identify *markerless*
 // legacy entries — re-running install over a settings file that was
 // hand-edited (no marker but pointing at our post-hook.ts) used to leave
@@ -407,7 +407,7 @@ function warnIfNarrowing(settings: SettingsShape, env: NodeJS.ProcessEnv): void 
   if (!hasWideDashiFeeder(settings)) return
   if (!pluginConsumersEnabled(env)) return
   process.stderr.write(
-    'WARNING: narrowing the dashi-channel hook feeders (dropping the wide ' +
+    'WARNING: narrowing the agent47-channel hook feeders (dropping the wide ' +
       'PreToolUse/PostToolUse `.*` feeder) while the plugin config has ' +
       'status.enabled/progress.enabled=true — those surfaces consume the ' +
       'per-tool event stream and will stop updating per tool call. Disable ' +

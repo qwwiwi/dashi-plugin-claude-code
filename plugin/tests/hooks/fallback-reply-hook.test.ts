@@ -33,7 +33,7 @@ function line(role: 'assistant' | 'user', content: unknown, uuid?: string): stri
 }
 
 const TG_PROMPT = (chatId: string, msgId: number): string =>
-  `<channel source="dashi-channel" source="telegram" chat_id="${chatId}" message_id="${msgId}">hi</channel>`
+  `<channel source="agent47-channel" source="telegram" chat_id="${chatId}" message_id="${msgId}">hi</channel>`
 
 describe('extractLeadingTelegramChatId (FIX 2 + FIX 7)', () => {
   test('extracts chat_id from a leading raw envelope', () => {
@@ -90,7 +90,7 @@ describe('analyzeCurrentTurn', () => {
     const transcript = [
       line('user', TG_PROMPT('1', 10)),
       line('assistant', [{ type: 'text', text: 'answer' }], 'u1'),
-      line('assistant', [{ type: 'tool_use', name: 'mcp__dashi-channel__reply', input: {} }], 'u2'),
+      line('assistant', [{ type: 'tool_use', name: 'mcp__agent47-channel__reply', input: {} }], 'u2'),
     ].join('\n')
     const r = analyzeCurrentTurn(transcript)
     expect(r.replied).toBe(true)
@@ -99,7 +99,7 @@ describe('analyzeCurrentTurn', () => {
   test('edit_message tool_use also counts as replied', () => {
     const transcript = [
       line('user', TG_PROMPT('1', 10)),
-      line('assistant', [{ type: 'tool_use', name: 'mcp__dashi-channel__edit_message', input: {} }], 'u1'),
+      line('assistant', [{ type: 'tool_use', name: 'mcp__agent47-channel__edit_message', input: {} }], 'u1'),
     ].join('\n')
     expect(analyzeCurrentTurn(transcript).replied).toBe(true)
   })
@@ -113,7 +113,7 @@ describe('analyzeCurrentTurn', () => {
       line('assistant', [{ type: 'text', text: 'жду го' }], 'u1'),
       line(
         'assistant',
-        [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'жду го' } }],
+        [{ type: 'tool_use', id: 'tu1', name: 'mcp__agent47-channel__reply', input: { text: 'жду го' } }],
         'u2',
       ),
       line('user', [{ type: 'tool_result', tool_use_id: 'tu1', is_error: true, content: 'ASK_GUARD ...' }]),
@@ -129,7 +129,7 @@ describe('analyzeCurrentTurn', () => {
       line('user', TG_PROMPT('1', 10)),
       line(
         'assistant',
-        [{ type: 'tool_use', id: 'tu2', name: 'mcp__dashi-channel__reply', input: {} }],
+        [{ type: 'tool_use', id: 'tu2', name: 'mcp__agent47-channel__reply', input: {} }],
         'u2',
       ),
       line('user', [{ type: 'tool_result', tool_use_id: 'tu2', content: 'sent' }]),
@@ -141,7 +141,7 @@ describe('analyzeCurrentTurn', () => {
     // No id on the tool_use → can never match an is_error tool_use_id → replied.
     const transcript = [
       line('user', TG_PROMPT('1', 10)),
-      line('assistant', [{ type: 'tool_use', name: 'mcp__dashi-channel__reply', input: {} }], 'u2'),
+      line('assistant', [{ type: 'tool_use', name: 'mcp__agent47-channel__reply', input: {} }], 'u2'),
     ].join('\n')
     expect(analyzeCurrentTurn(transcript).replied).toBe(true)
   })
@@ -151,9 +151,9 @@ describe('analyzeCurrentTurn', () => {
     // agent rephrases and the second reply (tu2) succeeds → owner got an answer.
     const transcript = [
       line('user', TG_PROMPT('1', 10)),
-      line('assistant', [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: {} }], 'u1'),
+      line('assistant', [{ type: 'tool_use', id: 'tu1', name: 'mcp__agent47-channel__reply', input: {} }], 'u1'),
       line('user', [{ type: 'tool_result', tool_use_id: 'tu1', is_error: true, content: 'ASK_GUARD (мандат…): не отправлен' }]),
-      line('assistant', [{ type: 'tool_use', id: 'tu2', name: 'mcp__dashi-channel__reply', input: {} }], 'u2'),
+      line('assistant', [{ type: 'tool_use', id: 'tu2', name: 'mcp__agent47-channel__reply', input: {} }], 'u2'),
       line('user', [{ type: 'tool_result', tool_use_id: 'tu2', content: 'sent' }]),
     ].join('\n')
     expect(analyzeCurrentTurn(transcript).replied).toBe(true)
@@ -170,7 +170,7 @@ describe('analyzeCurrentTurn', () => {
       line('assistant', [{ type: 'text', text: 'вот ответ' }], 'u1'),
       line(
         'assistant',
-        [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'вот ответ' } }],
+        [{ type: 'tool_use', id: 'tu1', name: 'mcp__agent47-channel__reply', input: { text: 'вот ответ' } }],
         'u2',
       ),
       line('user', [{ type: 'tool_result', tool_use_id: 'tu1', is_error: true, content: 'fetch failed: ETIMEDOUT' }]),
@@ -186,7 +186,7 @@ describe('analyzeCurrentTurn', () => {
       line('assistant', [{ type: 'text', text: 'жду го' }], 'u1'),
       line(
         'assistant',
-        [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'жду го' } }],
+        [{ type: 'tool_use', id: 'tu1', name: 'mcp__agent47-channel__reply', input: { text: 'жду го' } }],
         'u2',
       ),
       line('user', [

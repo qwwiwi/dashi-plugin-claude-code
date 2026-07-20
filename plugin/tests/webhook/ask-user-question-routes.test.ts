@@ -51,7 +51,7 @@ function makeMcpStub(): StubMcp {
 }
 
 beforeEach(() => {
-  stateDir = mkdtempSync(join(tmpdir(), 'dashi-channel-aiq-routes-'))
+  stateDir = mkdtempSync(join(tmpdir(), 'agent47-channel-aiq-routes-'))
   delete process.env.TELEGRAM_WEBHOOK_TOKEN
   const env = {
     TELEGRAM_BOT_TOKEN: FAKE_TOKEN,

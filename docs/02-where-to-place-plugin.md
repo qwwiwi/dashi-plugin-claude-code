@@ -152,7 +152,7 @@ User=<service-user>
 WorkingDirectory=/home/<service-user>/.claude-lab/<agent>/.claude/dashi-plugin-claude-code/plugin
 EnvironmentFile=/etc/dashi-plugin/<agent>/channel.env
 ExecStart=/usr/bin/tmux new-session -d -s channel-<agent> \
-  claude --dangerously-load-development-channels server:dashi-channel
+  claude --dangerously-load-development-channels server:agent47-channel
 ```
 
 ### macOS — launchd

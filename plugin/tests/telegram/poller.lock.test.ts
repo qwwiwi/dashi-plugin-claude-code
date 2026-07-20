@@ -22,7 +22,7 @@ let paths: StatePaths
 let config: AppConfig
 
 beforeEach(() => {
-  stateDir = mkdtempSync(join(tmpdir(), 'dashi-channel-poller-lock-'))
+  stateDir = mkdtempSync(join(tmpdir(), 'agent47-channel-poller-lock-'))
   const env = { TELEGRAM_BOT_TOKEN: FAKE_TOKEN, TELEGRAM_STATE_DIR: stateDir }
   config = loadConfig(env)
   paths = getStatePaths(config, {

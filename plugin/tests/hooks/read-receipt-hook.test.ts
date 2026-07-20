@@ -22,13 +22,13 @@ import {
 describe('parseChannelRefs', () => {
   test('extracts telegram chat_id + message_id from raw form', () => {
     const text =
-      '<channel source="dashi-channel" source="telegram" chat_id="164795011" user_id="164795011" ts="x" message_id="28045">hi</channel>'
+      '<channel source="agent47-channel" source="telegram" chat_id="164795011" user_id="164795011" ts="x" message_id="28045">hi</channel>'
     expect(parseChannelRefs(text)).toEqual([{ chat_id: '164795011', message_id: 28045 }])
   })
 
   test('extracts from JSON-escaped transcript form', () => {
     const line =
-      '{"type":"user","message":{"content":"<channel source=\\"dashi-channel\\" source=\\"telegram\\" chat_id=\\"164795011\\" message_id=\\"28049\\">voice</channel>"}}'
+      '{"type":"user","message":{"content":"<channel source=\\"agent47-channel\\" source=\\"telegram\\" chat_id=\\"164795011\\" message_id=\\"28049\\">voice</channel>"}}'
     expect(parseChannelRefs(line)).toEqual([{ chat_id: '164795011', message_id: 28049 }])
   })
 

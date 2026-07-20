@@ -15,7 +15,7 @@ import {
 describe('reminderForChat', () => {
   test('positive (DM) chat id → strict reply-tool reminder', () => {
     const r = reminderForChat('164795011')
-    expect(r).toContain('mcp__dashi-channel__reply')
+    expect(r).toContain('mcp__agent47-channel__reply')
     expect(r).toContain('MUST')
   })
 
@@ -77,7 +77,7 @@ describe('channel-reminder.ts — process contract', () => {
     expect(r.stderr).toBe('')
     const parsed = JSON.parse(r.stdout)
     expect(parsed.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit')
-    expect(parsed.hookSpecificOutput.additionalContext).toContain('mcp__dashi-channel__reply')
+    expect(parsed.hookSpecificOutput.additionalContext).toContain('mcp__agent47-channel__reply')
     expect(r.stdout).not.toContain(secret)
     expect(r.stdout).not.toContain('164795011')
   })
@@ -170,10 +170,10 @@ describe('tovReminder', () => {
 describe('composeReminder', () => {
   test('DM: channel discipline first, then TOV block', async () => {
     const r = await composeReminder({ CHAT_ID: '164795011' })
-    expect(r).toContain('mcp__dashi-channel__reply')
+    expect(r).toContain('mcp__agent47-channel__reply')
     expect(r).toContain('по-русски')
     // Channel reminder precedes the TOV block.
-    expect(r.indexOf('mcp__dashi-channel__reply')).toBeLessThan(r.indexOf('по-русски'))
+    expect(r.indexOf('mcp__agent47-channel__reply')).toBeLessThan(r.indexOf('по-русски'))
   })
 
   test('TOV disabled → only the channel reminder', async () => {
@@ -267,7 +267,7 @@ describe('autonomyReminder (registry injection)', () => {
     ).state
     saveAutonomyState({ root: dir }, '164795011', state)
     const r = await composeReminder({ CHAT_ID: '164795011', TELEGRAM_STATE_DIR: dir })
-    const iChannel = r.indexOf('mcp__dashi-channel__reply')
+    const iChannel = r.indexOf('mcp__agent47-channel__reply')
     const iAutonomy = r.indexOf('Активный мандат L-z')
     const iTov = r.indexOf('по-русски')
     expect(iChannel).toBeLessThan(iAutonomy)

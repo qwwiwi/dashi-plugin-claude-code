@@ -99,7 +99,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
 }
 
 function makeStatePaths(): StatePaths {
-  const root = mkdtempSync(join(tmpdir(), 'dashi-channel-tools-test-'))
+  const root = mkdtempSync(join(tmpdir(), 'agent47-channel-tools-test-'))
   return {
     root,
     env: join(root, '.env'),

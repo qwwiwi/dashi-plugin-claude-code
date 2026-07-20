@@ -8,6 +8,14 @@
 [![Claude Code](https://img.shields.io/badge/Claude_Code-v2.1.80+-d97757.svg)](https://code.claude.com/docs/en/channels-reference)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#license-and-author)
 
+> **This fork:** this is Maximus's fork of
+> [qwwiwi/dashi-plugin-claude-code](https://github.com/qwwiwi/dashi-plugin-claude-code)
+> (`origin` = `Maxidromus-projects/dashi-plugin-claude-code`, `upstream` read-only).
+> The channel plugin's own MCP-server identity was renamed `dashi-channel` →
+> `agent47-channel` — see [CHANGELOG.md § Fork notes](CHANGELOG.md#fork-notes--divergence-from-upstream)
+> for exactly what changed and what was deliberately left alone, so future
+> upstream merges stay easy to reconcile.
+
 **A Telegram → Claude Code channel plugin.** It turns an ordinary, live Claude Code session into a Telegram agent: the bot listens to one or more chats, replies inside the same session, and keeps all the work within your regular Anthropic Max subscription — with no separate SDK billing.
 
 It replaces the deprecated `claude -p` gateway pattern (a Python daemon that spawned a fresh headless session for every message). Cutover deadline — **2026-06-15** (Anthropic is splitting billing; details in section [13](#13-why-migrate--the-2026-06-15-deadline)).
@@ -70,7 +78,7 @@ In parallel, three "progress surfaces" run (fed by hooks, see section 4):
 | `ProgressReporter` | a separate rolling message with activity lines (PreToolUse/PostToolUse/Stop) via `editMessageText` |
 | `TaskMirror` | a third rolling message — milestones from `TodoWrite` / `TaskCreate` / `TaskUpdate` |
 
-Two ways to launch: a standalone Bun process (`bun start`, a quick token check) or production via `claude --dangerously-load-development-channels server:dashi-channel` (Claude Code itself hosts the plugin runtime). See section 12.
+Two ways to launch: a standalone Bun process (`bun start`, a quick token check) or production via `claude --dangerously-load-development-channels server:agent47-channel` (Claude Code itself hosts the plugin runtime). See section 12.
 
 ---
 
@@ -179,10 +187,10 @@ bash plugin/scripts/install-hooks.sh \
   --settings ~/.claude/settings.json \
   --chat-id <your-Telegram-chat-id> \
   --webhook-url http://127.0.0.1:8089/hooks/agent \
-  --agent-id dashi-channel
+  --agent-id agent47-channel
 ```
 
-Idempotent: marker-based replacement (`"dashi-channel-hook"`) — re-running doesn't duplicate entries and cleans up legacy markerless ones. The script installs **five** events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` (for Pre/PostToolUse the matcher is `.*`, i.e. all tool calls).
+Idempotent: marker-based replacement (`"agent47-channel-hook"`) — re-running doesn't duplicate entries and cleans up legacy markerless ones. The script installs **five** events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` (for Pre/PostToolUse the matcher is `.*`, i.e. all tool calls).
 
 ### How it works
 
@@ -483,11 +491,11 @@ $EDITOR ~/.claude-lab/myagent/secrets/channel.env   # TELEGRAM_BOT_TOKEN, TELEGR
 
 # 5. Launch (production variant — Claude Code hosts the runtime)
 set -a; . ~/.claude-lab/myagent/secrets/channel.env; set +a
-claude --dangerously-load-development-channels server:dashi-channel
+claude --dangerously-load-development-channels server:agent47-channel
 
 # 6. MANDATORY — install the hooks (otherwise there's no progress in Telegram)
 bash scripts/install-hooks.sh --settings ~/.claude/settings.json \
-  --chat-id <your-chat-id> --webhook-url http://127.0.0.1:8089/hooks/agent --agent-id dashi-channel
+  --chat-id <your-chat-id> --webhook-url http://127.0.0.1:8089/hooks/agent --agent-id agent47-channel
 
 # 7. Migrating from the old gateway? Run the doctor before AND after cutover
 #    (flag-less on a systemd host — it autodetects the unit/env/session; add
@@ -573,11 +581,11 @@ one Claude Code OAuth login
 |    Type=forking                                                |
 |    tmux -L channel-thrall                                      |
 |      claude session                                            |
-|        --dangerously-load-development-channels server:dashi-channel
+|        --dangerously-load-development-channels server:agent47-channel
 |        workspace: /srv/agents/thrall   (CLAUDE.md = identity)  |
 |        plugin: /srv/agents/thrall/.claude/dashi-plugin-claude-code/plugin
 |        env: /etc/dashi-plugin/thrall/channel.env               |
-|        state: /var/lib/dashi-channel/thrall                    |
+|        state: /var/lib/agent47-channel/thrall                    |
 |        Telegram bot token A · TELEGRAM_WEBHOOK_PORT=8089       |
 |        getUpdates poller A                                     |
 |                                                                |
@@ -588,7 +596,7 @@ one Claude Code OAuth login
 |        workspace: /srv/agents/arthas   (CLAUDE.md = identity)  |
 |        plugin: /srv/agents/arthas/.claude/dashi-plugin-claude-code/plugin
 |        env: /etc/dashi-plugin/arthas/channel.env               |
-|        state: /var/lib/dashi-channel/arthas                    |
+|        state: /var/lib/agent47-channel/arthas                    |
 |        Telegram bot token B · TELEGRAM_WEBHOOK_PORT=8090       |
 |        getUpdates poller B                                     |
 +----------------------------------------------------------------+
@@ -603,7 +611,7 @@ TELEGRAM_ALLOWED_USER_IDS=<your numeric id>
 TELEGRAM_ALLOWED_CHAT_IDS=<your numeric id>
 TELEGRAM_WORKSPACE_ROOT=/srv/agents/arthas
 AGENT_ID=arthas
-TELEGRAM_STATE_DIR=/var/lib/dashi-channel/arthas
+TELEGRAM_STATE_DIR=/var/lib/agent47-channel/arthas
 TELEGRAM_WEBHOOK_HOST=127.0.0.1
 TELEGRAM_WEBHOOK_PORT=8090
 TELEGRAM_WEBHOOK_TOKEN=<random hex>
@@ -646,7 +654,7 @@ Use a confirm loop instead: capture the pane every 3 seconds, send Enter only wh
 # /usr/local/bin/channel-confirm-arthas.sh
 for i in $(seq 1 30); do
   pane="$(tmux -L channel-arthas capture-pane -pt channel-arthas 2>/dev/null || true)"
-  if printf '%s' "$pane" | grep -q 'messages from server:dashi-channel inject\|Listening for channel messages'; then
+  if printf '%s' "$pane" | grep -q 'messages from server:agent47-channel inject\|Listening for channel messages'; then
     exit 0
   fi
   if printf '%s' "$pane" | grep -q 'Enter to confirm\|I am using this for local development\|Do you trust'; then
@@ -705,7 +713,7 @@ Assume an existing single-agent install and a new agent named `arthas`.
 ```bash
 export AGENT=arthas
 export WORKSPACE=/srv/agents/$AGENT
-export STATE_DIR=/var/lib/dashi-channel/$AGENT
+export STATE_DIR=/var/lib/agent47-channel/$AGENT
 export PORT=8090
 
 mkdir -p "$WORKSPACE/.claude" "$STATE_DIR"
@@ -752,7 +760,7 @@ bash scripts/install-hooks.sh \
 
 ```ini
 [Unit]
-Description=Dashi Channel agent arthas
+Description=Agent47 Channel agent arthas
 After=network-online.target
 Requires=network-online.target
 
@@ -763,7 +771,7 @@ Environment=HOME=/home/<service-user>
 Environment=PATH=/home/<service-user>/.bun/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=/srv/agents/arthas/.claude/dashi-plugin-claude-code/plugin
 EnvironmentFile=/etc/dashi-plugin/arthas/channel.env
-ExecStart=/usr/bin/tmux -L channel-arthas new-session -d -s channel-arthas 'claude --dangerously-load-development-channels server:dashi-channel'
+ExecStart=/usr/bin/tmux -L channel-arthas new-session -d -s channel-arthas 'claude --dangerously-load-development-channels server:agent47-channel'
 ExecStartPost=/usr/local/bin/channel-confirm-arthas.sh
 ExecStop=/usr/bin/tmux -L channel-arthas kill-session -t channel-arthas
 Restart=on-failure

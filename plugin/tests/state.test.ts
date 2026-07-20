@@ -18,7 +18,7 @@ let paths: StatePaths
 const FAKE_TOKEN = '123456789:AAH-fake_test_token_with_at_least_thirty_chars'
 
 beforeEach(() => {
-  stateDir = mkdtempSync(join(tmpdir(), 'dashi-channel-state-'))
+  stateDir = mkdtempSync(join(tmpdir(), 'agent47-channel-state-'))
   const env = { TELEGRAM_BOT_TOKEN: FAKE_TOKEN, TELEGRAM_STATE_DIR: stateDir }
   const cfg = loadConfig(env)
   paths = getStatePaths(cfg, {

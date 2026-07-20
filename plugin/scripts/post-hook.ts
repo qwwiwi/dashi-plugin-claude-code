@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// post-hook.ts — Claude Code hook → dashi-channel webhook proxy.
+// post-hook.ts — Claude Code hook → agent47-channel webhook proxy.
 //
 // Reads a Claude hook JSON envelope from stdin and POSTs it (with the chat
 // id and bearer token from env) to the plugin's `/hooks/agent` endpoint.

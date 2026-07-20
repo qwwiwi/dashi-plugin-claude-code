@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // Forked from anthropics/claude-plugins-official/external_plugins/telegram (MIT).
-// Composition root for the dashi-channel MCP server.
+// Composition root for the agent47-channel MCP server.
 //
 // T3 split the monolithic plugin/server.ts into focused modules under src/.
 // This file wires them: env→config→state→telegram→mcp. Inbound message
@@ -303,7 +303,7 @@ if (env.GROQ_API_KEY) {
   logSecrets.push(env.GROQ_API_KEY)
   crashSecrets.push(env.GROQ_API_KEY)
 }
-const log = createLogger('dashi-channel', { secrets: logSecrets })
+const log = createLogger('agent47-channel', { secrets: logSecrets })
 
 // Lock down the env file to owner-only after we've read it.
 try {
@@ -480,7 +480,7 @@ const telegramApi = createReliableTelegramApi(safeTelegramApi, log, {
 const mcp = new Server(
   // Single version source: package.json (kept in lockstep with the repo-root
   // .claude-plugin/plugin.json by tests/version-sync.test.ts).
-  { name: 'dashi-channel', version: pkg.version },
+  { name: 'agent47-channel', version: pkg.version },
   {
     capabilities: {
       tools: {},

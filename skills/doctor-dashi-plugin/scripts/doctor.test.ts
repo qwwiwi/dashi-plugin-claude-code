@@ -152,11 +152,11 @@ describe('findEnclosingClaudeMd / workspace placement', () => {
 describe('checkSettingsHooks', () => {
   const good = {
     hooks: {
-      SessionStart: [hookEntry('dashi-channel-hook')],
-      UserPromptSubmit: [hookEntry('dashi-channel-hook')],
-      PreToolUse: [{ ...hookEntry('dashi-channel-hook'), matcher: '.*' }],
-      PostToolUse: [{ ...hookEntry('dashi-channel-hook'), matcher: '.*' }],
-      Stop: [hookEntry('dashi-channel-hook'), hookEntry('dashi-channel-fallback-reply')],
+      SessionStart: [hookEntry('agent47-channel-hook')],
+      UserPromptSubmit: [hookEntry('agent47-channel-hook')],
+      PreToolUse: [{ ...hookEntry('agent47-channel-hook'), matcher: '.*' }],
+      PostToolUse: [{ ...hookEntry('agent47-channel-hook'), matcher: '.*' }],
+      Stop: [hookEntry('agent47-channel-hook'), hookEntry('agent47-channel-fallback-reply')],
     },
   }
 
@@ -177,7 +177,7 @@ describe('checkSettingsHooks', () => {
   })
 
   test('marker present but NO command → warn (hook would never fire)', () => {
-    const markerOnly = { hooks: { ...good.hooks, Stop: [{ marker: 'dashi-channel-hook' }, hookEntry('dashi-channel-fallback-reply')] } }
+    const markerOnly = { hooks: { ...good.hooks, Stop: [{ marker: 'agent47-channel-hook' }, hookEntry('agent47-channel-fallback-reply')] } }
     const stop = checkSettingsHooks(markerOnly).find((c) => c.id === 'hook-Stop')
     expect(stop?.status).toBe('warn')
     expect(stop?.detail).toContain('no runnable command')
@@ -201,7 +201,7 @@ describe('checkSettingsHooks', () => {
         ...good.hooks,
         Stop: [
           {
-            marker: 'dashi-channel-hook',
+            marker: 'agent47-channel-hook',
             hooks: [
               {
                 type: 'command',
@@ -210,7 +210,7 @@ describe('checkSettingsHooks', () => {
               },
             ],
           },
-          hookEntry('dashi-channel-fallback-reply'),
+          hookEntry('agent47-channel-fallback-reply'),
         ],
       },
     }
@@ -223,7 +223,7 @@ describe('checkSettingsHooks', () => {
         ...good.hooks,
         Stop: [
           {
-            marker: 'dashi-channel-hook',
+            marker: 'agent47-channel-hook',
             hooks: [
               {
                 type: 'command',
@@ -238,7 +238,7 @@ describe('checkSettingsHooks', () => {
   })
 
   test('no fallback hook → warn', () => {
-    const noFallback = { hooks: { ...good.hooks, Stop: [hookEntry('dashi-channel-hook')] } }
+    const noFallback = { hooks: { ...good.hooks, Stop: [hookEntry('agent47-channel-hook')] } }
     expect(checkSettingsHooks(noFallback).find((c) => c.id === 'fallback-reply-hook')?.status).toBe('warn')
   })
 })
@@ -251,7 +251,7 @@ describe('checkPermissionGate', () => {
   }
 
   test('no gate hook → skip (optional feature off)', () => {
-    const checks = checkPermissionGate({ hooks: { PreToolUse: [hookEntry('dashi-channel-hook')] } })
+    const checks = checkPermissionGate({ hooks: { PreToolUse: [hookEntry('agent47-channel-hook')] } })
     expect(checks).toHaveLength(1)
     expect(checks[0]!.status).toBe('skip')
   })
@@ -259,7 +259,7 @@ describe('checkPermissionGate', () => {
   test('gate registered + bypassPermissions → pass on both', () => {
     const checks = checkPermissionGate({
       permissions: { defaultMode: 'bypassPermissions' },
-      hooks: { PreToolUse: [gateEntry, hookEntry('dashi-channel-hook')] },
+      hooks: { PreToolUse: [gateEntry, hookEntry('agent47-channel-hook')] },
     })
     const byId = Object.fromEntries(checks.map((c) => [c.id, c.status]))
     expect(byId['permission-gate']).toBe('pass')
@@ -296,28 +296,28 @@ describe('checkPermissionGate', () => {
 
 describe('checkCommsConsistency — the latent silent-channel landmine', () => {
   test('enableAllProjectMcpServers=true covers everything', () => {
-    const mcp = { mcpServers: { 'dashi-channel': {}, 'dashi-gbrain-swarm': {} } }
+    const mcp = { mcpServers: { 'agent47-channel': {}, 'dashi-gbrain-swarm': {} } }
     const sl = { enableAllProjectMcpServers: true }
     expect(checkCommsConsistency(mcp, sl).status).toBe('pass')
   })
   test('false + missing server → FAIL (dropped on next restart)', () => {
-    const mcp = { mcpServers: { 'dashi-channel': {}, 'dashi-gbrain-swarm': {} } }
+    const mcp = { mcpServers: { 'agent47-channel': {}, 'dashi-gbrain-swarm': {} } }
     const sl = { enableAllProjectMcpServers: false, enabledMcpjsonServers: ['dashi-gbrain-swarm'] }
     const c = checkCommsConsistency(mcp, sl)
     expect(c.status).toBe('fail')
-    expect(c.detail).toContain('dashi-channel')
+    expect(c.detail).toContain('agent47-channel')
   })
   test('false + all listed → pass', () => {
-    const mcp = { mcpServers: { 'dashi-channel': {} } }
-    const sl = { enableAllProjectMcpServers: false, enabledMcpjsonServers: ['dashi-channel'] }
+    const mcp = { mcpServers: { 'agent47-channel': {} } }
+    const sl = { enableAllProjectMcpServers: false, enabledMcpjsonServers: ['agent47-channel'] }
     expect(checkCommsConsistency(mcp, sl).status).toBe('pass')
   })
   test('no servers declared → skip', () => {
     expect(checkCommsConsistency({ mcpServers: {} }, {}).status).toBe('skip')
   })
   test('malformed enabledMcpjsonServers (object, not array) → fail, no crash', () => {
-    const mcp = { mcpServers: { 'dashi-channel': {} } }
-    const sl = { enableAllProjectMcpServers: false, enabledMcpjsonServers: { 'dashi-channel': true } }
+    const mcp = { mcpServers: { 'agent47-channel': {} } }
+    const sl = { enableAllProjectMcpServers: false, enabledMcpjsonServers: { 'agent47-channel': true } }
     expect(checkCommsConsistency(mcp, sl).status).toBe('fail')
   })
 })
@@ -385,7 +385,7 @@ describe('live-session signal detectors', () => {
     expect(detectWelcomeHang(busy)).toBe(false)
   })
   test('detectListening confirms the live marker', () => {
-    expect(detectListening('Listening for channel messages from: server:dashi-channel')).toBe(true)
+    expect(detectListening('Listening for channel messages from: server:agent47-channel')).toBe(true)
     expect(detectListening('turn line 5')).toBe(false)
   })
   test('auth expired only on line-anchored login/401', () => {
@@ -442,7 +442,7 @@ describe('fleet (multi-agent) checks', () => {
     envReadable: true,
     port: '8089',
     tokenDigest: 'digest-a',
-    stateDir: '/var/lib/dashi-channel/a',
+    stateDir: '/var/lib/agent47-channel/a',
     workspaceRoot: '/srv/agents/a',
     webhookEnabled: true,
     hookPorts: ['8089'],
@@ -530,7 +530,7 @@ describe('fleet (multi-agent) checks', () => {
   })
 
   test('channel hooks in the shared settings = fail', () => {
-    const shared = JSON.stringify({ hooks: { Stop: [{ marker: 'dashi-channel-hook', hooks: [{ command: 'bun post-hook.ts' }] }] } })
+    const shared = JSON.stringify({ hooks: { Stop: [{ marker: 'agent47-channel-hook', hooks: [{ command: 'bun post-hook.ts' }] }] } })
     const checks = byId(checkFleet([agent({})], shared))
     expect(checks['fleet-shared-settings']?.status).toBe('fail')
   })
@@ -588,7 +588,7 @@ describe('fleet checks — review fixes (Codex HOLD round)', () => {
     envReadable: true,
     port: '8089',
     tokenDigest: 'digest-a',
-    stateDir: '/var/lib/dashi-channel/a',
+    stateDir: '/var/lib/agent47-channel/a',
     workspaceRoot: '/srv/agents/a',
     webhookEnabled: true,
     hookPorts: ['8089'],
@@ -697,7 +697,7 @@ describe('selectHookProfile', () => {
 
 describe('checkSettingsHooks — profile aware', () => {
   const stopOnly = {
-    hooks: { Stop: [hookEntry('dashi-channel-hook')] },
+    hooks: { Stop: [hookEntry('agent47-channel-hook')] },
   }
   test('mirror profile: Stop-only settings produce ZERO feeder warns', () => {
     const checks = checkSettingsHooks(stopOnly, 'mirror')
@@ -844,7 +844,7 @@ describe('checkEnvFileMode — the token file must be private', () => {
 
 describe('checkSharedSettingsClean — invariant a outside --fleet', () => {
   test('channel markers in the user-level file → FAIL', () => {
-    const c = checkSharedSettingsClean('{"hooks":{"Stop":[{"marker":"dashi-channel-hook"}]}}', false)
+    const c = checkSharedSettingsClean('{"hooks":{"Stop":[{"marker":"agent47-channel-hook"}]}}', false)
     expect(c.status).toBe('fail')
   })
   test('clean user-level file → pass; missing file → pass', () => {
@@ -852,7 +852,7 @@ describe('checkSharedSettingsClean — invariant a outside --fleet', () => {
     expect(checkSharedSettingsClean(null, false).status).toBe('pass')
   })
   test('user-level file IS the inspected file → skip (legacy layout)', () => {
-    expect(checkSharedSettingsClean('{"hooks":{"Stop":[{"marker":"dashi-channel-hook"}]}}', true).status).toBe('skip')
+    expect(checkSharedSettingsClean('{"hooks":{"Stop":[{"marker":"agent47-channel-hook"}]}}', true).status).toBe('skip')
   })
 })
 
@@ -958,7 +958,7 @@ describe('parseUnitFile — autodetect fields', () => {
     '[Service]',
     'EnvironmentFile=/srv/thrall/private/channel.env',
     'WorkingDirectory=/srv/thrall/.claude/jc/plugin',
-    `ExecStart=/usr/bin/tmux -L channel-thrall new-session -d -s channel-thrall 'claude --model fable --permission-mode bypassPermissions server:dashi-channel'`,
+    `ExecStart=/usr/bin/tmux -L channel-thrall new-session -d -s channel-thrall 'claude --model fable --permission-mode bypassPermissions server:agent47-channel'`,
     `ExecStop=/usr/bin/tmux -L channel-thrall kill-session -t channel-thrall`,
   ].join('\n')
   test('reads WorkingDirectory, session name and bypassPermissions', () => {
@@ -1052,7 +1052,7 @@ describe('review fixes — bind, env mode, mirror, stop hook, envValue, redact',
     expect(checkMultichatMirror([{ id: '164795011', mode: null, tmuxMirror: true }]).status).toBe('pass') // positive id = DM
   })
   test('mirror profile: fallback-only Stop does NOT satisfy the primary Stop hook (Codex M)', () => {
-    const fallbackOnly = { hooks: { Stop: [hookEntry('dashi-channel-fallback-reply')] } }
+    const fallbackOnly = { hooks: { Stop: [hookEntry('agent47-channel-fallback-reply')] } }
     const c = checkSettingsHooks(fallbackOnly, 'mirror').find((x) => x.id === 'hook-Stop')
     expect(c?.status).toBe('warn')
     expect(c?.detail).toContain('fallback')
@@ -1068,7 +1068,7 @@ describe('review fixes — bind, env mode, mirror, stop hook, envValue, redact',
   })
   test('shared-settings markers: generic post-hook.ts alone no longer FAILS (review L2)', () => {
     expect(checkSharedSettingsClean('{"hooks":{"Stop":[{"command":"bun my-post-hook.ts"}]}}', false).status).toBe('pass')
-    expect(checkSharedSettingsClean('{"hooks":{"Stop":[{"marker":"dashi-channel-fallback-reply"}]}}', false).status).toBe('fail')
+    expect(checkSharedSettingsClean('{"hooks":{"Stop":[{"marker":"agent47-channel-fallback-reply"}]}}', false).status).toBe('fail')
   })
   test('spawn-chat-shell: TMUX_PANE only in a comment does NOT pass (Codex M)', () => {
     expect(checkSpawnChatShell('# we forward TMUX_PANE here\nenv -i bash').status).toBe('fail')
@@ -1117,7 +1117,7 @@ describe('extractChatPolicies — bleed hardening (review M2)', () => {
 // ---------------------------------------------------------------------------
 
 describe('checkPermissionGate — incident lock (no gate under bypass = FAIL, not skip)', () => {
-  const settingsNoGate = { hooks: { PreToolUse: [hookEntry('dashi-channel-hook')] } }
+  const settingsNoGate = { hooks: { PreToolUse: [hookEntry('agent47-channel-hook')] } }
 
   test('no gate hook BUT unit runs bypassPermissions → FAIL (the Silvana incident)', () => {
     const checks = checkPermissionGate(settingsNoGate, existsSync0, /*unitBypass*/ true)
@@ -1233,7 +1233,7 @@ describe('fleet — Arthas-style bypass unit is detected as bypassPermissions:tr
       '[Service]',
       'EnvironmentFile=/srv/arthas/private/channel.env',
       'WorkingDirectory=/srv/arthas/.claude/jc/plugin',
-      `ExecStart=/usr/bin/tmux -L channel-arthas new-session -d -s channel-arthas 'claude --model sonnet --permission-mode bypassPermissions server:dashi-channel'`,
+      `ExecStart=/usr/bin/tmux -L channel-arthas new-session -d -s channel-arthas 'claude --model sonnet --permission-mode bypassPermissions server:agent47-channel'`,
     ].join('\n')
     expect(parseUnitFile(unit).bypassPermissions).toBe(true)
   })

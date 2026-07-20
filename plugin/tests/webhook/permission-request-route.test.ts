@@ -25,7 +25,7 @@ let baseConfig: AppConfig
 let handle: WebhookServerHandle | null
 
 beforeEach(() => {
-  stateDir = mkdtempSync(join(tmpdir(), 'dashi-channel-pgate-routes-'))
+  stateDir = mkdtempSync(join(tmpdir(), 'agent47-channel-pgate-routes-'))
   process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
   const env = { TELEGRAM_BOT_TOKEN: FAKE_TOKEN, TELEGRAM_STATE_DIR: stateDir }
   baseConfig = loadConfig(env)

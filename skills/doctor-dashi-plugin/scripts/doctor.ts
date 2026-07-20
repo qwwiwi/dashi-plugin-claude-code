@@ -50,14 +50,14 @@ export const REQUIRED_HOOK_EVENTS = [
   'Stop',
 ] as const
 
-export const HOOK_MARKER = 'dashi-channel-hook'
-export const FALLBACK_MARKER = 'dashi-channel-fallback-reply'
+export const HOOK_MARKER = 'agent47-channel-hook'
+export const FALLBACK_MARKER = 'agent47-channel-fallback-reply'
 // Permission-gate PreToolUse hook marker (2026-06-09). Written by
 // patch-claude-settings.ts when --permission-gate-helper is given.
 export const GATE_MARKER = 'dashi-permission-gate-hook'
 // AskUserQuestion relay hook — pairs with the gate so questions reach Telegram.
 export const ASK_MARKER = 'dashi-ask-user-question-hook'
-export const LIVE_MARKER = 'Listening for channel messages from: server:dashi-channel'
+export const LIVE_MARKER = 'Listening for channel messages from: server:agent47-channel'
 
 /**
  * Hook profile (2026-06-09). The 5-event feeder set is only REQUIRED when a
@@ -923,7 +923,7 @@ export function checkEnvFileMode(mode: number | null, path: string): Check {
 
 // Dashi-specific markers only: generic filenames like `post-hook.ts` belong
 // to anybody and made an unrelated tool's hook a hard FAIL (review L2).
-const CHANNEL_HOOK_MARKERS_RE = /dashi-channel-hook|dashi-permission-gate-hook|dashi-ask-user-question-hook|dashi-channel-fallback-reply/
+const CHANNEL_HOOK_MARKERS_RE = /agent47-channel-hook|dashi-permission-gate-hook|dashi-ask-user-question-hook|agent47-channel-fallback-reply/
 
 /**
  * Channel hooks in the USER-level ~/.claude/settings.json fire in EVERY

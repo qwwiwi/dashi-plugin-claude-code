@@ -33,7 +33,7 @@ export type SegmentType =
 // Render mode: `full_pane` keeps all non-hidden segments as today.
 // `latest_inbound_only` (introduced 2026-05-22 for the iPhone mirror)
 // anchors on the last inbound preview line that Claude Code emits when
-// the dashi-channel MCP pushes a notification (`← <channel>: …`). All
+// the agent47-channel MCP pushes a notification (`← <channel>: …`). All
 // segments before AND the anchor itself are dropped — only what came
 // AFTER the warchief's last message remains. If no preview is present
 // (fresh session) the mode degrades to `full_pane`.
@@ -135,9 +135,9 @@ const FOOTER_LINE_RES: readonly RegExp[] = [
 // ─── Input box + inbound-preview anchors ────────────────────────────
 
 // Inbound preview: Claude Code emits one such line when an MCP channel
-// (e.g. dashi-channel) pushes a notification mid-session — `← <name>:
+// (e.g. agent47-channel) pushes a notification mid-session — `← <name>:
 // <preview>`. The arrow is U+2190; the channel name is a kebab-case
-// identifier in our world (`dashi-channel`, `orgrimmar-inbox`, etc.).
+// identifier in our world (`agent47-channel`, `orgrimmar-inbox`, etc.).
 //
 // Codex review 2026-05-22 flagged the earlier `\S+:` form as too loose
 // — a tool that prints «← github: issue title» at column zero would

@@ -50,7 +50,7 @@ done
 URL="${TELEGRAM_WEBHOOK_URL:-}"
 TOKEN="${TELEGRAM_WEBHOOK_TOKEN:-}"
 CHAT="${TELEGRAM_HOOK_CHAT_ID:-}"
-AGENT="${TELEGRAM_HOOK_AGENT_ID:-dashi-channel}"
+AGENT="${TELEGRAM_HOOK_AGENT_ID:-agent47-channel}"
 HELPER_DEFAULT="$(cd "$(dirname "$0")" && pwd)/post-hook.ts"
 HELPER="${POST_HOOK_HELPER:-$HELPER_DEFAULT}"
 
@@ -200,13 +200,13 @@ fi
 
 SETTINGS="${CLAUDE_SETTINGS_FILE:-$HOME/.claude-lab/thrall/.claude/settings.json}"
 if [ -f "$SETTINGS" ]; then
-  has_marker=$(grep -c '"marker": "dashi-channel-hook"' "$SETTINGS" 2>/dev/null || echo 0)
+  has_marker=$(grep -c '"marker": "agent47-channel-hook"' "$SETTINGS" 2>/dev/null || echo 0)
   if [ "$has_marker" -ge 5 ]; then
     record "settings.json hooks installed" "ok" "$has_marker entries"
   elif [ "$has_marker" -gt 0 ]; then
     record "settings.json hooks installed" "warn" "$has_marker / 5 entries"
   else
-    record "settings.json hooks installed" "fail" "no dashi-channel-hook marker -- run install-hooks.sh"
+    record "settings.json hooks installed" "fail" "no agent47-channel-hook marker -- run install-hooks.sh"
   fi
 else
   record "settings.json hooks installed" "skip" "$SETTINGS not found"

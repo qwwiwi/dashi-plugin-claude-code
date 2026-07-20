@@ -434,9 +434,9 @@ describe('TmuxMirror — latest_inbound_only (default)', () => {
     const stub = makeStubApi()
     const pane = [
       '● Old turn from yesterday',
-      '← dashi-channel: stale-voice-1',
+      '← agent47-channel: stale-voice-1',
       '● Reply to stale voice 1',
-      '← dashi-channel: latest-voice',
+      '← agent47-channel: latest-voice',
       '● Live agent activity after the warchief\'s last message',
     ].join('\n')
     const exec = makeExec([ok(pane)])
@@ -465,7 +465,7 @@ describe('TmuxMirror — latest_inbound_only (default)', () => {
     const stub = makeStubApi()
     const pane = [
       '● Old turn',
-      '← dashi-channel: preview',
+      '← agent47-channel: preview',
       '● New turn',
     ].join('\n')
     const exec = makeExec([ok(pane)])

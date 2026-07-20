@@ -44,7 +44,7 @@ function runInstall(extraArgs: string[] = []): { code: number; stderr: string } 
       '--settings', settings,
       '--chat-id', '164795011',
       '--webhook-url', 'http://127.0.0.1:8089/hooks/agent',
-      '--agent-id', 'dashi-channel',
+      '--agent-id', 'agent47-channel',
       ...extraArgs,
     ],
     { encoding: 'utf8', env: { ...process.env, PATH: pathPrefix } },
@@ -67,7 +67,7 @@ describe('install-hooks.sh — fresh settings file', () => {
     expect(hooks.PreToolUse).toBeUndefined()
     expect(flat).toContain(POST_HOOK)
     expect(flat).toContain("TELEGRAM_HOOK_CHAT_ID='164795011'")
-    expect(flat).toContain("TELEGRAM_HOOK_AGENT_ID='dashi-channel'")
+    expect(flat).toContain("TELEGRAM_HOOK_AGENT_ID='agent47-channel'")
   })
 
   test('never writes TELEGRAM_WEBHOOK_TOKEN', () => {
@@ -104,7 +104,7 @@ describe('install-hooks.sh — URL validation (L3)', () => {
         '--settings', settings,
         '--chat-id', '164795011',
         '--webhook-url', badUrl,
-        '--agent-id', 'dashi-channel',
+        '--agent-id', 'agent47-channel',
       ],
       { encoding: 'utf8', env: { ...process.env, PATH: pathPrefix } },
     )
@@ -166,13 +166,13 @@ describe('install-hooks.sh — idempotency', () => {
     // our feeder, it survives ALONE on PreToolUse.
     const preToolUse = parsed.hooks?.PreToolUse ?? []
     const others = preToolUse.filter((e) => e.marker === 'someone-else')
-    const ours = preToolUse.filter((e) => e.marker === 'dashi-channel-hook')
+    const ours = preToolUse.filter((e) => e.marker === 'agent47-channel-hook')
     expect(others.length).toBe(1)
     expect(ours.length).toBe(0) // narrow set: no PreToolUse feeder
     expect(others[0]!.hooks?.[0]?.command).toBe('echo unrelated')
     // Our feeder still lands on the narrow events (e.g. Stop).
     const stop = parsed.hooks?.Stop ?? []
-    expect(stop.some((e) => e.marker === 'dashi-channel-hook')).toBe(true)
+    expect(stop.some((e) => e.marker === 'agent47-channel-hook')).toBe(true)
   })
 })
 
@@ -187,7 +187,7 @@ describe('patchSettingsFile — writeAtomic same-dir staging (regression)', () =
       helperPath: '/abs/post-hook.ts',
     })
     const entries = readFileSync(target, 'utf8')
-    expect(entries).toContain('dashi-channel-hook')
+    expect(entries).toContain('agent47-channel-hook')
     // No leftover *.tmp.* staging file (would imply rename failed silently
     // or temp lived in a different dir).
     const { readdirSync } = await import('fs')
@@ -273,7 +273,7 @@ describe('applyPatch (pure)', () => {
     // Stop is a feeder event: the legacy entry is replaced by our marked one.
     const stop = out.hooks.Stop ?? []
     expect(stop.length).toBe(1)
-    expect(stop[0]!.marker).toBe('dashi-channel-hook')
+    expect(stop[0]!.marker).toBe('agent47-channel-hook')
     expect(stop[0]!.hooks?.[0]?.command).toContain('/new/plugin/scripts/post-hook.ts')
     expect(stop.find((e) => e.hooks?.[0]?.command === legacyCmd)).toBeUndefined()
     // PreToolUse is NOT a feeder event: the legacy entry is stripped and, with
@@ -281,7 +281,7 @@ describe('applyPatch (pure)', () => {
     expect(out.hooks.PreToolUse).toBeUndefined()
   })
 
-  test('replaces previous dashi-channel-hook entry rather than appending', () => {
+  test('replaces previous agent47-channel-hook entry rather than appending', () => {
     let s: Record<string, unknown> = {}
     s = applyPatch(s, {
       settingsPath: '/tmp/x',
@@ -297,7 +297,7 @@ describe('applyPatch (pure)', () => {
     })
     const hooks = (s as { hooks?: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }).hooks
     const stop = hooks?.Stop ?? []
-    const ours = stop.filter((e) => e.marker === 'dashi-channel-hook')
+    const ours = stop.filter((e) => e.marker === 'agent47-channel-hook')
     expect(ours.length).toBe(1)
     expect(ours[0]!.hooks?.[0]?.command).toContain('http://new')
     expect(ours[0]!.hooks?.[0]?.command).not.toContain('http://old')
@@ -321,7 +321,7 @@ describe('applyPatch (pure)', () => {
     // Hands the bare origin (no /hooks/agent path) to the gate hook.
     expect(pre[0]!.hooks?.[0]?.command).toContain("TELEGRAM_WEBHOOK_URL='http://127.0.0.1:8093'")
     expect(pre[0]!.hooks?.[0]?.command).not.toContain('/hooks/agent')
-    expect(pre.some((e) => e.marker === 'dashi-channel-hook')).toBe(false)
+    expect(pre.some((e) => e.marker === 'agent47-channel-hook')).toBe(false)
     // No gate entry leaks onto other events.
     for (const ev of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'SessionEnd', 'Stop']) {
       expect((out.hooks[ev] ?? []).some((e) => e.marker === 'dashi-permission-gate-hook')).toBe(false)
@@ -373,7 +373,7 @@ function countPluginEntries(parsed: Record<string, unknown>): number {
   let total = 0
   for (const arr of Object.values(hooks)) {
     if (!Array.isArray(arr)) continue
-    total += arr.filter((e) => e?.marker === 'dashi-channel-hook').length
+    total += arr.filter((e) => e?.marker === 'agent47-channel-hook').length
   }
   return total
 }
@@ -388,13 +388,13 @@ describe('applyPatch (pure) — channel reminder', () => {
       reminderHelperPath: '/p/scripts/channel-reminder.ts',
     }) as { hooks: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }
     const ups = out.hooks.UserPromptSubmit ?? []
-    const reminder = ups.find((e) => e.marker === 'dashi-channel-reminder-hook')
+    const reminder = ups.find((e) => e.marker === 'agent47-channel-reminder-hook')
     expect(reminder).toBeDefined()
     expect(reminder!.hooks?.[0]?.command).toContain('channel-reminder.ts')
     expect(reminder!.hooks?.[0]?.command).toContain("CHAT_ID='164795011'")
     // Reminder must NOT appear on other events.
     for (const ev of ['SessionStart', 'PreToolUse', 'PostToolUse', 'Stop']) {
-      expect((out.hooks[ev] ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')).toBeUndefined()
+      expect((out.hooks[ev] ?? []).find((e) => e.marker === 'agent47-channel-reminder-hook')).toBeUndefined()
     }
   })
 
@@ -405,7 +405,7 @@ describe('applyPatch (pure) — channel reminder', () => {
       webhookUrl: 'http://x',
       helperPath: '/p/post-hook.ts',
     }) as { hooks: Record<string, Array<{ marker?: string }>> }
-    expect((out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')).toBeUndefined()
+    expect((out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'agent47-channel-reminder-hook')).toBeUndefined()
   })
 
   test('bakes the resolved state root into the reminder command (fix-loop #5)', () => {
@@ -417,7 +417,7 @@ describe('applyPatch (pure) — channel reminder', () => {
       reminderHelperPath: '/p/scripts/channel-reminder.ts',
       reminderStateDir: '/home/u/.claude/channels/dashi-telegram-canary',
     }) as { hooks: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }
-    const reminder = (out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')
+    const reminder = (out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'agent47-channel-reminder-hook')
     const cmd = reminder!.hooks?.[0]?.command ?? ''
     // Inline env assignment survives env -i multichat spawns and default
     // installs where TELEGRAM_STATE_DIR is never exported.
@@ -435,7 +435,7 @@ describe('applyPatch (pure) — channel reminder', () => {
       helperPath: '/p/post-hook.ts',
       reminderHelperPath: '/p/channel-reminder.ts',
     }) as { hooks: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }
-    const reminder = (out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')
+    const reminder = (out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'agent47-channel-reminder-hook')
     expect(reminder!.hooks?.[0]?.command).not.toContain('TELEGRAM_STATE_DIR=')
   })
 
@@ -447,7 +447,7 @@ describe('applyPatch (pure) — channel reminder', () => {
     let s: Record<string, unknown> = applyPatch({}, opts)
     s = applyPatch(s, opts)
     const ups = (s as { hooks: Record<string, Array<{ marker?: string }>> }).hooks.UserPromptSubmit ?? []
-    expect(ups.filter((e) => e.marker === 'dashi-channel-reminder-hook').length).toBe(1)
+    expect(ups.filter((e) => e.marker === 'agent47-channel-reminder-hook').length).toBe(1)
   })
 })
 
@@ -462,7 +462,7 @@ describe('hasWideDashiFeeder', () => {
       hasWideDashiFeeder({
         hooks: {
           PreToolUse: [
-            { marker: 'dashi-channel-hook', matcher: '.*', hooks: [{ type: 'command', command: 'bun post-hook.ts' }] },
+            { marker: 'agent47-channel-hook', matcher: '.*', hooks: [{ type: 'command', command: 'bun post-hook.ts' }] },
           ],
         },
       }),
@@ -475,7 +475,7 @@ describe('hasWideDashiFeeder', () => {
       hasWideDashiFeeder({
         hooks: {
           PostToolUse: [
-            { marker: 'dashi-channel-hook', matcher: '.*', hooks: [{ type: 'command', command: 'x' }] },
+            { marker: 'agent47-channel-hook', matcher: '.*', hooks: [{ type: 'command', command: 'x' }] },
           ],
         },
       }),
@@ -499,7 +499,7 @@ describe('hasWideDashiFeeder', () => {
         hooks: {
           PostToolUse: [
             {
-              marker: 'dashi-channel-hook',
+              marker: 'agent47-channel-hook',
               matcher: 'TaskCreate|TaskUpdate|TodoWrite',
               hooks: [{ type: 'command', command: 'x' }],
             },

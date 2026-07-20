@@ -22,7 +22,7 @@ migrating. Format: symptom → root cause → how to detect → how to avoid.
   goes silent. Latent — shows up hours later.
 - **Cause** (2026-06-02): setting `enableAllProjectMcpServers` to false while
   `enabledMcpjsonServers` omits a server that lives only in `.mcp.json` (e.g.
-  `dashi-channel`) drops it. MCP servers load at session start, so the live
+  `agent47-channel`) drops it. MCP servers load at session start, so the live
   session survives; the next boot has zero comms tools.
 - **Detect**: the doctor's `comms-consistency` check — if
   `enableAllProjectMcpServers !== true`, every `.mcp.json` server must be in
@@ -73,12 +73,12 @@ migrating. Format: symptom → root cause → how to detect → how to avoid.
   never calls the reply tool — the text stays in the transcript, the chief sees
   silence. A broken hook could instead eat or duplicate the reply.
 - **Design**: a Stop-hook forwards the final assistant text to Telegram **only**
-  when the turn ended without `mcp__dashi-channel__reply`. If reply was called →
+  when the turn ended without `mcp__agent47-channel__reply`. If reply was called →
   silent (no dup). `chat_id` comes only from the leading `<channel>` envelope
   (anti-injection); per-session dedup; `send_failed` is **not** deduped (so it
   retries next Stop); >4096 chars truncated with a marker.
 - **Detect**: the doctor's `fallback-reply-hook` check — Stop has a
-  `dashi-channel-fallback-reply` entry; the `/hooks/fallback-reply` route is up;
+  `agent47-channel-fallback-reply` entry; the `/hooks/fallback-reply` route is up;
   the channel was restarted after registration.
 - **Avoid**: comms code gets double review (Codex+Opus) — Codex's first pass
   caught a `send_failed`-deduped-as-delivered bug that would have silenced

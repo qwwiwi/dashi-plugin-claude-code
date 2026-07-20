@@ -22,7 +22,7 @@
         ┌──────────────────────────────┐
         │  Claude Code session         │
         │  ┌────────────────────────┐  │
-        │  │ dashi-channel plugin   │  │   ← Bun + TypeScript
+        │  │ agent47-channel plugin   │  │   ← Bun + TypeScript
         │  │   - poller             │  │
         │  │   - handlers           │  │
         │  │   - status manager     │  │

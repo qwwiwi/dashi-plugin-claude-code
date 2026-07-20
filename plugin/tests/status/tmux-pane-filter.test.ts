@@ -38,7 +38,7 @@ const BOOT_BANNER = [
 
 const CHANNEL_STATUS = [
   'Listening for channel messages from:',
-  ' server:dashi-channel',
+  ' server:agent47-channel',
 ].join('\n')
 
 const INBOUND_WARNING = [
@@ -103,7 +103,7 @@ describe('segmentizePane — classification', () => {
     expect(segs.length).toBe(1)
     expect(segs[0]?.type).toBe('channel_status')
     expect(segs[0]?.text).toContain('Listening for channel messages from:')
-    expect(segs[0]?.text).toContain('server:dashi-channel')
+    expect(segs[0]?.text).toContain('server:agent47-channel')
   })
 
   test('captures Experimental-inbound block until «to disable.»', () => {
@@ -185,7 +185,7 @@ describe('filterPane — applies hide-list', () => {
     expect(out).not.toContain('tmux focus-events')
     // Kept:
     expect(out).toContain('Listening for channel messages from:')
-    expect(out).toContain('server:dashi-channel')
+    expect(out).toContain('server:agent47-channel')
     expect(out).toContain('EdgeLab')
     expect(out).toContain('Сделано. Порядок восстановлен.')
   })
@@ -478,12 +478,12 @@ describe('segmentizePane — input_box', () => {
 // ─── inbound_preview segment (added 2026-05-22) ──────────────────────
 
 describe('segmentizePane — inbound_preview', () => {
-  test('«← dashi-channel: …» line is a single-line inbound_preview segment', () => {
-    const text = '← dashi-channel: <media kind="voice" file_id="AwAC***SpDA"'
+  test('«← agent47-channel: …» line is a single-line inbound_preview segment', () => {
+    const text = '← agent47-channel: <media kind="voice" file_id="AwAC***SpDA"'
     const segs = segmentizePane(text)
     expect(segs.length).toBe(1)
     expect(segs[0]?.type).toBe('inbound_preview')
-    expect(segs[0]?.text).toContain('dashi-channel')
+    expect(segs[0]?.text).toContain('agent47-channel')
   })
 
   test('indented or quoted «← …» does NOT classify as inbound_preview', () => {
@@ -516,10 +516,10 @@ describe('segmentizePane — inbound_preview', () => {
 
   test('multiple inbound previews in a row each get their own segment', () => {
     const text = [
-      '← dashi-channel: msg one',
-      '← dashi-channel: msg two',
+      '← agent47-channel: msg one',
+      '← agent47-channel: msg two',
       '● conversation between two messages',
-      '← dashi-channel: msg three',
+      '← agent47-channel: msg three',
     ].join('\n')
     const types = segmentizePane(text).map((s) => s.type)
     expect(types).toEqual([
@@ -557,9 +557,9 @@ describe('filterPane — mode latest_inbound_only', () => {
   test('drops every segment up to AND INCLUDING the last inbound preview', () => {
     const text = [
       '● Earlier conversation about EdgeLab',
-      '← dashi-channel: first voice from warchief',
+      '← agent47-channel: first voice from warchief',
       '● Reply to first voice',
-      '← dashi-channel: second voice from warchief',
+      '← agent47-channel: second voice from warchief',
       '● Reply still in progress',
     ].join('\n')
     const out = filterPane(text, { hide: [], mode: 'latest_inbound_only' })
@@ -587,7 +587,7 @@ describe('filterPane — mode latest_inbound_only', () => {
     // the pivot still finds it (mode runs first), then hide drops it.
     const text = [
       '● Old turn',
-      '← dashi-channel: PIVOT_LINE',
+      '← agent47-channel: PIVOT_LINE',
       '● New turn',
     ].join('\n')
     const out = filterPane(text, {
@@ -603,7 +603,7 @@ describe('filterPane — mode latest_inbound_only', () => {
     // No `mode` arg → existing behaviour preserved.
     const text = [
       '● Earlier turn',
-      '← dashi-channel: preview',
+      '← agent47-channel: preview',
       '● Later turn',
     ].join('\n')
     const out = filterPane(text, { hide: [] })

@@ -14,7 +14,7 @@ import {
 let stateDir: string
 
 beforeEach(() => {
-  stateDir = mkdtempSync(join(tmpdir(), 'dashi-channel-config-'))
+  stateDir = mkdtempSync(join(tmpdir(), 'agent47-channel-config-'))
 })
 
 afterEach(() => {

@@ -13,7 +13,7 @@ only then the Telegram queue (Problem 4 is the trap that skips this order).
   process and the forked claude are alive — claude is blocked on a prompt.
 - **Fix**: `tmux attach -t channel-<agent>` → Enter (and a second Enter if
   present) → detach `Ctrl-B D` → confirm `Listening for channel messages from:
-  server:dashi-channel`. Prevent with the `ExecStartPost` double-Enter and the
+  server:agent47-channel`. Prevent with the `ExecStartPost` double-Enter and the
   persistent accepts in settings.json.
 - **Lesson**: "active" = "process alive", not "working".
 

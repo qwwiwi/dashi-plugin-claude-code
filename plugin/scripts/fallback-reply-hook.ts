@@ -3,7 +3,7 @@
 //
 // feature/dm-fallback-reply-hook (2026-06-03). The warchief's Telegram DM
 // (the main/launcher session) answers him through the
-// `mcp__dashi-channel__reply` MCP tool — that send is what actually reaches
+// `mcp__agent47-channel__reply` MCP tool — that send is what actually reaches
 // his chat; the session transcript never does. If a turn ends WITHOUT having
 // called reply()/edit_message(), the warchief gets silence even though the
 // turn produced a final answer. This Stop hook closes that gap: on turn-end it
@@ -19,8 +19,8 @@
 // reused from read-receipt-hook.ts.
 //
 // Suppression invariants (no duplicate to the warchief):
-//   * If the turn called mcp__dashi-channel__reply OR
-//     mcp__dashi-channel__edit_message AND that call SUCCEEDED → a reply already
+//   * If the turn called mcp__agent47-channel__reply OR
+//     mcp__agent47-channel__edit_message AND that call SUCCEEDED → a reply already
 //     reached him → silent. fix-loop #7 / fix-loop-2: ONLY a reply whose
 //     tool_result came back as an explicit ASK-GUARD BLOCK (isError + the
 //     ASK_GUARD marker) is treated as "did NOT reach him" — its final text is
@@ -92,8 +92,8 @@ const TAIL_BYTES = 1024 * 1024
 // The two MCP tools that deliver a reply to the warchief's Telegram. If either
 // was called this turn, the warchief already saw the answer → no fallback.
 const REPLY_TOOL_NAMES = new Set<string>([
-  'mcp__dashi-channel__reply',
-  'mcp__dashi-channel__edit_message',
+  'mcp__agent47-channel__reply',
+  'mcp__agent47-channel__edit_message',
 ])
 
 const FETCH_TIMEOUT_MS = 5000

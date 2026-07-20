@@ -1,4 +1,4 @@
-# dashi-channel
+# agent47-channel
 
 Custom Claude Code channel plugin для Orgrimmar Telegram agents. Замена Python `claude -p` gateway. Параллелен Anthropic Telegram plugin'у — наш fork с full Jarvis parity.
 
@@ -22,8 +22,8 @@ bun install
 TELEGRAM_BOT_TOKEN=... bun run start
 
 # Via Claude Code with isolated state dir:
-TELEGRAM_STATE_DIR=/tmp/dashi-channel-test \
-  claude --dangerously-load-development-channels server:dashi-channel
+TELEGRAM_STATE_DIR=/tmp/agent47-channel-test \
+  claude --dangerously-load-development-channels server:agent47-channel
 ```
 
 `bun run start` — это `bun run src/server.ts`. Standalone-режим удобен для быстрой проверки токена; production-режим — через `claude --dangerously-load-development-channels`, чтобы Claude Code сам держал runtime плагина.
@@ -37,7 +37,7 @@ bash plugin/scripts/install-hooks.sh \
   --settings ~/.claude/settings.json \
   --chat-id <your-telegram-chat-id> \
   --webhook-url http://127.0.0.1:8089/hooks/agent \
-  --agent-id dashi-channel
+  --agent-id agent47-channel
 ```
 
 Идемпотентно. Marker-based replacement — повторный запуск не дублирует записи. Чистит legacy markerless entries указывающие на наш `post-hook.ts`.
@@ -63,7 +63,7 @@ bash plugin/scripts/install-hooks.sh \
   "hooks": {
     "Stop": [
       {
-        "marker": "dashi-channel-read-receipt",
+        "marker": "agent47-channel-read-receipt",
         "hooks": [
           {
             "type": "command",
@@ -80,11 +80,11 @@ bash plugin/scripts/install-hooks.sh \
 
 ## DM fallback reply (Stop hook → `/hooks/fallback-reply`)
 
-**Зачем (2026-06-03).** Личка вождя (главная/launcher-сессия) отвечает ему через MCP-тул `mcp__dashi-channel__reply` — именно этот вызов доходит до Telegram, транскрипт сессии — нет. Если ход завершился БЕЗ вызова `reply()`/`edit_message()`, вождь получает тишину, хотя финальный ответ хода есть. Этот fallback закрывает разрыв.
+**Зачем (2026-06-03).** Личка вождя (главная/launcher-сессия) отвечает ему через MCP-тул `mcp__agent47-channel__reply` — именно этот вызов доходит до Telegram, транскрипт сессии — нет. Если ход завершился БЕЗ вызова `reply()`/`edit_message()`, вождь получает тишину, хотя финальный ответ хода есть. Этот fallback закрывает разрыв.
 
 **Как работает.** По событию `Stop` хук `scripts/fallback-reply-hook.ts` читает транскрипт текущего хода (идёт с конца до последнего настоящего user-промпта — та же логика, что в `src/chats/hooks/stop-to-outbox.py`) и:
 
-1. Если ход вызвал `mcp__dashi-channel__reply` ИЛИ `mcp__dashi-channel__edit_message` — ответ уже дошёл до вождя → молчит (без дубля).
+1. Если ход вызвал `mcp__agent47-channel__reply` ИЛИ `mcp__agent47-channel__edit_message` — ответ уже дошёл до вождя → молчит (без дубля).
 2. Если у хода нет финального assistant-текста (чистый tool/thinking-ход) → молчит.
 3. Если ход не отвечал на Telegram-сообщение (в его user-промпте нет `<channel source="telegram" ... chat_id="...">`) → молчит. Этот же блок даёт `chat_id` назначения — не доверяя никакому chat_id из env.
 4. Иначе POST'ит `{chat_id, text}` в `POST /hooks/fallback-reply`. Роут (loopback + bearer + chat-allowlist) шлёт текст единственным ботом через `sendMessage`.
@@ -98,7 +98,7 @@ bash plugin/scripts/install-hooks.sh \
   "hooks": {
     "Stop": [
       {
-        "marker": "dashi-channel-fallback-reply",
+        "marker": "agent47-channel-fallback-reply",
         "hooks": [
           {
             "type": "command",
