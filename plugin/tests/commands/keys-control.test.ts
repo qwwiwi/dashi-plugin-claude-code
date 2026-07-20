@@ -219,6 +219,34 @@ describe('classifyPane', () => {
     expect(classifyPane('✻ Waiting for 3 background agents to finish')).toBe('busy')
   })
 
+  // Fix-loop (2026-07-20): the `● main` / `◯ <agent> …` list adds ONE LINE PER
+  // RUNNING AGENT above the footer, so with 5+ concurrent background agents the
+  // `Waiting for N…` marker (line 1 of the block) fell OUT of the 12-line
+  // BOTTOM_CHROME_LINES window while the idle footer tail stayed inside it — a
+  // busy pane misclassified as idle (RED against the #114 HEAD: N=1..4 'busy',
+  // N=5+ 'idle'). The marker is now matched against a much wider trailing
+  // window (BACKGROUND_WAIT_LINES=60) than the other chrome markers.
+  test('background-wait pane stays busy however many agents are listed', () => {
+    for (const n of [4, 5, 6, 8, 10]) {
+      const lines = [
+        `✻ Waiting for ${n} background agents to finish`,
+        '',
+        '──────────────────────────────────────────────────────────────────────',
+        '❯ some prompt',
+        '──────────────────────────────────────────────────────────────────────',
+        '  ⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage',
+        '',
+        '  ● main',
+      ]
+      for (let i = 0; i < n; i++) {
+        lines.push(
+          `  ◯ agent-${i}  some task label                                                     4m 48s · ↓ 134.0k tokens`,
+        )
+      }
+      expect(classifyPane(lines.join('\n'))).toBe('busy')
+    }
+  })
+
   // The OPPOSITE state must stay idle: once the main turn ends the wait line is
   // gone, but the `◯ <agent> … Nk tokens` list line PERSISTS while a background
   // agent keeps running and the composer is genuinely idle. This is the exact

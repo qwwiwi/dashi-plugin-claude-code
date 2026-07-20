@@ -386,14 +386,28 @@ const BOTTOM_CHROME_LINES = 12
 // live pane state (a false 'unknown'/'idle'). Trimming the blank tail keeps the
 // markers inside the window. classifyPane, the queued-check and firedMarkerCount
 // all read through this trimmed region.
-function bottomChrome(text: string): string {
+function trailingChrome(text: string, maxLines: number): string {
   const lines = text.split('\n')
   let end = lines.length
   while (end > 0 && lines[end - 1]!.trim().length === 0) end--
   const trimmed = lines.slice(0, end)
-  if (trimmed.length <= BOTTOM_CHROME_LINES) return trimmed.join('\n')
-  return trimmed.slice(trimmed.length - BOTTOM_CHROME_LINES).join('\n')
+  if (trimmed.length <= maxLines) return trimmed.join('\n')
+  return trimmed.slice(trimmed.length - maxLines).join('\n')
 }
+
+function bottomChrome(text: string): string {
+  return trailingChrome(text, BOTTOM_CHROME_LINES)
+}
+
+// The `● main` / `◯ <agent> …` background-agent list adds ONE LINE PER RUNNING
+// AGENT above the composer footer, so the transient `Waiting for N background
+// agents to finish` busy marker (checked below) gets pushed out of the narrow
+// BOTTOM_CHROME_LINES(12) window once 5+ agents are listed — a genuinely busy
+// pane then reads as idle (verified: N=1..4 correctly 'busy', N=5+ falsely
+// 'idle' against the 12-line window). Give JUST that one marker a much wider
+// trailing window. This stays within the fail-safe bias above: matching it too
+// far up only yields a FALSE busy (refuse to send, safe) — never a false idle.
+const BACKGROUND_WAIT_LINES = 60
 
 // Classify a pane snapshot by string-matching Claude Code TUI v2.1.200 markers,
 // anchored to the bottom UI chrome (FIX-5). PURE (no I/O) so it is trivially
@@ -455,7 +469,7 @@ export function classifyPane(text: string): PaneState {
   if (
     chrome.includes('esc to interrupt') ||
     /·\s*[↓↑][\s\d.,]*k?\s*tokens?\)/i.test(chrome) ||
-    /Waiting for \d+ background agents? to finish/i.test(chrome)
+    /Waiting for \d+ background agents? to finish/i.test(trailingChrome(text, BACKGROUND_WAIT_LINES))
   ) {
     return 'busy'
   }
