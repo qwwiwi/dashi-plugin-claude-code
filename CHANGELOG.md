@@ -13,6 +13,18 @@ Versions before 1.0.0 were not tracked — the project shipped ~60 merged PRs
 between 2026-05-14 and 2026-06-14 without a version discipline. 1.0.0
 retroactively marks the state of `main` on 2026-06-14.
 
+## [1.2.1] — 2026-07-21
+
+### Changed
+- **`plugin/.mcp.json` ships only the `dashi-channel` server.** The four
+  `dashi-gbrain-*` HTTP servers pointed at the author's private shared-memory
+  host (`mcp.orgrimmar.xyz`), which issues no public tokens — fresh installs
+  saw a permanent auth warning and agents wasted time probing an unreachable
+  service. Shared-memory MCP entries now live in
+  `examples/mcp.gbrain.example.json` as an opt-in template: self-host your own
+  brain (https://github.com/qwwiwi/public-gbrain-agentos), point the template
+  at YOUR host and merge it in. `.env.example` comment updated to match.
+
 ## [1.2.0] — 2026-07-10
 
 ### Added
