@@ -1,0 +1,33 @@
+{
+  "//": "OPTIONAL shared-memory MCP servers (gbrain). These are NOT part of the Telegram bridge and the plugin works fine without them. To use a shared brain, self-host your own instance (https://github.com/qwwiwi/public-gbrain-agentos), replace the host below with YOUR server, set GBRAIN_BEARER to a token issued by YOUR instance, and merge these entries into plugin/.mcp.json.",
+  "mcpServers": {
+    "gbrain-memory": {
+      "type": "http",
+      "url": "https://YOUR-GBRAIN-HOST/memory/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
+    },
+    "gbrain-recall": {
+      "type": "http",
+      "url": "https://YOUR-GBRAIN-HOST/recall/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
+    },
+    "gbrain-swarm": {
+      "type": "http",
+      "url": "https://YOUR-GBRAIN-HOST/swarm/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
+    },
+    "gbrain-tasks": {
+      "type": "http",
+      "url": "https://YOUR-GBRAIN-HOST/task/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GBRAIN_BEARER}"
+      }
+    }
+  }
+}
