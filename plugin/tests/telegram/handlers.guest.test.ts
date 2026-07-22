@@ -143,6 +143,14 @@ function makeDeps(opts: {
   return { deps, serverSpy, registry }
 }
 
+interface FakePhotoSize {
+  file_id: string
+  file_unique_id: string
+  width: number
+  height: number
+  file_size?: number
+}
+
 // Minimal guest_message update Context. handleGuestMessage reads only
 // ctx.update.guest_message.
 function makeGuestCtx(opts: {
@@ -152,7 +160,16 @@ function makeGuestCtx(opts: {
   callerId?: number
   guestQueryId?: string
   chatId?: number
-  replyTo?: { message_id: number; date: number; text: string; from: { id: number; is_bot: boolean } }
+  photo?: FakePhotoSize[]
+  document?: { file_id: string; file_unique_id?: string; file_name?: string; mime_type?: string }
+  voice?: { file_id: string; file_unique_id?: string; duration?: number; mime_type?: string }
+  replyTo?: {
+    message_id: number
+    date: number
+    text?: string
+    from: { id: number; is_bot: boolean }
+    photo?: FakePhotoSize[]
+  }
 }): Context {
   const from =
     opts.fromId !== undefined
@@ -174,6 +191,9 @@ function makeGuestCtx(opts: {
         ...(opts.guestQueryId !== undefined ? { guest_query_id: opts.guestQueryId } : {}),
         ...(opts.text !== undefined ? { text: opts.text } : {}),
         ...(opts.caption !== undefined ? { caption: opts.caption } : {}),
+        ...(opts.photo !== undefined ? { photo: opts.photo } : {}),
+        ...(opts.document !== undefined ? { document: opts.document } : {}),
+        ...(opts.voice !== undefined ? { voice: opts.voice } : {}),
         ...(opts.replyTo !== undefined ? { reply_to_message: opts.replyTo } : {}),
       },
     },
@@ -315,6 +335,136 @@ describe('handleGuestMessage', () => {
     const content = serverSpy.calls[0]!.params.content ?? ''
     expect(content).toContain('<untrusted_metadata')
     expect(content).toContain('Traceback: boom')
+  })
+
+  // ── Guest OWN media parity (eager, like a DM attachment) ────────────
+  test('guest photo with no caption → <media kind=photo local_path=...> (eager download)', async () => {
+    const { deps, serverSpy } = makeDeps()
+    // Stub getFile so downloadPhotoToInbox resolves a file_path.
+    deps.botApi = {
+      api: {
+        getFile: async (fileId: string) => ({
+          file_id: fileId,
+          file_unique_id: 'u',
+          file_path: 'photos/file_1.jpg',
+          file_size: 100,
+        }),
+      },
+    } as unknown as HandlerDeps['botApi']
+
+    const ctx = makeGuestCtx({
+      fromId: 164795011,
+      guestQueryId: 'gq-photo',
+      photo: [{ file_id: 'PBIG', file_unique_id: 'b', width: 1280, height: 720, file_size: 100 }],
+    })
+
+    const origFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 })) as unknown as typeof fetch
+    try {
+      await handleGuestMessage(ctx, deps)
+    } finally {
+      globalThis.fetch = origFetch
+    }
+
+    expect(serverSpy.calls.length).toBe(1)
+    const content = serverSpy.calls[0]!.params.content ?? ''
+    expect(content).toContain('kind="photo"')
+    expect(content).toContain('file_id="PBIG"')
+    expect(content).toContain('local_path=')
+  })
+
+  test('guest document → descriptor with file_id, NO download attempted', async () => {
+    const { deps, serverSpy } = makeDeps()
+    // makeTelegramApi().downloadFile THROWS — so if the document path tried to
+    // download, this test would throw. Reaching a clean delivery proves it did not.
+    const ctx = makeGuestCtx({
+      fromId: 164795011,
+      guestQueryId: 'gq-doc',
+      document: { file_id: 'DGUEST', file_name: 'report.pdf', mime_type: 'application/pdf' },
+    })
+    await handleGuestMessage(ctx, deps)
+    expect(serverSpy.calls.length).toBe(1)
+    const content = serverSpy.calls[0]!.params.content ?? ''
+    expect(content).toContain('kind="document"')
+    expect(content).toContain('file_id="DGUEST"')
+    expect(content).not.toContain('local_path')
+  })
+
+  test('guest voice → transcription attempted (missing_key with no GROQ key, no crash)', async () => {
+    // env is {} (no GROQ_API_KEY): maybeTranscribeVoice returns missing_key
+    // WITHOUT calling downloadFile. The EAGER path ran — a metadata-only voice
+    // would render status="skipped" instead.
+    const { deps, serverSpy } = makeDeps()
+    const ctx = makeGuestCtx({
+      fromId: 164795011,
+      guestQueryId: 'gq-voice',
+      voice: { file_id: 'VGUEST', duration: 4, mime_type: 'audio/ogg' },
+    })
+    await handleGuestMessage(ctx, deps)
+    expect(serverSpy.calls.length).toBe(1)
+    const content = serverSpy.calls[0]!.params.content ?? ''
+    expect(content).toContain('kind="voice"')
+    expect(content).toContain('transcription_status="missing_key"')
+  })
+
+  test('guest media-only mention (no caption) is NOT dropped', async () => {
+    const { deps, serverSpy, registry } = makeDeps()
+    const ctx = makeGuestCtx({
+      fromId: 164795011,
+      guestQueryId: 'gq-mediaonly',
+      document: { file_id: 'DONLY', file_name: 'x.zip' },
+    })
+    await handleGuestMessage(ctx, deps)
+    expect(serverSpy.calls.length).toBe(1)
+    expect(serverSpy.calls[0]!.params.content).toContain('file_id="DONLY"')
+    // Registered (claimable) — the drop gate did not fire.
+    expect(registry!.claim('gq-mediaonly').kind).toBe('ok')
+  })
+
+  // ── Reply-target media (metadata only) ──────────────────────────────
+  test('guest reply_to a photo → untrusted_metadata has media array, NO local_path', async () => {
+    const { deps, serverSpy } = makeDeps()
+    const ctx = makeGuestCtx({
+      text: 'что на фото выше?',
+      fromId: 164795011,
+      guestQueryId: 'gq-reply-photo',
+      replyTo: {
+        message_id: 500,
+        date: 1700000000,
+        from: { id: 999, is_bot: false },
+        photo: [{ file_id: 'RPHOTO', file_unique_id: 'r', width: 100, height: 100, file_size: 50 }],
+      },
+    })
+    await handleGuestMessage(ctx, deps)
+    expect(serverSpy.calls.length).toBe(1)
+    const content = serverSpy.calls[0]!.params.content ?? ''
+    expect(content).toContain('<untrusted_metadata')
+    // The media array is JSON-encoded inside the untrusted block.
+    expect(content).toContain('"media"')
+    expect(content).toContain('RPHOTO')
+    // Reply media is metadata-only — never eager-downloaded.
+    expect(content).not.toContain('local_path')
+  })
+
+  test('reply target with media but NO caption still emits an untrusted_metadata block', async () => {
+    const { deps, serverSpy } = makeDeps()
+    const ctx = makeGuestCtx({
+      text: 'смотри',
+      fromId: 164795011,
+      guestQueryId: 'gq-reply-nocap',
+      replyTo: {
+        message_id: 501,
+        date: 1700000000,
+        from: { id: 999, is_bot: false },
+        // No text/caption — pre-fix this produced NO block at all.
+        photo: [{ file_id: 'RNOCAP', file_unique_id: 'r2', width: 50, height: 50 }],
+      },
+    })
+    await handleGuestMessage(ctx, deps)
+    const content = serverSpy.calls[0]!.params.content ?? ''
+    expect(content).toContain('<untrusted_metadata')
+    expect(content).toContain('RNOCAP')
   })
 
   test('notify transport failure throws so the poller dead-letters', async () => {

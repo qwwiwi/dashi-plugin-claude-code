@@ -15,6 +15,7 @@ import type { Context } from 'grammy'
 
 import {
   handleInboundText,
+  handleInboundAnimation,
   handleInboundDocument,
   handleInboundSticker,
   handleInboundVideoNote,
@@ -246,7 +247,7 @@ function makeCtx(opts: {
 // Minimal Context with a media payload — for media handler tests. Mirrors
 // makeCtx but attaches a typed media field instead of `text`.
 function makeMediaCtx(opts: {
-  kind: 'document' | 'sticker' | 'video_note'
+  kind: 'document' | 'sticker' | 'video_note' | 'animation'
   chatId: number
   chatType: 'private' | 'group' | 'supergroup'
   fromId: number
@@ -267,6 +268,14 @@ function makeMediaCtx(opts: {
       break
     case 'video_note':
       payload = { video_note: { file_id: 'vn-fid', duration: 5 } }
+      break
+    case 'animation':
+      // GIF: Telegram sets BOTH animation and document. We surface it via the
+      // animation descriptor (server registers animation before document).
+      payload = {
+        animation: { file_id: 'an-fid', file_name: 'g.mp4', mime_type: 'video/mp4', duration: 3 },
+        document: { file_id: 'an-doc-fid', file_name: 'g.mp4', mime_type: 'video/mp4' },
+      }
       break
   }
   return {
@@ -624,6 +633,7 @@ describe('handleInboundText — InboundWatcher (PR-A3)', () => {
     ['document', handleInboundDocument],
     ['sticker', handleInboundSticker],
     ['video_note', handleInboundVideoNote],
+    ['animation', handleInboundAnimation],
   ] as const)(
     'media %s from allowed sender + busy session → watcher fires',
     async (kind, handler) => {
@@ -711,6 +721,28 @@ describe('handleInboundText — InboundWatcher (PR-A3)', () => {
       rmSync(statePaths.root, { recursive: true, force: true })
     },
   )
+
+  test('handleInboundAnimation delivers an animation descriptor (GIF support)', async () => {
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({ server: serverSpy.server })
+    const ctx = makeMediaCtx({
+      kind: 'animation',
+      chatId: 164795011,
+      chatType: 'private',
+      fromId: 164795011,
+    })
+
+    await handleInboundAnimation(ctx, deps)
+
+    expect(serverSpy.calls.length).toBe(1)
+    const content = JSON.stringify(serverSpy.calls[0]!.params)
+    expect(content).toContain('kind=\\"animation\\"')
+    expect(content).toContain('file_id=\\"an-fid\\"')
+    expect(content).toContain('mime=\\"video/mp4\\"')
+    // Surfaced as an animation, NOT the backward-compat document twin.
+    expect(content).not.toContain('an-doc-fid')
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
 
   test('plain text + NOT busy → watcher no-ops, channel notify still runs', async () => {
     const sendCalls: Array<{ chatId: string; text: string }> = []

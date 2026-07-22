@@ -21,6 +21,12 @@ export interface TelegramReplyMessage {
   text?: string
   caption?: string
   date: number
+  // Pre-rendered `<media .../>` descriptor strings for the reply target's
+  // attachment(s). METADATA ONLY — the reply author is not the allowlisted
+  // caller, so a reply photo is never eager-downloaded and a reply voice is
+  // never transcribed. adaptReply() populates this from the shared metadata
+  // builders. Absent when the reply target carries no media.
+  media?: string[]
 }
 
 export type UntrustedReplyContext =
@@ -30,6 +36,7 @@ export type UntrustedReplyContext =
       message_id: number
       body: string
       truncated: boolean
+      media?: string[]
     }
   | {
       sender: 'other_bot'
@@ -37,6 +44,7 @@ export type UntrustedReplyContext =
       message_id: number
       body: string
       truncated: boolean
+      media?: string[]
     }
   | {
       sender: 'human'
@@ -45,6 +53,7 @@ export type UntrustedReplyContext =
       message_id: number
       body: string
       truncated: boolean
+      media?: string[]
     }
 
 export const REPLY_BODY_MAX = 1200
@@ -61,12 +70,17 @@ export function buildReplyContext(
   bot: BotIdentity,
 ): UntrustedReplyContext | null {
   // Reply body fallback chain mirrors gateway.py:2769 (text || caption).
-  // T8 will extend this with media descriptors for photo/sticker/voice/video.
   const raw = reply.text ?? reply.caption ?? ''
   // Strip null bytes before measuring length, matching gateway.py:2812
   // ordering. \x00 escape keeps the source file ASCII-clean.
   const stripped = raw.replace(/\x00/g, '')
-  if (stripped.length === 0) return null
+  const media = reply.media && reply.media.length > 0 ? reply.media : undefined
+  // Drop the reply context only when it carries NOTHING — no usable body AND
+  // no media descriptor. A reply to a caption-less photo/voice has an empty
+  // body but real media, and must still surface (the pre-fix early-return
+  // dropped these entirely, so a reply to a bare photo produced no metadata
+  // block at all).
+  if (stripped.length === 0 && media === undefined) return null
 
   const truncated = stripped.length > REPLY_BODY_MAX
   const body = truncated ? stripped.slice(0, REPLY_BODY_MAX) : stripped
@@ -94,6 +108,7 @@ export function buildReplyContext(
       message_id: reply.message_id,
       body,
       truncated,
+      ...(media !== undefined ? { media } : {}),
     }
   }
 
@@ -103,6 +118,7 @@ export function buildReplyContext(
       message_id: reply.message_id,
       body,
       truncated,
+      ...(media !== undefined ? { media } : {}),
     }
     if (reply.from.username !== undefined) ctx.bot_username = reply.from.username
     return ctx
@@ -113,6 +129,7 @@ export function buildReplyContext(
     message_id: reply.message_id,
     body,
     truncated,
+    ...(media !== undefined ? { media } : {}),
   }
   if (reply.from.id !== undefined) human.user_id = reply.from.id
   if (reply.from.username !== undefined) human.username = reply.from.username

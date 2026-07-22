@@ -185,6 +185,145 @@ function htmlParseError(): Error {
   return new Error("Bad Request: can't parse entities: unclosed tag at byte offset 5")
 }
 
+function downloadReq(args: Record<string, unknown>): CallToolRequest {
+  return { params: { name: 'download_attachment', arguments: args } }
+}
+
+// A download stub that records calls and returns a canned inbox path.
+function makeDownloadApi(): { api: TelegramApi; downloadCalls: string[] } {
+  const downloadCalls: string[] = []
+  const noop = async (): Promise<never> => {
+    throw new Error('unexpected api call in download test')
+  }
+  const api: TelegramApi = {
+    sendMessage: noop as unknown as TelegramApi['sendMessage'],
+    sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
+    editMessageText: noop as unknown as TelegramApi['editMessageText'],
+    setMessageReaction: noop as unknown as TelegramApi['setMessageReaction'],
+    sendChatAction: async () => {},
+    sendDocument: noop as unknown as TelegramApi['sendDocument'],
+    sendPhoto: noop as unknown as TelegramApi['sendPhoto'],
+    downloadFile: async (fileId: string) => {
+      downloadCalls.push(fileId)
+      return { path: `/inbox/${fileId}.bin`, size: 10 }
+    },
+    deleteMessage: noop as unknown as TelegramApi['deleteMessage'],
+    answerGuestQuery: noop as unknown as TelegramApi['answerGuestQuery'],
+  }
+  return { api, downloadCalls }
+}
+
+describe('download_attachment tool — guest path', () => {
+  test('valid guest_query_id + foreign chat → succeeds, does NOT consume (reply still works)', async () => {
+    const { api, downloadCalls } = makeDownloadApi()
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'gq-dl') // callerChatId: -100987
+    const deps = makeDeps({ api, registry })
+
+    const result = await callTool(
+      downloadReq({ chat_id: '-100987', file_id: 'FILE1', guest_query_id: 'gq-dl' }),
+      deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toBe('/inbox/FILE1.bin')
+    expect(downloadCalls).toEqual(['FILE1'])
+
+    // A SECOND download for the same guest turn still works (non-consuming).
+    const second = await callTool(
+      downloadReq({ chat_id: '-100987', file_id: 'FILE2', guest_query_id: 'gq-dl' }),
+      deps,
+    )
+    expect(second.isError).toBeUndefined()
+    expect(downloadCalls).toEqual(['FILE1', 'FILE2'])
+
+    // And the one-shot REPLY is still claimable afterwards — download never
+    // spent the query.
+    expect(registry.claim('gq-dl').kind).toBe('ok')
+  })
+
+  test('chat mismatch with the query origin → error, no download', async () => {
+    const { api, downloadCalls } = makeDownloadApi()
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'gq-mismatch') // origin -100987
+    const deps = makeDeps({ api, registry })
+
+    const result = await callTool(
+      downloadReq({ chat_id: '-100555', file_id: 'FILE1', guest_query_id: 'gq-mismatch' }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(downloadCalls.length).toBe(0)
+  })
+
+  test('unknown guest_query_id → error, no download', async () => {
+    const { api, downloadCalls } = makeDownloadApi()
+    const deps = makeDeps({ api, registry: new GuestQueryRegistry() })
+    const result = await callTool(
+      downloadReq({ chat_id: '-100987', file_id: 'FILE1', guest_query_id: 'ghost' }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(downloadCalls.length).toBe(0)
+  })
+
+  test('expired guest_query_id → error, no download', async () => {
+    const { api, downloadCalls } = makeDownloadApi()
+    // TTL 1ms registry so the entry is stale immediately.
+    const registry = new GuestQueryRegistry(1, () => Date.now())
+    registry.register({
+      guestQueryId: 'gq-exp',
+      callerUserId: '164795011',
+      callerChatId: '-100987',
+      messageText: 'q',
+    })
+    await new Promise((r) => setTimeout(r, 5))
+    const deps = makeDeps({ api, registry })
+    const result = await callTool(
+      downloadReq({ chat_id: '-100987', file_id: 'FILE1', guest_query_id: 'gq-exp' }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(downloadCalls.length).toBe(0)
+  })
+
+  test('guest_query_id set but registry not wired → error', async () => {
+    const { api, downloadCalls } = makeDownloadApi()
+    const deps = makeDeps({ api }) // no registry
+    const result = await callTool(
+      downloadReq({ chat_id: '-100987', file_id: 'FILE1', guest_query_id: 'gq-x' }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('guest_mode is not enabled')
+    expect(downloadCalls.length).toBe(0)
+  })
+
+  test('regression: no guest_query_id + non-allowlisted chat still throws (allowlist path intact)', async () => {
+    const { api, downloadCalls } = makeDownloadApi()
+    const deps = makeDeps({ api, registry: new GuestQueryRegistry() })
+    // -100987 is NOT in allowed_chat_ids ([164795011]) → assertAllowedChat refuses.
+    const result = await callTool(
+      downloadReq({ chat_id: '-100987', file_id: 'FILE1' }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toContain('not allowlisted')
+    expect(downloadCalls.length).toBe(0)
+  })
+
+  test('no guest_query_id + allowlisted chat → normal download', async () => {
+    const { api, downloadCalls } = makeDownloadApi()
+    const deps = makeDeps({ api, registry: new GuestQueryRegistry() })
+    // 164795011 IS in allowed_chat_ids.
+    const result = await callTool(
+      downloadReq({ chat_id: '164795011', file_id: 'FILE1' }),
+      deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(downloadCalls).toEqual(['FILE1'])
+  })
+})
+
 describe('reply tool — guest path', () => {
   test('happy path: answerGuestQuery once, HTML parse_mode, no sendMessage, no chat-allowlist check', async () => {
     const stub = makeStubApi()
