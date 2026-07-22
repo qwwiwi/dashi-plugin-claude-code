@@ -98,6 +98,13 @@ export type PermissionRequestRoute = z.infer<typeof PermissionRequestRouteSchema
 export const DownloadAttachmentArgsSchema = z.object({
   chat_id: z.string().min(1),
   file_id: z.string().min(1),
+  // Guest Mode: when the inbound <channel> meta carried guest_query_id, pass
+  // it back here to authorize a download from the FOREIGN chat the bot was
+  // @-mentioned in. The chat allowlist cannot authorize that chat (the bot is
+  // not a member), so authorization is registry membership — mirrors
+  // ReplyArgsSchema.guest_query_id. Non-consuming: several attachments may be
+  // fetched before the single guest reply.
+  guest_query_id: z.string().min(1).optional(),
 })
 export type DownloadAttachmentArgs = z.infer<typeof DownloadAttachmentArgsSchema>
 

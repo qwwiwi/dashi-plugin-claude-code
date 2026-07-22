@@ -847,6 +847,7 @@ DM replies auto-upgrade to `sendRichMessage`: Telegram renders **raw markdown se
 
 - **Fail-closed:** only allowlisted user ids can summon the bot; anyone else is dropped before a handler runs.
 - **One-shot contract:** exactly one answer per query, ≤4096 chars, no attachments, no threading; the query expires ~15 minutes after arrival.
+- **Inbound media (v1.3.0):** the agent receives the mention's own media *and* the replied-to message's media at DM parity — photos are downloaded, voice is transcribed, files/video/GIF surface as `file_id` `<media>` descriptors. Reply-target media is metadata-only (the reply author isn't allowlisted). Pull the bytes for any guest attachment with the `download_attachment` tool, passing the same `guest_query_id`.
 - **Enabling requires both switches:** the Guest Mode toggle in BotFather AND `guest_mode.enabled=true` in config (a missing block means OFF).
 
 #### Context HUD + a single pinned status card

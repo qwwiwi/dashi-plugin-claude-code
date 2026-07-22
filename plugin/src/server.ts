@@ -95,6 +95,7 @@ import { registerOwnerScopedCommands } from './telegram/command-scope.js'
 import { startWebhookServer, type WebhookServerHandle } from './webhook/server.js'
 import {
   handleGuestMessage,
+  handleInboundAnimation,
   handleInboundAudio,
   handleInboundDocument,
   handleInboundPhoto,
@@ -1342,6 +1343,12 @@ bot.on('message:pinned_message', ctx => {
 })
 bot.on('message:text', ctx => handleInboundText(ctx, handlerDeps))
 bot.on('message:photo', ctx => handleInboundPhoto(ctx, handlerDeps))
+// Animation (GIF) MUST come BEFORE document: Telegram sets the `document`
+// field on animation messages for backward compatibility, and a non-next()
+// handler stops the middleware chain — so registering animation first is what
+// lets a GIF get its own `<media kind="animation">` descriptor instead of
+// being swallowed by the document handler.
+bot.on('message:animation', ctx => handleInboundAnimation(ctx, handlerDeps))
 bot.on('message:document', ctx => handleInboundDocument(ctx, handlerDeps))
 bot.on('message:voice', ctx => handleInboundVoice(ctx, handlerDeps))
 bot.on('message:audio', ctx => handleInboundAudio(ctx, handlerDeps))

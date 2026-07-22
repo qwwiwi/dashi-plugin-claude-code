@@ -79,6 +79,22 @@ export type MediaDescriptor =
       durationSec?: number
     }
   | {
+      // Animation (GIF / silent looping MP4). Telegram sets this field AND,
+      // for backward compatibility, the `document` field on the same message
+      // (Bot API «Message.animation»). We surface it as its own kind so the
+      // agent sees "GIF" rather than a generic document. Fields mirror
+      // `video` — an animation is a soundless short video from the API's
+      // point of view.
+      kind: 'animation'
+      fileId: string
+      name?: string
+      mime?: string
+      size?: number
+      durationSec?: number
+      width?: number
+      height?: number
+    }
+  | {
       kind: 'sticker'
       fileId: string
       emoji?: string
@@ -175,6 +191,17 @@ export function renderMediaDescriptor(media: MediaDescriptor): string {
     case 'video_note': {
       parts.push(attr('size', media.size))
       parts.push(attr('duration_sec', media.durationSec))
+      break
+    }
+    case 'animation': {
+      // Same attribute set/order as `video` — animations carry the same
+      // shape (name/mime/size/duration/width/height) in the Bot API.
+      parts.push(attr('name', safeMediaName(media.name)))
+      parts.push(attr('mime', media.mime))
+      parts.push(attr('size', media.size))
+      parts.push(attr('duration_sec', media.durationSec))
+      parts.push(attr('width', media.width))
+      parts.push(attr('height', media.height))
       break
     }
     case 'sticker': {

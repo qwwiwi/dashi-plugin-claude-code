@@ -135,6 +135,23 @@ export class GuestQueryRegistry {
     if (entry !== undefined && entry.state === 'inflight') entry.state = 'pending'
   }
 
+  // Non-consuming authorization check for the download_attachment tool. A
+  // guest turn may fetch SEVERAL attachments before its single reply, so this
+  // must NOT mutate state (unlike claim(), which is the one-shot reply gate).
+  // Returns true for a live entry (pending OR inflight) within TTL whose
+  // origin chat matches — false for unknown / answered / expired / a chat
+  // mismatch. Expiry does NOT delete the entry here (non-mutating): sweep()
+  // and claim() own eviction. A matching chat is required only when the entry
+  // recorded one (callerChatId undefined ⇒ origin unknown ⇒ cannot verify).
+  hasActiveEntry(guestQueryId: string, chatId: string): boolean {
+    const entry = this.entries.get(guestQueryId)
+    if (entry === undefined) return false
+    if (entry.state === 'answered') return false
+    if (this.now() - entry.createdAtMs > this.ttlMs) return false
+    if (entry.callerChatId !== undefined && entry.callerChatId !== chatId) return false
+    return true
+  }
+
   pendingCount(): number {
     this.sweep()
     let n = 0

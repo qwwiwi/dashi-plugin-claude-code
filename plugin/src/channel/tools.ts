@@ -372,12 +372,17 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'download_attachment',
     description:
-      'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Pass chat_id from the SAME inbound <channel> block so the tool can verify the file came from an allowlisted chat. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
+      'Download a file attachment from a Telegram message to the local inbox. Use when a <media> tag shows a file_id but no local_path. Pass chat_id from the SAME inbound <channel> block so the tool can verify the file came from an allowlisted chat. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB. GUEST MODE: when the inbound <channel> meta carries guest_query_id (guest="1"), pass that guest_query_id too — it authorizes fetching a file_id from the foreign chat the bot was @-mentioned in (that chat is not on the allowlist). You may call this several times for one guest turn; it does not consume the one-shot reply.',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string', description: 'The chat_id from inbound meta' },
-        file_id: { type: 'string', description: 'The attachment_file_id from inbound meta' },
+        file_id: { type: 'string', description: 'The file_id from a <media> descriptor or inbound meta' },
+        guest_query_id: {
+          type: 'string',
+          description:
+            'Guest Mode only: the guest_query_id from the inbound <channel> meta. When set, authorization is the guest-query registry instead of the chat allowlist.',
+        },
       },
       required: ['chat_id', 'file_id'],
     },
@@ -920,10 +925,29 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         const parsed = DownloadAttachmentArgsSchema.safeParse(rawArgs)
         if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
         const args = parsed.data
-        try {
-          assertAllowedChat(args.chat_id, config, deps.policy)
-        } catch (err) {
-          return toolError(name, err instanceof Error ? err.message : String(err))
+        if (args.guest_query_id !== undefined) {
+          // Guest Mode path. Authorization = registry membership, NOT the chat
+          // allowlist — the foreign chat is one the bot is not a member of, so
+          // assertAllowedChat would always (correctly) refuse it. Same pattern
+          // as the reply tool's guest branch. hasActiveEntry is non-consuming
+          // (a guest turn may fetch several attachments before its one reply)
+          // and folds in the swapped-pair guard: a live entry whose origin
+          // chat differs from args.chat_id fails the check.
+          if (deps.guestQueries === undefined) {
+            return toolError(name, 'guest downloads unavailable — guest_mode is not enabled in config')
+          }
+          if (!deps.guestQueries.hasActiveEntry(args.guest_query_id, args.chat_id)) {
+            return toolError(
+              name,
+              `guest query ${args.guest_query_id} is not an active guest query for chat ${args.chat_id} — pass the guest_query_id and chat_id from the SAME inbound <channel> meta (guest queries expire after 15 minutes)`,
+            )
+          }
+        } else {
+          try {
+            assertAllowedChat(args.chat_id, config, deps.policy)
+          } catch (err) {
+            return toolError(name, err instanceof Error ? err.message : String(err))
+          }
         }
         const out = await telegramApi.downloadFile(args.file_id, statePaths.inbox)
         return { content: [{ type: 'text', text: out.path }] }

@@ -155,6 +155,69 @@ describe('GuestQueryRegistry', () => {
     expect(registry.claim('q0').kind).toBe('ok')
   })
 
+  // ── hasActiveEntry (download_attachment authorization) ──────────────
+  describe('hasActiveEntry', () => {
+    test('pending entry with matching chat → true', () => {
+      const { registry } = makeRegistry()
+      registry.register(ENTRY) // callerChatId: '-100123'
+      expect(registry.hasActiveEntry('q1', '-100123')).toBe(true)
+    })
+
+    test('inflight entry (claimed, not yet answered) → true', () => {
+      const { registry } = makeRegistry()
+      registry.register(ENTRY)
+      expect(registry.claim('q1').kind).toBe('ok') // now inflight
+      expect(registry.hasActiveEntry('q1', '-100123')).toBe(true)
+    })
+
+    test('answered entry → false', () => {
+      const { registry } = makeRegistry()
+      registry.register(ENTRY)
+      registry.claim('q1')
+      registry.confirm('q1')
+      expect(registry.hasActiveEntry('q1', '-100123')).toBe(false)
+    })
+
+    test('expired entry → false, WITHOUT mutating (no delete)', () => {
+      const { registry, clock } = makeRegistry(1000)
+      registry.register(ENTRY)
+      clock.t += 1001
+      expect(registry.hasActiveEntry('q1', '-100123')).toBe(false)
+      // Non-mutating: a later claim still sees it as an entry (expired), not
+      // a swept 'unknown'. claim() is what deletes an expired entry.
+      expect(registry.claim('q1').kind).toBe('expired')
+    })
+
+    test('chat mismatch → false', () => {
+      const { registry } = makeRegistry()
+      registry.register(ENTRY) // origin -100123
+      expect(registry.hasActiveEntry('q1', '-100999')).toBe(false)
+    })
+
+    test('unknown id → false', () => {
+      const { registry } = makeRegistry()
+      expect(registry.hasActiveEntry('ghost', '-100123')).toBe(false)
+    })
+
+    test('idempotent across N calls — never consumes the entry', () => {
+      const { registry } = makeRegistry()
+      registry.register(ENTRY)
+      for (let i = 0; i < 5; i++) {
+        expect(registry.hasActiveEntry('q1', '-100123')).toBe(true)
+      }
+      // Still claimable exactly once after all those checks.
+      expect(registry.claim('q1').kind).toBe('ok')
+    })
+
+    test('entry with unknown origin (callerChatId undefined) accepts any chat', () => {
+      const { registry } = makeRegistry()
+      // Register WITHOUT callerChatId → entry.callerChatId is undefined.
+      registry.register({ guestQueryId: 'q-noorigin', callerUserId: '164795011', messageText: 'q' })
+      expect(registry.hasActiveEntry('q-noorigin', '-100123')).toBe(true)
+      expect(registry.hasActiveEntry('q-noorigin', '-999')).toBe(true)
+    })
+  })
+
   test('pendingCount tracks unconsumed live entries', () => {
     const { registry, clock } = makeRegistry(1000)
     registry.register({ ...ENTRY, guestQueryId: 'a' })

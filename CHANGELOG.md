@@ -13,6 +13,42 @@ Versions before 1.0.0 were not tracked — the project shipped ~60 merged PRs
 between 2026-05-14 and 2026-06-14 without a version discipline. 1.0.0
 retroactively marks the state of `main` on 2026-06-14.
 
+## [1.3.0] — 2026-07-22
+
+### Added
+- **Guest Mode media parity.** A guest `@`-mention now delivers inbound media
+  at DM parity: the mention's own photo (eager-downloaded to the inbox), voice
+  (transcribed), and document/audio/video/video_note/sticker/animation (as
+  `file_id` `<media>` descriptors), plus the replied-to message's media surfaced
+  as **metadata-only** `<media>` tags inside the `<untrusted_metadata>` reply
+  block. Previously the guest path was text-only and dropped a media-only
+  mention with no caption.
+- **`download_attachment` works in guest/foreign chats.** When called with a
+  `guest_query_id`, it authorizes via a **non-consuming** registry check
+  (`GuestQueryRegistry.hasActiveEntry` — matches a still-live entry created by
+  an allowlisted caller, with a chat-id origin guard) instead of the chat
+  allowlist. It never widens the legacy allowlist path (no `guest_query_id` =
+  unchanged `assertAllowedChat`), and the check does not consume the one-shot
+  reply.
+- **Animation (GIF)** as a first-class media kind on both the DM and guest
+  paths (previously a GIF surfaced only as its back-compat `document` twin).
+
+### Changed
+- Reply-target media is **never eager-downloaded or transcribed** — the replied-to
+  author is not the allowlisted caller, so reply media stays metadata-only for
+  every kind. The mention's own media (from the allowlisted caller) is still
+  eager.
+- Per-kind media descriptor builders extracted into `src/telegram/media-descriptors.ts`
+  (single source of truth, reused by the DM own-message, guest own-message, and
+  all reply paths). Pure refactor — no behavior change on existing paths.
+
+### Fixed
+- GIF de-dup: a GIF carries both `animation` and a compatibility `document`; the
+  media aggregators now emit it once (as `animation`), not twice.
+- A reply to a caption-less photo/voice/document no longer swallows the entire
+  reply-context block — the `<untrusted_metadata>` reply is emitted with its
+  media even when the reply itself has no text.
+
 ## [1.2.1] — 2026-07-21
 
 ### Changed

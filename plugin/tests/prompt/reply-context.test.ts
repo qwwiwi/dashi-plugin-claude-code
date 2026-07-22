@@ -111,6 +111,56 @@ describe('buildReplyContext', () => {
     expect(ctx?.body).toBe('photo caption text')
   })
 
+  // ── Reply-target media (metadata only) ──────────────────────────────
+  test('keeps context (non-null) when body is empty but media is present', () => {
+    // A reply to a caption-less photo: no text/caption, but a media
+    // descriptor. Pre-fix this returned null → NO untrusted_metadata block.
+    const reply = mkReply({
+      from: { id: 555, is_bot: false, username: 'alice' },
+      media: ['<media kind="photo" file_id="P1" />'],
+    })
+    const ctx = buildReplyContext(reply, bot)
+    expect(ctx).not.toBeNull()
+    expect(ctx?.sender).toBe('human')
+    expect(ctx?.body).toBe('')
+    expect(ctx?.media).toEqual(['<media kind="photo" file_id="P1" />'])
+  })
+
+  test('carries media alongside a non-empty body', () => {
+    const reply = mkReply({
+      from: { id: 555, is_bot: false },
+      caption: 'look here',
+      media: ['<media kind="photo" file_id="P2" />'],
+    })
+    const ctx = buildReplyContext(reply, bot)
+    expect(ctx?.body).toBe('look here')
+    expect(ctx?.media).toEqual(['<media kind="photo" file_id="P2" />'])
+  })
+
+  test('still returns null when body AND media are both empty', () => {
+    const reply = mkReply({ from: { id: 555, is_bot: false }, text: '', media: [] })
+    expect(buildReplyContext(reply, bot)).toBeNull()
+  })
+
+  test('media survives on the agent_previous_message branch', () => {
+    const reply = mkReply({
+      from: { id: 999, is_bot: true, username: 'dashibot' },
+      media: ['<media kind="voice" file_id="V1" transcription_status="skipped" />'],
+    })
+    const ctx = buildReplyContext(reply, bot)
+    expect(ctx?.sender).toBe('agent_previous_message')
+    expect(ctx?.media).toEqual([
+      '<media kind="voice" file_id="V1" transcription_status="skipped" />',
+    ])
+  })
+
+  test('no media key when reply carries no media', () => {
+    const reply = mkReply({ from: { id: 555, is_bot: false }, text: 'plain' })
+    const ctx = buildReplyContext(reply, bot)
+    expect(ctx).not.toBeNull()
+    expect(ctx && 'media' in ctx).toBe(false)
+  })
+
   // Fix 3 — botIdentity race guard. When bot.id is still 0 (the initial
   // sentinel before bot.init() resolves) the classifier MUST refuse to
   // attribute any reply, otherwise an early-arriving update would route to
@@ -139,6 +189,17 @@ describe('renderUntrustedMetadata', () => {
     // Round-trip: the JSON line in the middle must parse back cleanly.
     const middle = out.split('\n')[1]!
     expect(JSON.parse(middle)).toEqual({ sender: 'human', body: 'hi' })
+  })
+
+  test('round-trips a media array inside the JSON payload', () => {
+    const out = renderUntrustedMetadata('telegram_reply', {
+      sender: 'human',
+      body: '',
+      media: ['<media kind="photo" file_id="P1" />'],
+    })
+    const middle = out.split('\n')[1]!
+    const parsed = JSON.parse(middle) as { media: string[] }
+    expect(parsed.media).toEqual(['<media kind="photo" file_id="P1" />'])
   })
 
   test('throws on invalid kind', () => {

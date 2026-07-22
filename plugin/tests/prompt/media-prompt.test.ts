@@ -188,6 +188,27 @@ describe('renderMediaDescriptor', () => {
     )
   })
 
+  test('builds animation tag (fields mirror video)', () => {
+    const md: MediaDescriptor = {
+      kind: 'animation',
+      fileId: 'anF',
+      name: 'giphy.mp4',
+      mime: 'video/mp4',
+      size: 2048,
+      durationSec: 3,
+      width: 320,
+      height: 240,
+    }
+    expect(renderMediaDescriptor(md)).toBe(
+      '<media kind="animation" file_id="anF" name="giphy.mp4" mime="video/mp4" size="2048" duration_sec="3" width="320" height="240" />',
+    )
+  })
+
+  test('animation omits undefined attributes', () => {
+    const md: MediaDescriptor = { kind: 'animation', fileId: 'anF2' }
+    expect(renderMediaDescriptor(md)).toBe('<media kind="animation" file_id="anF2" />')
+  })
+
   test('omits undefined attributes', () => {
     const md: MediaDescriptor = {
       kind: 'document',
