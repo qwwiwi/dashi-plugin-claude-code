@@ -37,6 +37,7 @@ import {
   type StatePaths,
 } from './config.js'
 import { createLogger } from './log.js'
+import { classifyWatchdogState } from './process-watchdog.js'
 import { ensureStateDirs, migrateLegacyAllowlist, writeDeadLetter } from './state/store.js'
 import {
   callTool,
@@ -1429,22 +1430,64 @@ function shutdown(): void {
     .then(() => Promise.resolve(bot.stop()))
     .finally(() => process.exit(0))
 }
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
+// The MCP tool-call interface and the Telegram bridge (poller/webhook/
+// memory writer) have independent lifecycles — the bridge doesn't need a
+// live stdio transport to keep receiving and archiving messages. See
+// process-watchdog.ts for why stdin loss alone must NOT shut everything
+// down (bug-archivist-channel-crash.md).
+let stdioLossWarned = false
+const warnStdioLost = (): void => {
+  if (stdioLossWarned) return
+  stdioLossWarned = true
+  log.warn(
+    'mcp stdio transport ended while parent process is still alive — ' +
+      'tool-call interface unavailable, telegram bridge keeps running',
+    { ppid: process.ppid },
+  )
+}
+process.stdin.on('end', warnStdioLost)
+process.stdin.on('close', warnStdioLost)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 process.on('SIGHUP', shutdown)
 
-// Orphan watchdog: stdin events above don't reliably fire when the parent
-// chain is severed by a crash. Poll for reparenting (POSIX) or dead stdin.
 const bootPpid = process.ppid
 setInterval(() => {
-  const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
-    process.stdin.destroyed ||
-    process.stdin.readableEnded
-  if (orphaned) shutdown()
+  const state = classifyWatchdogState({
+    ppid: process.ppid,
+    bootPpid,
+    platform: process.platform,
+    stdinDestroyed: process.stdin.destroyed,
+    stdinReadableEnded: process.stdin.readableEnded,
+  })
+  if (state === 'orphaned') {
+    shutdown()
+    return
+  }
+  if (state === 'stdio-lost') warnStdioLost()
 }, 5000).unref()
+
+// Keep-alive: the webhook HTTP server and the poller's in-flight
+// long-poll request SHOULD already keep Bun's event loop alive on their
+// own — but relying on that implicitly has proven unreliable in practice
+// (bug-archivist-channel-crash.md): a freshly-restarted, otherwise-idle
+// process (no real Telegram traffic — no incoming messages, no MCP tool
+// calls) died silently ~65-125s after start on every observed run, with
+// no signal, no OOM, no crash, no orphaning, and no error logged
+// anywhere. Adding a `beforeExit`/`exit` listener during investigation
+// made the same idle process survive well past that window on every
+// subsequent run — strong evidence the loop was going empty for a brief
+// instant (a natural, voluntary exit(0)) rather than being killed. This
+// almost never surfaces on sibling agents (marketer/coder) because their
+// stdio is kept busy by frequent real MCP tool-call traffic; archivist
+// currently has none, so the rare empty-loop instant is far more likely
+// to be hit. Rather than depend on incidental listener side effects, we
+// pin a persistent, deliberately-NOT-unref'd no-op interval: the loop can
+// never go empty, regardless of any other handle's ref-counting.
+setInterval(() => {}, 60_000)
+process.on('exit', (code) => {
+  log.info('process exiting', { code })
+})
 
 // ─────────────────────────────────────────────────────────────────────
 // Connect MCP transport. After this, Claude Code can list tools.
