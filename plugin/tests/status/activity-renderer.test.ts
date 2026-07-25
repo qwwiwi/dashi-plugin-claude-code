@@ -425,8 +425,8 @@ describe('IPv4 mask exemptions (M3)', () => {
     expect(maskSecrets('bind 0.0.0.0:80')).toBe('bind 0.0.0.0:80')
   })
 
-  test('public IPv4 ranges still masked', () => {
-    expect(maskSecrets('curl 8.8.8.8')).toBe('curl 8.***.***.8')
+  test('public IPv4 is shown in full; private ranges stay masked', () => {
+    expect(maskSecrets('curl 8.8.8.8')).toBe('curl 8.8.8.8')
     expect(maskSecrets('connect 10.2.3.44 done')).toBe('connect 10.***.***.44 done')
   })
 
