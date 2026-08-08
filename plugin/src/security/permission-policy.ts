@@ -164,7 +164,10 @@ const READ_ONLY_TOOLS = new Set<string>([
 ])
 
 // Tools that take a filesystem path we must policy-check.
-const READ_PATH_TOOLS = new Set<string>(['Read', 'NotebookRead'])
+// Инструменты, чей путь ОБЯЗАН проверяться на секретность. Grep/Glob/LS входят
+// сюда наравне с Read: поиск по файлу выдаёт его содержимое строками, то есть
+// это чтение — и запрет на чтение секретов должен работать одинаково для всех.
+const READ_PATH_TOOLS = new Set<string>(['Read', 'NotebookRead', 'Grep', 'Glob', 'LS'])
 const WRITE_PATH_TOOLS = new Set<string>(['Edit', 'Write', 'NotebookEdit', 'MultiEdit'])
 
 // ── Built-in hard rules (operator cannot relax) ─────────────────────────
@@ -179,6 +182,14 @@ const BUILTIN_DENY_PATHS: readonly string[] = [
   '**/*.key',
   '**/.secrets/**',
   '**/secrets/**',
+  // Сам каталог, без содержимого: шаблон с завершающим `/**` не совпадает с
+  // `~/.ssh` или `~/.secrets`, поэтому перечисление каталога (Glob/LS) проходило
+  // мимо запрета. Список файлов с ключами — это уже разведка, закрываем.
+  '**/.secrets',
+  '**/secrets',
+  '**/.ssh',
+  '**/.aws',
+  '**/.config/gcloud',
   '**/id_rsa*',
   '**/id_ed25519*',
   '**/.ssh/**',
@@ -2000,7 +2011,12 @@ function rulesMatch(
 }
 
 function extractPath(toolInput: Record<string, unknown>): string | undefined {
-  const fp = toolInput.file_path ?? toolInput.notebook_path
+  // `path` — поле Grep/Glob/LS. Без него поисковые инструменты приходили сюда
+  // БЕЗ пути, проверка секретных путей не выполнялась, а сами они помечены
+  // read-only → tier=allow. Итог: `Grep(pattern:"TOKEN", path:"~/.secrets")`
+  // возвращал строки с секретами там, где `Read` того же файла жёстко запрещён
+  // (сообщено внешним исследователем 2026-08-03, воспроизведено по коду).
+  const fp = toolInput.file_path ?? toolInput.notebook_path ?? toolInput.path
   return typeof fp === 'string' && fp.length > 0 ? fp : undefined
 }
 
