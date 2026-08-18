@@ -21,6 +21,24 @@ import { parseLaunchModelFlag } from '../config.js'
 // process; the extra hops cover a wrapper/shell without walking to PID 1.
 const MAX_ANCESTORS = 8
 
+// Only a Claude Code process's `--model` counts. A wrapper further down the
+// chain may carry a `--model` of its own (a launcher, a different CLI), and
+// taking it would mask the real harness above it (codex MEDIUM, 2026-08-18).
+// The walk therefore SKIPS non-Claude candidates and keeps climbing.
+function isClaudeProcess(argv: readonly string[]): boolean {
+  const exe = argv[0]
+  if (exe === undefined) return false
+  // Basename of argv[0]: `claude`, `/usr/local/bin/claude`, `node .../claude.js`.
+  const base = exe.split('/').pop()?.toLowerCase() ?? ''
+  if (base === 'claude' || base.startsWith('claude.')) return true
+  // Runtime-launched form: `node|bun <path-to>/claude(.js|.mjs)`.
+  if (base === 'node' || base === 'bun') {
+    const script = argv[1]?.split('/').pop()?.toLowerCase() ?? ''
+    return script === 'claude' || script.startsWith('claude.')
+  }
+  return false
+}
+
 function readCmdline(pid: number): readonly string[] | undefined {
   try {
     const raw = readFileSync(`/proc/${pid}/cmdline`, 'utf8')
@@ -78,7 +96,7 @@ export function readLaunchModelId(opts?: ReadLaunchModelOptions): string | undef
     let parent: number | undefined
     try {
       const argv = readCmd(pid)
-      if (argv !== undefined) {
+      if (argv !== undefined && isClaudeProcess(argv)) {
         const model = parseLaunchModelFlag(argv)
         if (model !== undefined) return model
       }

@@ -37,6 +37,30 @@ describe('readLaunchModelId', () => {
     expect(readLaunchModelId({ startPid: 100, ...t })).toBeUndefined()
   })
 
+  // codex MEDIUM 2026-08-18: a wrapper carrying its own --model must not mask
+  // the real Claude Code process further up the chain.
+  test('a non-Claude wrapper with its own --model is skipped', () => {
+    const t = tree({
+      100: { argv: ['bun', 'src/server.ts'], ppid: 200 },
+      200: { argv: ['some-launcher', '--model', 'wrapper-model[1m]'], ppid: 300 },
+      300: { argv: ['claude', '--model', 'claude-opus-5[1m]'] },
+    })
+    expect(readLaunchModelId({ startPid: 100, ...t })).toBe('claude-opus-5[1m]')
+  })
+
+  test('claude launched through a runtime (node/bun <path>/claude.js) is recognized', () => {
+    const t = tree({
+      100: { argv: ['bun', 'src/server.ts'], ppid: 200 },
+      200: { argv: ['node', '/usr/lib/claude-code/claude.js', '--model', 'claude-opus-5[1m]'] },
+    })
+    expect(readLaunchModelId({ startPid: 100, ...t })).toBe('claude-opus-5[1m]')
+  })
+
+  test('a --model on a non-Claude process alone yields nothing', () => {
+    const t = tree({ 100: { argv: ['python', 'train.py', '--model', 'resnet[1m]'] } })
+    expect(readLaunchModelId({ startPid: 100, ...t })).toBeUndefined()
+  })
+
   test('unreadable process (no /proc entry) → undefined, never throws', () => {
     const t = tree({})
     expect(readLaunchModelId({ startPid: 100, ...t })).toBeUndefined()

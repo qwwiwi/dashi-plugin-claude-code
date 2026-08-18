@@ -897,7 +897,12 @@ export function parseLaunchModelFlag(argv: readonly string[]): string | undefine
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
     if (arg === undefined) continue
+    // `--` ends option parsing; everything after it is positional (codex LOW).
+    if (arg === '--') break
     if (arg === '--model') {
+      // Reset FIRST: a later malformed `--model` overrides an earlier good one,
+      // matching real CLI semantics — the flag was re-specified (codex LOW).
+      found = undefined
       const next = argv[i + 1]
       // A bare trailing `--model`, or one followed by another flag, has no value.
       if (next !== undefined && next.length > 0 && !next.startsWith('-')) found = next
@@ -905,7 +910,7 @@ export function parseLaunchModelFlag(argv: readonly string[]): string | undefine
     }
     if (arg.startsWith('--model=')) {
       const value = arg.slice('--model='.length)
-      if (value.length > 0) found = value
+      found = value.length > 0 ? value : undefined
     }
   }
   return found
@@ -919,16 +924,23 @@ function stripWindowMarker(id: string): string {
 
 // Does `launchModel` prove that `id` (a transcript model id, lowercased, with no
 // marker of its own) is running the 1M variant? Only when the launch flag both
-// carries the marker AND names the SAME model — otherwise a mid-session `/model`
-// switch (opus-5[1m] launched, sonnet now serving) would inherit a window the
-// current model does not have.
+// carries the marker AND names EXACTLY the model the transcript reports.
+//
+// Exact equality, not a family match: a family match in either direction lets a
+// short alias (`--model opus[1m]`) claim a 1M window for every Opus id the
+// session might later serve, which is not proof of anything (codex HIGH,
+// 2026-08-18).
+//
+// KNOWN LIMIT: a mid-session `/model` switch BETWEEN the 1M and 200k variants of
+// the SAME model is invisible here — both serve the identical bare transcript id
+// (`claude-opus-5`), so the launch flag stays the only evidence and the HUD keeps
+// reporting 1M until restart. Switching to any OTHER model is handled correctly
+// (different id → no match). The operator override remains the escape hatch.
 function launchProvesOneMillion(id: string, launchModel: string | undefined): boolean {
   if (launchModel === undefined || launchModel.length === 0) return false
   const launch = launchModel.toLowerCase()
   if (!ONE_MILLION_MARKER.test(launch)) return false
-  const base = stripWindowMarker(launch)
-  if (base.length === 0) return false
-  return base === id || matchesModelFamily(id, base) || matchesModelFamily(base, id)
+  return stripWindowMarker(launch) === id
 }
 
 // Normalize an operator-supplied window value to a usable token count, or

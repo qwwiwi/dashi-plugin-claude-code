@@ -208,6 +208,14 @@ describe('parseLaunchModelFlag', () => {
 
   test('last occurrence wins (CLI flag semantics)', () => {
     expect(parseLaunchModelFlag(['claude', '--model', 'a', '--model', 'b'])).toBe('b')
+    // codex LOW: a later MALFORMED --model still overrides the earlier value.
+    expect(parseLaunchModelFlag(['claude', '--model', 'a', '--model='])).toBeUndefined()
+    expect(parseLaunchModelFlag(['claude', '--model', 'a', '--model', '--verbose'])).toBeUndefined()
+  })
+
+  test('option parsing stops at `--`', () => {
+    expect(parseLaunchModelFlag(['claude', '--', '--model', 'positional'])).toBeUndefined()
+    expect(parseLaunchModelFlag(['claude', '--model', 'a', '--', '--model', 'b'])).toBe('a')
   })
 })
 
@@ -226,6 +234,13 @@ describe('resolveContextWindowForModel — launch flag', () => {
     expect(
       resolveContextWindowForModel('claude-opus-5', { launchModel: 'claude-opus-5' }),
     ).toBe(200_000)
+  })
+
+  // codex HIGH 2026-08-18: a family match in either direction let a short alias
+  // claim 1M for every model of that family. Exact id equality only.
+  test('a short alias launch flag does NOT prove 1M for a concrete id', () => {
+    expect(resolveContextWindowForModel('claude-opus-5', { launchModel: 'opus[1m]' })).toBe(200_000)
+    expect(resolveContextWindowForModel('opus', { launchModel: 'claude-opus-5[1m]' })).toBe(200_000)
   })
 
   test('a DIFFERENT model now serving does not inherit the launch window', () => {
