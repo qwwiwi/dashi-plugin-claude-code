@@ -195,6 +195,11 @@ export interface OobContext {
   // override wins, else the transcript model's table window, else the fallback.
   // Undefined when no operator override is configured.
   contextWindowOverride?: number
+  // The hosting Claude Code process's `--model` flag (readLaunchModelId). Some
+  // 1M variants are served under a BARE transcript id (`claude-opus-5` from
+  // `--model claude-opus-5[1m]`), so this is the only surviving proof of the
+  // window. Undefined when the flag could not be read.
+  launchModel?: string
   // Process uptime in seconds (process.uptime()); rendered when present.
   uptimeSeconds?: number
   // Autonomy M2: inbound message id, used to build the idempotent grantSourceId
@@ -316,6 +321,7 @@ async function statusText(ctx: OobContext): Promise<string> {
       const windowTokens = resolveContextWindowForModel(usage.model, {
         override: ctx.contextWindowOverride,
         fallback: fallbackWindow,
+        launchModel: ctx.launchModel,
       })
       contextLine = formatContextUsage(usage, windowTokens)
     }

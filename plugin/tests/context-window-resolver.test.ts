@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
   DEFAULT_CONTEXT_WINDOW_TOKENS,
   MODEL_CONTEXT_WINDOWS,
+  parseLaunchModelFlag,
   resolveContextWindowForModel,
   resolveContextWindowOverride,
   resolveContextWindowTokens,
@@ -179,5 +180,76 @@ describe('resolveContextWindowOverride — config + env chain', () => {
   test('resolveContextWindowTokens honors the env override', () => {
     process.env[KEY] = '1000000'
     expect(resolveContextWindowTokens(cfg(undefined))).toBe(1_000_000)
+  })
+})
+
+// --- Launch-flag marker (2026-08-18) ---------------------------------------
+// Claude Code launched as `--model claude-opus-5[1m]` writes a BARE
+// `"model":"claude-opus-5"` into the transcript, so the marker survives only in
+// the CLI argv. Without it the HUD showed 200k for a 1M session.
+
+describe('parseLaunchModelFlag', () => {
+  test('reads --model <id> and --model=<id>', () => {
+    expect(parseLaunchModelFlag(['claude', '--model', 'claude-opus-5[1m]'])).toBe(
+      'claude-opus-5[1m]',
+    )
+    expect(parseLaunchModelFlag(['claude', '--model=claude-opus-5[1m]'])).toBe(
+      'claude-opus-5[1m]',
+    )
+  })
+
+  test('absent / valueless flag → undefined', () => {
+    expect(parseLaunchModelFlag(['claude', '--permission-mode', 'bypassPermissions'])).toBeUndefined()
+    expect(parseLaunchModelFlag(['claude', '--model'])).toBeUndefined()
+    // A following flag is not a value.
+    expect(parseLaunchModelFlag(['claude', '--model', '--verbose'])).toBeUndefined()
+    expect(parseLaunchModelFlag(['claude', '--model='])).toBeUndefined()
+  })
+
+  test('last occurrence wins (CLI flag semantics)', () => {
+    expect(parseLaunchModelFlag(['claude', '--model', 'a', '--model', 'b'])).toBe('b')
+  })
+})
+
+describe('resolveContextWindowForModel — launch flag', () => {
+  test('bare transcript id + [1m] launch flag for the SAME model → 1M', () => {
+    expect(
+      resolveContextWindowForModel('claude-opus-5', { launchModel: 'claude-opus-5[1m]' }),
+    ).toBe(1_000_000)
+    // Case-insensitive, and the real tmux argv form.
+    expect(
+      resolveContextWindowForModel('CLAUDE-OPUS-5', { launchModel: 'claude-opus-5[1m]' }),
+    ).toBe(1_000_000)
+  })
+
+  test('launch flag WITHOUT the marker changes nothing', () => {
+    expect(
+      resolveContextWindowForModel('claude-opus-5', { launchModel: 'claude-opus-5' }),
+    ).toBe(200_000)
+  })
+
+  test('a DIFFERENT model now serving does not inherit the launch window', () => {
+    // Mid-session /model switch: launched opus-5[1m], sonnet is serving.
+    expect(
+      resolveContextWindowForModel('claude-sonnet-5', { launchModel: 'claude-opus-5[1m]' }),
+    ).toBe(200_000)
+    expect(
+      resolveContextWindowForModel('claude-opus-4-6', { launchModel: 'claude-opus-5[1m]' }),
+    ).toBe(200_000)
+  })
+
+  test('operator override still wins over the launch flag', () => {
+    expect(
+      resolveContextWindowForModel('claude-opus-5', {
+        launchModel: 'claude-opus-5[1m]',
+        override: 300_000,
+      }),
+    ).toBe(300_000)
+  })
+
+  test('absent model with a [1m] launch flag stays on the fallback', () => {
+    expect(
+      resolveContextWindowForModel(undefined, { launchModel: 'claude-opus-5[1m]' }),
+    ).toBe(DEFAULT_CONTEXT_WINDOW_TOKENS)
   })
 })

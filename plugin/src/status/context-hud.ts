@@ -291,6 +291,12 @@ export interface ContextHudOptions {
   // window so a Fable-5 session reports its true 1M window. Optional so the many
   // test literals that predate it keep compiling.
   windowOverride?: number | undefined
+  // The `--model` flag of the hosting Claude Code process (readLaunchModelId,
+  // read once at boot). Some 1M variants report a BARE model id in the
+  // transcript (`claude-opus-5` under `--model claude-opus-5[1m]`); the launch
+  // flag is then the only proof the window is 1M and not the table's 200k.
+  // Optional — when absent the model table drives the window as before.
+  launchModel?: string | undefined
   // Owner chat(s) — the ONLY chats the HUD acts in. Stringified for comparison
   // against the hook payload's chatId.
   ownerChatIds: ReadonlyArray<string | number>
@@ -313,6 +319,7 @@ export class ContextHud {
   private readonly sessionInfo: SessionInfoReader
   private readonly windowTokens: number
   private readonly windowOverride?: number | undefined
+  private readonly launchModel?: string | undefined
   private readonly owner: ReadonlySet<string>
   private readonly stateDir: string
   private readonly enabled: boolean
@@ -374,6 +381,7 @@ export class ContextHud {
     this.sessionInfo = opts.sessionInfo
     this.windowTokens = opts.windowTokens
     this.windowOverride = opts.windowOverride
+    this.launchModel = opts.launchModel
     this.owner = new Set(opts.ownerChatIds.map((id) => String(id)))
     this.stateDir = opts.stateDir
     this.enabled = opts.enabled
@@ -788,6 +796,7 @@ export class ContextHud {
     const windowTokens = resolveContextWindowForModel(model, {
       override: this.windowOverride,
       fallback: this.windowTokens,
+      launchModel: this.launchModel,
     })
     // M3: the reconciled (pane-verified) view wins over the event-only snapshot.
     const rv = this.reconciled.get(chatId)

@@ -58,6 +58,7 @@ import { TmuxMirror } from './status/tmux-mirror.js'
 import { defaultTmuxExec } from './status/pane-capture.js'
 import { TaskRealityMirror } from './status/task-reality-mirror.js'
 import { SessionInfoStore } from './status/session-info.js'
+import { readLaunchModelId } from './status/launch-model.js'
 import {
   ContextHud,
   handleHudCallback,
@@ -558,12 +559,19 @@ const hudApi: HudTelegramApi = {
   unpinChatMessage: (chatId, messageId) =>
     bot.api.unpinChatMessage(chatId, messageId).then(() => undefined),
 }
+// The hosting Claude Code process's `--model` flag, read ONCE at boot. It is
+// the only place the `[1m]` window marker survives for models the API reports
+// bare (e.g. `claude-opus-5` served by `--model claude-opus-5[1m]`), so both the
+// pinned HUD and /status need it to show a 1M window instead of the table's 200k.
+const launchModelId = readLaunchModelId()
+log.info('launch model detected', { launch_model: launchModelId ?? '(none)' })
 const contextHud = new ContextHud({
   api: hudApi,
   log,
   sessionInfo: sessionInfoStore,
   windowTokens: resolveContextWindowTokens(config),
   windowOverride: resolveContextWindowOverride(config),
+  ...(launchModelId !== undefined ? { launchModel: launchModelId } : {}),
   ownerChatIds: hudOwnerChatIds,
   stateDir: statePaths.root,
   enabled: resolveHudEnabled(config),
@@ -1311,6 +1319,9 @@ const handlerDeps: HandlerDeps = {
   ...(tmuxKeysTarget !== undefined ? { tmuxKeys: { target: tmuxKeysTarget } } : {}),
   // Session facts (transcript_path + model) for /status context usage.
   sessionInfo: sessionInfoStore,
+  // Launch `--model` flag — lets /status resolve a 1M window for models the
+  // transcript reports bare (see readLaunchModelId).
+  ...(launchModelId !== undefined ? { launchModel: launchModelId } : {}),
   // Multichat router + policy. Both must be present for handlers.ts to
   // take the router path; passing one without the other is a wiring bug
   // (handlers.ts treats the pair atomically).

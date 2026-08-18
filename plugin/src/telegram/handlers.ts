@@ -167,6 +167,10 @@ export interface HandlerDeps {
   // decoupled from the concrete SessionInfoStore. Optional — absent in legacy
   // wiring / tests, in which case /status shows «контекст: —».
   sessionInfo?: { get(chatId?: string): { transcriptPath?: string; model?: string } }
+  // The model id the hosting Claude Code process was launched with (readLaunchModelId,
+  // resolved once at boot). Carries the `[1m]` window marker that the transcript's
+  // model id drops, so /status can resolve a 1M window exactly like the pinned HUD.
+  launchModel?: string | undefined
   // Multichat router. When present together with `policy`, all gated
   // inbound traffic is dispatched to the per-chat tmux session via
   // `router.dispatch(InboundMessage)` instead of the legacy
@@ -1289,6 +1293,9 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
         uptimeSeconds: process.uptime(),
         ...(ctx.message?.message_id !== undefined ? { messageId: ctx.message.message_id } : {}),
         ...(windowOverride !== undefined ? { contextWindowOverride: windowOverride } : {}),
+        ...(deps.launchModel !== undefined && deps.launchModel.length > 0
+          ? { launchModel: deps.launchModel }
+          : {}),
         ...(session?.transcriptPath ? { transcriptPath: session.transcriptPath } : {}),
         ...(session?.model ? { modelName: session.model } : {}),
         ...(deps.statusManager
