@@ -56,6 +56,28 @@ describe('readLaunchModelId', () => {
     expect(readLaunchModelId({ startPid: 100, ...t })).toBe('claude-opus-5[1m]')
   })
 
+  // codex MEDIUM 2026-08-18: the official npm entrypoint has a generic
+  // `cli.js` basename — only the path identifies it.
+  test('official npm entrypoint (@anthropic-ai/claude-code/cli.js) is recognized', () => {
+    const t = tree({
+      100: { argv: ['bun', 'src/server.ts'], ppid: 200 },
+      200: {
+        argv: [
+          'node',
+          '/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js',
+          '--model',
+          'claude-opus-5[1m]',
+        ],
+      },
+    })
+    expect(readLaunchModelId({ startPid: 100, ...t })).toBe('claude-opus-5[1m]')
+  })
+
+  test('an unrelated node cli.js is still NOT treated as Claude', () => {
+    const t = tree({ 100: { argv: ['node', '/opt/other-tool/cli.js', '--model', 'x[1m]'] } })
+    expect(readLaunchModelId({ startPid: 100, ...t })).toBeUndefined()
+  })
+
   test('a --model on a non-Claude process alone yields nothing', () => {
     const t = tree({ 100: { argv: ['python', 'train.py', '--model', 'resnet[1m]'] } })
     expect(readLaunchModelId({ startPid: 100, ...t })).toBeUndefined()

@@ -216,6 +216,10 @@ describe('parseLaunchModelFlag', () => {
   test('option parsing stops at `--`', () => {
     expect(parseLaunchModelFlag(['claude', '--', '--model', 'positional'])).toBeUndefined()
     expect(parseLaunchModelFlag(['claude', '--model', 'a', '--', '--model', 'b'])).toBe('a')
+    // codex control round claimed a valueless `--model` SWALLOWS the following
+    // `--`; it does not — the branch never advances the index itself, so the
+    // terminator is seen on the next iteration. Pinned as a regression test.
+    expect(parseLaunchModelFlag(['claude', '--model', '--', '--model', 'b'])).toBeUndefined()
   })
 })
 

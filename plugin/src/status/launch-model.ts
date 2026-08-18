@@ -31,10 +31,17 @@ function isClaudeProcess(argv: readonly string[]): boolean {
   // Basename of argv[0]: `claude`, `/usr/local/bin/claude`, `node .../claude.js`.
   const base = exe.split('/').pop()?.toLowerCase() ?? ''
   if (base === 'claude' || base.startsWith('claude.')) return true
-  // Runtime-launched form: `node|bun <path-to>/claude(.js|.mjs)`.
+  // Runtime-launched forms: `node|bun <path>/claude(.js|.mjs)` AND the official
+  // npm entrypoint `node <prefix>/@anthropic-ai/claude-code/cli.js`, where the
+  // script basename is a generic `cli.js` and only the PATH identifies it
+  // (codex MEDIUM, 2026-08-18). Matching a `claude*` path SEGMENT covers both
+  // without loosening the filter to any `cli.js`.
   if (base === 'node' || base === 'bun') {
-    const script = argv[1]?.split('/').pop()?.toLowerCase() ?? ''
-    return script === 'claude' || script.startsWith('claude.')
+    const script = argv[1]?.toLowerCase()
+    if (script === undefined || script.startsWith('-')) return false
+    return script
+      .split('/')
+      .some((seg) => seg === 'claude' || seg.startsWith('claude.') || seg.startsWith('claude-'))
   }
   return false
 }
