@@ -116,6 +116,7 @@ function makeStubApi(clock: FakeClock): StubApi {
       maybeThrow('sendMessage')
       return { message_id: calls.length + 1 }
     },
+    async editRichMessage() { return { fallback: true } as const },
     async editMessageText(chatId, messageId, text, opts) {
       maybeThrow('editMessageText')
       calls.push({ method: 'editMessageText', chatId, messageId, text, opts, ts: clock.now() })

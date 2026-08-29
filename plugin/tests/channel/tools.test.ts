@@ -27,6 +27,7 @@ function makeStubApi(overrides: Partial<TelegramApi> = {}): TelegramApi {
     // Default rich stub reports fallback so legacy reply tests (richMessages
     // disabled in makeConfig) never accidentally exercise the rich path.
     sendRichMessage: async () => ({ fallback: true as const }),
+    editRichMessage: async () => ({ fallback: true as const }),
     editMessageText: async (_chatId: string, _messageId: number, _text: string, _opts: EditOpts) => {
       /* noop */
     },

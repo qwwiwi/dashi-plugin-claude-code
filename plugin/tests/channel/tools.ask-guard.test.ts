@@ -53,6 +53,7 @@ function makeRecordingApi(sent: SentRecord[]): TelegramApi {
       return { message_id: 1 }
     },
     sendRichMessage: async () => ({ fallback: true as const }),
+    editRichMessage: async () => ({ fallback: true }) as const,
     editMessageText: async (_c: string, _m: number, _t: string, _o: EditOpts) => {},
     setMessageReaction: async (_c: string, _m: number, _e: string) => {},
     sendChatAction: async () => {},

@@ -61,6 +61,7 @@ function fakeTelegram(state: Sends): TelegramApi {
     async sendRichMessage() {
       return { fallback: true as const }
     },
+    async editRichMessage() { return { fallback: true } as const },
     async editMessageText(chatId, messageId, text, opts) {
       state.editCalls.push({ chatId, messageId, text, opts })
     },

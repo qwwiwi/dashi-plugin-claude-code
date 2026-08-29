@@ -81,6 +81,7 @@ function makeTelegramApi(): TelegramApi {
   return {
     sendMessage: fail('sendMessage') as TelegramApi['sendMessage'],
     sendRichMessage: fail('sendRichMessage') as unknown as TelegramApi['sendRichMessage'],
+    editRichMessage: async () => ({ fallback: true }) as const,
     editMessageText: fail('editMessageText') as TelegramApi['editMessageText'],
     setMessageReaction: fail(
       'setMessageReaction',

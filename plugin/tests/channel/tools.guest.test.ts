@@ -116,6 +116,7 @@ function makeStubApi(opts: { failures?: Error[] } = {}): {
     },
     // Guest replies must never take the rich path — throw loudly if they do.
     sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
+    editRichMessage: async () => ({ fallback: true }) as const,
     editMessageText: noop as unknown as TelegramApi['editMessageText'],
     setMessageReaction: noop as unknown as TelegramApi['setMessageReaction'],
     sendChatAction: async () => {},
@@ -198,6 +199,7 @@ function makeDownloadApi(): { api: TelegramApi; downloadCalls: string[] } {
   const api: TelegramApi = {
     sendMessage: noop as unknown as TelegramApi['sendMessage'],
     sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
+    editRichMessage: async () => ({ fallback: true }) as const,
     editMessageText: noop as unknown as TelegramApi['editMessageText'],
     setMessageReaction: noop as unknown as TelegramApi['setMessageReaction'],
     sendChatAction: async () => {},

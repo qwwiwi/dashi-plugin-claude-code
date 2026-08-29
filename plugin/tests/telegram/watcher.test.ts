@@ -95,6 +95,7 @@ function makeFakeApi(): FakeApi {
       return { message_id: 999 }
     },
     sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
+    editRichMessage: async () => ({ fallback: true }) as const,
     editMessageText: noop as unknown as TelegramApi['editMessageText'],
     setMessageReaction: noop as unknown as TelegramApi['setMessageReaction'],
     sendChatAction: noop as unknown as TelegramApi['sendChatAction'],

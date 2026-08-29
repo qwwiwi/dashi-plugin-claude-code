@@ -245,6 +245,17 @@ export function createRateLimitedTelegramApi(
     // sendMessage (one outbound bubble), so they route through the identical
     // FIFO + token-bucket + 429-retry path. Ordering with sibling sends to
     // the same chat is preserved.
+    async editRichMessage(
+      chatId: string,
+      messageId: number,
+      rawMarkdown: string,
+    ) {
+      // Edits target a message already on screen — they do not create a new
+      // one, so they do not go through the per-chat send queue. Pass straight
+      // through, exactly like editMessageText does.
+      return raw.editRichMessage(chatId, messageId, rawMarkdown)
+    },
+
     async sendRichMessage(
       chatId: string,
       rawMarkdown: string,

@@ -51,6 +51,7 @@ import { splitMessage } from '../format/chunk.js'
 import { assertSendableFile, isPhotoExtension } from '../security/paths.js'
 import {
   buildRichMessagePayload,
+  buildRichEditPayload,
   contentFitsRichLimits,
   hardenSoftBreaks,
   needsRichRendering,
@@ -145,6 +146,13 @@ export interface SendRichMessageOpts {
 // duplicated.
 export type SendRichMessageResult = { message_id: number } | { fallback: true }
 
+// Result of a rich in-place EDIT. `ok` means the message on screen now shows
+// the rich body (including the "not modified" no-op — it already did).
+// `fallback` means the caller should retry the edit through the legacy path.
+// A TRANSIENT failure is NOT represented here: it throws, because the edit
+// may already have landed and a legacy retry would fight it.
+export type EditRichMessageResult = { ok: true } | { fallback: true }
+
 export interface DownloadResult {
   path: string
   mime?: string
@@ -182,6 +190,15 @@ export interface TelegramApi {
     rawMarkdown: string,
     opts: SendRichMessageOpts,
   ): Promise<SendRichMessageResult>
+  // Bot API 10.1 rich EDIT: re-render a message already on screen as rich,
+  // in place. Same body as sendRichMessage plus message_id; no topic routing
+  // (Telegram rejects a rich edit that carries it). Redaction runs in the
+  // safe wrapper BEFORE the raw call, exactly like the send path.
+  editRichMessage(
+    chatId: string,
+    messageId: number,
+    rawMarkdown: string,
+  ): Promise<EditRichMessageResult>
   editMessageText(chatId: string, messageId: number, text: string, opts: EditOpts): Promise<void>
   setMessageReaction(chatId: string, messageId: number, emoji: string): Promise<void>
   sendChatAction(chatId: string, action: ChatAction): Promise<void>
@@ -249,6 +266,24 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
         throw new Error('sendRichMessage returned no message_id')
       }
       return { message_id: messageId }
+    },
+    async editRichMessage(chatId, messageId, rawMarkdown) {
+      // Same raw escape hatch as sendRichMessage: grammY has no typed
+      // editMessageText.rich_message. The safe wrapper already redacted the
+      // markdown; this layer only transports it.
+      const body = buildRichEditPayload(rawMarkdown, {
+        chat_id: chatId,
+        message_id: messageId,
+      })
+      const rawApi = bot.api.raw as unknown as Record<string, unknown>
+      const editRich = rawApi.editMessageText as unknown as (
+        b: Record<string, unknown>,
+      ) => Promise<unknown>
+      await editRich(body as unknown as Record<string, unknown>)
+      // Telegram answers with the edited Message (or `true` for some shapes).
+      // We deliberately do NOT parse it: a post-edit parse quirk must not be
+      // mistaken for a failed edit and trigger a duplicate legacy edit.
+      return { ok: true }
     },
     async editMessageText(chatId, messageId, text, opts) {
       const other: Record<string, unknown> = {}
@@ -983,9 +1018,40 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         } catch (err) {
           return toolError(name, err instanceof Error ? err.message : String(err))
         }
+        const messageId = Number(args.message_id)
+        // Wave 2: re-render the message richly IN PLACE when its new body
+        // carries a construct the legacy edit degrades. Same gate as the
+        // reply path — content decides, shields veto — so a progress card
+        // that grew a table stops collapsing into bullet lists on every
+        // update. `hardenSoftBreaks` runs first for the same CommonMark
+        // reason as the send path, and the size gate measures what we send.
+        const editRichBody = hardenSoftBreaks(args.text)
+        const editRichEligible =
+          config.richMessages.enabled &&
+          args.format !== 'markdownv2' &&
+          needsRichRendering(editRichBody) &&
+          !hasDetailsMathCrashShape(editRichBody) &&
+          !hasCjkGarbleShape(editRichBody) &&
+          deps.richLatch !== undefined &&
+          !deps.richLatch.sendDisabled &&
+          !config.richMessages.perChatOptOut.includes(args.chat_id) &&
+          contentFitsRichLimits(editRichBody) &&
+          isDmChat(args.chat_id)
+
+        if (editRichEligible) {
+          // A transient failure THROWS out of the safe wrapper on purpose:
+          // the edit may already have landed, so retrying through the legacy
+          // path could fight a successful edit. The outer try turns it into
+          // a tool error. Only an explicit { fallback: true } falls through.
+          const res = await telegramApi.editRichMessage(args.chat_id, messageId, editRichBody)
+          if ('ok' in res) {
+            return { content: [{ type: 'text', text: `edited (id: ${args.message_id})` }] }
+          }
+        }
+
         const opts: EditOpts = {}
         if (args.format === 'markdownv2') opts.parse_mode = 'MarkdownV2'
-        await telegramApi.editMessageText(args.chat_id, Number(args.message_id), args.text, opts)
+        await telegramApi.editMessageText(args.chat_id, messageId, args.text, opts)
         return { content: [{ type: 'text', text: `edited (id: ${args.message_id})` }] }
       }
 

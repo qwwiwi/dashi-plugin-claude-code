@@ -418,3 +418,64 @@ const CJK_RE =
 export function hasCjkGarbleShape(text: string): boolean {
   return Boolean(text) && CJK_RE.test(text)
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Rich EDIT (wave 2)
+// ─────────────────────────────────────────────────────────────────────
+//
+// `editMessageText` accepts the same `rich_message` body as sendRichMessage,
+// so a message already on screen can be re-rendered richly IN PLACE — no
+// fresh send + delete, therefore no duplicate. Ported from Hermes
+// `_try_edit_rich` (v0.20.6).
+//
+// Deliberate omission, straight from upstream: topic routing
+// (message_thread_id / direct_messages_topic_id) is NOT forwarded on edits.
+// Edits address an existing message by chat_id + message_id; adding topic
+// fields makes Telegram reject the rich edit and silently drops the caller
+// onto the legacy path that flattens tables into bullet lists.
+
+export interface BuildRichEditOpts {
+  chat_id: string
+  message_id: number
+}
+
+export interface RichEditBody {
+  chat_id: string
+  message_id: number
+  rich_message: InputRichMessage
+}
+
+/**
+ * Build the raw-api body for a rich in-place edit. Pure — the caller has
+ * already redacted `rawMarkdown` in the safe wrapper.
+ */
+export function buildRichEditPayload(
+  rawMarkdown: string,
+  opts: BuildRichEditOpts,
+): RichEditBody {
+  return {
+    chat_id: opts.chat_id,
+    message_id: opts.message_id,
+    rich_message: { markdown: rawMarkdown },
+  }
+}
+
+/**
+ * True when Telegram rejected an edit because the new content is identical
+ * to what is already on screen. Upstream treats this as a SUCCESSFUL no-op:
+ * the message already shows exactly what we wanted, and falling through to a
+ * legacy edit would only repeat the same rejection while flattening tables.
+ */
+export function isNotModifiedError(err: unknown): boolean {
+  const msg =
+    typeof err === 'string'
+      ? err
+      : typeof err === 'object' && err !== null
+        ? String(
+            (err as { description?: unknown; message?: unknown }).description ??
+              (err as { message?: unknown }).message ??
+              '',
+          )
+        : ''
+  return msg.toLowerCase().includes('not modified')
+}

@@ -394,6 +394,14 @@ export function createReliableTelegramApi(
       return res
     },
 
+    async editRichMessage(
+      chatId: string,
+      messageId: number,
+      rawMarkdown: string,
+    ) {
+      return raw.editRichMessage(chatId, messageId, rawMarkdown)
+    },
+
     async sendRichMessage(
       chatId,
       rawMarkdown,

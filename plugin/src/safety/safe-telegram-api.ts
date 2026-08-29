@@ -29,11 +29,12 @@ import type {
   SendMessageOpts,
   SendRichMessageOpts,
   SendRichMessageResult,
+  EditRichMessageResult,
   TelegramApi,
 } from '../channel/tools.js'
 import { redactSecrets } from './redact.js'
 import { validateTelegramHtml } from './html-validator.js'
-import { richErrorClass } from '../format/rich.js'
+import { richErrorClass, isNotModifiedError } from '../format/rich.js'
 import type { RichLatch } from './rich-latch.js'
 
 /**
@@ -202,6 +203,44 @@ export function createSafeTelegramApi(
         // here: the rate-limit wrapper owns 429 retries, and swallowing a
         // transient then sending via HTML risks a duplicate if the rich send
         // actually landed. Re-throw so the reply tool's outer try reports it.
+        throw err
+      }
+    },
+
+    async editRichMessage(
+      chatId: string,
+      messageId: number,
+      rawMarkdown: string,
+    ): Promise<EditRichMessageResult> {
+      // Mirrors sendRichMessage's contract exactly — see that method for the
+      // reasoning behind each branch. Differences are called out inline.
+      if (richLatch === undefined || richLatch.sendDisabled) {
+        return { fallback: true }
+      }
+      const redacted = redactSecrets(rawMarkdown, extraSecrets)
+      try {
+        return await raw.editRichMessage(chatId, messageId, redacted)
+      } catch (err) {
+        // "Message is not modified" is a SUCCESSFUL no-op: the message on
+        // screen already shows exactly this rich body. Falling through to a
+        // legacy edit would repeat the same rejection AND flatten tables.
+        // Checked FIRST — Telegram returns it as a 400, which the classifier
+        // would otherwise read as a parser rejection. (Hermes _try_edit_rich.)
+        if (isNotModifiedError(err)) {
+          return { ok: true }
+        }
+        const cls = richErrorClass(err)
+        if (cls === 'capability') {
+          richLatch.sendDisabled = true
+          log.warn('rich edit unsupported — latched off for the session')
+          return { fallback: true }
+        }
+        if (cls === 'parser' || cls === 'oversize') {
+          return { fallback: true }
+        }
+        // Transient: the edit may ALREADY have landed. Re-throw instead of
+        // reporting fallback — a legacy retry here could fight a successful
+        // edit. The caller surfaces this as a tool error.
         throw err
       }
     },

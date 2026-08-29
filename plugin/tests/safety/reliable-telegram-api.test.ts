@@ -95,6 +95,7 @@ function makeStub(program: {
     async sendRichMessage(): Promise<SendRichMessageResult> {
       return throwIf(program.sendRichMessage?.() ?? { fallback: true })
     },
+    async editRichMessage() { return { fallback: true } as const },
     async editMessageText(): Promise<void> {
       const i = stub.editCalls++
       const r = program.editMessageTextSeq?.[i]

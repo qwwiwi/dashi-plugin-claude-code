@@ -60,6 +60,7 @@ function makeInnerApi(
       recorder.sendRich.push({ chatId, rawMarkdown, opts })
       return richBehaviour()
     },
+    async editRichMessage() { return { fallback: true } as const },
     async editMessageText(_chatId, _messageId, _text, _opts: EditOpts) {},
     async setMessageReaction(_chatId, _messageId, _emoji) {},
     async sendChatAction() {},
