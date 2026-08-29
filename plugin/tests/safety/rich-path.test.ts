@@ -276,9 +276,16 @@ describe('safe-telegram-api.sendRichMessage', () => {
 // ─── reply tool: rich decision gate + no-dup / no-loss invariant ──────────
 
 describe("callTool('reply') rich gate", () => {
+  // Selective delivery (2026-08-29): rich now auto-enables only for bodies
+  // carrying a construct HTML degrades. These gate tests verify the SEND
+  // mechanics (one send, fallback, transient, hardening, threading,
+  // redaction), not the removed "always rich in DMs" rule — so each body
+  // below carries a real GFM table to stay on the rich path.
+  const TABLE = '| a | b |\n| --- | --- |\n| 1 | 2 |'
+
   test('happy path: one sendRichMessage, returns id, NO chunked sendMessage', async () => {
     const h = makeHarness({ richBehaviour: async () => ({ message_id: 4242 }) })
-    const result = await callTool(replyReq({ chat_id: PRINCE_DM, text: '# Hi\n\n| a | b |' }), h.deps)
+    const result = await callTool(replyReq({ chat_id: PRINCE_DM, text: `# Hi\n\n${TABLE}` }), h.deps)
 
     expect(result.isError).toBeUndefined()
     expect(h.recorder.sendRich).toHaveLength(1)
@@ -289,7 +296,7 @@ describe("callTool('reply') rich gate", () => {
 
   test('rich fallback → exactly ONE HTML send, no duplicate', async () => {
     const h = makeHarness({ richBehaviour: async () => ({ fallback: true }) })
-    const result = await callTool(replyReq({ chat_id: PRINCE_DM, text: 'plain body' }), h.deps)
+    const result = await callTool(replyReq({ chat_id: PRINCE_DM, text: `plain body\n\n${TABLE}` }), h.deps)
 
     expect(result.isError).toBeUndefined()
     expect(h.recorder.sendRich).toHaveLength(1) // attempted …
@@ -305,7 +312,7 @@ describe("callTool('reply') rich gate", () => {
         throw { error_code: 503, description: 'Service Unavailable' }
       },
     })
-    const result = await callTool(replyReq({ chat_id: PRINCE_DM, text: 'body' }), h.deps)
+    const result = await callTool(replyReq({ chat_id: PRINCE_DM, text: `body\n\n${TABLE}` }), h.deps)
 
     // The outer try in callTool turns the thrown transient into a tool error.
     expect(result.isError).toBe(true)
@@ -343,12 +350,12 @@ describe("callTool('reply') rich gate", () => {
   test('rich body is the HARDENED markdown (soft breaks promoted before send)', async () => {
     const h = makeHarness({ richBehaviour: async () => ({ message_id: 4242 }) })
     const result = await callTool(
-      replyReq({ chat_id: PRINCE_DM, text: 'M1 — a\nM2 — b' }),
+      replyReq({ chat_id: PRINCE_DM, text: `M1 — a\nM2 — b\n\n${TABLE}` }),
       h.deps,
     )
     expect(result.isError).toBeUndefined()
     expect(h.recorder.sendRich).toHaveLength(1)
-    expect(h.recorder.sendRich[0]?.rawMarkdown).toBe('M1 — a\\\nM2 — b')
+    expect(h.recorder.sendRich[0]?.rawMarkdown).toContain('M1 — a\\\nM2 — b')
     h.cleanup()
   })
 
@@ -438,7 +445,7 @@ describe("callTool('reply') rich gate", () => {
 
   test('reply_to threads the rich message via reply_to_message_id', async () => {
     const h = makeHarness({ richBehaviour: async () => ({ message_id: 11 }) })
-    await callTool(replyReq({ chat_id: PRINCE_DM, text: 'hi', reply_to: '321' }), h.deps)
+    await callTool(replyReq({ chat_id: PRINCE_DM, text: `hi\n\n${TABLE}`, reply_to: '321' }), h.deps)
     expect(h.recorder.sendRich).toHaveLength(1)
     expect(h.recorder.sendRich[0]?.opts.reply_to_message_id).toBe(321)
     h.cleanup()
@@ -447,7 +454,7 @@ describe("callTool('reply') rich gate", () => {
   test('redaction end-to-end: secret in reply text never reaches raw rich call', async () => {
     const h = makeHarness({ richBehaviour: async () => ({ message_id: 1 }) })
     await callTool(
-      replyReq({ chat_id: PRINCE_DM, text: 'my key sk-abcdefghijklmnopqrstuvwxyz0123456789 ok' }),
+      replyReq({ chat_id: PRINCE_DM, text: `my key sk-abcdefghijklmnopqrstuvwxyz0123456789 ok\n\n${TABLE}` }),
       h.deps,
     )
     expect(h.recorder.sendRich).toHaveLength(1)

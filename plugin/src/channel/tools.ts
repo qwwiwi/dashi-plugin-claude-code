@@ -53,6 +53,9 @@ import {
   buildRichMessagePayload,
   contentFitsRichLimits,
   hardenSoftBreaks,
+  needsRichRendering,
+  hasDetailsMathCrashShape,
+  hasCjkGarbleShape,
 } from '../format/rich.js'
 import { analyzeFormat, formatHint } from '../format/format-check.js'
 import type { RichLatch } from '../safety/rich-latch.js'
@@ -764,10 +767,28 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         // a 32756-byte input hardened past the 32768 cap and burned a doomed
         // API call before the transparent fallback).
         const richBody = hardenSoftBreaks(args.text)
+        // Selective delivery (owner directive 2026-08-29, ported 1:1 from
+        // Hermes v0.20.6): rich is NOT a default mode — it auto-enables only
+        // when the body carries a construct HTML degrades (table, task list,
+        // <details>, block math). Ordinary prose keeps the HTML path so font
+        // weight/spacing stay consistent and the text stays easy to copy.
+        // `format: 'rich'` is NOT an override. The tool schema already says
+        // the explicit value "just forces the same gate", and upstream Hermes
+        // requires _needs_rich_rendering() unconditionally — an escape hatch
+        // that ships prose through rich would reintroduce exactly the copy /
+        // font-weight problem this change removes. (Codex review finding.)
+        const contentWantsRich = needsRichRendering(richBody)
+        // Client-damage shields: both send the body the legacy way rather
+        // than dropping it. details+math crashes Telegram Desktop 6.9.1;
+        // CJK renders with overlapping glyph artifacts on Mac/Desktop.
+        const clientSafeForRich =
+          !hasDetailsMathCrashShape(richBody) && !hasCjkGarbleShape(richBody)
         const richEligible =
           config.richMessages.enabled &&
           args.format !== 'text' &&
           args.format !== 'markdownv2' &&
+          contentWantsRich &&
+          clientSafeForRich &&
           richLatch !== undefined &&
           !richLatch.sendDisabled &&
           !config.richMessages.perChatOptOut.includes(args.chat_id) &&

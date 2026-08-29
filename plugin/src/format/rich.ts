@@ -313,3 +313,108 @@ export function buildRichMessagePayload(
   }
   return body
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Selective rich delivery + client-crash shields
+// ─────────────────────────────────────────────────────────────────────
+//
+// Ported 1:1 from the Hermes reference implementation (NousResearch/
+// hermes-agent, release v2026.8.27 / v0.20.6, plugins/platforms/telegram/
+// adapter.py). Hermes shipped rich messages first, then walked the default
+// back to opt-in after live client damage. Rather than repeat their path we
+// adopt the end state directly:
+//
+//   1. needsRichRendering() — only pay the rich path when raw markdown
+//      MATERIALLY beats the HTML path. Ordinary prose stays on HTML so
+//      Telegram renders a consistent font weight/spacing and the text stays
+//      easy to copy (their stated reason for defaulting rich off: rich
+//      bodies are awkward to copy as plain text, which is worse than a
+//      degraded table for command snippets and mobile handoffs).
+//   2. hasDetailsMathCrashShape() — math INSIDE a <details> block crashes
+//      Telegram Desktop 6.9.1 while rendering a rich message
+//      (telegramdesktop/tdesktop#30808). The Bot API accepts the payload, so
+//      the sender must refuse up front.
+//   3. hasCjkGarbleShape() — CJK/Hangul text renders with overlapping glyph
+//      artifacts in current Telegram Mac/Desktop rich rendering (#47653).
+//      The HTML path renders the same text cleanly.
+//
+// Both shields are "skip rich, send the legacy way" — never "drop the
+// message". Content that trips them still ships, just through HTML.
+
+// A GFM table separator row: `|---|:--:|` etc. Presence of such a line is the
+// cheapest reliable signal that the body contains a pipe table — the one
+// construct the HTML converter flattens into a <pre> block.
+const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/
+// GFM task list: `- [ ] item` / `* [x] item`.
+const TASK_LIST_RE = /^[ \t]*[-*+][ \t]+\[[ xX]\][ \t]+/m
+// Collapsible block markers at the start of a line.
+const DETAILS_LINE_RE = /^(<details\b|<\/details>|<summary\b|<\/summary>)/m
+// Block math delimiter.
+const BLOCK_MATH = '$$'
+
+/**
+ * True when the body contains a construct the legacy HTML path degrades, so
+ * the rich endpoint is worth using. Everything else — ordinary prose, bold,
+ * links, inline code, fenced code — renders fine as HTML and stays there.
+ *
+ * This is the auto-enable rule: rich is not a mode the caller turns on, it is
+ * a capability the CONTENT asks for.
+ */
+export function needsRichRendering(text: string): boolean {
+  if (!text) return false
+  // Constructs INSIDE a fenced code block are literals the reader wants
+  // verbatim — the HTML path already preserves them, so routing the whole
+  // message through rich for a `| --- |` line inside ```…``` buys nothing.
+  // fenceProtectedLines() is the same fence tracker hardenSoftBreaks uses,
+  // so both agree on what counts as code. (Codex review finding.)
+  const lines = text.split('\n')
+  const inFence = fenceProtectedLines(lines)
+  const prose = lines.filter((_, i) => !inFence[i]).join('\n')
+  if (!prose) return false
+  for (let i = 0; i < lines.length; i++) {
+    if (!inFence[i] && TABLE_SEPARATOR_RE.test(lines[i]!)) return true
+  }
+  if (TASK_LIST_RE.test(prose)) return true
+  if (DETAILS_LINE_RE.test(prose)) return true
+  if (prose.includes(BLOCK_MATH)) return true
+  return false
+}
+
+// `<details ...> … </details>`, non-greedy, across newlines.
+const DETAILS_BLOCK_RE = /<details\b[^>]*>[\s\S]*?<\/details>/gi
+// Math inside such a block: $$…$$, \[…\], \(…\), or a common LaTeX command.
+const MATH_IN_DETAILS_RE =
+  /(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\\(?:sum|frac|alpha|beta|gamma|delta|theta|lambda|mu|pi|sigma|int|prod|sqrt|lim|infty|begin\{(?:equation|align|matrix|cases)\}))/i
+
+/**
+ * True when the body pairs a collapsible block with math — the shape that
+ * crashes Telegram Desktop 6.9.1 during rich rendering. Skip rich, send HTML.
+ */
+export function hasDetailsMathCrashShape(text: string): boolean {
+  if (!text) return false
+  const blocks = text.match(DETAILS_BLOCK_RE)
+  if (!blocks) return false
+  return blocks.some(block => MATH_IN_DETAILS_RE.test(block))
+}
+
+// Hiragana/Katakana, CJK ext-A, CJK unified, Hangul syllables, CJK
+// compatibility ideographs, and the astral CJK extensions. The astral range
+// needs the `u` flag.
+// NOTE — deliberate SUPERSET of the Hermes regex. The owner asked for a 1:1
+// port; this is the ONE place I widened it, and only in the safe direction.
+// Upstream matches precomposed Hangul syllables (AC00-D7AF) but not the
+// DECOMPOSED form: «han» written as U+1112 U+1161 U+11AB is the same visible
+// Korean text, garbles identically, yet slips past the upstream class.
+// Adding the Jamo blocks can only route MORE text to the safe HTML path,
+// never fewer — it cannot expose a client to the artifact. (Codex review.)
+const CJK_RE =
+  /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\u1100-\u11ff\u3130-\u318f\ua960-\ua97f\ud7b0-\ud7ff]|[\u{20000}-\u{323af}]/u
+
+/**
+ * True when the body contains CJK/Hangul text, which current Telegram
+ * Mac/Desktop rich rendering garbles with overlapping glyph artifacts.
+ * Skip rich, send HTML — which renders the same text cleanly.
+ */
+export function hasCjkGarbleShape(text: string): boolean {
+  return Boolean(text) && CJK_RE.test(text)
+}
