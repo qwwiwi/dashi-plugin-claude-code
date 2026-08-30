@@ -33,6 +33,7 @@ HELPER=""
 PERMISSION_GATE=""
 GATE_HELPER=""
 POLICY_PATH=""
+NOTIFICATION_HELPER=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,6 +55,10 @@ while [ $# -gt 0 ]; do
       GATE_HELPER="$2"; shift 2;;
     --policy-path)
       POLICY_PATH="$2"; shift 2;;
+    --notification-helper)
+      # Explicit path to notification-hook.ts. Default (when the sibling file
+      # exists) is auto-registered below.
+      NOTIFICATION_HELPER="$2"; shift 2;;
     -h|--help)
       sed -n 's/^# \{0,1\}//p' "$0" | head -n 18
       exit 0;;
@@ -113,6 +118,21 @@ if [ -n "$PERMISSION_GATE" ] || [ -n "$GATE_HELPER" ]; then
   if [ -n "$POLICY_PATH" ]; then
     ARGS+=(--policy-path "$POLICY_PATH")
   fi
+fi
+
+# Notification hook (Stage 1, 2026-08-30). Auto-registered when the sibling
+# notification-hook.ts exists so agents pick it up on their next install run
+# without a new flag on the caller side. Callers can override with an explicit
+# --notification-helper path.
+if [ -z "$NOTIFICATION_HELPER" ] && [ -f "$SCRIPT_DIR/notification-hook.ts" ]; then
+  NOTIFICATION_HELPER="$SCRIPT_DIR/notification-hook.ts"
+fi
+if [ -n "$NOTIFICATION_HELPER" ]; then
+  if [ ! -f "$NOTIFICATION_HELPER" ]; then
+    echo "install-hooks.sh: notification helper '$NOTIFICATION_HELPER' not found" >&2
+    exit 3
+  fi
+  ARGS+=(--notification-helper "$NOTIFICATION_HELPER")
 fi
 
 # Ensure the parent dir exists so `bun` can write the file atomically.

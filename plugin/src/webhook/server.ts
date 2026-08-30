@@ -27,6 +27,7 @@ import {
   AskUserQuestionAnswerSchema,
   AskUserQuestionRequestSchema,
   FallbackReplyRouteRequestSchema,
+  NotificationRouteRequestSchema,
   PermissionRequestRouteSchema,
   ReactRouteRequestSchema,
   WebhookPayloadSchema,
@@ -65,6 +66,10 @@ const REACT_BODY_LIMIT_BYTES = 4 * 1024
 // 4096-char text. 32 KB covers the worst-case multibyte body with headroom
 // while still cheap to abuse-proof.
 const FALLBACK_REPLY_BODY_LIMIT_BYTES = 32 * 1024
+// Notification bodies carry chat_id + agent_id + session_id + a 2000-char
+// message (Claude Code's `Notification` hook body). 8 KB is comfortable
+// headroom for the worst-case multibyte body while staying cheap to abuse.
+const NOTIFICATION_BODY_LIMIT_BYTES = 8 * 1024
 // Permission-request bodies carry tool_name + a bounded preview/reason
 // (4096 + 1024 chars). 32 KB covers the worst-case multibyte body with
 // headroom while staying cheap to abuse-proof.
@@ -411,6 +416,16 @@ async function handleRequest(
   // feature gate (config.permission_gate.enabled), then submit + long-wait.
   if (method === 'POST' && path === '/hooks/permission/request') {
     await handlePermissionRequest(req, res, deps, webhookToken)
+    return
+  }
+
+  // Notification bridge (2026-08-30, Stage 1): Claude Code's native
+  // `Notification` hook forwards permission_prompt/idle_prompt/elicitation_dialog
+  // messages here so the operator sees a warning in Telegram instead of the
+  // CLI stalling silently in tmux. One-way (no reply keyboard yet); Stage 2
+  // will add tmux send-keys callback when the operator confirms it's needed.
+  if (method === 'POST' && path === '/hooks/notification') {
+    await handleNotification(req, res, deps, webhookToken)
     return
   }
 
@@ -923,6 +938,66 @@ async function handleFallbackReply(
     // so a send that keeps failing is re-attempted on the next Stop fire
     // instead of being silently marked delivered.
     log.warn('fallback-reply sendMessage failed', {
+      chat_id: payload.chat_id,
+      error: err instanceof Error ? redactToken(err.message) : String(err),
+    })
+    reply(res, 200, { status: 'send_failed' })
+    return
+  }
+
+  reply(res, 200, { status: 'sent' })
+}
+
+// 2026-08-30 Stage 1: POST /hooks/notification — Claude Code Notification hook
+// forwarder. The native `Notification` event fires for permission_prompt,
+// idle_prompt, elicitation_dialog and auth_success — all of which otherwise
+// stall silently in the tmux pane the operator never opens. We format the
+// message as «⚠️ <agent> ждёт: <body> — открой tmux <agent>» and send via
+// sendMessage. One-way for now (Stage 2 will add an inline keyboard that
+// injects the numeric answer via tmux send-keys). Auth: loopback + bearer +
+// chatId allowlist, same fence as fallback-reply. Fail-open on send errors
+// (200 status:send_failed) so a wedged bot never makes the hook itself hang.
+async function handleNotification(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: WebhookDeps,
+  webhookToken: string | undefined,
+): Promise<void> {
+  const { config, log, sendMessage } = deps
+
+  if (!authGate(req, res, webhookToken)) return
+
+  if (!sendMessage) {
+    reply(res, 503, { status: 'notification_unavailable' })
+    return
+  }
+
+  const parsed = await readJsonBody(
+    req,
+    res,
+    log,
+    NOTIFICATION_BODY_LIMIT_BYTES,
+    NotificationRouteRequestSchema,
+    'notification',
+  )
+  if (!parsed.ok) return
+  const payload = parsed.value
+
+  if (!chatIdAllowed(config, payload.chat_id)) {
+    log.warn('notification chatId not in allowlist', { chat_id: payload.chat_id })
+    reply(res, 403, { error: 'chatId not in allowlist' })
+    return
+  }
+
+  const agentId = payload.agent_id ?? ''
+  const label = agentId.length > 0 ? agentId : 'session'
+  const hint = agentId.length > 0 ? ` — открой tmux ${agentId}` : ''
+  const text = `⚠️ ${label} ждёт ответ: ${payload.message}${hint}`
+
+  try {
+    await sendMessage(payload.chat_id, text)
+  } catch (err) {
+    log.warn('notification sendMessage failed', {
       chat_id: payload.chat_id,
       error: err instanceof Error ? redactToken(err.message) : String(err),
     })

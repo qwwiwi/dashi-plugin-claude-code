@@ -28,6 +28,11 @@ const MARKER = 'dashi-channel-hook'
 // installs/updates alongside the notification-mirror hook without either
 // clobbering the other. Only added when --permission-gate-helper is given.
 const GATE_MARKER = 'dashi-permission-gate-hook'
+// Notification hook (2026-08-30, Stage 1). Distinct marker so it installs
+// alongside the other dashi hooks. Registered when --notification-helper is
+// given (or when the sibling scripts/notification-hook.ts exists) so agents
+// upgraded from older plugins get it automatically.
+const NOTIFICATION_MARKER = 'dashi-notification-hook'
 // Substring of the dashi helper script path used to identify *markerless*
 // legacy entries — re-running install over a settings file that was
 // hand-edited (no marker but pointing at our post-hook.ts) used to leave
@@ -41,6 +46,11 @@ const HOOK_EVENTS = [
   'PostToolUse',
   'Stop',
 ] as const
+
+// Notification is not part of the mirror pass (it uses a different helper
+// script and endpoint), so we track it as a separate event key. Kept out of
+// HOOK_EVENTS to avoid the loop generating a mirror entry for it.
+const NOTIFICATION_EVENT = 'Notification'
 
 type HookEvent = (typeof HOOK_EVENTS)[number]
 
@@ -60,6 +70,10 @@ export interface PatchOptions {
   readonly permissionGateHelperPath?: string
   /** Optional explicit policy path for the gate hook (TELEGRAM_PERMISSION_POLICY_PATH). */
   readonly policyPath?: string
+  /** When set, also register the Notification hook forwarder pointing at this
+   *  helper (scripts/notification-hook.ts). Uses `<origin>/hooks/notification`
+   *  as its endpoint, derived from --webhook-url. */
+  readonly notificationHelperPath?: string
 }
 
 interface HookEntry {
@@ -137,6 +151,29 @@ function buildGateEntry(opts: PatchOptions): HookEntry {
   }
 }
 
+// Notification helper command. Uses the same TELEGRAM_HOOK_* env layout as the
+// mirror hook so the operator only sets TELEGRAM_WEBHOOK_TOKEN once. Endpoint
+// is `<origin>/hooks/notification` — derived from --webhook-url so both hooks
+// hit the same plugin process without a second URL flag at install time.
+function buildNotificationCommand(opts: PatchOptions): string {
+  const helper = opts.notificationHelperPath!
+  const url = `${webhookOrigin(opts.webhookUrl)}/hooks/notification`
+  const envParts: string[] = [
+    `TELEGRAM_HOOK_CHAT_ID=${sq(opts.chatId)}`,
+  ]
+  if (opts.agentId) envParts.push(`TELEGRAM_HOOK_AGENT_ID=${sq(opts.agentId)}`)
+  envParts.push(`TELEGRAM_WEBHOOK_URL=${sq(url)}`)
+  return `${envParts.join(' ')} bun ${sq(helper)}`
+}
+
+function buildNotificationEntry(opts: PatchOptions): HookEntry {
+  return {
+    marker: NOTIFICATION_MARKER,
+    matcher: '.*',
+    hooks: [{ type: 'command', command: buildNotificationCommand(opts) }],
+  }
+}
+
 // True if an entry's command string points at our helper script, even if
 // the marker was hand-stripped or never present. Survives different
 // absolute prefixes (e.g. user moved the plugin between dirs) by matching
@@ -155,6 +192,7 @@ function isLegacyDashiEntry(entry: HookEntry | undefined): boolean {
 export function applyPatch(settings: SettingsShape, opts: PatchOptions): SettingsShape {
   const hooks: NonNullable<SettingsShape['hooks']> = { ...(settings.hooks ?? {}) }
   const withGate = opts.permissionGateHelperPath !== undefined
+  const withNotification = opts.notificationHelperPath !== undefined
   for (const event of HOOK_EVENTS) {
     const next = buildEntryFor(event, opts)
     const existing = hooks[event] ?? []
@@ -172,6 +210,20 @@ export function applyPatch(settings: SettingsShape, opts: PatchOptions): Setting
     }
     hooks[event] = rebuilt
   }
+  // Notification event: separate helper + endpoint. Managed independently so
+  // an upgrade to Stage 2 (adding an inline-keyboard callback) doesn't
+  // require touching the mirror pass.
+  if (withNotification) {
+    const notifEvent = NOTIFICATION_EVENT as HookEvent
+    const existing = (hooks as Record<string, HookEntry[] | undefined>)[notifEvent] ?? []
+    const filtered = existing.filter(
+      (e) => !e || e.marker !== NOTIFICATION_MARKER,
+    )
+    ;(hooks as Record<string, HookEntry[] | undefined>)[notifEvent] = [
+      ...filtered,
+      buildNotificationEntry(opts),
+    ]
+  }
   return { ...settings, hooks }
 }
 
@@ -183,6 +235,7 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
   let helperPath = ''
   let permissionGateHelperPath: string | undefined
   let policyPath: string | undefined
+  let notificationHelperPath: string | undefined
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     const next = argv[i + 1]
@@ -193,6 +246,7 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
     if (a === '--helper' && next) { helperPath = next; i++; continue }
     if (a === '--permission-gate-helper' && next) { permissionGateHelperPath = next; i++; continue }
     if (a === '--policy-path' && next) { policyPath = next; i++; continue }
+    if (a === '--notification-helper' && next) { notificationHelperPath = next; i++; continue }
   }
   if (!settingsPath || !chatId || !webhookUrl) {
     process.stderr.write(
@@ -215,6 +269,7 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
     ...(agentId ? { agentId } : {}),
     ...(permissionGateHelperPath ? { permissionGateHelperPath } : {}),
     ...(policyPath ? { policyPath } : {}),
+    ...(notificationHelperPath ? { notificationHelperPath } : {}),
   }
   return opts
 }

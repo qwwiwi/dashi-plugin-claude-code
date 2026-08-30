@@ -61,6 +61,21 @@ export const FallbackReplyRouteRequestSchema = z.object({
 })
 export type FallbackReplyRouteRequest = z.infer<typeof FallbackReplyRouteRequestSchema>
 
+// Webhook route body — POST /hooks/notification (2026-08-30, Stage 1). Claude
+// Code's native `Notification` hook (permission_prompt, idle_prompt,
+// elicitation_dialog, auth_success) forwards its `message` here so the
+// operator sees a warning in Telegram instead of the CLI stalling silently in
+// tmux. agent_id is used for the label; session_id is echoed for correlation
+// but not otherwise trusted. message is bounded well below Telegram's 4096
+// cap so the wrapped «⚠️ <agent> ждёт: <msg>» still fits.
+export const NotificationRouteRequestSchema = z.object({
+  chat_id: z.string().regex(/^-?\d+$/),
+  agent_id: z.string().max(64).default(''),
+  session_id: z.string().max(256).default(''),
+  message: z.string().min(1).max(2000),
+})
+export type NotificationRouteRequest = z.infer<typeof NotificationRouteRequestSchema>
+
 // Webhook route body — POST /hooks/permission/request (2026-06-09). The
 // PreToolUse permission-gate hook posts a `confirm`-tier tool call here; the
 // plugin sends an Allow/Deny keyboard to the warchief and long-waits for the
