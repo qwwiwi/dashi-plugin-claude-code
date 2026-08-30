@@ -50,6 +50,7 @@ import { createReliableTelegramApi } from './safety/reliable-telegram-api.js'
 import { OutboundActivityTracker } from './status/outbound-activity.js'
 import { HeartbeatMonitor } from './status/heartbeat-monitor.js'
 import { createRichLatch } from './safety/rich-latch.js'
+import { richDeliveryAllowed } from './format/rich.js'
 import { redactSecrets } from './safety/redact.js'
 import { StatusManager } from './status/status-manager.js'
 import { ProgressReporter } from './status/progress-reporter.js'
@@ -1233,8 +1234,18 @@ if (
         // Wave 3: rich delivery for group answers. Goes through the same
         // safe-wrapped instance, so redaction + the session latch apply
         // exactly as they do on the DM path.
+        //
+        // The fleet kill switch (TELEGRAM_RICH_MESSAGES=0) and the per-chat
+        // opt-out own this path exactly as they own the DM one (Fable review
+        // 2026-08-30, HIGH #2): before this gate an operator could silence
+        // rich and watch groups keep sending it. Refusing here returns the
+        // wrapper's own «not sent» shape, so the router falls through to the
+        // legacy HTML + chunking path — a disabled feature never costs a
+        // message.
         sendRichMessage: (chatId, rawMarkdown, opts) =>
-          telegramApi.sendRichMessage(chatId, rawMarkdown, opts),
+          richDeliveryAllowed(config.richMessages, chatId)
+            ? telegramApi.sendRichMessage(chatId, rawMarkdown, opts)
+            : Promise.resolve({ fallback: true }),
         sendChatAction: (chatId, action) =>
           telegramApi.sendChatAction(chatId, action),
         // Outbox attachments — the safe-wrapped API holds the token; the

@@ -9,6 +9,7 @@ import {
   needsRichRendering,
   hasDetailsMathCrashShape,
   hasCjkGarbleShape,
+  richDeliveryAllowed,
 } from '../../src/format/rich.js'
 
 describe('needsRichRendering — the auto-enable rule', () => {
@@ -162,5 +163,32 @@ describe('review fixes', () => {
 
   test('Russian still does NOT trip the widened CJK shield', () => {
     expect(hasCjkGarbleShape('Проверка кириллицы и latin text')).toBe(false)
+  })
+})
+
+// Fable review 2026-08-30, HIGH #2: the operator switches used to be
+// open-coded on the DM path and simply absent on the group path, so a fleet
+// kill switch silenced private chats while groups kept sending rich. The
+// predicate below is now the single place both paths ask.
+describe('richDeliveryAllowed — the operator gate', () => {
+  test('enabled with an empty opt-out permits any chat', () => {
+    expect(richDeliveryAllowed({ enabled: true, perChatOptOut: [] }, '-100123')).toBe(true)
+  })
+
+  test('the kill switch silences every chat, groups included', () => {
+    expect(richDeliveryAllowed({ enabled: false, perChatOptOut: [] }, '-100123')).toBe(false)
+    expect(richDeliveryAllowed({ enabled: false, perChatOptOut: [] }, '164795011')).toBe(false)
+  })
+
+  test('per-chat opt-out silences exactly that chat', () => {
+    const policy = { enabled: true, perChatOptOut: ['-100123'] }
+    expect(richDeliveryAllowed(policy, '-100123')).toBe(false)
+    expect(richDeliveryAllowed(policy, '-100999')).toBe(true)
+  })
+
+  test('chat ids compare as strings — a numeric-looking id is not coerced', () => {
+    expect(
+      richDeliveryAllowed({ enabled: true, perChatOptOut: ['164795011'] }, '164795011'),
+    ).toBe(false)
   })
 })

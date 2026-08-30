@@ -420,6 +420,36 @@ export function hasCjkGarbleShape(text: string): boolean {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Operator gate — kill switch + per-chat opt-out
+// ─────────────────────────────────────────────────────────────────────
+
+/** The operator-owned half of `config.richMessages`. */
+export interface RichDeliveryPolicy {
+  enabled: boolean
+  perChatOptOut: ReadonlyArray<string>
+}
+
+/**
+ * True when the operator permits rich delivery into this chat.
+ *
+ * Two switches, both owned by whoever runs the process, neither of them
+ * about content: the fleet kill switch (`TELEGRAM_RICH_MESSAGES=0`) and the
+ * per-chat opt-out list. Content shields (`needsRichRendering` and friends)
+ * are a separate question asked afterwards.
+ *
+ * Extracted 2026-08-30 (Fable review, HIGH #2): the DM path checked both
+ * inline while the group path checked neither, so a kill switch that
+ * silenced private chats left groups sending rich. One named predicate is
+ * harder to forget than two open-coded conditions.
+ */
+export function richDeliveryAllowed(
+  policy: RichDeliveryPolicy,
+  chatId: string,
+): boolean {
+  return policy.enabled && !policy.perChatOptOut.includes(chatId)
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Rich EDIT (wave 2)
 // ─────────────────────────────────────────────────────────────────────
 //
