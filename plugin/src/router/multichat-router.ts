@@ -895,8 +895,16 @@ export class MultichatRouter {
         // nothing ever picks it up again) and the `for` loop in drainOutbox
         // stranded every remaining claim of the same pass. Inside the try
         // `sentChunks` is still 0, so a failed rich send takes the same
-        // chunk-0 path as a failed sendMessage: reject → dead-letter, which
-        // an operator can retry safely.
+        // chunk-0 path as a failed sendMessage: reject → dead-letter.
+        //
+        // That dead letter is a QUARANTINE RECORD, not a retry queue (Codex
+        // review 2026-08-30). By the time a transient reaches us the reliable
+        // layer has already classified it: a pre-send failure never touched
+        // Telegram, but an ambiguous one (ECONNRESET / ETIMEDOUT / 5xx) may
+        // have been processed before the answer died. The fleet policy is a
+        // loud possible-loss over a silent duplicate, so we say so in the
+        // reason the sidecar carries — an operator must eyeball the chat
+        // before any redrive.
         let richSent = false
         if (message.format === 'auto' && this.telegramApi.sendRichMessage) {
           const richBody = hardenSoftBreaks(body)
@@ -910,7 +918,24 @@ export class MultichatRouter {
             if (opts.reply_to_message_id !== undefined) {
               richOpts.reply_to_message_id = opts.reply_to_message_id
             }
-            const res = await this.telegramApi.sendRichMessage(chatId, richBody, richOpts)
+            let res
+            try {
+              res = await this.telegramApi.sendRichMessage(chatId, richBody, richOpts)
+            } catch (richErr) {
+              const reason =
+                richErr instanceof Error ? richErr.message : String(richErr)
+              this.logger.error('router.outbox.rich_ambiguous', {
+                chat_id: chatId,
+                original: claim.originalName,
+                error: reason,
+              })
+              // Rethrow so the delivery catch below dead-letters the claim
+              // (sentChunks is still 0), but carry the warning into the
+              // sidecar so nobody redrives a message that may be on screen.
+              throw new Error(
+                `rich send failed — AMBIGUOUS DELIVERY, the message may already be visible; verify the chat before any redrive: ${reason}`,
+              )
+            }
             if ('message_id' in res) {
               this.logger.info('router.outbox.rich_sent', {
                 chat_id: chatId,

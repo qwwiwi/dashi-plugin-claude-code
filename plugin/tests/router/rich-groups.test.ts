@@ -12,7 +12,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
-import { mkdir, readdir, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -364,5 +364,19 @@ describe('multichat router — rich group delivery (wave 3)', () => {
     // And the queue kept moving — the second claim still reached Telegram.
     expect(spy.sends.length).toBe(1)
     expect(spy.sends[0]?.text).toContain('обычный ответ следом')
+
+    // Codex review 2026-08-30: a transient may be AMBIGUOUS — Telegram can
+    // accept the send and die answering. The dead letter is a quarantine
+    // record, so its sidecar must warn against a blind redrive.
+    const sidecarName = deadLetter.find((name) => name.endsWith('.fail.json'))
+    expect(sidecarName).toBeDefined()
+    const sidecar = JSON.parse(
+      await readFile(join(outboxDir, 'dead-letter', sidecarName as string), 'utf8'),
+    ) as { reason: string }
+    expect(sidecar.reason).toContain('AMBIGUOUS DELIVERY')
+    expect(sidecar.reason).toContain('ETIMEDOUT')
+    expect(
+      fx.loggerState.logs.some((l) => l.msg === 'router.outbox.rich_ambiguous'),
+    ).toBe(true)
   }, 5_000)
 })
