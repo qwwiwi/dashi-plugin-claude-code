@@ -28,8 +28,15 @@
 import { lstat, readdir, realpath, unlink } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 
-import type { TelegramApi } from '../channel/tools.js'
+import type { TelegramApi, SendRichMessageOpts } from '../channel/tools.js'
 import { splitMessage } from '../format/chunk.js'
+import {
+  contentFitsRichLimits,
+  hardenSoftBreaks,
+  needsRichRendering,
+  hasDetailsMathCrashShape,
+  hasCjkGarbleShape,
+} from '../format/rich.js'
 import { markdownToTelegramHtml } from '../format/html.js'
 import { isPhotoExtension, MAX_ATTACHMENT_BYTES } from '../security/paths.js'
 import type { Logger } from '../log.js'
@@ -57,6 +64,10 @@ import type { TmuxSessionPool } from './tmux-session-pool.js'
 export interface MultichatTelegramApi {
   sendMessage: TelegramApi['sendMessage']
   sendChatAction: TelegramApi['sendChatAction']
+  // Wave 3 (2026-08-30): rich delivery for GROUP answers. Optional so the
+  // many existing router fixtures compile untouched — when absent, the
+  // router behaves exactly as before (HTML + 4000-char chunking).
+  sendRichMessage?: TelegramApi['sendRichMessage']
   // Outbox attachments (parity with the launcher reply tool). Optional so the
   // many existing router test fixtures (text-only) need no change; production
   // (server.ts) always wires both. When absent, file sends are skipped. The
@@ -862,9 +873,56 @@ export class MultichatRouter {
       // it, so we log `partial_delivery` and CONFIRM the claim instead
       // (same «never duplicate the user-visible message» stance as the
       // confirm-failure path below).
+      // Wave 3: rich delivery for group answers. Scoped to format 'auto' on
+      // purpose — that is the ONE case where the router owns text shape (the
+      // Stop hook hands over raw markdown and asks us to convert). For
+      // 'html' / 'markdown' / 'text' the writer already decided the shape,
+      // and re-rendering their bytes as markdown would corrupt it.
+      //
+      // Same rule as the DM path: the CONTENT decides. Ordinary group prose
+      // keeps HTML + chunking; only a table / task list / details / block
+      // math earns the rich endpoint, and the two client shields veto it.
+      // A rich send is ONE message, so the partial-delivery policy below
+      // simply does not apply to it — there are no later chunks to strand.
+      let richSent = false
+      if (message.format === 'auto' && this.telegramApi.sendRichMessage) {
+        const richBody = hardenSoftBreaks(body)
+        if (
+          needsRichRendering(richBody) &&
+          !hasDetailsMathCrashShape(richBody) &&
+          !hasCjkGarbleShape(richBody) &&
+          contentFitsRichLimits(richBody)
+        ) {
+          const richOpts: SendRichMessageOpts = {}
+          if (opts.reply_to_message_id !== undefined) {
+            richOpts.reply_to_message_id = opts.reply_to_message_id
+          }
+          // The safe wrapper reports { fallback: true } for every non-
+          // transient refusal; a transient throws and is handled by the
+          // existing catch below exactly like a failed sendMessage.
+          const res = await this.telegramApi.sendRichMessage(chatId, richBody, richOpts)
+          if ('message_id' in res) {
+            this.logger.info('router.outbox.rich_sent', {
+              chat_id: chatId,
+              bytes: Buffer.byteLength(richBody, 'utf8'),
+            })
+            // Flag, NOT an early return: attachments and the claim
+            // confirmation still have to run below. Returning here would
+            // strand the claim in processing/ and drop any files.
+            richSent = true
+          }
+        }
+      }
+
       let sentChunks = 0
       try {
-        const chunks = message.format === 'auto' ? splitMessage(text) : [text]
+        // Rich already shipped the whole body as ONE message — exactly one
+        // path sends, so the answer is never duplicated.
+        const chunks = richSent
+          ? []
+          : message.format === 'auto'
+            ? splitMessage(text)
+            : [text]
         for (let i = 0; i < chunks.length; i++) {
           // reply_to threads only the first chunk — mirrors the reply
           // tool's chunking contract (no quote-spam on long answers).

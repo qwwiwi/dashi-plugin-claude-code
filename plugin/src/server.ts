@@ -1230,6 +1230,11 @@ if (
         // router never edits or deletes messages.
         sendMessage: (chatId, text, opts) =>
           telegramApi.sendMessage(chatId, text, opts),
+        // Wave 3: rich delivery for group answers. Goes through the same
+        // safe-wrapped instance, so redaction + the session latch apply
+        // exactly as they do on the DM path.
+        sendRichMessage: (chatId, rawMarkdown, opts) =>
+          telegramApi.sendRichMessage(chatId, rawMarkdown, opts),
         sendChatAction: (chatId, action) =>
           telegramApi.sendChatAction(chatId, action),
         // Outbox attachments — the safe-wrapped API holds the token; the
