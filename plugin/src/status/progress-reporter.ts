@@ -93,16 +93,16 @@ interface ChatProgressEntry {
 // inline tags (<b>, <code>, <pre>) are rendered.
 const HTML_OPTS = { parse_mode: 'HTML' as const }
 
-// Tools that should never appear in the rolling activity card. Reads, greps,
-// globs, and deferred-tool lookups are bookkeeping; the dashi-channel MCP
-// reply tools are the channel itself (mirroring them would recurse), and
-// gbrain-recall is background context fetching the warchief does not need to
-// see. Bash/Edit/Write/WebFetch/WebSearch/Agent and gbrain mutations
-// (memory/swarm/tasks) keep flowing through.
+// Tools that should never appear in the rolling activity card. Deferred-tool
+// lookups (ToolSearch) are pure bookkeeping; the dashi-channel MCP reply tools
+// are the channel itself (mirroring them would recurse), and gbrain-recall is
+// background context fetching the operator does not need to see.
+//
+// NB: Read/Grep/Glob are intentionally NOT skipped — the operator's preferred
+// verbose card (gateway era) listed reads and globs alongside Bash/Edit. They
+// were un-filtered 2026-06-14 to restore that density. Bash/Edit/Write/
+// WebFetch/WebSearch/Agent and gbrain mutations always flow through.
 const NOISY_TOOL_NAMES: ReadonlySet<string> = new Set([
-  'Read',
-  'Grep',
-  'Glob',
   'ToolSearch',
 ])
 const NOISY_TOOL_PREFIXES: ReadonlyArray<string> = [

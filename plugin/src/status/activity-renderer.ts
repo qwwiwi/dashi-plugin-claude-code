@@ -165,7 +165,13 @@ export function humanizeTool(toolName: string, toolInput: ToolInput): string | n
     case 'Agent': {
       const sub = strField(toolInput, 'subagent_type') || '?'
       const label = SUBAGENT_LABELS[sub] ?? `running ${sub}`
-      return `<b>${escapeHtml(label)}</b>`
+      const labelHtml = `<b>${escapeHtml(label)}</b>`
+      // gateway.py:_render_dispatches — a running subagent showed its task
+      // description ("> exploring structure -- Find UIS client …") so the
+      // operator sees WHAT the agent was dispatched to do, not just its
+      // label. Restored 2026-06-14 (operator-preferred verbose card).
+      const desc = strField(toolInput, 'description').slice(0, 60)
+      return desc ? `${labelHtml} -- ${escapeHtml(desc)}` : labelHtml
     }
     case 'Bash': {
       const cmd = strField(toolInput, 'command').trim()
@@ -276,9 +282,11 @@ export function renderActivityBlock(
     const total = snapshot.calls.length
     const window = Math.min(ACTIVITY_WINDOW, total)
     const recent = snapshot.calls.slice(total - window)
-    if (total > recent.length) {
-      lines.push(escapeHtml(`▸ ... +${total - recent.length} earlier`))
-    }
+    // gateway.py:_render_activity — header carries the running total ("steps
+    // (N total):"); the last `window` calls follow. The total count is what
+    // replaces the older "+N earlier" collapse line. Restored 2026-06-14
+    // (operator-preferred verbose card).
+    lines.push(escapeHtml(`steps (${total} total):`))
     for (const call of recent) {
       if (call.humanized) {
         // Humanized string is already HTML-safe: inner identifiers were
