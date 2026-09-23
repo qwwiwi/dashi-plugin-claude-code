@@ -43,22 +43,22 @@ describe('ElevenLabs Loore API bridge', () => {
     }
   })
 
-  test('allows only Loore dubbing capabilities, not account or credential APIs', () => {
-    for (const endpoint of [
-      '/v1/voices',
-      '/v1/voices/voice-id',
-      '/v1/models',
-      '/v1/text-to-speech/voice-id',
-      '/v1/text-to-speech/voice-id/stream',
-      '/v1/speech-to-speech/voice-id',
-      '/v1/dubbing',
-      '/v1/dubbing/dubbing-id',
-      '/v1/dubbing/dubbing-id/audio/ru',
-    ]) {
-      expect(validateEndpoint(endpoint).origin).toBe(ELEVENLABS_ORIGIN)
+  test('allows only method-scoped Loore dubbing capabilities, not account APIs', () => {
+    for (const endpoint of ['/v1/voices', '/v1/voices/voice-id', '/v1/models', '/v1/dubbing/dubbing-id', '/v1/dubbing/dubbing-id/audio/ru']) {
+      expect(validateEndpoint(endpoint, 'GET').origin).toBe(ELEVENLABS_ORIGIN)
     }
-    for (const endpoint of ['/v1/user', '/v1/service-accounts/api-keys', '/v1/workspace/invites', '/v1/projects']) {
-      expect(() => validateEndpoint(endpoint)).toThrow('not allowlisted')
+    for (const endpoint of ['/v1/text-to-speech/voice-id', '/v1/text-to-speech/voice-id/stream', '/v1/speech-to-speech/voice-id', '/v1/dubbing']) {
+      expect(validateEndpoint(endpoint, 'POST').origin).toBe(ELEVENLABS_ORIGIN)
+    }
+    for (const [endpoint, method] of [
+      ['/v1/voices/add', 'POST'],
+      ['/v1/text-to-speech/voice-id', 'GET'],
+      ['/v1/user', 'GET'],
+      ['/v1/service-accounts/api-keys', 'POST'],
+      ['/v1/workspace/invites', 'POST'],
+      ['/v1/projects', 'GET'],
+    ] as const) {
+      expect(() => validateEndpoint(endpoint, method)).toThrow('not allowlisted')
     }
   })
 

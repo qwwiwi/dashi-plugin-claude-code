@@ -1,17 +1,21 @@
 #!/usr/bin/env bun
+import { stat } from 'node:fs/promises'
 
 export const ELEVENLABS_ORIGIN = 'https://api.elevenlabs.io'
-const ELEVENLABS_KEY_PATH = '/home/openclaw/.claude-lab/thrall/secrets/elevenlabs-loore.key'
+const ELEVENLABS_KEY_PATH = '/etc/loore-elevenlabs/key'
 const MAX_REQUEST_BYTES = 100 * 1024 * 1024
 const MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 const MAX_ERROR_BYTES = 1024 * 1024
 const MAX_KEY_BYTES = 4096
-const ALLOWED_ENDPOINT_RES: readonly RegExp[] = [
+const ALLOWED_GET_ENDPOINT_RES: readonly RegExp[] = [
   /^\/v1\/voices(?:\/[A-Za-z0-9_-]+)?$/,
   /^\/v1\/models$/,
+  /^\/v1\/dubbing\/[A-Za-z0-9_-]+(?:\/audio\/[A-Za-z0-9_-]+)?$/,
+]
+const ALLOWED_POST_ENDPOINT_RES: readonly RegExp[] = [
   /^\/v1\/text-to-speech\/[A-Za-z0-9_-]+(?:\/stream)?$/,
   /^\/v1\/speech-to-speech\/[A-Za-z0-9_-]+(?:\/stream)?$/,
-  /^\/v1\/dubbing(?:\/[A-Za-z0-9_-]+(?:\/audio\/[A-Za-z0-9_-]+)?)?$/,
+  /^\/v1\/dubbing$/,
 ]
 
 export interface BridgeConfig {
@@ -47,7 +51,7 @@ function assertHeaderValue(name: string, value: string): void {
   }
 }
 
-export function validateEndpoint(raw: string): URL {
+export function validateEndpoint(raw: string, method: 'GET' | 'POST' = 'GET'): URL {
   if (!raw.startsWith('/v1/') || raw.startsWith('//') || raw.includes('\\') || raw.includes('#')) {
     throw new Error('endpoint must be an absolute /v1/... path on ElevenLabs')
   }
@@ -64,7 +68,8 @@ export function validateEndpoint(raw: string): URL {
   if (url.origin !== ELEVENLABS_ORIGIN || !url.pathname.startsWith('/v1/')) {
     throw new Error('endpoint escaped the fixed ElevenLabs origin')
   }
-  if (!ALLOWED_ENDPOINT_RES.some((re) => re.test(decodedPath))) {
+  const allowedEndpointRes = method === 'GET' ? ALLOWED_GET_ENDPOINT_RES : ALLOWED_POST_ENDPOINT_RES
+  if (!allowedEndpointRes.some((re) => re.test(decodedPath))) {
     throw new Error('endpoint is not allowlisted for Loore dubbing')
   }
   return url
@@ -111,7 +116,7 @@ export function parseCliArgs(argv: readonly string[]): BridgeConfig {
 
   return {
     method,
-    endpointUrl: validateEndpoint(endpoint),
+    endpointUrl: validateEndpoint(endpoint, method),
     bodyFromStdin,
     contentType,
     accept,
@@ -187,10 +192,13 @@ async function writeStdout(payload: Uint8Array): Promise<void> {
 }
 
 async function run(config: BridgeConfig): Promise<void> {
-  const keyFile = Bun.file(ELEVENLABS_KEY_PATH)
-  if (!(await keyFile.exists())) throw new Error('ElevenLabs credential file is unavailable')
-  if (keyFile.size > MAX_KEY_BYTES) throw new Error('ElevenLabs credential file exceeds 4 KiB')
-  const key = (await keyFile.text()).trim()
+  const keyInfo = await stat(ELEVENLABS_KEY_PATH)
+  const brokerUid = process.getuid?.()
+  if (!keyInfo.isFile() || brokerUid === undefined || keyInfo.uid !== brokerUid || (keyInfo.mode & 0o077) !== 0) {
+    throw new Error('ElevenLabs credential metadata is unsafe')
+  }
+  if (keyInfo.size === 0 || keyInfo.size > MAX_KEY_BYTES) throw new Error('ElevenLabs credential file size is invalid')
+  const key = (await Bun.file(ELEVENLABS_KEY_PATH).text()).trim()
   if (key.length === 0 || /[\r\n\0]/.test(key)) throw new Error('ElevenLabs credential file is malformed')
 
   const headers = new Headers({ Accept: config.accept, 'xi-api-key': key })
