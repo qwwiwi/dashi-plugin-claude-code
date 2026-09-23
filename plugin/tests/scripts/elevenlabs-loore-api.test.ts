@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   ELEVENLABS_ORIGIN,
   assertBodyDoesNotContainSecret,
+  filterSubscriptionResponse,
   parseCliArgs,
   readLimitedBytes,
   redactSecret,
@@ -87,5 +88,43 @@ describe('ElevenLabs Loore API bridge', () => {
   test('rejects request bytes containing the API key and redacts errors', () => {
     expect(() => assertBodyDoesNotContainSecret(new TextEncoder().encode('prefix-abc123-suffix'), 'abc123')).toThrow('credential')
     expect(redactSecret('upstream repeated abc123 and abc123', 'abc123')).toBe('upstream repeated [REDACTED] and [REDACTED]')
+  })
+})
+
+
+describe('subscription credit balance', () => {
+  test('must be requested verbatim: no query, no encoding, no trailing slash', () => {
+    expect(validateEndpoint('/v1/user/subscription', 'GET').pathname).toBe('/v1/user/subscription')
+    for (const endpoint of [
+      '/v1/user/subscription?x=1',
+      '/v1/user/%73ubscription',
+      '/v1/user%2Fsubscription',
+      '/v1/user/subscription/',
+      '/v1/user/subscription%2Fextra',
+    ]) {
+      expect(() => validateEndpoint(endpoint, 'GET')).toThrow()
+    }
+  })
+
+  test('only the numeric credit fields reach the agent', () => {
+    const upstream = {
+      tier: 'creator',
+      character_count: 1200,
+      character_limit: 100000,
+      next_character_count_reset_unix: 1790000000,
+      currency: 'usd',
+      open_invoices: [{ amount_due_cents: 2200 }],
+      next_invoice: { amount_due_cents: 2200, tax_cents: 0 },
+      character_limit_text: 'not a number',
+    }
+    const out = JSON.parse(
+      new TextDecoder().decode(filterSubscriptionResponse(new TextEncoder().encode(JSON.stringify(upstream)))),
+    )
+    expect(out).toEqual({ character_count: 1200, character_limit: 100000, next_character_count_reset_unix: 1790000000 })
+  })
+
+  test('non-JSON or non-object responses are refused', () => {
+    expect(() => filterSubscriptionResponse(new TextEncoder().encode('not json'))).toThrow()
+    expect(() => filterSubscriptionResponse(new TextEncoder().encode('[1,2]'))).toThrow()
   })
 })

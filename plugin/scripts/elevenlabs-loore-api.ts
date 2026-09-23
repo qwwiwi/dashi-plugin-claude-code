@@ -8,6 +8,12 @@ const MAX_REQUEST_BYTES = 100 * 1024 * 1024
 const MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 const MAX_ERROR_BYTES = 1024 * 1024
 const MAX_KEY_BYTES = 4096
+// Credit balance: the only account endpoint the broker exposes. It must be
+// requested verbatim (no query, no percent-encoding), and only the three
+// credit fields ever reach the agent – invoices, taxes and plan details stay
+// inside the broker.
+const SUBSCRIPTION_PATH = '/v1/user/subscription'
+const SUBSCRIPTION_FIELDS = ['character_count', 'character_limit', 'next_character_count_reset_unix'] as const
 const ALLOWED_GET_ENDPOINT_RES: readonly RegExp[] = [
   /^\/v1\/voices(?:\/[A-Za-z0-9_-]+)?$/,
   /^\/v1\/models$/,
@@ -77,7 +83,30 @@ export function validateEndpoint(raw: string, method: 'GET' | 'POST' = 'GET'): U
   if (!allowedEndpointRes.some((re) => re.test(decodedPath))) {
     throw new Error('endpoint is not allowlisted for Loore dubbing')
   }
+  if (decodedPath === SUBSCRIPTION_PATH && raw !== SUBSCRIPTION_PATH) {
+    throw new Error('subscription endpoint must be requested verbatim, without query or encoding')
+  }
   return url
+}
+
+/** Reduce the subscription response to the numeric credit fields only. */
+export function filterSubscriptionResponse(payload: Uint8Array): Uint8Array {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(payload))
+  } catch {
+    throw new Error('subscription response is not JSON')
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('subscription response is not an object')
+  }
+  const source = parsed as Record<string, unknown>
+  const filtered: Record<string, number> = {}
+  for (const field of SUBSCRIPTION_FIELDS) {
+    const value = source[field]
+    if (typeof value === 'number' && Number.isFinite(value)) filtered[field] = value
+  }
+  return new TextEncoder().encode(JSON.stringify(filtered))
 }
 
 export function parseCliArgs(argv: readonly string[]): BridgeConfig {
@@ -241,6 +270,10 @@ async function run(config: BridgeConfig): Promise<void> {
   if (!response.ok) {
     const excerpt = new TextDecoder().decode(payload.slice(0, 4096))
     throw new Error(`ElevenLabs HTTP ${response.status}: ${redactSecret(excerpt, key)}`)
+  }
+  if (config.endpointUrl.pathname === SUBSCRIPTION_PATH) {
+    await writeStdout(filterSubscriptionResponse(payload))
+    return
   }
   await writeStdout(payload)
 }
