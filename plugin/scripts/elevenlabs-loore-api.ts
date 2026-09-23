@@ -89,6 +89,17 @@ export function validateEndpoint(raw: string, method: 'GET' | 'POST' = 'GET'): U
   return url
 }
 
+/**
+ * Error text for a non-OK upstream response. The account endpoint never
+ * echoes its body: an error body could carry billing fields that the success
+ * path filters out. Other endpoints keep a redacted 4 KiB excerpt.
+ */
+export function upstreamErrorMessage(status: number, pathname: string, payload: Uint8Array, key: string): string {
+  if (pathname === SUBSCRIPTION_PATH) return `ElevenLabs HTTP ${status}`
+  const excerpt = new TextDecoder().decode(payload.slice(0, 4096))
+  return `ElevenLabs HTTP ${status}: ${redactSecret(excerpt, key)}`
+}
+
 /** Reduce the subscription response to the numeric credit fields only. */
 export function filterSubscriptionResponse(payload: Uint8Array): Uint8Array {
   let parsed: unknown
@@ -268,8 +279,7 @@ async function run(config: BridgeConfig): Promise<void> {
   const payload = await readLimitedBytes(response.body, responseLimit, 'ElevenLabs response')
   assertResponseDoesNotContainSecret(payload, key)
   if (!response.ok) {
-    const excerpt = new TextDecoder().decode(payload.slice(0, 4096))
-    throw new Error(`ElevenLabs HTTP ${response.status}: ${redactSecret(excerpt, key)}`)
+    throw new Error(upstreamErrorMessage(response.status, config.endpointUrl.pathname, payload, key))
   }
   if (config.endpointUrl.pathname === SUBSCRIPTION_PATH) {
     await writeStdout(filterSubscriptionResponse(payload))

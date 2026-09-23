@@ -3,6 +3,7 @@ import {
   ELEVENLABS_ORIGIN,
   assertBodyDoesNotContainSecret,
   filterSubscriptionResponse,
+  upstreamErrorMessage,
   parseCliArgs,
   readLimitedBytes,
   redactSecret,
@@ -126,5 +127,11 @@ describe('subscription credit balance', () => {
   test('non-JSON or non-object responses are refused', () => {
     expect(() => filterSubscriptionResponse(new TextEncoder().encode('not json'))).toThrow()
     expect(() => filterSubscriptionResponse(new TextEncoder().encode('[1,2]'))).toThrow()
+  })
+  test('error responses of the account endpoint never echo the upstream body', () => {
+    const body = new TextEncoder().encode(JSON.stringify({ next_invoice: { amount_due_cents: 2200 } }))
+    expect(upstreamErrorMessage(402, '/v1/user/subscription', body, 'sk_test')).toBe('ElevenLabs HTTP 402')
+    expect(upstreamErrorMessage(400, '/v1/models', new TextEncoder().encode('bad sk_test'), 'sk_test')).toContain('ElevenLabs HTTP 400:')
+    expect(upstreamErrorMessage(400, '/v1/models', new TextEncoder().encode('bad sk_test'), 'sk_test')).not.toContain('sk_test')
   })
 })
