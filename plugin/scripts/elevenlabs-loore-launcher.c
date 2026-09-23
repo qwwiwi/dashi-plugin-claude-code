@@ -1,11 +1,15 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <linux/prctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -14,7 +18,7 @@
 #endif
 
 #ifndef BUN_PATH
-#define BUN_PATH "/home/openclaw/.local/bin/bun"
+#define BUN_PATH "/usr/local/libexec/loore-elevenlabs-bun"
 #endif
 
 #ifndef BRIDGE_PATH
@@ -24,6 +28,36 @@
 static int fail(const char *message) {
   fprintf(stderr, "loore-elevenlabs-api: %s\n", message);
   return 126;
+}
+
+static int close_inherited_fds(void) {
+#ifdef SYS_close_range
+  if (syscall(SYS_close_range, 3U, UINT_MAX, 0U) == 0) return 0;
+  if (errno != ENOSYS && errno != EINVAL) return -1;
+#endif
+
+  DIR *directory = opendir("/proc/self/fd");
+  if (directory != NULL) {
+    const int directory_fd = dirfd(directory);
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+      char *end = NULL;
+      errno = 0;
+      const long fd = strtol(entry->d_name, &end, 10);
+      if (errno == 0 && end != entry->d_name && *end == '\0' && fd >= 3 && fd != directory_fd) {
+        close((int)fd);
+      }
+    }
+    closedir(directory);
+    return 0;
+  }
+
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return -1;
+  rlim_t maximum = limit.rlim_cur;
+  if (maximum == RLIM_INFINITY) maximum = 1048576;
+  for (rlim_t fd = 3; fd < maximum; fd += 1) close((int)fd);
+  return 0;
 }
 
 int main(int argc, char **argv) {
@@ -59,9 +93,7 @@ int main(int argc, char **argv) {
   umask(077);
   if (chdir("/") != 0) return fail("cannot enter safe working directory");
 
-  long max_fd = sysconf(_SC_OPEN_MAX);
-  if (max_fd < 0 || max_fd > 65536) max_fd = 65536;
-  for (int fd = 3; fd < max_fd; fd += 1) close(fd);
+  if (close_inherited_fds() != 0) return fail("cannot close inherited file descriptors");
 
   if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
     return fail("cannot enable no-new-privileges");
