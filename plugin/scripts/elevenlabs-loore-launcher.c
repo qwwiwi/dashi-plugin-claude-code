@@ -70,16 +70,53 @@ static int close_inherited_fds(void) {
   return 0;
 }
 
+static int ensure_standard_fds(void) {
+  for (int target = 0; target <= 2; target += 1) {
+    errno = 0;
+    if (fcntl(target, F_GETFD) >= 0 || errno != EBADF) continue;
+    const int flags = target == 0 ? O_RDONLY : O_WRONLY;
+    const int fd = open("/dev/null", flags);
+    if (fd < 0) return -1;
+    if (fd != target) {
+      if (dup2(fd, target) < 0) {
+        close(fd);
+        return -1;
+      }
+      close(fd);
+    }
+  }
+  return 0;
+}
+
+static int acquire_broker_lock(void) {
+  if (mkdir("/run/loore-elevenlabs", 0700) != 0 && errno != EEXIST) return -1;
+  struct stat directory_info;
+  if (lstat("/run/loore-elevenlabs", &directory_info) != 0 || !S_ISDIR(directory_info.st_mode) ||
+      directory_info.st_uid != 0 || (directory_info.st_mode & 0777) != 0700) {
+    errno = EPERM;
+    return -1;
+  }
+  const int fd = open("/run/loore-elevenlabs/broker.lock", O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+  if (fd < 0) return -1;
+  struct stat lock_info;
+  if (fstat(fd, &lock_info) != 0 || !S_ISREG(lock_info.st_mode) || lock_info.st_uid != 0 ||
+      (lock_info.st_mode & 0777) != 0600 || flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    close(fd);
+    errno = EPERM;
+    return -1;
+  }
+  return fd;
+}
+
 static int set_broker_limits(void) {
   const struct rlimit no_core = {0, 0};
   const struct rlimit cpu = {180, 180};
-  const struct rlimit address_space = {768UL * 1024UL * 1024UL, 768UL * 1024UL * 1024UL};
   const struct rlimit file_size = {128UL * 1024UL * 1024UL, 128UL * 1024UL * 1024UL};
   const struct rlimit processes = {64, 64};
   const struct rlimit files = {64, 64};
   return setrlimit(RLIMIT_CORE, &no_core) || setrlimit(RLIMIT_CPU, &cpu) ||
-         setrlimit(RLIMIT_AS, &address_space) || setrlimit(RLIMIT_FSIZE, &file_size) ||
-         setrlimit(RLIMIT_NPROC, &processes) || setrlimit(RLIMIT_NOFILE, &files);
+         setrlimit(RLIMIT_FSIZE, &file_size) || setrlimit(RLIMIT_NPROC, &processes) ||
+         setrlimit(RLIMIT_NOFILE, &files);
 }
 
 int main(int argc, char **argv) {
@@ -90,6 +127,7 @@ int main(int argc, char **argv) {
   if (geteuid() != 0) {
     return fail("launcher is not installed setuid-root");
   }
+  if (ensure_standard_fds() != 0) return fail("cannot initialize standard file descriptors");
   if (argc < 2 || argc > 64) {
     return fail("invalid argument count");
   }
@@ -110,19 +148,21 @@ int main(int argc, char **argv) {
   if (chdir("/") != 0) return fail("cannot enter safe working directory");
   if (close_inherited_fds() != 0) return fail("cannot close inherited file descriptors");
 
-  const int lock_fd = open("/run/lock/loore-elevenlabs-api.lock", O_RDWR | O_CREAT, 0600);
-  if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
-    return fail("another broker request is already running");
-  }
+  const int lock_fd = acquire_broker_lock();
+  if (lock_fd < 0) return fail("cannot acquire the broker lock");
   if (set_broker_limits() != 0) return fail("cannot set broker resource limits");
   if (setgroups(0, NULL) != 0 || setresgid((gid_t)BROKER_GID, (gid_t)BROKER_GID, (gid_t)BROKER_GID) != 0 ||
       setresuid((uid_t)BROKER_UID, (uid_t)BROKER_UID, (uid_t)BROKER_UID) != 0) {
     return fail("cannot establish dedicated broker identity");
   }
-  if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 || prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-    return fail("cannot apply broker process protections");
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+    return fail("cannot enable no-new-privileges");
   }
-  signal(SIGALRM, SIG_DFL);
+  sigset_t empty_mask;
+  if (sigemptyset(&empty_mask) != 0 || sigprocmask(SIG_SETMASK, &empty_mask, NULL) != 0 ||
+      signal(SIGALRM, SIG_DFL) == SIG_ERR) {
+    return fail("cannot initialize the broker deadline");
+  }
   alarm(135);
 
   char **child_argv = calloc((size_t)argc + 2, sizeof(char *));

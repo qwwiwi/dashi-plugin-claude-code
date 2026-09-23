@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { stat } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { open } from 'node:fs/promises'
 
 export const ELEVENLABS_ORIGIN = 'https://api.elevenlabs.io'
 const ELEVENLABS_KEY_PATH = '/etc/loore-elevenlabs/key'
@@ -192,13 +193,20 @@ async function writeStdout(payload: Uint8Array): Promise<void> {
 }
 
 async function run(config: BridgeConfig): Promise<void> {
-  const keyInfo = await stat(ELEVENLABS_KEY_PATH)
   const brokerUid = process.getuid?.()
-  if (!keyInfo.isFile() || brokerUid === undefined || keyInfo.uid !== brokerUid || (keyInfo.mode & 0o077) !== 0) {
-    throw new Error('ElevenLabs credential metadata is unsafe')
+  if (brokerUid === undefined) throw new Error('broker uid is unavailable')
+  const keyHandle = await open(ELEVENLABS_KEY_PATH, constants.O_RDONLY | constants.O_NOFOLLOW)
+  let key: string
+  try {
+    const keyInfo = await keyHandle.stat()
+    if (!keyInfo.isFile() || keyInfo.uid !== brokerUid || (keyInfo.mode & 0o777) !== 0o400) {
+      throw new Error('ElevenLabs credential metadata is unsafe')
+    }
+    if (keyInfo.size === 0 || keyInfo.size > MAX_KEY_BYTES) throw new Error('ElevenLabs credential file size is invalid')
+    key = (await keyHandle.readFile({ encoding: 'utf8' })).trim()
+  } finally {
+    await keyHandle.close()
   }
-  if (keyInfo.size === 0 || keyInfo.size > MAX_KEY_BYTES) throw new Error('ElevenLabs credential file size is invalid')
-  const key = (await Bun.file(ELEVENLABS_KEY_PATH).text()).trim()
   if (key.length === 0 || /[\r\n\0]/.test(key)) throw new Error('ElevenLabs credential file is malformed')
 
   const headers = new Headers({ Accept: config.accept, 'xi-api-key': key })
