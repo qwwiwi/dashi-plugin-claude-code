@@ -1,31 +1,29 @@
 #!/usr/bin/env bun
-import { mkdir, rename, rm } from 'node:fs/promises'
-import { dirname, resolve, sep } from 'node:path'
 
 export const ELEVENLABS_ORIGIN = 'https://api.elevenlabs.io'
 export const ELEVENLABS_KEY_PATH = '/home/openclaw/.claude-lab/thrall/secrets/elevenlabs-loore.key'
-const SECRET_DIR = dirname(ELEVENLABS_KEY_PATH)
+const MAX_REQUEST_BYTES = 100 * 1024 * 1024
 const MAX_RESPONSE_BYTES = 100 * 1024 * 1024
+const MAX_ERROR_BYTES = 1024 * 1024
 
 export interface BridgeConfig {
   method: 'GET' | 'POST'
   endpointUrl: URL
-  bodyPath: string | undefined
+  bodyFromStdin: boolean
   contentType: string | undefined
   accept: string
-  outputPath: string
 }
 
 const USAGE = `Usage:
   bun scripts/elevenlabs-loore-api.ts \\
     --method GET|POST \\
     --endpoint /v1/... \\
-    [--body-file /path/to/request-body] \\
-    [--content-type application/json] \\
+    [--body-stdin --content-type application/json] \\
     [--accept application/json] \\
-    --output /path/to/response
+    > /path/to/response
 
-The API key path and destination origin are fixed and cannot be overridden.`
+The API key path and destination origin are fixed and cannot be overridden.
+POST request bodies are read only from stdin; responses are written only to stdout.`
 
 function requireValue(argv: readonly string[], index: number, option: string): string {
   const value = argv[index + 1]
@@ -39,11 +37,6 @@ function assertHeaderValue(name: string, value: string): void {
   if (value.length === 0 || value.length > 512 || /[\r\n\0]/.test(value)) {
     throw new Error(`invalid ${name} header value`)
   }
-}
-
-function isInSecretTree(path: string): boolean {
-  const absolute = resolve(path)
-  return absolute === SECRET_DIR || absolute.startsWith(`${SECRET_DIR}${sep}`)
 }
 
 export function validateEndpoint(raw: string): URL {
@@ -69,10 +62,9 @@ export function validateEndpoint(raw: string): URL {
 export function parseCliArgs(argv: readonly string[]): BridgeConfig {
   let method: 'GET' | 'POST' | undefined
   let endpoint: string | undefined
-  let bodyPath: string | undefined
+  let bodyFromStdin = false
   let contentType: string | undefined
   let accept = 'application/json, audio/*;q=0.9, */*;q=0.1'
-  let outputPath: string | undefined
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
@@ -84,17 +76,13 @@ export function parseCliArgs(argv: readonly string[]): BridgeConfig {
     } else if (arg === '--endpoint') {
       endpoint = requireValue(argv, i, arg)
       i += 1
-    } else if (arg === '--body-file') {
-      bodyPath = resolve(requireValue(argv, i, arg))
-      i += 1
+    } else if (arg === '--body-stdin') {
+      bodyFromStdin = true
     } else if (arg === '--content-type') {
       contentType = requireValue(argv, i, arg)
       i += 1
     } else if (arg === '--accept') {
       accept = requireValue(argv, i, arg)
-      i += 1
-    } else if (arg === '--output') {
-      outputPath = resolve(requireValue(argv, i, arg))
       i += 1
     } else {
       throw new Error(`unknown argument: ${arg ?? '<missing>'}`)
@@ -103,28 +91,84 @@ export function parseCliArgs(argv: readonly string[]): BridgeConfig {
 
   if (method === undefined) throw new Error('--method is required')
   if (endpoint === undefined) throw new Error('--endpoint is required')
-  if (outputPath === undefined) throw new Error('--output is required')
-  if (method === 'GET' && bodyPath !== undefined) throw new Error('GET requests cannot include --body-file')
-  if (bodyPath !== undefined && contentType === undefined) throw new Error('--content-type is required with --body-file')
-  if (bodyPath === undefined && contentType !== undefined) throw new Error('--content-type requires --body-file')
-  if ((bodyPath !== undefined && isInSecretTree(bodyPath)) || isInSecretTree(outputPath)) {
-    throw new Error('the Thrall secret tree cannot be used as request body or output')
-  }
+  if (method === 'GET' && bodyFromStdin) throw new Error('GET requests cannot include --body-stdin')
+  if (method === 'GET' && contentType !== undefined) throw new Error('GET requests cannot include --content-type')
+  if (method === 'POST' && !bodyFromStdin) throw new Error('POST requests require --body-stdin')
+  if (bodyFromStdin && contentType === undefined) throw new Error('--content-type is required with --body-stdin')
   assertHeaderValue('Accept', accept)
   if (contentType !== undefined) assertHeaderValue('Content-Type', contentType)
 
   return {
     method,
     endpointUrl: validateEndpoint(endpoint),
-    bodyPath,
+    bodyFromStdin,
     contentType,
     accept,
-    outputPath,
+  }
+}
+
+export async function readLimitedBytes(
+  stream: ReadableStream<Uint8Array> | null,
+  limit: number,
+  label: string,
+): Promise<Uint8Array> {
+  if (stream === null) return new Uint8Array()
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > limit) {
+        await reader.cancel(`${label} exceeds byte limit`)
+        throw new Error(`${label} exceeds byte limit`)
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const joined = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    joined.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return joined
+}
+
+function containsBytes(haystack: Uint8Array, needle: Uint8Array): boolean {
+  if (needle.byteLength === 0 || needle.byteLength > haystack.byteLength) return false
+  outer: for (let i = 0; i <= haystack.byteLength - needle.byteLength; i += 1) {
+    for (let j = 0; j < needle.byteLength; j += 1) {
+      if (haystack[i + j] !== needle[j]) continue outer
+    }
+    return true
+  }
+  return false
+}
+
+export function assertBodyDoesNotContainSecret(body: Uint8Array, secret: string): void {
+  if (containsBytes(body, new TextEncoder().encode(secret))) {
+    throw new Error('request body contains the ElevenLabs credential')
+  }
+}
+
+function assertResponseDoesNotContainSecret(body: Uint8Array, secret: string): void {
+  if (containsBytes(body, new TextEncoder().encode(secret))) {
+    throw new Error('upstream response contained the ElevenLabs credential and was suppressed')
   }
 }
 
 export function redactSecret(text: string, secret: string): string {
   return secret.length === 0 ? text : text.split(secret).join('[REDACTED]')
+}
+
+async function writeStdout(payload: Uint8Array): Promise<void> {
+  if (process.stdout.write(payload)) return
+  await new Promise<void>((resolvePromise) => process.stdout.once('drain', resolvePromise))
 }
 
 async function run(config: BridgeConfig): Promise<void> {
@@ -141,29 +185,28 @@ async function run(config: BridgeConfig): Promise<void> {
     redirect: 'error',
     signal: AbortSignal.timeout(120_000),
   }
-  if (config.bodyPath !== undefined) {
-    const bodyFile = Bun.file(config.bodyPath)
-    if (!(await bodyFile.exists())) throw new Error('request body file is unavailable')
-    init.body = bodyFile
+  if (config.bodyFromStdin) {
+    const requestBody = await readLimitedBytes(Bun.stdin.stream(), MAX_REQUEST_BYTES, 'request body')
+    assertBodyDoesNotContainSecret(requestBody, key)
+    const requestBuffer = new ArrayBuffer(requestBody.byteLength)
+    new Uint8Array(requestBuffer).set(requestBody)
+    init.body = requestBuffer
   }
 
   const response = await fetch(config.endpointUrl, init)
-  const payload = await response.arrayBuffer()
-  if (payload.byteLength > MAX_RESPONSE_BYTES) throw new Error('ElevenLabs response exceeds 100 MiB safety cap')
+  const contentLength = Number(response.headers.get('content-length'))
+  const responseLimit = response.ok ? MAX_RESPONSE_BYTES : MAX_ERROR_BYTES
+  if (Number.isFinite(contentLength) && contentLength > responseLimit) {
+    await response.body?.cancel('response exceeds byte limit')
+    throw new Error('ElevenLabs response exceeds byte limit')
+  }
+  const payload = await readLimitedBytes(response.body, responseLimit, 'ElevenLabs response')
+  assertResponseDoesNotContainSecret(payload, key)
   if (!response.ok) {
     const excerpt = new TextDecoder().decode(payload.slice(0, 4096))
     throw new Error(`ElevenLabs HTTP ${response.status}: ${redactSecret(excerpt, key)}`)
   }
-
-  await mkdir(dirname(config.outputPath), { recursive: true })
-  const temporary = `${config.outputPath}.tmp-${process.pid}-${Date.now()}`
-  try {
-    await Bun.write(temporary, payload)
-    await rename(temporary, config.outputPath)
-  } finally {
-    await rm(temporary, { force: true })
-  }
-  process.stdout.write(`${JSON.stringify({ status: response.status, bytes: payload.byteLength, output: config.outputPath })}\n`)
+  await writeStdout(payload)
 }
 
 async function main(): Promise<void> {

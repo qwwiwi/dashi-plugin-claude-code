@@ -1,30 +1,46 @@
 import { describe, expect, test } from 'bun:test'
 import {
   ELEVENLABS_ORIGIN,
+  assertBodyDoesNotContainSecret,
   parseCliArgs,
+  readLimitedBytes,
   redactSecret,
   validateEndpoint,
 } from '../../scripts/elevenlabs-loore-api'
 
+function streamOf(...chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk)
+      controller.close()
+    },
+  })
+}
+
 describe('ElevenLabs Loore API bridge', () => {
   test('accepts a GET to the fixed ElevenLabs v1 origin', () => {
-    const cfg = parseCliArgs(['--method', 'GET', '--endpoint', '/v1/voices', '--output', '/tmp/voices.json'])
+    const cfg = parseCliArgs(['--method', 'GET', '--endpoint', '/v1/voices'])
     expect(cfg.method).toBe('GET')
     expect(cfg.endpointUrl.toString()).toBe(`${ELEVENLABS_ORIGIN}/v1/voices`)
-    expect(cfg.outputPath).toBe('/tmp/voices.json')
+    expect(cfg.bodyFromStdin).toBe(false)
   })
 
-  test('accepts a POST body without accepting a key path override', () => {
+  test('accepts POST stdin without accepting file, output, or key overrides', () => {
     const cfg = parseCliArgs([
       '--method', 'POST',
       '--endpoint', '/v1/text-to-speech/voice-id',
-      '--body-file', '/tmp/request.json',
+      '--body-stdin',
       '--content-type', 'application/json',
-      '--output', '/tmp/audio.mp3',
     ])
-    expect(cfg.bodyPath).toBe('/tmp/request.json')
+    expect(cfg.bodyFromStdin).toBe(true)
     expect(cfg.contentType).toBe('application/json')
-    expect(() => parseCliArgs(['--key-file', '/tmp/other.key'])).toThrow('unknown argument')
+    for (const args of [
+      ['--key-file', '/tmp/other.key'],
+      ['--body-file', '/tmp/request.json'],
+      ['--output', '/tmp/response.json'],
+    ]) {
+      expect(() => parseCliArgs(args)).toThrow('unknown argument')
+    }
   })
 
   test('rejects external origins, traversal, fragments and malformed v1 paths', () => {
@@ -33,19 +49,21 @@ describe('ElevenLabs Loore API bridge', () => {
     }
   })
 
-  test('rejects using the Thrall secret tree as request body or output', () => {
-    const secret = '/home/openclaw/.claude-lab/thrall/secrets/elevenlabs-loore.key'
-    const base = ['--method', 'POST', '--endpoint', '/v1/dubbing', '--content-type', 'application/json']
-    expect(() => parseCliArgs([...base, '--body-file', secret, '--output', '/tmp/out.json'])).toThrow('secret tree')
-    expect(() => parseCliArgs([...base, '--body-file', '/tmp/body.json', '--output', secret])).toThrow('secret tree')
+  test('rejects header injection and invalid stdin combinations', () => {
+    expect(() => parseCliArgs(['--method', 'GET', '--endpoint', '/v1/voices', '--accept', 'x\r\ny: z'])).toThrow('header')
+    expect(() => parseCliArgs(['--method', 'GET', '--endpoint', '/v1/voices', '--body-stdin'])).toThrow('GET')
+    expect(() => parseCliArgs(['--method', 'POST', '--endpoint', '/v1/dubbing', '--body-stdin'])).toThrow('--content-type')
+    expect(() => parseCliArgs(['--method', 'POST', '--endpoint', '/v1/dubbing', '--content-type', 'application/json'])).toThrow('--body-stdin')
   })
 
-  test('rejects header injection and GET bodies', () => {
-    expect(() => parseCliArgs(['--method', 'GET', '--endpoint', '/v1/voices', '--accept', 'x\r\ny: z', '--output', '/tmp/x'])).toThrow('header')
-    expect(() => parseCliArgs(['--method', 'GET', '--endpoint', '/v1/voices', '--body-file', '/tmp/x', '--output', '/tmp/y'])).toThrow('GET')
+  test('enforces byte limits while consuming a stream', async () => {
+    const ok = await readLimitedBytes(streamOf(new Uint8Array([1, 2]), new Uint8Array([3])), 3, 'test')
+    expect([...ok]).toEqual([1, 2, 3])
+    await expect(readLimitedBytes(streamOf(new Uint8Array([1, 2]), new Uint8Array([3, 4])), 3, 'test')).rejects.toThrow('limit')
   })
 
-  test('redacts the key from upstream error text', () => {
+  test('rejects request bytes containing the API key and redacts errors', () => {
+    expect(() => assertBodyDoesNotContainSecret(new TextEncoder().encode('prefix-abc123-suffix'), 'abc123')).toThrow('credential')
     expect(redactSecret('upstream repeated abc123 and abc123', 'abc123')).toBe('upstream repeated [REDACTED] and [REDACTED]')
   })
 })
