@@ -44,7 +44,7 @@ describe('ElevenLabs Loore API bridge', () => {
   })
 
   test('allows only method-scoped Loore dubbing capabilities, not account APIs', () => {
-    for (const endpoint of ['/v1/voices', '/v1/voices/voice-id', '/v1/models', '/v1/dubbing/dubbing-id', '/v1/dubbing/dubbing-id/audio/ru']) {
+    for (const endpoint of ['/v1/voices', '/v1/voices/voice-id', '/v1/models', '/v1/user/subscription', '/v1/dubbing/dubbing-id', '/v1/dubbing/dubbing-id/audio/ru']) {
       expect(validateEndpoint(endpoint, 'GET').origin).toBe(ELEVENLABS_ORIGIN)
     }
     for (const endpoint of ['/v1/text-to-speech/voice-id', '/v1/text-to-speech/voice-id/stream', '/v1/speech-to-speech/voice-id', '/v1/dubbing']) {
@@ -54,6 +54,9 @@ describe('ElevenLabs Loore API bridge', () => {
       ['/v1/voices/add', 'POST'],
       ['/v1/text-to-speech/voice-id', 'GET'],
       ['/v1/user', 'GET'],
+      ['/v1/user/subscription', 'POST'],
+      ['/v1/user/subscription/extra', 'GET'],
+      ['/v1/user/api-keys', 'GET'],
       ['/v1/service-accounts/api-keys', 'POST'],
       ['/v1/workspace/invites', 'POST'],
       ['/v1/projects', 'GET'],

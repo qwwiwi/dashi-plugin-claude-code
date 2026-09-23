@@ -11,6 +11,10 @@ const MAX_KEY_BYTES = 4096
 const ALLOWED_GET_ENDPOINT_RES: readonly RegExp[] = [
   /^\/v1\/voices(?:\/[A-Za-z0-9_-]+)?$/,
   /^\/v1\/models$/,
+  // Read-only credit balance: the dubbing pipeline records credits before/after
+  // a run and aborts early when the balance is insufficient. Only the exact
+  // subscription path – the rest of /v1/user stays denied.
+  /^\/v1\/user\/subscription$/,
   /^\/v1\/dubbing\/[A-Za-z0-9_-]+(?:\/audio\/[A-Za-z0-9_-]+)?$/,
 ]
 const ALLOWED_POST_ENDPOINT_RES: readonly RegExp[] = [
