@@ -248,6 +248,29 @@ const FORK_BOMB_RE = /:\s*\(\s*\)\s*\{[^}]*\|[^}]*&[^}]*\}\s*;\s*:/
 // `grep … ~/.aws/credentials`, `tar cz ~/.ssh`, `cat /proc/$$/environ` must
 // hard-deny just like a Read of the same file. A leading boundary char keeps
 // `environment`/`monkey.json`-style false positives out.
+// Warchief-approved exception (2026-09-23): Thrall may reference exactly the
+// Loore ElevenLabs key file from Bash. Both path spellings resolve to the same
+// inode. Each expression consumes an entire unquoted or fully quoted shell word.
+// Quotes are not generic boundaries: adjacent quote fragments concatenate in
+// shell, so `'path'.bak`, `prefix'path'` and `'path'/child` must stay denied.
+// Matching is case-sensitive (Linux paths are case-sensitive), and `:` is not a
+// local-word boundary so `host:/path` remains denied.
+const SECRET_BASH_EXACT_ALLOWED_PATH_RES: readonly RegExp[] = [
+  /(^|[\s=|&;])~\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key(?=$|[\s|&;])/g,
+  /(^|[\s=|&;])'~\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key'(?=$|[\s|&;])/g,
+  /(^|[\s=|&;])"~\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key"(?=$|[\s|&;])/g,
+  /(^|[\s=|&;])\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key(?=$|[\s|&;])/g,
+  /(^|[\s=|&;])'\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key'(?=$|[\s|&;])/g,
+  /(^|[\s=|&;])"\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key"(?=$|[\s|&;])/g,
+]
+
+// The path exception is for literal handoff to a local external dubbing script,
+// not shell computation, display, copying, upload or inline code. When the exact
+// path was recognized, these constructs fail closed before the generic scan.
+const SECRET_BASH_ALLOWED_PATH_UNSAFE_SYNTAX_RE = /[$`*?\[\]<>]|\.\.|<</
+const SECRET_BASH_ALLOWED_PATH_DIRECT_ACCESS_RE = /\b(?:cat|head|tail|sed|awk|grep|less|more|strings|xxd|od|base64|openssl|cp|mv|ln|rm|shred|install|tar|zip|scp|rsync|curl|wget|ssh|nc|ncat|socat|tee|dd|jq|dirname|realpath|readlink|find|sha(?:1|224|256|384|512)sum|md5sum)\b/i
+const SECRET_BASH_ALLOWED_PATH_INLINE_CODE_RE = /\b(?:python(?:[0-9.]+)?|node|ruby|perl|php|bash|sh|zsh)\b[^\n;&|]{0,200}(?:\s-(?:c|e)\b|\s--eval\b)/i
+
 const SECRET_BASH_RES: readonly RegExp[] = [
   /(^|[\s'"=:(/<>|&;])\.env($|[\s'".)/<>|&;]|\.[a-z0-9_-]+)/i,
   /\.pem\b/i,
@@ -394,7 +417,23 @@ function builtinBashHardDeny(command: string): string | null {
 
 /** Built-in secret-path hard-deny over a Bash command. */
 function bashReferencesSecret(command: string): boolean {
-  return SECRET_BASH_RES.some((re) => re.test(command))
+  let commandForSecretScan = command
+  let allowedPathReferenced = false
+  for (const allowedPathRe of SECRET_BASH_EXACT_ALLOWED_PATH_RES) {
+    commandForSecretScan = commandForSecretScan.replace(allowedPathRe, (_match, boundary: string) => {
+      allowedPathReferenced = true
+      return `${boundary}__ELEVENLABS_LOORE_KEY_PATH__`
+    })
+  }
+  if (
+    allowedPathReferenced &&
+    (SECRET_BASH_ALLOWED_PATH_UNSAFE_SYNTAX_RE.test(command) ||
+      SECRET_BASH_ALLOWED_PATH_DIRECT_ACCESS_RE.test(command) ||
+      SECRET_BASH_ALLOWED_PATH_INLINE_CODE_RE.test(command))
+  ) {
+    return true
+  }
+  return SECRET_BASH_RES.some((re) => re.test(commandForSecretScan))
 }
 
 /** Interpreter/exfil pipe evasion that must reach the owner as a confirm.
