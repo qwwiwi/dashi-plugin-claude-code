@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test'
 import {
   ELEVENLABS_ORIGIN,
   assertBodyDoesNotContainSecret,
+  filterSubscriptionResponse,
+  upstreamErrorMessage,
   parseCliArgs,
   readLimitedBytes,
   redactSecret,
@@ -44,7 +46,7 @@ describe('ElevenLabs Loore API bridge', () => {
   })
 
   test('allows only method-scoped Loore dubbing capabilities, not account APIs', () => {
-    for (const endpoint of ['/v1/voices', '/v1/voices/voice-id', '/v1/models', '/v1/dubbing/dubbing-id', '/v1/dubbing/dubbing-id/audio/ru']) {
+    for (const endpoint of ['/v1/voices', '/v1/voices/voice-id', '/v1/models', '/v1/user/subscription', '/v1/dubbing/dubbing-id', '/v1/dubbing/dubbing-id/audio/ru']) {
       expect(validateEndpoint(endpoint, 'GET').origin).toBe(ELEVENLABS_ORIGIN)
     }
     for (const endpoint of ['/v1/text-to-speech/voice-id', '/v1/text-to-speech/voice-id/stream', '/v1/speech-to-speech/voice-id', '/v1/dubbing']) {
@@ -54,6 +56,9 @@ describe('ElevenLabs Loore API bridge', () => {
       ['/v1/voices/add', 'POST'],
       ['/v1/text-to-speech/voice-id', 'GET'],
       ['/v1/user', 'GET'],
+      ['/v1/user/subscription', 'POST'],
+      ['/v1/user/subscription/extra', 'GET'],
+      ['/v1/user/api-keys', 'GET'],
       ['/v1/service-accounts/api-keys', 'POST'],
       ['/v1/workspace/invites', 'POST'],
       ['/v1/projects', 'GET'],
@@ -84,5 +89,49 @@ describe('ElevenLabs Loore API bridge', () => {
   test('rejects request bytes containing the API key and redacts errors', () => {
     expect(() => assertBodyDoesNotContainSecret(new TextEncoder().encode('prefix-abc123-suffix'), 'abc123')).toThrow('credential')
     expect(redactSecret('upstream repeated abc123 and abc123', 'abc123')).toBe('upstream repeated [REDACTED] and [REDACTED]')
+  })
+})
+
+
+describe('subscription credit balance', () => {
+  test('must be requested verbatim: no query, no encoding, no trailing slash', () => {
+    expect(validateEndpoint('/v1/user/subscription', 'GET').pathname).toBe('/v1/user/subscription')
+    for (const endpoint of [
+      '/v1/user/subscription?x=1',
+      '/v1/user/%73ubscription',
+      '/v1/user%2Fsubscription',
+      '/v1/user/subscription/',
+      '/v1/user/subscription%2Fextra',
+    ]) {
+      expect(() => validateEndpoint(endpoint, 'GET')).toThrow()
+    }
+  })
+
+  test('only the numeric credit fields reach the agent', () => {
+    const upstream = {
+      tier: 'creator',
+      character_count: 1200,
+      character_limit: 100000,
+      next_character_count_reset_unix: 1790000000,
+      currency: 'usd',
+      open_invoices: [{ amount_due_cents: 2200 }],
+      next_invoice: { amount_due_cents: 2200, tax_cents: 0 },
+      character_limit_text: 'not a number',
+    }
+    const out = JSON.parse(
+      new TextDecoder().decode(filterSubscriptionResponse(new TextEncoder().encode(JSON.stringify(upstream)))),
+    )
+    expect(out).toEqual({ character_count: 1200, character_limit: 100000, next_character_count_reset_unix: 1790000000 })
+  })
+
+  test('non-JSON or non-object responses are refused', () => {
+    expect(() => filterSubscriptionResponse(new TextEncoder().encode('not json'))).toThrow()
+    expect(() => filterSubscriptionResponse(new TextEncoder().encode('[1,2]'))).toThrow()
+  })
+  test('error responses of the account endpoint never echo the upstream body', () => {
+    const body = new TextEncoder().encode(JSON.stringify({ next_invoice: { amount_due_cents: 2200 } }))
+    expect(upstreamErrorMessage(402, '/v1/user/subscription', body, 'sk_test')).toBe('ElevenLabs HTTP 402')
+    expect(upstreamErrorMessage(400, '/v1/models', new TextEncoder().encode('bad sk_test'), 'sk_test')).toContain('ElevenLabs HTTP 400:')
+    expect(upstreamErrorMessage(400, '/v1/models', new TextEncoder().encode('bad sk_test'), 'sk_test')).not.toContain('sk_test')
   })
 })
