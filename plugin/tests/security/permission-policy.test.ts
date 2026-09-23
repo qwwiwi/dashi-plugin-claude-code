@@ -502,7 +502,7 @@ describe('secret-path bash hard-deny (Codex Critical #2)', () => {
       }
     })
     test('allows the dedicated bridge invocation because the key path is internal', () => {
-      const command = 'bun scripts/elevenlabs-loore-api.ts --method GET --endpoint /v1/voices > /tmp/voices.json'
+      const command = '/usr/local/bin/loore-elevenlabs-api --method GET --endpoint /v1/voices > /tmp/voices.json'
       expect(classify('Bash', { command }, VARIANT1).tier).toBe('allow')
     })
   })

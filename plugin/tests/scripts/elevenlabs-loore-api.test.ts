@@ -43,6 +43,25 @@ describe('ElevenLabs Loore API bridge', () => {
     }
   })
 
+  test('allows only Loore dubbing capabilities, not account or credential APIs', () => {
+    for (const endpoint of [
+      '/v1/voices',
+      '/v1/voices/voice-id',
+      '/v1/models',
+      '/v1/text-to-speech/voice-id',
+      '/v1/text-to-speech/voice-id/stream',
+      '/v1/speech-to-speech/voice-id',
+      '/v1/dubbing',
+      '/v1/dubbing/dubbing-id',
+      '/v1/dubbing/dubbing-id/audio/ru',
+    ]) {
+      expect(validateEndpoint(endpoint).origin).toBe(ELEVENLABS_ORIGIN)
+    }
+    for (const endpoint of ['/v1/user', '/v1/service-accounts/api-keys', '/v1/workspace/invites', '/v1/projects']) {
+      expect(() => validateEndpoint(endpoint)).toThrow('not allowlisted')
+    }
+  })
+
   test('rejects external origins, traversal, fragments and malformed v1 paths', () => {
     for (const endpoint of ['https://evil.invalid/v1/x', '//evil.invalid/v1/x', '/v1/../x', '/v1//x', '/v2/voices', '/v1/x#fragment']) {
       expect(() => validateEndpoint(endpoint)).toThrow()

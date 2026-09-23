@@ -1,10 +1,18 @@
 #!/usr/bin/env bun
 
 export const ELEVENLABS_ORIGIN = 'https://api.elevenlabs.io'
-export const ELEVENLABS_KEY_PATH = '/home/openclaw/.claude-lab/thrall/secrets/elevenlabs-loore.key'
+const ELEVENLABS_KEY_PATH = '/home/openclaw/.claude-lab/thrall/secrets/elevenlabs-loore.key'
 const MAX_REQUEST_BYTES = 100 * 1024 * 1024
 const MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 const MAX_ERROR_BYTES = 1024 * 1024
+const MAX_KEY_BYTES = 4096
+const ALLOWED_ENDPOINT_RES: readonly RegExp[] = [
+  /^\/v1\/voices(?:\/[A-Za-z0-9_-]+)?$/,
+  /^\/v1\/models$/,
+  /^\/v1\/text-to-speech\/[A-Za-z0-9_-]+(?:\/stream)?$/,
+  /^\/v1\/speech-to-speech\/[A-Za-z0-9_-]+(?:\/stream)?$/,
+  /^\/v1\/dubbing(?:\/[A-Za-z0-9_-]+(?:\/audio\/[A-Za-z0-9_-]+)?)?$/,
+]
 
 export interface BridgeConfig {
   method: 'GET' | 'POST'
@@ -15,7 +23,7 @@ export interface BridgeConfig {
 }
 
 const USAGE = `Usage:
-  bun scripts/elevenlabs-loore-api.ts \\
+  /usr/local/bin/loore-elevenlabs-api \\
     --method GET|POST \\
     --endpoint /v1/... \\
     [--body-stdin --content-type application/json] \\
@@ -55,6 +63,9 @@ export function validateEndpoint(raw: string): URL {
   const url = new URL(raw, ELEVENLABS_ORIGIN)
   if (url.origin !== ELEVENLABS_ORIGIN || !url.pathname.startsWith('/v1/')) {
     throw new Error('endpoint escaped the fixed ElevenLabs origin')
+  }
+  if (!ALLOWED_ENDPOINT_RES.some((re) => re.test(decodedPath))) {
+    throw new Error('endpoint is not allowlisted for Loore dubbing')
   }
   return url
 }
@@ -167,13 +178,18 @@ export function redactSecret(text: string, secret: string): string {
 }
 
 async function writeStdout(payload: Uint8Array): Promise<void> {
-  if (process.stdout.write(payload)) return
-  await new Promise<void>((resolvePromise) => process.stdout.once('drain', resolvePromise))
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    process.stdout.write(payload, (error: Error | null | undefined) => {
+      if (error) rejectPromise(error)
+      else resolvePromise()
+    })
+  })
 }
 
 async function run(config: BridgeConfig): Promise<void> {
   const keyFile = Bun.file(ELEVENLABS_KEY_PATH)
   if (!(await keyFile.exists())) throw new Error('ElevenLabs credential file is unavailable')
+  if (keyFile.size > MAX_KEY_BYTES) throw new Error('ElevenLabs credential file exceeds 4 KiB')
   const key = (await keyFile.text()).trim()
   if (key.length === 0 || /[\r\n\0]/.test(key)) throw new Error('ElevenLabs credential file is malformed')
 

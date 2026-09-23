@@ -250,8 +250,9 @@ const FORK_BOMB_RE = /:\s*\(\s*\)\s*\{[^}]*\|[^}]*&[^}]*\}\s*;\s*:/
 // `environment`/`monkey.json`-style false positives out.
 // Warchief-approved exception (2026-09-23): Bash may perform only a
 // standalone metadata check for the Loore ElevenLabs key. Actual API access is
-// mediated by scripts/elevenlabs-loore-api.ts, which reads this fixed path
-// internally and never places the key in argv, stdout or the environment.
+// mediated by the root-owned /usr/local/bin/loore-elevenlabs-api broker,
+// which reads this fixed path internally and never places the key in argv,
+// stdout or the environment.
 const SECRET_BASH_EXACT_METADATA_CHECK_RES: readonly RegExp[] = [
   /^test[ \t]+-s[ \t]+~\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key$/,
   /^test[ \t]+-s[ \t]+\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key$/,
