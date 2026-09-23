@@ -462,6 +462,29 @@ describe('secret-path bash hard-deny (Codex Critical #2)', () => {
       const v = classify('Bash', { command: `KEY_FILE='${tildePath}' cat .env` }, VARIANT1)
       expect(v.tier).toBe('deny')
     })
+    test('rejects shell quote-fragment concatenation around the allowed spelling', () => {
+      for (const command of [
+        `python3 scripts/dub.py --key-file='${tildePath}'.bak`,
+        `python3 scripts/dub.py --key-file='${tildePath}'/child`,
+        `python3 scripts/dub.py --key-file=prefix'${absolutePath}'`,
+      ]) {
+        expect(classify('Bash', { command }, VARIANT1).tier).toBe('deny')
+      }
+    })
+    test('rejects case variants and remote host:path operands', () => {
+      const commands = [
+        'cat /HOME/OPENCLAW/.CLAUDE-LAB/THRALL/SECRETS/ELEVENLABS-LOORE.KEY',
+        `scp host:${absolutePath} /tmp/key-copy`,
+      ]
+      for (const command of commands) {
+        expect(classify('Bash', { command }, VARIANT1).tier).toBe('deny')
+      }
+    })
+    test('allows repeated exact references without leaking RegExp state', () => {
+      const command = `test -s '${absolutePath}' && python3 scripts/dub.py --key-file="${absolutePath}"`
+      expect(classify('Bash', { command }, VARIANT1).tier).toBe('allow')
+      expect(classify('Bash', { command }, VARIANT1).tier).toBe('allow')
+    })
   })
 
   test('ordinary file ops are unaffected', () => {

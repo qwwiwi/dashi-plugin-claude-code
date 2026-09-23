@@ -249,12 +249,19 @@ const FORK_BOMB_RE = /:\s*\(\s*\)\s*\{[^}]*\|[^}]*&[^}]*\}\s*;\s*:/
 // hard-deny just like a Read of the same file. A leading boundary char keeps
 // `environment`/`monkey.json`-style false positives out.
 // Warchief-approved exception (2026-09-23): Thrall may reference exactly the
-// Loore ElevenLabs key file from Bash. Both spellings resolve to the same inode.
-// Boundaries deliberately exclude `.` and `/`, so suffixes, backups and children
-// remain covered by the generic secret hard-deny below.
+// Loore ElevenLabs key file from Bash. Both path spellings resolve to the same
+// inode. Each expression consumes an entire unquoted or fully quoted shell word.
+// Quotes are not generic boundaries: adjacent quote fragments concatenate in
+// shell, so `'path'.bak`, `prefix'path'` and `'path'/child` must stay denied.
+// Matching is case-sensitive (Linux paths are case-sensitive), and `:` is not a
+// local-word boundary so `host:/path` remains denied.
 const SECRET_BASH_EXACT_ALLOWED_PATH_RES: readonly RegExp[] = [
-  /(^|[\s'"=:(<>|&;])~\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key(?=$|[\s'")<>|&;])/gi,
-  /(^|[\s'"=:(<>|&;])\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key(?=$|[\s'")<>|&;])/gi,
+  /(^|[\s=(<>|&;])~\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key(?=$|[\s)<>|&;])/g,
+  /(^|[\s=(<>|&;])'~\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key'(?=$|[\s)<>|&;])/g,
+  /(^|[\s=(<>|&;])"~\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key"(?=$|[\s)<>|&;])/g,
+  /(^|[\s=(<>|&;])\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key(?=$|[\s)<>|&;])/g,
+  /(^|[\s=(<>|&;])'\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key'(?=$|[\s)<>|&;])/g,
+  /(^|[\s=(<>|&;])"\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key"(?=$|[\s)<>|&;])/g,
 ]
 
 const SECRET_BASH_RES: readonly RegExp[] = [
