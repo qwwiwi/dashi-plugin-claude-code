@@ -248,6 +248,15 @@ const FORK_BOMB_RE = /:\s*\(\s*\)\s*\{[^}]*\|[^}]*&[^}]*\}\s*;\s*:/
 // `grep … ~/.aws/credentials`, `tar cz ~/.ssh`, `cat /proc/$$/environ` must
 // hard-deny just like a Read of the same file. A leading boundary char keeps
 // `environment`/`monkey.json`-style false positives out.
+// Warchief-approved exception (2026-09-23): Thrall may reference exactly the
+// Loore ElevenLabs key file from Bash. Both spellings resolve to the same inode.
+// Boundaries deliberately exclude `.` and `/`, so suffixes, backups and children
+// remain covered by the generic secret hard-deny below.
+const SECRET_BASH_EXACT_ALLOWED_PATH_RES: readonly RegExp[] = [
+  /(^|[\s'"=:(<>|&;])~\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key(?=$|[\s'")<>|&;])/gi,
+  /(^|[\s'"=:(<>|&;])\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key(?=$|[\s'")<>|&;])/gi,
+]
+
 const SECRET_BASH_RES: readonly RegExp[] = [
   /(^|[\s'"=:(/<>|&;])\.env($|[\s'".)/<>|&;]|\.[a-z0-9_-]+)/i,
   /\.pem\b/i,
@@ -394,7 +403,11 @@ function builtinBashHardDeny(command: string): string | null {
 
 /** Built-in secret-path hard-deny over a Bash command. */
 function bashReferencesSecret(command: string): boolean {
-  return SECRET_BASH_RES.some((re) => re.test(command))
+  let commandForSecretScan = command
+  for (const allowedPathRe of SECRET_BASH_EXACT_ALLOWED_PATH_RES) {
+    commandForSecretScan = commandForSecretScan.replace(allowedPathRe, '$1__ELEVENLABS_LOORE_KEY_PATH__')
+  }
+  return SECRET_BASH_RES.some((re) => re.test(commandForSecretScan))
 }
 
 /** Interpreter/exfil pipe evasion that must reach the owner as a confirm.

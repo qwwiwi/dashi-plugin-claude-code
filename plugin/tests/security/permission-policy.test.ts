@@ -441,6 +441,29 @@ describe('secret-path bash hard-deny (Codex Critical #2)', () => {
       expect(v.matchedRule).toContain('builtin:deny_bash')
     })
   }
+  describe('single audited ElevenLabs Loore key exception', () => {
+    const tildePath = '~/.claude-lab/thrall/secrets/elevenlabs-loore.key'
+    const absolutePath = '/home/openclaw/.claude-lab/thrall/secrets/elevenlabs-loore.key'
+
+    test('allows the exact tilde path in a Bash argument', () => {
+      const v = classify('Bash', { command: `ELEVENLABS_KEY_FILE='${tildePath}' python3 scripts/dub.py` }, VARIANT1)
+      expect(v.tier).toBe('allow')
+    })
+    test('allows the exact absolute path because it resolves to the same file', () => {
+      const v = classify('Bash', { command: `python3 scripts/dub.py --key-file='${absolutePath}'` }, VARIANT1)
+      expect(v.tier).toBe('allow')
+    })
+    test('does not allow a suffix, child path, or a neighbouring secret', () => {
+      for (const path of [`${tildePath}.bak`, `${tildePath}/child`, '~/.claude-lab/thrall/secrets/other.key']) {
+        expect(classify('Bash', { command: `python3 scripts/dub.py --key-file='${path}'` }, VARIANT1).tier).toBe('deny')
+      }
+    })
+    test('does not mask another secret reference in the same command', () => {
+      const v = classify('Bash', { command: `KEY_FILE='${tildePath}' cat .env` }, VARIANT1)
+      expect(v.tier).toBe('deny')
+    })
+  })
+
   test('ordinary file ops are unaffected', () => {
     expect(classify('Bash', { command: 'cat package.json' }, VARIANT1).tier).toBe('allow')
     expect(classify('Bash', { command: 'cat src/environment.ts' }, VARIANT1).tier).toBe('allow')
