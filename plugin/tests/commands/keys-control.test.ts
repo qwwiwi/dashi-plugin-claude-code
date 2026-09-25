@@ -185,6 +185,20 @@ describe('classifyPane', () => {
     ).toBe('busy')
   })
 
+  // Manual-mode footer wording change (live pane, 2026-09-20): "? for
+  // shortcuts" was replaced by a standalone "⏸ manual mode on" status line —
+  // same idle state, new text. Without a marker for it the idle pane read as
+  // 'unknown' and /new + /compact refused ("не удалось определить состояние
+  // сессии") even though the composer was genuinely empty and idle.
+  test('manual-mode "⏸ manual mode on" footer (no "? for shortcuts") is idle', () => {
+    expect(classifyPane('⏸ manual mode on')).toBe('idle')
+    expect(
+      classifyPane(['❯ 3', '────────────', '  ⏸ manual mode on'].join('\n')),
+    ).toBe('idle')
+    // interrupt hint still wins over the manual-mode marker
+    expect(classifyPane('✳ Working… (esc to interrupt)\n⏸ manual mode on')).toBe('busy')
+  })
+
   // Fable fix-loop 2 (2026-07-14, live-proven BLOCK): the multi-agent build
   // renders the IDENTICAL idle footer tail `← for agents · ↓ to manage` (NO
   // `esc to interrupt`) while the MAIN turn is still running but BLOCKED waiting
