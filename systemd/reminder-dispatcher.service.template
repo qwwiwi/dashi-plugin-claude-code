@@ -1,0 +1,27 @@
+[Unit]
+Description=gbrain Reminder Dispatcher (fires_at Telegram delivery)
+After=postgresql.service network.target gbrain-task-mcp.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User={{SERVICE_USER}}
+Group={{SERVICE_USER}}
+WorkingDirectory={{INSTALL_DIR}}
+Environment=PYTHONPATH={{INSTALL_DIR}}
+Environment=PGHOST=localhost
+Environment=PGPORT=5432
+Environment=PGDATABASE=gbrain
+Environment=PGUSER=gbrain
+Environment=DISPATCHER_INTERVAL_SECONDS=30
+EnvironmentFile={{ETC_DIR}}/secrets.env
+ExecStart={{INSTALL_DIR}}/.venv/bin/python -m services.reminder_dispatcher
+Restart=on-failure
+RestartSec=10
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target
