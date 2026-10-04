@@ -220,6 +220,16 @@ When Claude hits an interactive prompt inside the session, the plugin surfaces i
 
 Every decision is written to an audit JSONL (`statePaths.logs.permissions`). The short-id alphabet excludes the letter `l` (to avoid confusion with `1`/`i`).
 
+### Secret-path allowlist for the permission gate (`DASHI_SECRET_PATH_ALLOWLIST`)
+
+The PreToolUse permission gate (`scripts/permission-gate-hook.ts`) hard-denies any Bash command that references a secret path (`*.key`, `secrets/`, `.env`, …). If an agent legitimately needs to check that a key file is present — e.g. a root-owned broker reads the key itself and the agent must never see it — set, in the environment of the channel process:
+
+```
+DASHI_SECRET_PATH_ALLOWLIST=/home/you/.claude-lab/myagent/secrets/example.key
+```
+
+Several paths are separated by `:` or `,`; entries may be absolute or `~/…` (expanded against `HOME`). For a listed path, Bash may run **only** a standalone `test -s <path>` (unquoted, `'…'` or `"…"`, or unquoted `~/…` when the path is under `HOME`). Everything else stays denied: reading, copying, suffixes, child paths, neighbours, `$(…)` derivations, compound commands, and `Read`/`Grep` of the file. Unset (the default) means no exception. Restart the channel after changing it.
+
 ### AskUserQuestion relay (PR #28)
 
 The `AskUserQuestion` tool renders in Telegram as an inline keyboard (`src/channel/ask-user-question.ts` + `src/telegram/ask-user-question.ts`):

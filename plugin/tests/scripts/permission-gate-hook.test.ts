@@ -13,7 +13,7 @@ import {
   decideLocal,
   previewToolCall,
 } from '../../scripts/permission-gate-hook.js'
-import type { PermissionPolicy } from '../../src/security/permission-policy.js'
+import { parseSecretPathAllowlist, type PermissionPolicy } from '../../src/security/permission-policy.js'
 
 const ALLOW_POLICY: PermissionPolicy = {
   default_tier: 'allow',
@@ -64,6 +64,63 @@ describe('decideLocal', () => {
     })
     expect(d.action).toBe('confirm')
     expect(d.verdict?.tier).toBe('confirm')
+  })
+})
+
+describe('secret-path allowlist wiring (DASHI_SECRET_PATH_ALLOWLIST)', () => {
+  const keyPath = '/home/user/.claude-lab/agent/secrets/example.key'
+  const envelope = {
+    hook_event_name: 'PreToolUse',
+    tool_name: 'Bash',
+    tool_input: { command: `test -s ${keyPath}` },
+  }
+
+  test('decideLocal without an allowlist → deny', () => {
+    const d = decideLocal({ envelope, policy: ALLOW_POLICY, scope: 'main' })
+    expect(JSON.parse(d.stdout!).hookSpecificOutput.permissionDecision).toBe('deny')
+  })
+  test('decideLocal with the path allowlisted → allow', () => {
+    const d = decideLocal({
+      envelope,
+      policy: ALLOW_POLICY,
+      scope: 'main',
+      secretPathAllowlist: parseSecretPathAllowlist(keyPath, '/home/user'),
+    })
+    expect(JSON.parse(d.stdout!).hookSpecificOutput.permissionDecision).toBe('allow')
+  })
+
+  async function runHook(extraEnv: Record<string, string>): Promise<string> {
+    const dir = mkdtempSync(join(tmpdir(), 'perm-gate-allowlist-'))
+    try {
+      const policyPath = join(dir, 'permission-policy.yaml')
+      writeFileSync(policyPath, 'default_tier: allow\n')
+      const proc = Bun.spawn(['bun', join(import.meta.dir, '../../scripts/permission-gate-hook.ts')], {
+        stdin: new TextEncoder().encode(JSON.stringify(envelope)),
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          PATH: process.env.PATH ?? '',
+          HOME: '/home/user',
+          TELEGRAM_PERMISSION_POLICY_PATH: policyPath,
+          ...extraEnv,
+        },
+      })
+      const out = await new Response(proc.stdout).text()
+      await proc.exited
+      return JSON.parse(out).hookSpecificOutput.permissionDecision as string
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  test('hook process: env unset → deny', async () => {
+    expect(await runHook({})).toBe('deny')
+  })
+  test('hook process: env names the exact path → allow', async () => {
+    expect(await runHook({ DASHI_SECRET_PATH_ALLOWLIST: keyPath })).toBe('allow')
+  })
+  test('hook process: env names a neighbour → deny', async () => {
+    expect(await runHook({ DASHI_SECRET_PATH_ALLOWLIST: `${keyPath}.bak` })).toBe('deny')
   })
 })
 

@@ -248,17 +248,84 @@ const FORK_BOMB_RE = /:\s*\(\s*\)\s*\{[^}]*\|[^}]*&[^}]*\}\s*;\s*:/
 // `grep … ~/.aws/credentials`, `tar cz ~/.ssh`, `cat /proc/$$/environ` must
 // hard-deny just like a Read of the same file. A leading boundary char keeps
 // `environment`/`monkey.json`-style false positives out.
-// Warchief-approved exception (2026-09-23): Bash may perform only a
-// standalone metadata check for the Loore ElevenLabs key. Actual API access is
-// mediated by the root-owned /usr/local/bin/loore-elevenlabs-api broker,
-// which reads this fixed path internally and never places the key in argv,
-// stdout or the environment.
-const SECRET_BASH_EXACT_METADATA_CHECK_RES: readonly RegExp[] = [
-  /^test[ \t]+-s[ \t]+~\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key$/,
-  /^test[ \t]+-s[ \t]+\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key$/,
-  /^test[ \t]+-s[ \t]+'\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key'$/,
-  /^test[ \t]+-s[ \t]+"\/home\/openclaw\/\.claude-lab\/thrall\/secrets\/elevenlabs-loore\.key"$/,
-]
+// ── Operator secret-path allowlist (metadata check only) ────────────────
+//
+// An operator may name EXACT secret file paths for which Bash may run ONE
+// command shape: a standalone existence/non-empty metadata check
+// `test -s <path>`. Nothing else is relaxed: any other command, any suffix,
+// child path, neighbour, derivation, shell concatenation or compound command
+// touching the path still hard-denies. Typical use: a root-owned broker reads
+// the key internally (never in argv/stdout/env) and the agent only needs to
+// verify the key file is present.
+//
+// Source: env var DASHI_SECRET_PATH_ALLOWLIST, entries separated by `:` or
+// `,`. Empty/unset (the default) = no exception. Each entry must be an
+// absolute path or `~/…` (expanded against HOME). Entries containing anything
+// outside a conservative path alphabet (whitespace, quotes, `$`, globs, …),
+// `.`/`..` segments, empty segments or a trailing slash are ignored.
+//
+// Accepted spellings per allowed path P (exact, case-sensitive):
+//   test -s P | test -s 'P' | test -s "P" | test -s ~/<rel>  (unquoted tilde
+//   form only, and only when P lives under HOME — a quoted `~` is not
+//   expanded by the shell, so it is not accepted).
+export const SECRET_PATH_ALLOWLIST_ENV = 'DASHI_SECRET_PATH_ALLOWLIST'
+
+/** Opaque set of exact `test -s` argument spellings the operator allowed. */
+export type SecretPathAllowlist = ReadonlySet<string>
+
+const EMPTY_SECRET_PATH_ALLOWLIST: SecretPathAllowlist = new Set<string>()
+
+const SAFE_SECRET_PATH_RE = /^\/[A-Za-z0-9._@+\/-]+$/
+
+function isSafeAbsolutePath(p: string): boolean {
+  if (!SAFE_SECRET_PATH_RE.test(p)) return false
+  if (p.endsWith('/')) return false
+  const segs = p.slice(1).split('/')
+  return segs.every((s) => s.length > 0 && s !== '.' && s !== '..')
+}
+
+/**
+ * Parse the operator allowlist (value of DASHI_SECRET_PATH_ALLOWLIST) into the
+ * exact set of accepted `test -s` argument spellings. Pure: the caller passes
+ * the raw env value and HOME. Invalid entries are dropped (fail-closed).
+ */
+export function parseSecretPathAllowlist(
+  raw: string | undefined,
+  home: string | undefined,
+): SecretPathAllowlist {
+  if (raw === undefined || raw.trim().length === 0) return EMPTY_SECRET_PATH_ALLOWLIST
+  const homeDir = home !== undefined && isSafeAbsolutePath(home) ? home : undefined
+  const out = new Set<string>()
+  for (const part of raw.split(/[:,]/)) {
+    const entry = part.trim()
+    if (entry.length === 0) continue
+    let abs: string
+    if (entry.startsWith('~/')) {
+      if (homeDir === undefined) continue
+      abs = `${homeDir}/${entry.slice(2)}`
+    } else {
+      abs = entry
+    }
+    if (!isSafeAbsolutePath(abs)) continue
+    out.add(abs)
+    out.add(`'${abs}'`)
+    out.add(`"${abs}"`)
+    if (homeDir !== undefined && abs.startsWith(`${homeDir}/`)) {
+      out.add(`~/${abs.slice(homeDir.length + 1)}`)
+    }
+  }
+  return out
+}
+
+const SECRET_METADATA_CHECK_RE = /^test[ \t]+-s[ \t]+(\S+)$/
+
+/** True only for a standalone `test -s <allowed spelling>` command. */
+function isAllowedSecretMetadataCheck(command: string, allowlist: SecretPathAllowlist): boolean {
+  if (allowlist.size === 0) return false
+  const m = SECRET_METADATA_CHECK_RE.exec(command.trim())
+  if (m === null) return false
+  return allowlist.has(m[1] as string)
+}
 
 const SECRET_BASH_RES: readonly RegExp[] = [
   /(^|[\s'"=:(/<>|&;])\.env($|[\s'".)/<>|&;]|\.[a-z0-9_-]+)/i,
@@ -405,9 +472,8 @@ function builtinBashHardDeny(command: string): string | null {
 }
 
 /** Built-in secret-path hard-deny over a Bash command. */
-function bashReferencesSecret(command: string): boolean {
-  const trimmed = command.trim()
-  if (SECRET_BASH_EXACT_METADATA_CHECK_RES.some((re) => re.test(trimmed))) {
+function bashReferencesSecret(command: string, allowlist: SecretPathAllowlist): boolean {
+  if (isAllowedSecretMetadataCheck(command, allowlist)) {
     return false
   }
   return SECRET_BASH_RES.some((re) => re.test(command))
@@ -2061,6 +2127,11 @@ export interface ClassifyInput {
   readonly policy: PermissionPolicy
   /** Scope id (e.g. "main" or a chat id). Looked up in policy.scopes. */
   readonly scope?: string
+  /**
+   * Operator secret-path allowlist (see parseSecretPathAllowlist). Absent =
+   * empty = no exception to the built-in secret-reference block.
+   */
+  readonly secretPathAllowlist?: SecretPathAllowlist
 }
 
 /**
@@ -2081,6 +2152,7 @@ export interface ClassifyInput {
  */
 export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   const { toolName, toolInput, policy, scope } = input
+  const secretPathAllowlist = input.secretPathAllowlist ?? EMPTY_SECRET_PATH_ALLOWLIST
 
   if (typeof toolName !== 'string' || toolName.length === 0) {
     return { tier: 'deny', reason: 'malformed tool call: missing tool_name', matchedRule: 'builtin:malformed' }
@@ -2126,7 +2198,7 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     if (catastrophic) {
       return { tier: 'deny', reason: `catastrophic command blocked: ${catastrophic}`, matchedRule: `builtin:deny_bash:${catastrophic}` }
     }
-    if (bashReferencesSecret(rawCommand)) {
+    if (bashReferencesSecret(rawCommand, secretPathAllowlist)) {
       return { tier: 'deny', reason: 'secret/credential reference in Bash command blocked', matchedRule: 'builtin:deny_bash_secret' }
     }
     // Non-overridable HARD-DENY: a mutating systemctl on the agent's OWN comms

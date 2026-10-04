@@ -13,6 +13,71 @@ Versions before 1.0.0 were not tracked — the project shipped ~60 merged PRs
 between 2026-05-14 and 2026-06-14 without a version discipline. 1.0.0
 retroactively marks the state of `main` on 2026-06-14.
 
+## [1.4.0] — 2026-10-04
+
+### Security
+- **Search tools no longer bypass the secret-read block** (PR #124). `Grep`,
+  `Glob` and `LS` carry their target in `path`, not `file_path`, so the policy
+  saw them as path-less calls, skipped the built-in secret-path check, and the
+  read-only default let them through — `Grep` over a secrets directory returned
+  the key lines. These tools are now path-checked exactly like `Read`, and the
+  bare `secrets` / `.secrets` / `.ssh` / `.aws` / gcloud directories themselves
+  (not only their contents) are blocked, so listing them is denied too.
+
+### Added
+- **Config-driven secret-path allowlist** (`DASHI_SECRET_PATH_ALLOWLIST`). An
+  operator may name exact secret file paths (`:`- or `,`-separated, absolute or
+  `~/…`) for which Bash may run one command shape only: a standalone
+  `test -s <path>` existence check. Every other use of the path — reads,
+  copies, suffixes, child paths, neighbours, derivations, compound commands —
+  stays hard-denied, and `Read`/`Grep` of the file are never relaxed. Unset
+  (the default) means no exception. This replaces an operator-specific
+  exception that was hardcoded in the policy (see Changed).
+- **Selective rich-message delivery** (PR #127). Rich messages are no longer
+  sent for every DM: they switch on by content, only when the body holds a
+  construct the HTML path degrades (GFM table, task list, `<details>`, block
+  formula). Two client-bug shields fall back to the HTML path instead of
+  losing the message: a formula inside `<details>` (crashes Telegram Desktop)
+  and CJK/Hangul text (glyph overlap on Mac/Desktop).
+- **Rich on edit** (PR #128). `edit_message` re-renders a rich card in place
+  via `editMessageText` + `rich_message`, so progress cards with tables no
+  longer collapse into lists on update. "Message is not modified" counts as
+  success; capability errors latch a fallback once per session; transient
+  errors are surfaced rather than retried.
+- **Rich tables in groups** (PR #129). The multichat outbox router now sends
+  rich messages for `format: 'auto'` replies, so tables in group chats are no
+  longer drawn with spaces. Writer-chosen `html`/`markdown`/`text` formats are
+  left untouched.
+
+### Changed
+- **HUD 1M context marker from the launch flag** (PR #125). When the
+  transcript reports a bare model id but the session was launched with a
+  `[1m]` model flag for the same model, the pinned card and `/status` now show
+  the 1M window instead of 200k. Operator overrides still win; a mid-session
+  `/model` switch does not inherit the launch window.
+- **TOV reminder dash** (PR #130). The per-turn tone-of-voice reminder now uses
+  an en dash (`–`) instead of a double hyphen, in both the doc and the embedded
+  fallback.
+- The operator-specific secret-path exception that was hardcoded in
+  `permission-policy.ts` (PRs #137–#139) is gone; the same guarded behaviour is
+  now available to any operator through `DASHI_SECRET_PATH_ALLOWLIST`.
+  **Upgrade note:** an operator who relied on that exception must set the env
+  var for the channel process before restarting it.
+
+### Fixed
+- **Rich in groups: network failures no longer eat the message, kill-switch
+  covers groups** (PR #131). A transient error on the group rich send escaped
+  `deliverClaim`, leaving the claim stuck in `outbox/processing/` and dropping
+  the rest of the drain pass; it now goes to dead-letter like a failed first
+  chunk, with an explicit "possibly delivered" marker for ambiguous network
+  errors. `TELEGRAM_RICH_MESSAGES=0` and per-chat opt-out now also apply to
+  group chats.
+
+### Removed
+- Private ElevenLabs broker deployment tooling (a bridge script, a setuid
+  launcher and their tests, PRs #137–#139) — it was operator-specific and does
+  not belong in the public plugin.
+
 ## [1.3.0] — 2026-07-22
 
 ### Added
@@ -53,8 +118,8 @@ retroactively marks the state of `main` on 2026-06-14.
 
 ### Changed
 - **`plugin/.mcp.json` ships only the `dashi-channel` server.** The four
-  `dashi-gbrain-*` HTTP servers pointed at the author's private shared-memory
-  host (`mcp.orgrimmar.xyz`), which issues no public tokens — fresh installs
+  `dashi-gbrain-*` HTTP servers pointed at a shared-memory service on the
+  author's private host, which issues no public tokens — fresh installs
   saw a permanent auth warning and agents wasted time probing an unreachable
   service. Shared-memory MCP entries now live in
   `examples/mcp.gbrain.example.json` as an opt-in template: self-host your own
