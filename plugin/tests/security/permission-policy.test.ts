@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   classifyToolCall,
   globMatch,
+  parseSecretPathAllowlist,
   type PermissionPolicy,
   PermissionPolicySchema,
 } from '../../src/security/permission-policy.js'
@@ -441,36 +442,118 @@ describe('secret-path bash hard-deny (Codex Critical #2)', () => {
       expect(v.matchedRule).toContain('builtin:deny_bash')
     })
   }
-  describe('single audited ElevenLabs Loore key exception', () => {
-    const tildePath = '~/.claude-lab/thrall/secrets/elevenlabs-loore.key'
-    const absolutePath = '/home/openclaw/.claude-lab/thrall/secrets/elevenlabs-loore.key'
+  describe('operator secret-path allowlist (DASHI_SECRET_PATH_ALLOWLIST)', () => {
+    const home = '/home/user'
+    const tildePath = '~/.claude-lab/agent/secrets/example.key'
+    const absolutePath = '/home/user/.claude-lab/agent/secrets/example.key'
+    const allowlist = parseSecretPathAllowlist(absolutePath, home)
 
-    test('allows only an exact standalone metadata check for the audited file', () => {
-      const commands = [
-        `test -s ${tildePath}`,
-        `test -s ${absolutePath}`,
-        `test -s '${absolutePath}'`,
-        `test -s "${absolutePath}"`,
-      ]
-      for (const command of commands) {
-        expect(classify('Bash', { command }, VARIANT1).tier).toBe('allow')
-        expect(classify('Bash', { command }, VARIANT1).tier).toBe('allow')
+    function classifyWith(command: string, list = allowlist) {
+      return classifyToolCall({ toolName: 'Bash', toolInput: { command }, policy: VARIANT1, secretPathAllowlist: list })
+    }
+
+    const allowedSpellings = [
+      `test -s ${tildePath}`,
+      `test -s ${absolutePath}`,
+      `test -s '${absolutePath}'`,
+      `test -s "${absolutePath}"`,
+      `test\t-s\t${absolutePath}`,
+      `  test -s ${absolutePath}  `,
+    ]
+
+    test('unset / empty env = no exception: every spelling stays blocked', () => {
+      for (const list of [undefined, parseSecretPathAllowlist(undefined, home), parseSecretPathAllowlist('', home), parseSecretPathAllowlist(' , : ', home)]) {
+        for (const command of allowedSpellings) {
+          const v = list === undefined
+            ? classify('Bash', { command }, VARIANT1)
+            : classifyWith(command, list)
+          expect(v.tier).toBe('deny')
+          expect(v.matchedRule).toBe('builtin:deny_bash_secret')
+        }
       }
     })
-    test('rejects suffixes, child paths, neighbours, and a second secret', () => {
+
+    test('allows only an exact standalone metadata check for the listed file', () => {
+      for (const command of allowedSpellings) {
+        expect(classifyWith(command).tier).toBe('allow')
+      }
+    })
+
+    test('a tilde entry is expanded against HOME and accepts the same spellings', () => {
+      const list = parseSecretPathAllowlist(tildePath, home)
+      for (const command of allowedSpellings) {
+        expect(classifyWith(command, list).tier).toBe('allow')
+      }
+      // Without a usable HOME the tilde entry is dropped (fail-closed).
+      const noHome = parseSecretPathAllowlist(tildePath, undefined)
+      expect(noHome.size).toBe(0)
+      expect(classifyWith(`test -s ${absolutePath}`, noHome).tier).toBe('deny')
+    })
+
+    test('the unquoted tilde form is accepted only for paths under HOME', () => {
+      const outside = parseSecretPathAllowlist('/srv/agent/secrets/example.key', home)
+      expect(classifyWith('test -s /srv/agent/secrets/example.key', outside).tier).toBe('allow')
+      expect(classifyWith('test -s ~/srv/agent/secrets/example.key', outside).tier).toBe('deny')
+    })
+
+    test('a quoted tilde is not expanded by the shell and stays blocked', () => {
+      expect(classifyWith(`test -s '${tildePath}'`).tier).toBe('deny')
+      expect(classifyWith(`test -s "${tildePath}"`).tier).toBe('deny')
+    })
+
+    test('several entries, colon- or comma-separated', () => {
+      const second = '/home/user/.claude-lab/agent/secrets/second.key'
+      for (const raw of [`${absolutePath}:${second}`, `${absolutePath},${second}`, ` ${absolutePath} , ${second} `]) {
+        const list = parseSecretPathAllowlist(raw, home)
+        expect(classifyWith(`test -s ${absolutePath}`, list).tier).toBe('allow')
+        expect(classifyWith(`test -s ${second}`, list).tier).toBe('allow')
+      }
+    })
+
+    test('unsafe entries are ignored', () => {
+      for (const raw of [
+        'relative/secrets/example.key',
+        '/home/user/.claude-lab/agent/secrets/../secrets/example.key',
+        '/home/user/.claude-lab/agent/secrets/./example.key',
+        '/home/user/.claude-lab/agent//secrets/example.key',
+        '/home/user/.claude-lab/agent/secrets/',
+        '/home/user/.claude-lab/agent/secrets/*.key',
+        '/home/user/.claude-lab/agent/secrets/ex ample.key',
+        "/home/user/.claude-lab/agent/secrets/ex'ample.key",
+        '/home/user/.claude-lab/agent/secrets/$KEY',
+        '~user/.claude-lab/agent/secrets/example.key',
+      ]) {
+        expect(parseSecretPathAllowlist(raw, home).size).toBe(0)
+      }
+    })
+
+    test('rejects suffixes, child paths, neighbours, case variants and a second secret', () => {
       const commands = [
         `test -s ${tildePath}.bak`,
         `test -s ${tildePath}/child`,
-        'test -s ~/.claude-lab/thrall/secrets/other.key',
+        `test -s ${absolutePath}.bak`,
+        `test -s ${absolutePath}/child`,
+        'test -s ~/.claude-lab/agent/secrets/other.key',
+        'test -s /home/user/.claude-lab/agent/secrets/example.ke',
+        'test -s /HOME/USER/.CLAUDE-LAB/AGENT/SECRETS/EXAMPLE.KEY',
         `test -s ${absolutePath} && cat .env`,
+        `test -s ${absolutePath}; cat ${absolutePath}`,
+        `test -s ${absolutePath}\ncat ${absolutePath}`,
+        `test -s ${absolutePath} ${absolutePath}`,
+        `test -f ${absolutePath}`,
+        `test -r ${absolutePath}`,
+        `[ -s ${absolutePath} ]`,
+        `/usr/bin/test -s ${absolutePath}`,
+        `sudo test -s ${absolutePath}`,
       ]
       for (const command of commands) {
-        expect(classify('Bash', { command }, VARIANT1).tier).toBe('deny')
+        expect(classifyWith(command).tier).toBe('deny')
       }
     })
+
     test('rejects every non-metadata use, including shell-fragmented commands', () => {
       const commands = [
-        `python3 scripts/dub.py --key-file='${absolutePath}'`,
+        `python3 scripts/tool.py --key-file='${absolutePath}'`,
         `./steal ${absolutePath}`,
         `cat ${absolutePath}`,
         `c''at ${absolutePath}`,
@@ -482,10 +565,11 @@ describe('secret-path bash hard-deny (Codex Critical #2)', () => {
         `echo replacement > ${absolutePath}`,
       ]
       for (const command of commands) {
-        expect(classify('Bash', { command }, VARIANT1).tier).toBe('deny')
+        expect(classifyWith(command).tier).toBe('deny')
       }
     })
-    test('rejects derivation and shell concatenation around the audited spelling', () => {
+
+    test('rejects derivation and shell concatenation around the listed spelling', () => {
       const commands = [
         `cat "$(dirname ${absolutePath})"/*`,
         `tar cz $(dirname ${tildePath})`,
@@ -494,16 +578,17 @@ describe('secret-path bash hard-deny (Codex Critical #2)', () => {
         `readlink -f ${absolutePath}`,
         `test -s '${absolutePath}'.bak`,
         `test -s prefix'${absolutePath}'`,
+        `test -s '${absolutePath}"`,
         `scp host:${absolutePath} /tmp/key-copy`,
-        'test -s /HOME/OPENCLAW/.CLAUDE-LAB/THRALL/SECRETS/ELEVENLABS-LOORE.KEY',
       ]
       for (const command of commands) {
-        expect(classify('Bash', { command }, VARIANT1).tier).toBe('deny')
+        expect(classifyWith(command).tier).toBe('deny')
       }
     })
-    test('allows the dedicated bridge invocation because the key path is internal', () => {
-      const command = '/usr/local/bin/loore-elevenlabs-api --method GET --endpoint /v1/voices > /tmp/voices.json'
-      expect(classify('Bash', { command }, VARIANT1).tier).toBe('allow')
+
+    test('the allowlist never relaxes Read/Grep of the listed file', () => {
+      const v = classifyToolCall({ toolName: 'Read', toolInput: { file_path: absolutePath }, policy: VARIANT1, secretPathAllowlist: allowlist })
+      expect(v.tier).toBe('deny')
     })
   })
 

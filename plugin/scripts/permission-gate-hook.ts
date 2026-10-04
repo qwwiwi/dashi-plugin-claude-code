@@ -38,9 +38,12 @@ import { load as parseYaml, JSON_SCHEMA } from 'js-yaml'
 
 import {
   classifyToolCall,
+  parseSecretPathAllowlist,
   PermissionPolicySchema,
+  SECRET_PATH_ALLOWLIST_ENV,
   type PermissionPolicy,
   type PermissionVerdict,
+  type SecretPathAllowlist,
 } from '../src/security/permission-policy.js'
 import { validateLoopbackUrl, isConnectionRefused } from './ask-user-question-hook.js'
 
@@ -234,8 +237,10 @@ export function decideLocal(args: {
   readonly envelope: Record<string, unknown>
   readonly policy: PermissionPolicy
   readonly scope: string
+  /** Operator secret-path allowlist; absent = no exception. */
+  readonly secretPathAllowlist?: SecretPathAllowlist
 }): LocalDecision {
-  const { envelope, policy, scope } = args
+  const { envelope, policy, scope, secretPathAllowlist } = args
   const event = envelope.hook_event_name
   // This hook is installed for PreToolUse ONLY (install-hooks wires the gate
   // marker exclusively on PreToolUse; the notification mirror is a separate
@@ -253,6 +258,7 @@ export function decideLocal(args: {
     toolInput: envelope.tool_input,
     policy,
     scope,
+    ...(secretPathAllowlist !== undefined ? { secretPathAllowlist } : {}),
   })
   if (verdict.tier === 'allow') return { action: 'emit', stdout: renderAllow() }
   if (verdict.tier === 'deny') return { action: 'emit', stdout: renderDeny(verdict.reason) }
@@ -359,7 +365,8 @@ async function main(): Promise<void> {
   if (warning) warn(warning)
   const scope = env.CHAT_ID && env.CHAT_ID.length > 0 ? env.CHAT_ID : 'main'
 
-  const local = decideLocal({ envelope: envelope as Record<string, unknown>, policy, scope })
+  const secretPathAllowlist = parseSecretPathAllowlist(env[SECRET_PATH_ALLOWLIST_ENV], env.HOME)
+  const local = decideLocal({ envelope: envelope as Record<string, unknown>, policy, scope, secretPathAllowlist })
   if (local.action === 'emit') {
     emit(local.stdout ?? '')
     return
