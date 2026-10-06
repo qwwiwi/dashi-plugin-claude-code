@@ -45,7 +45,11 @@ import {
   type ToolDeps,
 } from './channel/tools.js'
 import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
-import { createRateLimitedTelegramApi } from './safety/rate-limited-telegram-api.js'
+import {
+  createFileFloodWaitStore,
+  createJsonlRateLimitEventSink,
+  createRateLimitedTelegramApi,
+} from './safety/rate-limited-telegram-api.js'
 import { createReliableTelegramApi } from './safety/reliable-telegram-api.js'
 import { OutboundActivityTracker } from './status/outbound-activity.js'
 import { HeartbeatMonitor } from './status/heartbeat-monitor.js'
@@ -446,7 +450,25 @@ const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
 // OUTERMOST so its verdict reflects the final outcome of the whole stack.
 // No call site can bypass — the raw reference is shadowed below.
 const rawTelegramApi = createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN)
-const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log)
+// Flood-wait state and the 429 journal live under the channel's state root:
+// the breaker window survives a restart (a restart inside the window used
+// to forget the ban and re-arm it with the first reply), and every 429 is
+// written with its Telegram method so the call that earned a ban can be
+// found instead of guessed.
+// The window is stamped with the bot id (numeric prefix of the token) so a
+// token swap inside the same state dir cannot inherit another bot's ban.
+// Only a well-formed token yields an id: a malformed one must never end up
+// stamped into the state file or a log line as a whole.
+const floodWaitBotId = /^(\d{5,}):/.exec(env.TELEGRAM_BOT_TOKEN)?.[1]
+const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log, {
+  floodWaitStore: createFileFloodWaitStore(join(statePaths.root, 'flood-wait.json'), log, {
+    botId: floodWaitBotId,
+  }),
+  onRateLimitEvent: createJsonlRateLimitEventSink(
+    join(statePaths.root, 'logs', 'telegram-429.jsonl'),
+    log,
+  ),
+})
 // The bot token itself is included in extraSecrets so any code path that
 // accidentally tries to ship the token (e.g. error message including a
 // URL-with-token from grammy) gets it scrubbed before the bytes leave us.
@@ -535,8 +557,10 @@ const sessionInfoStore = new SessionInfoStore()
 //
 // The HUD's text sends/edits go through the SAME safe-wrapped, rate-limited
 // telegramApi as every other outbound call (redaction + HTML validation). Pin
-// carries no user text, so it is adapted straight from grammY here at the
-// composition root (mirrors registerOwnerScopedCommands' bot.api.* adapters).
+// carries no user text, so it is adapted from grammY here at the composition
+// root — under the flood-wait guard, like registerOwnerScopedCommands' bot.api.*
+// adapters: a pin/unpin inside an open flood-wait window must not hit the API
+// and re-arm the ban.
 // Every HUD op is best-effort inside ContextHud — a broken HUD never breaks
 // message delivery.
 // FIX-8 (both reviews): owner chats come from resolveOwnerChatIds (owner_chat_ids
@@ -554,12 +578,17 @@ const hudApi: HudTelegramApi = {
   editMessageText: (chatId, messageId, text, opts) =>
     telegramApi.editMessageText(chatId, messageId, text, opts),
   pinChatMessage: (chatId, messageId, opts) =>
-    bot.api.pinChatMessage(chatId, messageId, opts).then(() => undefined),
+    rateLimitedTelegramApi
+      .withFloodGuard('pinChatMessage', () => bot.api.pinChatMessage(chatId, messageId, opts))
+      .then(() => undefined),
   // bump() legs (status pin): delete goes through the safe wrapper (rate
-  // limiting); unpin carries no user text and is adapted from grammY like pin.
+  // limiting); unpin carries no user text and is adapted from grammY like pin,
+  // under the same flood-wait guard.
   deleteMessage: (chatId, messageId) => telegramApi.deleteMessage(chatId, messageId),
   unpinChatMessage: (chatId, messageId) =>
-    bot.api.unpinChatMessage(chatId, messageId).then(() => undefined),
+    rateLimitedTelegramApi
+      .withFloodGuard('unpinChatMessage', () => bot.api.unpinChatMessage(chatId, messageId))
+      .then(() => undefined),
 }
 // The hosting Claude Code process's `--model` flag, read ONCE at boot. It is
 // the only place the `[1m]` window marker survives for models the API reports
@@ -1318,9 +1347,15 @@ const handlerDeps: HandlerDeps = {
   telegramApi,
   log,
   bot: botIdentity,
-  // bot.api implements getFile — handlers.ts narrows it to BotApiForDownload
-  // so the media module never reaches into grammY internals.
-  botApi: { api: bot.api },
+  // getFile for photo download goes through the flood-wait breaker and the
+  // 429 retry like every other Bot API call; handlers.ts narrows this to
+  // BotApiForDownload so the media module never reaches into grammY.
+  botApi: {
+    api: {
+      getFile: (fileId: string) =>
+        rateLimitedTelegramApi.withFloodGuard('getFile', () => bot.api.getFile(fileId)),
+    },
+  },
   botToken: env.TELEGRAM_BOT_TOKEN,
   env: env.GROQ_API_KEY !== undefined ? { GROQ_API_KEY: env.GROQ_API_KEY } : {},
   permissionHooks,
@@ -1589,10 +1624,19 @@ void (async () => {
   // NEVER allowed_chat_ids — pinning the menu scope in a group would expose it
   // publicly. registerOwnerScopedCommands additionally skips any non-DM id.
   const ownerChatIds: ReadonlyArray<number | string> = resolveOwnerChatIds(config)
+  // Both calls go through the flood-wait breaker: a bare bot.api call here
+  // would hit Telegram inside a ban window on every restart and re-arm it.
+  // registerOwnerScopedCommands already logs and ignores failures.
   await registerOwnerScopedCommands(
     {
-      deleteMyCommands: (options) => bot.api.deleteMyCommands(options),
-      setMyCommands: (commands, options) => bot.api.setMyCommands([...commands], options),
+      deleteMyCommands: (options) =>
+        rateLimitedTelegramApi.withFloodGuard('deleteMyCommands', () =>
+          bot.api.deleteMyCommands(options),
+        ),
+      setMyCommands: (commands, options) =>
+        rateLimitedTelegramApi.withFloodGuard('setMyCommands', () =>
+          bot.api.setMyCommands([...commands], options),
+        ),
     },
     cmds,
     ownerChatIds,
