@@ -37,14 +37,21 @@ const MEDIA_BLOCKS: Record<string, { field: string; label: string }> = {
   voice_note: { field: 'voice', label: 'голосовое' },
 }
 
+// Nesting cap for RichText / RichBlock recursion. Real messages nest a few
+// levels; a hostile or corrupt payload nested thousands deep must not blow
+// the stack inside the middleware (that would stop next() and drop the update).
+const MAX_DEPTH = 64
+
 /** Flatten a RichText (string | RichText[] | typed object) to plain text. */
-export function richTextToPlain(rt: unknown): string {
+export function richTextToPlain(rt: unknown, depth = 0): string {
+  if (depth > MAX_DEPTH) return ''
+  const d = depth + 1
   if (typeof rt === 'string') return rt
-  if (Array.isArray(rt)) return rt.map(richTextToPlain).join('')
+  if (Array.isArray(rt)) return rt.map(x => richTextToPlain(x, d)).join('')
   if (!isObj(rt)) return ''
   switch (rt.type) {
     case 'url': {
-      const label = richTextToPlain(rt.text)
+      const label = richTextToPlain(rt.text, d)
       const url = typeof rt.url === 'string' ? rt.url : ''
       return url && label !== url ? `${label} (${url})` : label || url
     }
@@ -53,21 +60,32 @@ export function richTextToPlain(rt: unknown): string {
     case 'mathematical_expression':
       return typeof rt.expression === 'string' ? `$${rt.expression}$` : ''
     case 'code':
-      return `\`${richTextToPlain(rt.text)}\``
-    case 'button':
-      return isObj(rt.button) && typeof rt.button.text === 'string' ? `[${rt.button.text}]` : ''
+      return `\`${richTextToPlain(rt.text, d)}\``
+    case 'button': {
+      // RichMessageButton.text is RichText, not just a string.
+      const label = isObj(rt.button) ? richTextToPlain(rt.button.text, d) : ''
+      return label ? `[${label}]` : ''
+    }
     case 'anchor':
       return ''
     default:
       // bold/italic/mention/hashtag/… and any future inline type: keep the text.
-      return richTextToPlain(rt.text)
+      return richTextToPlain(rt.text, d)
   }
 }
 
-function captionOf(block: Obj): string {
-  const cap = block.caption
-  if (isObj(cap)) return richTextToPlain(cap.text)
-  return richTextToPlain(cap)
+// RichBlockCaption {text, credit?} (media/collage/map) or a bare RichText
+// (table caption). A credit is appended after « – ».
+function captionOf(cap: unknown, d: number): string {
+  if (isObj(cap) && cap.type === undefined && ('text' in cap || 'credit' in cap)) {
+    return withCredit(richTextToPlain(cap.text, d), cap.credit, d)
+  }
+  return richTextToPlain(cap, d)
+}
+
+function withCredit(text: string, credit: unknown, d: number): string {
+  const c = richTextToPlain(credit, d)
+  return c ? [text, `– ${c}`].filter(Boolean).join(' ') : text
 }
 
 function indent(text: string, prefix: string): string {
@@ -77,29 +95,29 @@ function indent(text: string, prefix: string): string {
     .join('\n')
 }
 
-function blocksToText(blocks: unknown): string {
-  if (!Array.isArray(blocks)) return ''
+function blocksToText(blocks: unknown, depth: number): string {
+  if (!Array.isArray(blocks) || depth > MAX_DEPTH) return ''
   return blocks
-    .map(blockToText)
+    .map(b => blockToText(b, depth + 1))
     .filter(s => s.length > 0)
     .join('\n\n')
 }
 
-function blockToText(block: unknown): string {
-  if (!isObj(block)) return ''
+function blockToText(block: unknown, d: number): string {
+  if (!isObj(block) || d > MAX_DEPTH) return ''
   const media = typeof block.type === 'string' ? MEDIA_BLOCKS[block.type] : undefined
   if (media !== undefined) {
-    const cap = captionOf(block)
+    const cap = captionOf(block.caption, d)
     return cap ? `[${media.label}] ${cap}` : `[${media.label}]`
   }
   switch (block.type) {
     case 'heading': {
       const size = typeof block.size === 'number' && block.size >= 1 && block.size <= 6 ? block.size : 1
-      return `${'#'.repeat(size)} ${richTextToPlain(block.text)}`
+      return `${'#'.repeat(size)} ${richTextToPlain(block.text, d)}`
     }
     case 'pre': {
       const lang = typeof block.language === 'string' ? block.language : ''
-      return `\`\`\`${lang}\n${richTextToPlain(block.text)}\n\`\`\``
+      return `\`\`\`${lang}\n${richTextToPlain(block.text, d)}\n\`\`\``
     }
     case 'divider':
       return '---'
@@ -112,7 +130,7 @@ function blockToText(block: unknown): string {
         .map(item => {
           const label = typeof item.label === 'string' && item.label ? item.label : '-'
           const box = item.has_checkbox === true ? (item.is_checked === true ? '[x] ' : '[ ] ') : ''
-          const body = blocksToText(item.blocks)
+          const body = blocksToText(item.blocks, d)
           const [first = '', ...rest] = body.split('\n')
           const tail = rest.length ? '\n' + indent(rest.join('\n'), '   ') : ''
           return `${label} ${box}${first}${tail}`
@@ -120,108 +138,141 @@ function blockToText(block: unknown): string {
         .join('\n')
     }
     case 'blockquote':
-      return indent(blocksToText(block.blocks), '> ')
+      return indent(withCredit(blocksToText(block.blocks, d), block.credit, d), '> ')
     case 'expandable_blockquote':
     case 'pullquote':
-      return indent(richTextToPlain(block.text), '> ')
+      return indent(withCredit(richTextToPlain(block.text, d), block.credit, d), '> ')
     case 'details': {
-      const summary = richTextToPlain(block.summary)
-      const body = blocksToText(block.blocks)
+      const summary = richTextToPlain(block.summary, d)
+      const body = blocksToText(block.blocks, d)
       return [summary, body].filter(Boolean).join('\n')
     }
     case 'collage':
     case 'slideshow': {
-      const cap = captionOf(block)
-      return [blocksToText(block.blocks), cap].filter(Boolean).join('\n\n')
+      const cap = captionOf(block.caption, d)
+      return [blocksToText(block.blocks, d), cap].filter(Boolean).join('\n\n')
     }
     case 'table': {
       if (!Array.isArray(block.cells)) return ''
       const rows = block.cells
         .filter(Array.isArray)
-        .map(row => `| ${row.map(cell => (isObj(cell) ? richTextToPlain(cell.text) : '')).join(' | ')} |`)
-      const cap = richTextToPlain(block.caption)
+        .map(row => `| ${row.map(cell => (isObj(cell) ? richTextToPlain(cell.text, d) : '')).join(' | ')} |`)
+      const cap = captionOf(block.caption, d)
       return [cap, rows.join('\n')].filter(Boolean).join('\n')
     }
-    case 'map':
-      return '[карта]'
-    case 'buttons':
+    case 'map': {
+      const cap = captionOf(block.caption, d)
+      return cap ? `[карта] ${cap}` : '[карта]'
+    }
+    case 'buttons': {
+      if (!Array.isArray(block.buttons)) return ''
+      return block.buttons
+        .map(b => (isObj(b) ? richTextToPlain(b.text, d) : ''))
+        .filter(Boolean)
+        .map(label => `[${label}]`)
+        .join(' ')
+    }
     case 'anchor':
     case 'thinking':
       return ''
     default:
       // paragraph, footer, and any future block type that carries `text`.
-      return richTextToPlain(block.text) || blocksToText(block.blocks)
+      return richTextToPlain(block.text, d) || blocksToText(block.blocks, d)
   }
 }
 
 /** Flatten `message.rich_message` to plain text. Never throws. */
 export function richMessageToText(rich: unknown): string {
   if (!isObj(rich)) return ''
-  return blocksToText(rich.blocks).trim()
+  return blocksToText(rich.blocks, 0).trim()
 }
 
-// Depth-first list of media blocks (collages/slideshows/quotes nest blocks).
-function collectMediaBlocks(blocks: unknown, out: Obj[]): Obj[] {
-  if (!Array.isArray(blocks)) return out
+// Depth-first list of media blocks (collages/slideshows/quotes/lists nest blocks).
+function collectMediaBlocks(blocks: unknown, out: Obj[], depth: number): Obj[] {
+  if (!Array.isArray(blocks) || depth > MAX_DEPTH) return out
   for (const b of blocks) {
     if (!isObj(b)) continue
-    if (typeof b.type === 'string' && MEDIA_BLOCKS[b.type] !== undefined) out.push(b)
-    collectMediaBlocks(b.blocks, out)
-    if (Array.isArray(b.items)) for (const item of b.items) if (isObj(item)) collectMediaBlocks(item.blocks, out)
+    if (typeof b.type === 'string' && MEDIA_BLOCKS[b.type] !== undefined && b[b.type] !== undefined) out.push(b)
+    collectMediaBlocks(b.blocks, out, depth + 1)
+    if (Array.isArray(b.items)) {
+      for (const item of b.items) if (isObj(item)) collectMediaBlocks(item.blocks, out, depth + 1)
+    }
   }
   return out
 }
 
 /**
+ * Outcome of normalizing one message:
+ *   'flattened' — text/caption (and maybe one media field) were filled in;
+ *   'kept'      — a rich message already had text/caption, left untouched
+ *                 (logged so an undocumented Telegram shape is visible in prod);
+ *   'none'      — not a rich message, or nothing to add.
+ */
+export type RichNormalizeOutcome = 'flattened' | 'kept' | 'none'
+
+/**
  * Fill `text`/`caption` (and, when needed, one top-level media field) of an
  * inbound message from its `rich_message`. Mutates `message` in place.
- * Returns true when the message was changed.
  */
-export function normalizeRichInbound(message: Obj): boolean {
+export function normalizeRichInbound(message: Obj): RichNormalizeOutcome {
   const rich = message.rich_message
-  if (!isObj(rich)) return false
-  if (message.text !== undefined || message.caption !== undefined) return false
+  if (!isObj(rich)) return 'none'
+  if (message.text !== undefined || message.caption !== undefined) return 'kept'
 
   let text = richMessageToText(rich)
-  let hasMedia = TOP_LEVEL_MEDIA.some(f => message[f] !== undefined)
+  const media = collectMediaBlocks(rich.blocks, [], 0)
+  const topField = TOP_LEVEL_MEDIA.find(f => message[f] !== undefined)
+  let attached = 0
 
-  if (!hasMedia) {
-    const media = collectMediaBlocks(rich.blocks, [])
+  if (topField !== undefined) {
+    // Telegram duplicated one media into the top-level field (e.g. `photo`):
+    // one matching block is that same media, the rest are not attached.
+    attached = media.some(b => typeof b.type === 'string' && MEDIA_BLOCKS[b.type]?.field === topField) ? 1 : 0
+  } else if (media[0] !== undefined && typeof media[0].type === 'string') {
     const first = media[0]
-    if (first !== undefined && typeof first.type === 'string') {
-      const spec = MEDIA_BLOCKS[first.type]
-      if (spec !== undefined && first[first.type] !== undefined) {
-        message[spec.field] = first[first.type]
-        hasMedia = true
-        if (media.length > 1) {
-          text = [text, `[в rich-сообщении ещё ${media.length - 1} медиа – не приложено]`].filter(Boolean).join('\n\n')
-        }
-      }
+    const spec = MEDIA_BLOCKS[first.type as string]
+    if (spec !== undefined) {
+      message[spec.field] = first[first.type as string]
+      attached = 1
     }
   }
-
-  if (!text && !hasMedia) return false
-  if (hasMedia) {
-    if (text) message.caption = text
-  } else {
-    message.text = text
+  const missing = media.length - attached
+  if (missing > 0) {
+    text = [text, `[в rich-сообщении ещё ${missing} медиа – не приложено]`].filter(Boolean).join('\n\n')
   }
-  return true
+
+  const hasMedia = topField !== undefined || attached > 0
+  if (!text) return attached > 0 ? 'flattened' : 'none'
+  if (hasMedia) message.caption = text
+  else message.text = text
+  return 'flattened'
 }
 
 /**
- * grammY middleware: normalize `message` / `guest_message` rich content before
- * any filter (`message:text`, `message:photo`, …) runs. `onFlatten` is called
- * with the update key for each message it changed (logging hook).
+ * grammY middleware: normalize `message` / `guest_message` rich content (and
+ * the message they reply to, so a reply to a rich card keeps its context)
+ * before any filter (`message:text`, `message:photo`, …) runs. `onEvent` is a
+ * logging hook. Any unexpected error is reported and the update still flows.
  */
 export function richInboundMiddleware(
-  onFlatten?: (updateKey: string) => void,
+  onEvent?: (updateKey: string, outcome: Exclude<RichNormalizeOutcome, 'none'>) => void,
+  onError?: (error: unknown) => void,
 ): (ctx: { update: object }, next: () => Promise<void>) => Promise<void> {
   return (ctx, next) => {
-    const update = ctx.update as Obj
-    for (const key of ['message', 'guest_message']) {
-      const msg = update[key]
-      if (isObj(msg) && normalizeRichInbound(msg)) onFlatten?.(key)
+    try {
+      const update = ctx.update as Obj
+      for (const key of ['message', 'guest_message']) {
+        const msg = update[key]
+        if (!isObj(msg)) continue
+        const outcome = normalizeRichInbound(msg)
+        if (outcome !== 'none') onEvent?.(key, outcome)
+        if (isObj(msg.reply_to_message)) {
+          const replyOutcome = normalizeRichInbound(msg.reply_to_message)
+          if (replyOutcome !== 'none') onEvent?.(`${key}.reply_to_message`, replyOutcome)
+        }
+      }
+    } catch (err) {
+      onError?.(err)
     }
     return next()
   }

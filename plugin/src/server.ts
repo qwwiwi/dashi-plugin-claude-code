@@ -439,7 +439,12 @@ const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
 // not in `text`/`caption`, so the `message:text`/media handlers below never
 // saw it (owner's rich prompt dropped, 2026-10-11). Registered FIRST so every
 // filter downstream sees the flattened text; it only fills empty fields.
-bot.use(richInboundMiddleware(update => log.info('rich inbound message flattened', { update })))
+bot.use(
+  richInboundMiddleware(
+    (update, outcome) => log.info('rich inbound message', { update, outcome }),
+    err => log.warn('rich inbound normalize failed (update passed through)', { error: String(err) }),
+  ),
+)
 // Raw API talks to grammy. Every downstream consumer (StatusManager, oob,
 // handlers, poller, webhook) receives the fully layered instance built below.
 // Composition (fix-loop-1 #9 — this comment is the canonical map):

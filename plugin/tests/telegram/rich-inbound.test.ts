@@ -9,6 +9,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   normalizeRichInbound,
+  richInboundMiddleware,
   richMessageToText,
 } from '../../src/telegram/rich-inbound.js'
 
@@ -91,7 +92,7 @@ describe('normalizeRichInbound', () => {
       message_id: 1,
       rich_message: { blocks: [{ type: 'paragraph', text: 'длинный промт' }] },
     }
-    expect(normalizeRichInbound(msg)).toBe(true)
+    expect(normalizeRichInbound(msg)).toBe('flattened')
     expect(msg.text).toBe('длинный промт')
     expect(msg.caption).toBeUndefined()
   })
@@ -107,7 +108,7 @@ describe('normalizeRichInbound', () => {
         ],
       },
     }
-    expect(normalizeRichInbound(msg)).toBe(true)
+    expect(normalizeRichInbound(msg)).toBe('flattened')
     expect(msg.caption).toBe('промт для Тралла\n\n[фото]')
     expect(msg.text).toBeUndefined()
   })
@@ -122,7 +123,7 @@ describe('normalizeRichInbound', () => {
         ],
       },
     }
-    expect(normalizeRichInbound(msg)).toBe(true)
+    expect(normalizeRichInbound(msg)).toBe('flattened')
     expect(msg.photo).toEqual(photoSizes)
     expect(msg.caption).toBe('текст\n\n[фото]')
     expect(msg.text).toBeUndefined()
@@ -155,20 +156,20 @@ describe('normalizeRichInbound', () => {
 
   test('never overwrites existing text or caption', () => {
     const withText: Record<string, unknown> = { text: 'orig', rich_message: { blocks: [{ type: 'paragraph', text: 'x' }] } }
-    expect(normalizeRichInbound(withText)).toBe(false)
+    expect(normalizeRichInbound(withText)).toBe('kept')
     expect(withText.text).toBe('orig')
     const withCaption: Record<string, unknown> = {
       photo: photoSizes,
       caption: 'orig',
       rich_message: { blocks: [{ type: 'paragraph', text: 'x' }] },
     }
-    expect(normalizeRichInbound(withCaption)).toBe(false)
+    expect(normalizeRichInbound(withCaption)).toBe('kept')
     expect(withCaption.caption).toBe('orig')
   })
 
   test('no rich_message: untouched', () => {
     const msg: Record<string, unknown> = { message_id: 6, text: 'hi' }
-    expect(normalizeRichInbound(msg)).toBe(false)
+    expect(normalizeRichInbound(msg)).toBe('none')
     expect(msg).toEqual({ message_id: 6, text: 'hi' })
   })
 })
@@ -207,5 +208,86 @@ describe('richInboundMiddleware with a real grammY Bot', () => {
         rich_message: { blocks: [{ type: 'paragraph', text: 'промт' }, { type: 'photo', photo: photoSizes }] },
       }),
     ).toEqual([{ kind: 'photo', body: 'промт\n\n[фото]' }])
+  })
+})
+
+describe('fix-loop 1 (Codex + Fable review)', () => {
+  test('captions keep their credit; blockquote credit and map caption survive', () => {
+    const text = richMessageToText({
+      blocks: [
+        { type: 'photo', photo: photoSizes, caption: { text: 'скрин', credit: 'Тралл' } },
+        { type: 'blockquote', blocks: [{ type: 'paragraph', text: 'цитата' }], credit: 'вождь' },
+        { type: 'map', location: { latitude: 0, longitude: 0 }, zoom: 1, width: 1, height: 1, caption: { text: 'Встречаемся в 10' } },
+      ],
+    })
+    expect(text).toBe('[фото] скрин – Тралл\n\n> цитата – вождь\n\n[карта] Встречаемся в 10')
+  })
+
+  test('button text is RichText (array allowed), inline and in a buttons block', () => {
+    expect(richMessageToText({ blocks: [{ type: 'paragraph', text: { type: 'button', button: { text: ['Открыть ', { type: 'bold', text: 'отчёт' }] } } }] })).toBe('[Открыть отчёт]')
+    expect(richMessageToText({ blocks: [{ type: 'buttons', buttons: [{ text: 'Да' }, { text: ['Нет'] }] }] })).toBe('[Да] [Нет]')
+  })
+
+  test('100 000-level nesting does not throw', () => {
+    let rt: unknown = 'дно'
+    for (let i = 0; i < 100_000; i++) rt = [rt]
+    let blocks: unknown = [{ type: 'paragraph', text: 'верх' }]
+    for (let i = 0; i < 100_000; i++) blocks = [{ type: 'blockquote', blocks }]
+    expect(() => richMessageToText({ blocks: [{ type: 'paragraph', text: rt }] })).not.toThrow()
+    expect(() => normalizeRichInbound({ rich_message: { blocks } })).not.toThrow()
+  })
+
+  test('top-level photo plus a document block: the document is reported as not attached', () => {
+    const msg: Record<string, unknown> = {
+      photo: photoSizes,
+      rich_message: {
+        blocks: [
+          { type: 'photo', photo: photoSizes },
+          { type: 'document', document: { file_id: 'doc' }, caption: { text: 'отчёт.pdf' } },
+        ],
+      },
+    }
+    expect(normalizeRichInbound(msg)).toBe('flattened')
+    expect(msg.document).toBeUndefined()
+    expect(msg.caption).toBe('[фото]\n\n[документ] отчёт.pdf\n\n[в rich-сообщении ещё 1 медиа – не приложено]')
+  })
+
+  test('media-only rich message with a top-level photo and nothing else is not reported as changed', () => {
+    const msg: Record<string, unknown> = { photo: photoSizes, rich_message: { blocks: [{ type: 'anchor', name: 'a' }] } }
+    expect(normalizeRichInbound(msg)).toBe('none')
+    expect(msg.caption).toBeUndefined()
+  })
+
+  test('middleware normalizes reply_to_message so a reply to a rich card keeps its context', async () => {
+    const update: Record<string, unknown> = {
+      update_id: 1,
+      message: {
+        text: 'сделай вот это',
+        reply_to_message: { rich_message: { blocks: [{ type: 'paragraph', text: 'карточка бота' }] } },
+      },
+    }
+    const events: string[] = []
+    let nextCalled = false
+    await richInboundMiddleware((k, o) => events.push(`${k}:${o}`))({ update }, async () => { nextCalled = true })
+    const reply = (update.message as Record<string, Record<string, unknown>>).reply_to_message
+    expect(reply?.text).toBe("карточка бота")
+    expect(events).toEqual(['message.reply_to_message:flattened'])
+    expect(nextCalled).toBe(true)
+  })
+
+  test('middleware reports kept rich messages and never blocks next() on an error', async () => {
+    const events: string[] = []
+    await richInboundMiddleware((k, o) => events.push(`${k}:${o}`))(
+      { update: { message: { caption: 'c', photo: photoSizes, rich_message: { blocks: [] } } } },
+      async () => {},
+    )
+    expect(events).toEqual(['message:kept'])
+
+    const errors: unknown[] = []
+    let nextCalled = false
+    const hostile = { get message(): never { throw new Error('boom') } }
+    await richInboundMiddleware(undefined, e => errors.push(e))({ update: hostile }, async () => { nextCalled = true })
+    expect(errors.length).toBe(1)
+    expect(nextCalled).toBe(true)
   })
 })
