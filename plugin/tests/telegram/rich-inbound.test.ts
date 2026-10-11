@@ -291,3 +291,28 @@ describe('fix-loop 1 (Codex + Fable review)', () => {
     expect(nextCalled).toBe(true)
   })
 })
+
+describe('fix-loop 2 (review nits)', () => {
+  test('a block typed "constructor" is not treated as media', () => {
+    expect(richMessageToText({ blocks: [{ type: 'constructor', text: 'текст' }] })).toBe('текст')
+    const msg: Record<string, unknown> = { rich_message: { blocks: [{ type: 'constructor', constructor: 'x' }] } }
+    expect(normalizeRichInbound(msg)).toBe('none')
+  })
+
+  test('top-level animation matches a document block (GIF twin fields): no false «не приложено»', () => {
+    const msg: Record<string, unknown> = {
+      animation: { file_id: 'gif' },
+      document: { file_id: 'gif' },
+      rich_message: { blocks: [{ type: 'document', document: { file_id: 'gif' } }] },
+    }
+    normalizeRichInbound(msg)
+    expect(msg.caption).toBe('[документ]')
+  })
+
+  test('a throwing onError still lets the update through', async () => {
+    let nextCalled = false
+    const hostile = { get message(): never { throw new Error('boom') } }
+    await richInboundMiddleware(undefined, () => { throw new Error('logger down') })({ update: hostile }, async () => { nextCalled = true })
+    expect(nextCalled).toBe(true)
+  })
+})

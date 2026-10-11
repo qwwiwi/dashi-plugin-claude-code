@@ -42,6 +42,12 @@ const MEDIA_BLOCKS: Record<string, { field: string; label: string }> = {
 // the stack inside the middleware (that would stop next() and drop the update).
 const MAX_DEPTH = 64
 
+// Own-property lookup: a block typed "constructor"/"toString" must not resolve
+// through Object.prototype into a fake media spec.
+function mediaSpec(type: unknown): { field: string; label: string } | undefined {
+  return typeof type === 'string' && Object.hasOwn(MEDIA_BLOCKS, type) ? MEDIA_BLOCKS[type] : undefined
+}
+
 /** Flatten a RichText (string | RichText[] | typed object) to plain text. */
 export function richTextToPlain(rt: unknown, depth = 0): string {
   if (depth > MAX_DEPTH) return ''
@@ -105,7 +111,7 @@ function blocksToText(blocks: unknown, depth: number): string {
 
 function blockToText(block: unknown, d: number): string {
   if (!isObj(block) || d > MAX_DEPTH) return ''
-  const media = typeof block.type === 'string' ? MEDIA_BLOCKS[block.type] : undefined
+  const media = mediaSpec(block.type)
   if (media !== undefined) {
     const cap = captionOf(block.caption, d)
     return cap ? `[${media.label}] ${cap}` : `[${media.label}]`
@@ -192,7 +198,7 @@ function collectMediaBlocks(blocks: unknown, out: Obj[], depth: number): Obj[] {
   if (!Array.isArray(blocks) || depth > MAX_DEPTH) return out
   for (const b of blocks) {
     if (!isObj(b)) continue
-    if (typeof b.type === 'string' && MEDIA_BLOCKS[b.type] !== undefined && b[b.type] !== undefined) out.push(b)
+    if (mediaSpec(b.type) !== undefined && b[b.type as string] !== undefined) out.push(b)
     collectMediaBlocks(b.blocks, out, depth + 1)
     if (Array.isArray(b.items)) {
       for (const item of b.items) if (isObj(item)) collectMediaBlocks(item.blocks, out, depth + 1)
@@ -227,10 +233,13 @@ export function normalizeRichInbound(message: Obj): RichNormalizeOutcome {
   if (topField !== undefined) {
     // Telegram duplicated one media into the top-level field (e.g. `photo`):
     // one matching block is that same media, the rest are not attached.
-    attached = media.some(b => typeof b.type === 'string' && MEDIA_BLOCKS[b.type]?.field === topField) ? 1 : 0
+    // Telegram sets `document` alongside `animation` for GIFs, so the two match.
+    const same = (f: string | undefined): boolean =>
+      f === topField || ((f === 'animation' || f === 'document') && (topField === 'animation' || topField === 'document'))
+    attached = media.some(b => same(mediaSpec(b.type)?.field)) ? 1 : 0
   } else if (media[0] !== undefined && typeof media[0].type === 'string') {
     const first = media[0]
-    const spec = MEDIA_BLOCKS[first.type as string]
+    const spec = mediaSpec(first.type)
     if (spec !== undefined) {
       message[spec.field] = first[first.type as string]
       attached = 1
@@ -272,7 +281,11 @@ export function richInboundMiddleware(
         }
       }
     } catch (err) {
-      onError?.(err)
+      try {
+        onError?.(err)
+      } catch {
+        // A throwing logger must not stop the update either.
+      }
     }
     return next()
   }

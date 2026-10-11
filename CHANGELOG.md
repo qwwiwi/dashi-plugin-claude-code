@@ -24,7 +24,7 @@ retroactively marks the state of `main` on 2026-06-14.
   `text`, or into `caption` when the message has media, and promotes the first
   media block to its top-level field when the media lives only inside a block.
   Existing `text`/`caption` are never overwritten. Applies to `message` and
-  `guest_message` and to the message they reply to (a reply to a bot's rich card keeps its context). Media blocks not attached are listed in the text; nesting is capped and a normalizer error never blocks the update. New module `src/telegram/rich-inbound.ts`, 20 tests.
+  `guest_message` and to the message they reply to (a reply to a bot's rich card keeps its context). Media blocks not attached are listed in the text; nesting is capped and a normalizer error never blocks the update. New module `src/telegram/rich-inbound.ts`, 23 tests.
 
 ## [1.4.0] — 2026-10-04
 
