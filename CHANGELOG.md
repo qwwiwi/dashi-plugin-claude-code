@@ -13,6 +13,19 @@ Versions before 1.0.0 were not tracked — the project shipped ~60 merged PRs
 between 2026-05-14 and 2026-06-14 without a version discipline. 1.0.0
 retroactively marks the state of `main` on 2026-06-14.
 
+## [1.4.1] — 2026-10-11
+
+### Fixed
+- **Rich messages from the owner no longer lose their text.** Bot API 10.1
+  rich messages carry content in `rich_message.blocks`, not `text`/`caption`,
+  so the `message:text` / media handlers dropped the text and only an attached
+  screenshot reached the session. A middleware now flattens the blocks
+  (paragraphs, headings, lists, quotes, code, tables, media captions) into
+  `text`, or into `caption` when the message has media, and promotes the first
+  media block to its top-level field when the media lives only inside a block.
+  Existing `text`/`caption` are never overwritten. Applies to `message` and
+  `guest_message` and to the message they reply to (a reply to a bot's rich card keeps its context). Media blocks not attached are listed in the text; nesting is capped and a normalizer error never blocks the update. New module `src/telegram/rich-inbound.ts`, 23 tests.
+
 ## [1.4.0] — 2026-10-04
 
 ### Security
