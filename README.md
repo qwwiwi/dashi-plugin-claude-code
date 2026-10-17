@@ -220,6 +220,16 @@ When Claude hits an interactive prompt inside the session, the plugin surfaces i
 
 Every decision is written to an audit JSONL (`statePaths.logs.permissions`). The short-id alphabet excludes the letter `l` (to avoid confusion with `1`/`i`).
 
+### The permission gate is optional
+
+The gate (`scripts/permission-gate-hook.ts`) is **opt-in** – an extra layer of protection on top of ordinary hooks. It is not installed by default: `scripts/install-hooks.sh` registers it only with `--permission-gate`.
+
+- **You want extra protection** (a new or third-party agent, a shared host, you want to confirm sensitive commands with a Telegram button) – install the gate and configure the policy file as described below.
+- **You don't** – skip the gate. The channel works fully on ordinary Claude Code hooks (the agent's own PreToolUse hooks, `settings.json`); there are no Allow / Deny cards in Telegram.
+- **To remove an installed gate** – delete the `PreToolUse` entry with marker `dashi-permission-gate-hook` from the agent's `settings.json` and restart the channel.
+
+Everything below applies only if you installed the gate.
+
 ### Secret-path allowlist for the permission gate (`DASHI_SECRET_PATH_ALLOWLIST`)
 
 The PreToolUse permission gate (`scripts/permission-gate-hook.ts`) hard-denies any Bash command that references a secret path (`*.key`, `secrets/`, `.env`, …). If an agent legitimately needs to check that a key file is present — e.g. a root-owned broker reads the key itself and the agent must never see it — set, in the environment of the channel process:
