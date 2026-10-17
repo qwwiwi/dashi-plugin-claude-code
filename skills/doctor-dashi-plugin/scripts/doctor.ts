@@ -961,7 +961,9 @@ export function checkSharedSettingsClean(homeRaw: string | null, selectedIsHome:
  * decision 2026-10-17) — lifting them lets download-and-execute and git
  * config/hook code execution run silently.
  */
-export const DANGEROUS_OVERRIDE_RULES: readonly string[] = ['sudo ', 'rm -rf ', 'rm -fr ', 'pipe-interpreter', 'git-exec-surface']
+export const DANGEROUS_OVERRIDE_RULES: readonly string[] = [
+  'sudo ', 'rm -rf ', 'rm -fr ', 'pipe-interpreter', 'git-exec-surface', 'git-exec-surface:all', 'git-push-delete',
+]
 
 /** The named detectors among DANGEROUS_OVERRIDE_RULES (lifted for allowlisted shapes only). */
 export const DETECTOR_OVERRIDE_RULES: readonly string[] = ['pipe-interpreter', 'git-exec-surface']
@@ -969,6 +971,30 @@ export const DETECTOR_OVERRIDE_RULES: readonly string[] = ['pipe-interpreter', '
 /** What a detector lift relaxes (mirrors gitLiftAllowed / pipeLiftAllowed in the gate). */
 export const DETECTOR_LIFT_NOTE =
   '; a lifted detector relaxes ALLOWLISTED SIMPLE commands only — git-exec-surface: one bare `git -c <allowlisted key>=<value> <allowlisted subcommand>` (no wrapper, env prefix, redirection, expansion or operator; push without force/delete); pipe-interpreter: `curl|wget <one URL> | sh|bash|python3`; everything else still confirms'
+
+/** Pipe-only allowlist note, used when the git detector is fully lifted. */
+const PIPE_LIFT_NOTE =
+  '; a lifted pipe-interpreter relaxes ALLOWLISTED SIMPLE commands only — `curl|wget <one URL> | sh|bash|python3`; everything else still confirms'
+
+/** What `git-exec-surface:all` lifts and what it still guards (mirrors gitCodeExecSurface). */
+export const FULL_GIT_LIFT_NOTE =
+  '; git-exec-surface:all lifts every git config/env/flag hit EXCEPT those that run a program — code-executing config keys (alias.*=!…, core.pager, core.sshCommand, core.hooksPath, core.fsmonitor, core.editor, sequence.editor, *.command/*.cmd, filter.*, diff.*.textconv, diff.external, credential.helper, gpg.program, include.path, tool *.path, submodule.*.update, any `!` value, …), unresolvable keys, GIT_SSH_COMMAND/GIT_EXTERNAL_DIFF/GIT_PAGER/GIT_EDITOR/GIT_ASKPASS/GIT_CONFIG_*, --upload-pack/--receive-pack (and abbreviations)/-u/--exec, hook and .git/config writes — those still confirm. This guard is BEST-EFFORT (a denylist, not a sandbox; known gaps: GIT_EXEC_PATH, GIT_TEMPLATE_DIR, --template=, GIT_DIR, ~/.gitconfig writes, --extcmd) — with default_tier allow an agent can run programs directly anyway, so list :all only for trusted agents'
+
+/** Push-delete opt-in note. */
+const PUSH_DELETE_NOTE = '; git-push-delete (with git push) lets a push delete a remote ref without confirmation'
+
+/** The detector part of the risky-override WARN, matched to what is actually listed. */
+export function detectorLiftNote(lifted: readonly string[]): string {
+  const full = lifted.includes('git-exec-surface:all')
+  const simpleGit = lifted.includes('git-exec-surface') && !full
+  const pipe = lifted.includes('pipe-interpreter')
+  let note = ''
+  if (simpleGit) note += DETECTOR_LIFT_NOTE
+  else if (pipe) note += PIPE_LIFT_NOTE
+  if (full) note += FULL_GIT_LIFT_NOTE
+  if (lifted.includes('git-push-delete')) note += PUSH_DELETE_NOTE
+  return note
+}
 
 /**
  * One YAML scalar item: quoted → cut at the closing quote (a `#` inside quotes
@@ -1075,7 +1101,7 @@ export function checkPermissionPolicy(policyText: string | null, policyPath: str
       id: 'permission-policy-risky-override',
       title: 'confirm_overrides lifts sudo / rm -rf / exec detectors (ultra-autonomy)',
       status: 'warn',
-      detail: `confirm_overrides lifts ${dangerous.join(', ')} to run silently — deliberate under ultra-autonomy; catastrophic forms (rm -rf /, fork bomb, secrets, own-channel systemctl, force push) and the operator deny list stay enforced in code regardless${dangerous.some((d) => DETECTOR_OVERRIDE_RULES.includes(d)) ? DETECTOR_LIFT_NOTE : ''}`,
+      detail: `confirm_overrides lifts ${dangerous.join(', ')} to run silently — deliberate under ultra-autonomy; catastrophic forms (rm -rf /, fork bomb, secrets, own-channel systemctl, force push) and the operator deny list stay enforced in code regardless${detectorLiftNote(dangerous)}`,
       fix: 'intended? leave it. If not, remove these from confirm_overrides.builtin_rules',
     })
   } else if (opaque) {

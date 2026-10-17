@@ -249,7 +249,31 @@ Accepted names: the substring rules (`sudo `, `rm -rf `, `rm -fr `, `git push`, 
 - `git-exec-surface`: the command must be one segment whose first word is literally `git` — no wrapper (`time`, `xargs`, `env`, `nice`, `nohup`, `find`, `flock`, `parallel`, `timeout`, `sudo`), no `GIT_*`/env prefix, no redirection, no expansion (`$`, backticks, `$(…)`, `${IFS}`), no pipe or `;`/`&&`/`||`. Global options are limited to `-c` with an allowlisted key: `user.name`, `user.email`, `color.*`, `advice.*`, `init.defaultBranch`, `core.quotepath`, `pull.rebase`, `push.autoSetupRemote`, and `commit.gpgsign=false`. The subcommand must be one of `status`, `log`, `diff`, `show`, `add`, `commit`, `fetch`, `pull`, `checkout`, `switch`, `branch`, `merge`, `stash`, `tag` (without delete), `rev-parse`, `remote -v` / `remote show`, or `push` without force, delete, mirror or prune flags and without `+` or colon refspecs. Transport-program flags (`--upload-pack`, `--receive-pack`, `--exec`, fetch `-u`) are never allowed.
 - `pipe-interpreter`: exactly `curl` (flags from `-fsSL`, `--fail`, `--silent`, `--show-error`, `--location`, `--compressed`, `--tlsv1.2`, `--proto =https`) or `wget` (`-q`, `-O-`, `--quiet`, …) with exactly one http(s) URL, piped once into `sh`, `bash` or `python3` (or `sh|bash -s -- <plain args>`). No expansions, redirections, `@file` uploads or other operators.
 
-When a lift does apply, the secret-path, catastrophic and own-channel checks are re-run on the command with adjacent quoted word parts joined (`.e""nv` → `.env`), so a secret path split by quotes cannot get through the lift. A push that deletes a remote ref (`git push origin :main`, `--delete`, `-d`, `--prune`) still confirms even when the `git push` rule is lifted.
+When a lift does apply, the secret-path, catastrophic and own-channel checks are re-run on the command with adjacent quoted word parts joined (`.e""nv` → `.env`), so a secret path split by quotes cannot get through the lift. A push that deletes a remote ref (`git push origin :main`, `--delete`, `-d`, `--prune`) still confirms even when the `git push` rule is lifted. This check is deliberately conservative: it also confirms when the words appear in a heredoc body or a quoted string, because such text is often executed later (`eval "$x"`, `… | sh`, `xargs git push`, `bash <<<`, write-then-run).
+
+**Full git lifts (opt-in, owner decision 2026-10-17)** — for agents that write code and push without cards:
+
+- `git-push-delete` — together with `git push`, a push that deletes a remote ref no longer confirms (the conservative check above is skipped entirely).
+- `git-exec-surface:all` — every git-exec-surface hit passes regardless of shape (wrappers, env prefixes, redirections, expansions, several segments, any `-c` key) **except surfaces that make git run a program**, which still confirm:
+  - config keys set via `-c`, `--config-env`, `git config`, `GIT_CONFIG_*` or a `.git/config` write: `alias.*` whose value starts with `!`, `core.pager`, `core.sshCommand`, `core.hooksPath`, `core.fsmonitor`, `core.editor`, `sequence.editor`, `*.command` / `*.cmd`, `filter.*.clean|smudge|process`, `diff.*.textconv`, `diff.external`, `credential.helper`, `gpg.program`, plus `core.askpass`, `core.gitProxy`, `pager.*`, `merge.*.driver`, `remote.*.uploadpack|receivepack`, `include.path` / `includeIf`, `protocol.*.allow`, `difftool|mergetool|browser|man.*.path`, `submodule.*.update`, `sendemail.smtpServer|sendmailCmd`, `instaweb.*`, `init.templateDir`, and **any** key whose value starts with `!`;
+  - a config key that cannot be resolved (`git -c "$k=v"`, `git clone -c`/`--config` with a variable key, a variable git command word with config flags), and an `alias.*` set through `--config-env` (the value is unknowable);
+  - env vars `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_PROXY_COMMAND`, `GIT_ALLOW_PROTOCOL` and any `GIT_CONFIG_*` assignment;
+  - transport-program flags `--upload-pack`, `--receive-pack` and their abbreviations (`--upl=`, `--rec=`, `--upload-p`, anywhere, including inside `$(…)` / `<(…)`), `-u` (clone/fetch/pull/ls-remote), `--exec`, `--exec-path=`;
+  - writes to `.git/hooks` and `.git/config`.
+
+  Under `:all` this guard runs on every command that mentions git (or sets one of the env vars above), even when git-exec-surface itself did not fire — e.g. `git config core.pager x` or `GIT_PAGER=x git log` confirm under `:all` though they pass by default. The secret-path, catastrophic and own-channel re-check still runs after the lift.
+
+  **This guard is BEST-EFFORT — a denylist, not a sandbox.** With `default_tier: allow` an agent can run any program directly anyway, so `git-exec-surface:all` is for trusted agents only. Known gaps (follow-up ticket): `GIT_EXEC_PATH`, `GIT_TEMPLATE_DIR`, `--template=`, `GIT_DIR` / `--git-dir` / `-C` into an untrusted repository, `HOME` / `XDG_CONFIG_HOME` swaps, writes to `~/.gitconfig`, `git difftool --extcmd` / `-x`.
+
+```yaml
+confirm_overrides:
+  builtin_rules:
+    - "git push"
+    - "git-push-delete"
+    - "git-exec-surface:all"
+```
+
+Force push stays a hard deny with every lift listed; `pipe-interpreter` has no full lift.
 
 Listing one detector does not relax the other, and a compound command that also trips a non-listed rule still confirms. The built-in hard-deny (secret paths, catastrophic shell, mutating `systemctl` on the agent's own channel, force push) and the operator `deny` list run before this layer and are never affected. The doctor reports a lifted `sudo`/`rm -rf`/detector as a WARN.
 

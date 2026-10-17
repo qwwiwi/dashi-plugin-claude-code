@@ -90,7 +90,30 @@ allow:
 #     or `| sh -s -- <plain args>`), nothing else in the command.
 # When a lift applies, secret-path and catastrophic checks re-run with
 # quote-split words joined (`.e""nv` -> `.env`). A push that deletes a remote
-# ref (`:main`, --delete) still confirms even with "git push" lifted.
+# ref (`:main`, --delete) still confirms even with "git push" lifted
+# (conservatively: also when the words sit in a heredoc or a quoted string).
+# Full git lifts (opt-in, owner decision 2026-10-17; agents that push without
+# cards):
+#   git-push-delete      — with "git push": a remote-ref delete no longer confirms
+#   git-exec-surface:all — any git-exec-surface shape passes EXCEPT surfaces
+#     that run a program, which still confirm: code-executing config keys
+#     (alias.*=!…, core.pager, core.sshCommand, core.hooksPath, core.fsmonitor,
+#     core.editor, sequence.editor, *.command/*.cmd, filter.*, diff.*.textconv,
+#     diff.external, credential.helper, gpg.program, include.path, *.path of
+#     difftool/mergetool/browser/man, submodule.*.update, sendemail programs,
+#     instaweb.*, init.templateDir, any value starting with `!`, …) however
+#     they are set, unresolvable keys (`-c "$k=v"`, clone -c/--config), an
+#     alias via --config-env, GIT_SSH_COMMAND / GIT_EXTERNAL_DIFF / GIT_PAGER /
+#     GIT_EDITOR / GIT_ASKPASS / GIT_ALLOW_PROTOCOL / GIT_CONFIG_*,
+#     --upload-pack / --receive-pack (and abbreviations) / -u / --exec,
+#     .git/hooks and .git/config writes. Under :all the guard runs on every
+#     command that mentions git, even when git-exec-surface did not fire.
+#     BEST-EFFORT: a denylist, not a sandbox — with default_tier: allow an
+#     agent can run programs directly anyway, so :all is for trusted agents.
+#     Known gaps: GIT_EXEC_PATH, GIT_TEMPLATE_DIR, --template=, GIT_DIR /
+#     --git-dir / -C into an untrusted repo, HOME / XDG_CONFIG_HOME swaps,
+#     ~/.gitconfig writes, difftool --extcmd / -x.
+# Force push stays a hard deny either way; pipe-interpreter has no full lift.
 # SECURITY TRADE-OFF: a lifted simple download-and-execute still runs code
 # you have not seen. The built-in hard-deny (secrets, catastrophic shell,
 # own-channel systemctl, force push) and the deny list above are NEVER

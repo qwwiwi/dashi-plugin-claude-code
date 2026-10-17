@@ -148,7 +148,10 @@ export interface PermissionPolicy {
    * overridable only by explicit operator opt-in (owner decision 2026-10-17),
    * and then only for allowlisted simple shapes (gitLiftAllowed /
    * pipeLiftAllowed — anything else still confirms); not listed, they confirm
-   * exactly as before. A compound command matching an
+   * exactly as before. `git-exec-surface:all` lifts the git detector except
+   * for surfaces that execute a program (gitCodeExecSurface);
+   * `git-push-delete` stops a remote-ref-deleting push from confirming when
+   * `git push` is overridden. A compound command matching an
    * overridden AND a non-overridden built-in rule still confirms.
    */
   readonly confirm_overrides?: { readonly builtin_rules?: readonly string[] }
@@ -241,13 +244,22 @@ const BUILTIN_CONFIRM_BASH: readonly string[] = [
 //   * `git-exec-surface` — one bare `git` segment with `-c` keys from an
 //     allowlist (user.*, color.*, advice.*, …) and an allowlisted subcommand,
 //     push only without force / delete (gitLiftAllowed).
+//   * `git-exec-surface:all` — full lift (owner decision 2026-10-17: agents
+//     write code and push without cards): every git-exec-surface hit passes
+//     EXCEPT a surface that runs a program (code-executing config keys,
+//     `alias.*=!…`, GIT_SSH_COMMAND / GIT_PAGER / GIT_CONFIG_* and friends,
+//     transport-program flags, hook / .git/config writes — gitCodeExecSurface).
+//     Implies `git-exec-surface`.
+//   * `git-push-delete` — a push that deletes a remote ref (`git push origin
+//     :x`, `--delete`, `-d`, `--prune`) no longer confirms once `git push` is
+//     overridden too.
 // Hard-deny (catastrophic shell, secret reads, own-channel systemctl, force
 // push) and the operator deny list run BEFORE this layer and are never
-// affected.
-const OPT_IN_CONFIRM_DETECTORS = ['pipe-interpreter', 'git-exec-surface'] as const
+// affected. `pipe-interpreter` has NO full lift.
+const OPT_IN_CONFIRM_DETECTORS = ['pipe-interpreter', 'git-exec-surface', 'git-exec-surface:all', 'git-push-delete'] as const
 
 /** Every name `confirm_overrides.builtin_rules` accepts. */
-function overridableConfirmRuleNames(): readonly string[] {
+export function overridableConfirmRuleNames(): readonly string[] {
   return [...BUILTIN_CONFIRM_BASH, ...OPT_IN_CONFIRM_DETECTORS]
 }
 
@@ -2243,6 +2255,215 @@ export function gitPushDelete(rawCommand: string): boolean {
   return false
 }
 
+// ── `git-exec-surface:all` still guards code execution (PR #147 review) ──
+//
+// The full lift relaxes every git-exec-surface hit EXCEPT the ones that make
+// git run a program the command names. Checked fail-closed on the flattened
+// (quotes dropped, ANSI-C decoded, lowercased) text — a mention anywhere in
+// the command confirms — plus an argv pass that confirms when a config KEY
+// cannot be resolved (variable / substitution in the key position).
+// Over-confirming a benign mention (`git log --grep core.pager`) is accepted.
+// Under `:all` it runs on every command that mentions git (gitCommandMentioned),
+// not only when git-exec-surface fired. BEST-EFFORT denylist, not a sandbox.
+
+// Config keys whose value git executes. Owner list (2026-10-17) plus
+// safe-side extras that execute too: core.askpass / gitproxy /
+// alternateRefsCommand, pager.<cmd>, *.cmd (difftool / mergetool),
+// merge.*.driver, remote.*.uploadpack / receivepack / vcs,
+// uploadpack.packObjectsHook, include.path / includeIf (pull in a config file
+// with any key), protocol.*.allow (enables the `ext::` transport).
+const GIT_CODE_EXEC_KEY_RE = new RegExp(
+  [
+    'core\\.(?:pager|sshcommand|hookspath|fsmonitor|editor|askpass|gitproxy|alternaterefscommand)',
+    'sequence\\.editor',
+    '(?:^|[^a-z0-9_.-])pager\\.',
+    '\\.command(?![a-z0-9_-])',
+    '\\.cmd(?![a-z0-9_-])',
+    'filter\\.[^\\s=]*\\.(?:clean|smudge|process)',
+    'diff\\.[^\\s=]*\\.textconv',
+    'diff\\.external',
+    'credential\\.(?:[^\\s=]*\\.)?helper',
+    'gpg\\.(?:[^\\s=]*\\.)?program',
+    'merge\\.[^\\s=]*\\.driver',
+    'remote\\.[^\\s=]*\\.(?:uploadpack|receivepack|vcs)',
+    'uploadpack\\.packobjectshook',
+    'include(?:if)?\\.',
+    'protocol\\.(?:[^\\s=]*\\.)?allow',
+    // fix-loop 2 (Fable): tool paths, submodule update commands, send-email
+    // programs, instaweb, init templates (they install hooks).
+    '(?:difftool|mergetool|browser|man)\\.[^\\s=]*\\.path',
+    'submodule\\.[^\\s=]*\\.update',
+    'sendemail\\.(?:[^\\s=]*\\.)?(?:smtpserver|sendmailcmd)',
+    'instaweb\\.',
+    'init\\.templatedir',
+  ].join('|'),
+)
+// `alias.<x>` whose value is a shell command (`!…`) or unresolvable (`$`, backtick).
+const GIT_ALIAS_EXEC_RE = /alias\.[^\s=]+(?:=|\s+)[!$`]/
+// Any `-c key=!…` value (git runs `!` values as shell commands for several
+// keys) and an alias whose value comes from the environment (`--config-env`,
+// any of its `--config-e…` prefixes): the value is unknowable.
+const GIT_BANG_VALUE_RE = /(?:^|\s)-c\s*[^\s=]+=\s*!/
+const GIT_CONFIG_ENV_ALIAS_RE = /--config-(?:e(?:nv?)?)?[=\s]+alias\./
+// Transport-program flags abbreviated to any unambiguous-looking prefix
+// (`--upl=`, `--rec=`, `--upload-p`), anywhere in the flattened text —
+// including inside `$(…)` / `<(…)`. Conservative: `--re` / `--rec` also
+// prefix `--recurse-submodules`; spelling that option out in full passes.
+const GIT_TRANSPORT_ABBREV_RE = new RegExp(
+  `--(?:${[...new Set(LONG_EXEC_PREFIX_TARGETS.flatMap((t) => Array.from({ length: t.length - 1 }, (_, i) => t.slice(0, i + 2))))]
+    .sort((a, b) => b.length - a.length)
+    .join('|')})(?![a-z0-9_])`,
+)
+// Env vars that make git run a program, and every GIT_CONFIG_* assignment.
+const GIT_CODE_EXEC_ENV_RE =
+  /(?:^|[^a-z0-9_])(?:git_ssh|git_ssh_command|git_external_diff|git_pager|git_editor|git_sequence_editor|git_askpass|ssh_askpass|git_proxy_command|git_allow_protocol|git_config_[a-z0-9_]*)\s*=/
+// Transport-program flags and git's exec path.
+const GIT_TRANSPORT_EXEC_RE = /--upload-pack|--receive-pack|--exec(?![a-z0-9_-])|--exec-path=/
+// Hook installs and direct .git/config writes (they can set any key above).
+const GIT_HOOK_OR_CONFIG_FILE_RE = /\.git\/hooks|\.git\/config/
+
+// `git config` options that consume the next token as their value.
+const GIT_CONFIG_VALUE_OPTS = new Set(['-f', '--file', '--blob', '--type', '--default', '--comment', '--value'])
+
+/** Long transport flag token (`--upload-pack`, `--receive-pack` down to 2-char
+ *  prefixes, `--exec`, `--exec-path=<x>`), dequoted. `--config-env` is NOT
+ *  here: under the full lift it is judged by its key. */
+function transportExecToken(tok: string): boolean {
+  if (!tok.startsWith('--')) return false
+  if (/^--exec-path=.+/.test(tok)) return true
+  const name = (tok.slice(2).split('=')[0] as string).toLowerCase()
+  if (name === 'exec') return true
+  return name.length >= 2 && LONG_EXEC_PREFIX_TARGETS.some((t) => t.startsWith(name))
+}
+
+/** A `<key>=<value>` whose value is a `!` shell command. */
+function bangValue(kv: string | undefined): boolean {
+  if (kv === undefined) return false
+  const eq = kv.indexOf('=')
+  return eq >= 0 && kv.slice(eq + 1).trimStart().startsWith('!')
+}
+
+/** A config key that cannot be resolved statically. */
+function unresolvedKey(kv: string | undefined): boolean {
+  if (kv === undefined) return true
+  const key = kv.split('=')[0] as string
+  return key.length === 0 || /[$`]/.test(key)
+}
+
+function segmentCodeExec(segment: string, depth: number): boolean {
+  const toks = tokenizeQuoteAware(segment)
+  if (toks === null) return true // unbalanced → fail-closed
+  const cw = commandWordAt(toks)
+  const head = cw === null ? '' : (cw.word.split('/').pop() ?? cw.word).toLowerCase()
+  const configish = toks.some((t) => t === '-c' || t.startsWith('--conf') || t === 'config')
+  // A variable command word (`"$GIT" -c "$k=v" log`) cannot be resolved.
+  if (head.startsWith('$') && configish) return true
+  const inv = normalizeGitInvocation(toks)
+  if (inv !== null) {
+    if (inv.configs.some((c) => unresolvedKey(c) || bangValue(c))) return true
+    for (let i = 0; i < toks.length; i += 1) {
+      const t = toks[i] as string
+      if (transportExecToken(t)) return true
+      if (t.startsWith('--conf')) {
+        const v = t.includes('=') ? t.slice(t.indexOf('=') + 1) : toks[i + 1]
+        if (unresolvedKey(v) || bangValue(v)) return true
+        // `--config-env=<key>=<ENV>`: the value is unknowable — an alias via
+        // the environment can be a `!` shell alias.
+        const name = (t.slice(2).split('=')[0] as string).toLowerCase()
+        if (name.length >= 7 && 'config-env'.startsWith(name) && (v ?? '').toLowerCase().startsWith('alias.')) return true
+      }
+    }
+    // `git clone -c <k>=<v>` / `-c<k>=<v>` / `--config[=]<k>=<v>`: config set
+    // AFTER the subcommand (applied to the new repo before checkout).
+    if (inv.sub === 'clone') {
+      for (let i = 0; i < inv.args.length; i += 1) {
+        const a = inv.args[i] as string
+        let v: string | undefined | null = null
+        if (a === '-c') v = inv.args[i + 1]
+        else if (a.startsWith('-c') && a.length > 2) v = a.slice(2)
+        else if (isConfigFamilyToken(a)) v = a.includes('=') ? a.slice(a.indexOf('=') + 1) : inv.args[i + 1]
+        if (v !== null && (unresolvedKey(v) || bangValue(v))) return true
+      }
+    }
+    if (GIT_UPLOAD_PACK_U_SUBCOMMANDS.has(inv.sub) && inv.args.some((a) => /^-[A-Za-z]*u/.test(a))) return true
+    if (inv.sub === 'config') {
+      for (let i = 0; i < inv.args.length; i += 1) {
+        const a = inv.args[i] as string
+        if (GIT_CONFIG_VALUE_OPTS.has(a)) { i += 1; continue }
+        if (a.startsWith('-')) continue
+        if (unresolvedKey(a)) return true
+        // `git config <key> !…` — a shell-command value.
+        const val = inv.args[i + 1]
+        if (val !== undefined && val.startsWith('!')) return true
+        break
+      }
+    }
+  }
+  // Quoted shell code (`bash -c '…'`, `eval "…"`, `ssh h '…'`) is re-parsed.
+  const codeRunner = CODE_RUNNER_HEADS.has(head)
+  for (let i = 0; i < toks.length; i += 1) {
+    const t = toks[i] as string
+    if (!/[\s;|&]/.test(t)) continue
+    const afterCodeFlag = i > 0 && CODE_STRING_FLAG_RE.test(toks[i - 1] as string)
+    if (!codeRunner && !afterCodeFlag) continue
+    if (depth >= 3) return true
+    if (commandCodeExec(t, depth + 1)) return true
+  }
+  return false
+}
+
+function commandCodeExec(command: string, depth: number): boolean {
+  const segs = segmentBashQuoteAware(stripLineContinuations(command))
+  if (segs === null) return true
+  return segs.some((s) => segmentCodeExec(s, depth))
+}
+
+/** The command mentions git (a `git` / `git-*` word) or sets a git program env var. */
+export function gitCommandMentioned(rawCommand: string): boolean {
+  const flat = flattenIndirection(stripLineContinuations(rawCommand)).toLowerCase()
+  return /(?:^|[^a-z0-9_.-])git(?:-[a-z][a-z-]*)?(?![a-z0-9_.-])/.test(flat) || flat.includes('.git/') || GIT_CODE_EXEC_ENV_RE.test(flat)
+}
+
+/**
+ * BEST-EFFORT denylist, not a sandbox (under `default_tier: allow` an agent
+ * can run programs directly anyway — `:all` is for trusted agents).
+ * Known gaps (follow-up ticket): GIT_EXEC_PATH, GIT_TEMPLATE_DIR,
+ * `--template=`, GIT_DIR / `--git-dir` / `-C` into an untrusted repo,
+ * HOME / XDG_CONFIG_HOME swaps, writes to ~/.gitconfig, difftool
+ * `--extcmd` / `-x`.
+ *
+ * True when a command touches a git surface that EXECUTES a program: a
+ * code-running config key (set via `-c`, `--config-env`, `git config`,
+ * GIT_CONFIG_*, a .git/config write), an `alias.*` shell alias, a program-
+ * running env var, a transport-program flag, or a hook install. These still
+ * confirm under `git-exec-surface:all`; everything else that git-exec-surface
+ * flags is lifted. Fail-closed: unresolvable config keys, a variable command
+ * word with config flags, and unparseable quoting all confirm.
+ */
+export function gitCodeExecSurface(rawCommand: string): boolean {
+  const joined = stripLineContinuations(rawCommand)
+  const flatRaw = flattenIndirection(joined)
+  const flat = flatRaw.toLowerCase()
+  if (
+    GIT_CODE_EXEC_KEY_RE.test(flat) ||
+    GIT_ALIAS_EXEC_RE.test(flat) ||
+    GIT_BANG_VALUE_RE.test(flat) ||
+    GIT_CONFIG_ENV_ALIAS_RE.test(flat) ||
+    GIT_CODE_EXEC_ENV_RE.test(flat) ||
+    GIT_TRANSPORT_EXEC_RE.test(flat) ||
+    GIT_TRANSPORT_ABBREV_RE.test(flat) ||
+    GIT_HOOK_OR_CONFIG_FILE_RE.test(flat)
+  ) {
+    return true
+  }
+  // Inside a substitution the argv pass cannot see git (`x=$(git -c "$k=v" …)`):
+  // any `-c` whose key part is unresolvable confirms.
+  if (/\$\(|[<>]\(|`/.test(joined) && /(?:^|\s)(?:-c\s*|--conf[a-z-]*[=\s]+)[^\s=]*[$`]/.test(flatRaw)) return true
+  if (commandCodeExec(joined, 0)) return true
+  // ANSI-C quoting: also run the argv pass on the decoded view.
+  return joined.includes("$'") && commandCodeExec(flatRaw, 0)
+}
+
 // ── Opt-in detector lifts are ALLOWLIST-only (PR #145 review, 2026-10-17) ──
 //
 // Listing `git-exec-surface` / `pipe-interpreter` in
@@ -2808,11 +3029,12 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // insensitively itself, so lowercasing here would only re-introduce the
     // flag-case collapse (`-C`/`-c`) that bit gitExecSurface.
     const raw = rawCommand!
-    // Remote-ref deletion by push (`:main`, `--delete`) is never lifted: when
-    // the `git push` substring rule is overridden, it still confirms. Scoped
-    // to that override so defaults stay byte-identical (there the `git push`
-    // substring rule above already confirms).
-    if (overridden.includes('git push') && gitPushDelete(raw)) {
+    // Remote-ref deletion by push (`:main`, `--delete`): when the `git push`
+    // substring rule is overridden, it still confirms — unless the operator
+    // also lists `git-push-delete` (owner decision 2026-10-17). Scoped to that
+    // override so defaults stay byte-identical (there the `git push` substring
+    // rule above already confirms).
+    if (overridden.includes('git push') && !overridden.includes('git-push-delete') && gitPushDelete(raw)) {
       return { tier: 'confirm', reason: 'push that deletes a remote ref needs confirmation', matchedRule: 'builtin:confirm_bash:git-push-delete' }
     }
     //
@@ -2833,8 +3055,23 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // must not become arbitrary local code execution). Pass the RAW command so
     // the case-sensitive `-c` check distinguishes `git -C` from `git -c`.
     const gitFires = gitExecSurface(raw)
-    const gitLifted = overridden.includes('git-exec-surface')
-    if (gitFires && (!gitLifted || !gitLiftAllowed(raw))) {
+    // `git-exec-surface:all` is the full lift: everything the detector flags
+    // passes EXCEPT a surface that executes a program (gitCodeExecSurface).
+    // The flattened hard-deny re-check below still runs.
+    const gitFullLift = overridden.includes('git-exec-surface:all')
+    const gitLifted = gitFullLift || overridden.includes('git-exec-surface')
+    // Under `:all` the code-exec guard runs even when git-exec-surface did
+    // not fire (`git config core.pager x`, `GIT_PAGER=x git log`), but only
+    // for commands that mention git or set a git program env var, so non-git
+    // work (`#include.h`, `build.cmd`) keeps flowing. Defaults are untouched.
+    if (gitFullLift && (gitFires || gitCommandMentioned(raw)) && gitCodeExecSurface(raw)) {
+      return {
+        tier: 'confirm',
+        reason: 'git config/hook execution surface needs confirmation (git-exec-surface:all still guards config, env and flags that run a program)',
+        matchedRule: 'builtin:confirm_bash:git-exec-surface',
+      }
+    }
+    if (gitFires && !gitFullLift && (!gitLifted || !gitLiftAllowed(raw))) {
       return {
         tier: 'confirm',
         reason: `git config/hook execution surface needs confirmation${gitLifted ? LIFT_NOTE : ''}`,

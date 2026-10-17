@@ -239,7 +239,31 @@ confirm_overrides:
 - `git-exec-surface`: команда — один сегмент, первое слово ровно `git`. Без обёрток (`time`, `xargs`, `env`, `nice`, `nohup`, `find`, `flock`, `parallel`, `timeout`, `sudo`), без префикса `GIT_*`/env, без перенаправлений, без подстановок (`$`, обратные кавычки, `$(…)`, `${IFS}`), без `|`, `;`, `&&`, `||`. Глобальные опции — только `-c` с ключом из списка: `user.name`, `user.email`, `color.*`, `advice.*`, `init.defaultBranch`, `core.quotepath`, `pull.rebase`, `push.autoSetupRemote`, `commit.gpgsign=false`. Подкоманда — одна из `status`, `log`, `diff`, `show`, `add`, `commit`, `fetch`, `pull`, `checkout`, `switch`, `branch`, `merge`, `stash`, `tag` (без удаления), `rev-parse`, `remote -v` / `remote show` или `push` без флагов force, delete, mirror, prune и без refspec с `+` или двоеточием. Флаги транспортной программы (`--upload-pack`, `--receive-pack`, `--exec`, `-u` у fetch) не допускаются никогда.
 - `pipe-interpreter`: ровно `curl` (флаги из `-fsSL`, `--fail`, `--silent`, `--show-error`, `--location`, `--compressed`, `--tlsv1.2`, `--proto =https`) или `wget` (`-q`, `-O-`, `--quiet`, …) с одним http(s) URL, один раз переданный в `sh`, `bash` или `python3` (или `sh|bash -s -- <простые аргументы>`). Без подстановок, перенаправлений, загрузки `@файл` и других операторов.
 
-Когда снятие срабатывает, проверки секретных путей, катастрофических команд и своего канала повторяются на команде со склеенными соседними частями слова в кавычках (`.e""nv` → `.env`), так что разрезанный кавычками секретный путь не проходит через снятие. Push, удаляющий ветку на удалённом репозитории (`git push origin :main`, `--delete`, `-d`, `--prune`), просит подтверждение даже при снятом правиле `git push`.
+Когда снятие срабатывает, проверки секретных путей, катастрофических команд и своего канала повторяются на команде со склеенными соседними частями слова в кавычках (`.e""nv` → `.env`), так что разрезанный кавычками секретный путь не проходит через снятие. Push, удаляющий ветку на удалённом репозитории (`git push origin :main`, `--delete`, `-d`, `--prune`), просит подтверждение даже при снятом правиле `git push`. Эта проверка намеренно консервативна: она срабатывает и на тело heredoc, и на строку в кавычках, потому что такой текст часто потом исполняется (`eval "$x"`, `… | sh`, `xargs git push`, `bash <<<`, «записал файл — запустил»).
+
+**Полное снятие для git (opt-in, решение владельца 2026-10-17)** — для агентов, которые пишут код и пушат без карточек:
+
+- `git-push-delete` — вместе с `git push`: push, удаляющий ветку на удалённом репозитории, больше не просит подтверждение (консервативная проверка выше пропускается целиком).
+- `git-exec-surface:all` — любое срабатывание git-exec-surface проходит независимо от формы (обёртки, env-префиксы, перенаправления, подстановки, несколько сегментов, любой ключ `-c`), **кроме поверхностей, через которые git запускает программу**, — они по-прежнему просят подтверждение:
+  - ключи конфига через `-c`, `--config-env`, `git config`, `GIT_CONFIG_*` или запись в `.git/config`: `alias.*` со значением на `!`, `core.pager`, `core.sshCommand`, `core.hooksPath`, `core.fsmonitor`, `core.editor`, `sequence.editor`, `*.command` / `*.cmd`, `filter.*.clean|smudge|process`, `diff.*.textconv`, `diff.external`, `credential.helper`, `gpg.program`, а также `core.askpass`, `core.gitProxy`, `pager.*`, `merge.*.driver`, `remote.*.uploadpack|receivepack`, `include.path` / `includeIf`, `protocol.*.allow`, `difftool|mergetool|browser|man.*.path`, `submodule.*.update`, `sendemail.smtpServer|sendmailCmd`, `instaweb.*`, `init.templateDir` и **любой** ключ со значением на `!`;
+  - ключ конфига, который нельзя вычислить статически (`git -c "$k=v"`, `git clone -c`/`--config` с ключом из переменной, git через переменную с флагами конфига), и `alias.*`, заданный через `--config-env` (значение неизвестно);
+  - переменные `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_PROXY_COMMAND`, `GIT_ALLOW_PROTOCOL` и любое присваивание `GIT_CONFIG_*`;
+  - флаги транспортной программы `--upload-pack`, `--receive-pack` и их сокращения (`--upl=`, `--rec=`, `--upload-p` — где угодно, в том числе внутри `$(…)` / `<(…)`), `-u` (clone/fetch/pull/ls-remote), `--exec`, `--exec-path=`;
+  - запись в `.git/hooks` и `.git/config`.
+
+  При `:all` эта защита проверяет каждую команду, где упомянут git (или задана одна из переменных выше), даже если сам git-exec-surface не сработал: например, `git config core.pager x` или `GIT_PAGER=x git log` при `:all` просят подтверждение, хотя по умолчанию проходят. Повторная проверка секретных путей, катастрофических команд и своего канала после снятия остаётся.
+
+  **Эта защита работает по принципу «насколько получится» — это список запретов, а не песочница.** При `default_tier: allow` агент и так может запустить любую программу напрямую, поэтому `git-exec-surface:all` — только для доверенных агентов. Известные пробелы (отдельный тикет): `GIT_EXEC_PATH`, `GIT_TEMPLATE_DIR`, `--template=`, `GIT_DIR` / `--git-dir` / `-C` в недоверенный репозиторий, подмена `HOME` / `XDG_CONFIG_HOME`, запись в `~/.gitconfig`, `git difftool --extcmd` / `-x`.
+
+```yaml
+confirm_overrides:
+  builtin_rules:
+    - "git push"
+    - "git-push-delete"
+    - "git-exec-surface:all"
+```
+
+Force push остаётся hard deny при любых снятиях; полного снятия для `pipe-interpreter` нет.
 
 Снятие одного детектора не ослабляет другой, а составная команда, задевшая неснятое правило, по-прежнему просит подтверждение. Встроенный hard-deny (секретные пути, катастрофические команды, мутирующий `systemctl` собственного канала агента, force push) и операторский список `deny` работают до этого слоя и не затрагиваются. Доктор показывает снятые `sudo`/`rm -rf`/детекторы как WARN.
 

@@ -15,6 +15,46 @@ retroactively marks the state of `main` on 2026-06-14.
 
 ## [Unreleased]
 
+## [1.4.3] — 2026-10-17
+
+### Security
+- **Full git lifts by explicit opt-in** (owner decision 2026-10-17: agents
+  write code and push without approval cards). Two new
+  `confirm_overrides.builtin_rules` names:
+  - `git-push-delete` — together with `git push`, a push deleting a remote ref
+    no longer confirms (the push-delete check is skipped entirely).
+  - `git-exec-surface:all` — every git-exec-surface hit passes regardless of
+    shape, EXCEPT surfaces that make git run a program, which still confirm:
+    code-executing config keys however they are set (`alias.*=!…`,
+    `core.pager`, `core.sshCommand`, `core.hooksPath`, `core.fsmonitor`,
+    `core.editor`, `sequence.editor`, `*.command` / `*.cmd`, `filter.*`,
+    `diff.*.textconv`, `diff.external`, `credential.helper`, `gpg.program`,
+    plus safe-side extras such as `include.path`, `pager.*`,
+    `merge.*.driver`, `protocol.*.allow`, `*.path` of difftool / mergetool /
+    browser / man, `submodule.*.update`, sendemail programs, `instaweb.*`,
+    `init.templateDir`, and any value starting with `!`), unresolvable config
+    keys (`-c "$k=v"`, `git clone -c` / `--config`), an `alias.*` set through
+    `--config-env`, `GIT_SSH_COMMAND` / `GIT_EXTERNAL_DIFF` / `GIT_PAGER` /
+    `GIT_EDITOR` / `GIT_ASKPASS` / `GIT_ALLOW_PROTOCOL` / `GIT_CONFIG_*`,
+    `--upload-pack` / `--receive-pack` and their abbreviations (also inside
+    `$(…)` / `<(…)`), `-u`, `--exec`, and `.git/hooks` / `.git/config`
+    writes. Under `:all` the guard runs on every command that mentions git,
+    even when git-exec-surface itself did not fire. The flattened secret /
+    catastrophic / own-channel re-check still runs. **The guard is
+    best-effort — a denylist, not a sandbox**: with `default_tier: allow` an
+    agent can run programs directly anyway, so `:all` is for trusted agents.
+    Known gaps (follow-up ticket): `GIT_EXEC_PATH`, `GIT_TEMPLATE_DIR`,
+    `--template=`, `GIT_DIR` / `--git-dir` / `-C` into an untrusted repo,
+    `HOME` / `XDG_CONFIG_HOME` swaps, `~/.gitconfig` writes, difftool
+    `--extcmd` / `-x`.
+  Not listed, behavior is unchanged. Force push, secrets, own-channel
+  `systemctl` and the operator deny list are untouched; `pipe-interpreter` has
+  no full lift. `gitPushDelete` itself is unchanged: masking quoted / heredoc
+  text was tried and rejected in review (Codex, Fable), because that text is
+  often executed later (`eval "$x"`, `… | sh`, `xargs git push`, `bash <<<`,
+  write-then-run) — those forms are pinned as regression tests. The doctor
+  surfaces both names as a WARN and describes what `:all` still guards.
+
 ## [1.4.2] — 2026-10-17
 
 ### Security
