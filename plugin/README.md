@@ -228,7 +228,7 @@ Default-OFF — opt-in через config:
 - Polls `tmux capture-pane -p -t <pane_target> -S -<line_count>` каждые `poll_interval_ms`
 - ANSI/CSI/OSC/DCS sequences стрипаются, control chars (кроме `\n`, `\t`) удаляются
 - Текст пропускается через `redactSecrets` (тот же что в safe-telegram-api), затем HTML-escape, затем оборачивается в `<pre>`
-- Hash-based dedup: identical poll → нет API call. Хеш по нормализованному тексту: таймеры, счётчики токенов, часы, проценты, спиннеры маскируются – смена одних счётчиков правку не вызывает
+- Hash-based dedup: identical poll → нет API call. Хеш по нормализованному тексту: счётчики маскируются только в служебных строках Claude Code (спиннер, `esc to interrupt`, строки агентов, хвостовая колонка времени), остальное – как есть; смена одних счётчиков обновляет зеркало не чаще раза в 5 минут
 - Flood control: не чаще одной правки в `min_edit_interval_ms` (20000) и не больше `max_edits_per_min` (3); 429 – пауза на реальный `retry_after`, пока 429 активен, flood gate бота пропускает фоновые правки (зеркало/статус/прогресс) без вызова API
 - Edit «message to edit not found» (400 с подходящим description) → re-send. Прочие 4xx (403, 413 и т.д.) НЕ триггерят resend, чтобы не было storm
 - `mode: latest_inbound_only` (default с PR #21) обрезает всё до последнего `← <channel>: …` preview — видно только то, что агент делает после последнего сообщения вождя

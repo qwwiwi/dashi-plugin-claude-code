@@ -18,7 +18,7 @@
 
 import type { AppConfig } from '../config.js'
 import type { Logger } from '../log.js'
-import type { ChatAction, EditOpts, TelegramApi } from '../channel/tools.js'
+import type { ChatAction, EditOpts, SendMessageOpts, TelegramApi } from '../channel/tools.js'
 import {
   shouldStreamForChat,
   type MultichatPolicy,
@@ -511,7 +511,8 @@ export class StatusManager {
             chatId,
             prev.handle.messageId,
             supersededText,
-            { parse_mode: 'HTML' },
+            // background: the flood gate must cover lifecycle edits too.
+            { parse_mode: 'HTML', background: true },
           )
         } catch (err) {
           const cls = classifyEditError(err)
@@ -533,9 +534,10 @@ export class StatusManager {
     const text = renderState(initialState, 0, this.now())
     let messageId = 0
     if (!suppressBubble) {
-      const sendOpts: { parse_mode: 'HTML'; reply_to_message_id?: number } = {
-        parse_mode: 'HTML',
-      }
+      // background: the status bubble is non-essential — skipped while the
+      // flood gate is closed (start() then rethrows; callers treat status
+      // as best-effort).
+      const sendOpts: SendMessageOpts = { parse_mode: 'HTML', background: true }
       if (replyToMessageId !== undefined) sendOpts.reply_to_message_id = replyToMessageId
 
       let sent: { message_id: number }
@@ -717,7 +719,7 @@ export class StatusManager {
   // exactly once per chat per concurrent burst.
   private async createBubble(entry: InternalEntry, state: StatusState): Promise<void> {
     const text = renderState(state, 0, this.now())
-    const sendOpts: { parse_mode?: 'HTML'; reply_to_message_id?: number } = {}
+    const sendOpts: SendMessageOpts = { background: true }
     // Skip parse_mode when we've previously had a parse downgrade so
     // the broken HTML can't trip Telegram a second time.
     if (!entry.parseDowngraded) sendOpts.parse_mode = 'HTML'
@@ -728,7 +730,7 @@ export class StatusManager {
       const sent = await this.telegramApi.sendMessage(
         entry.handle.chatId,
         text,
-        sendOpts as { parse_mode: 'HTML'; reply_to_message_id?: number },
+        sendOpts,
       )
       entry.handle.messageId = sent.message_id
       entry.lastText = text
@@ -764,7 +766,7 @@ export class StatusManager {
         // bottom of the chat unconnected to the originating message.
         // We drop only `parse_mode`, keeping every other option
         // (including reply_to_message_id) intact.
-        const retryOpts: { reply_to_message_id?: number } = {}
+        const retryOpts: SendMessageOpts = { background: true }
         if (entry.replyToMessageId !== undefined) {
           retryOpts.reply_to_message_id = entry.replyToMessageId
         }
@@ -772,7 +774,7 @@ export class StatusManager {
           const sent = await this.telegramApi.sendMessage(
             entry.handle.chatId,
             text,
-            retryOpts as { parse_mode: 'HTML'; reply_to_message_id?: number },
+            retryOpts,
           )
           entry.handle.messageId = sent.message_id
           entry.lastText = text
@@ -1098,7 +1100,8 @@ export class StatusManager {
           chatId,
           messageId,
           text,
-          { parse_mode: 'HTML' },
+          // background: cancel / TTL edits stay behind the flood gate.
+          { parse_mode: 'HTML', background: true },
         )
       } catch (err) {
         const cls = classifyEditError(err)

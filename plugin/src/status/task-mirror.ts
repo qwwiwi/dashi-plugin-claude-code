@@ -54,7 +54,9 @@ const ICONS = {
 } as const
 
 // HTML used as parse_mode for both send and edit — same as ProgressReporter.
-const HTML_OPTS = { parse_mode: 'HTML' as const }
+// background: the task card is non-essential — the rate-limited layer's
+// flood gate skips it while a 429 is active instead of hitting the API.
+const HTML_OPTS = { parse_mode: 'HTML' as const, background: true }
 
 export interface TaskMirrorDeps {
   telegramApi: TelegramApiForProgress

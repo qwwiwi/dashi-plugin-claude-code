@@ -135,35 +135,110 @@ function makeMirror(
 const edits = (ops: Op[]): Op[] => ops.filter((o) => o.method === 'editMessageText')
 
 describe('normalizeForHash', () => {
-  test('masks elapsed timers, token counters, clocks, spinners', () => {
-    const a = '✻ Cogitating… (3m 38s · ↓ 214.9k tokens · esc to interrupt)\nagent-1  1d 0h 17m  14:05:33  42%'
-    const b = '✽ Pondering… (3m 43s · ↓ 215.2k tokens · esc to interrupt)\nagent-1  1d 0h 18m  14:05:38  43%'
+  test('masks counters inside Claude Code status rows only', () => {
+    const a = [
+      '✻ Cogitating… (3m 38s · ↓ 214.9k tokens · esc to interrupt)',
+      '  agent-1 · 3m 38s · ↓ 214.9k tokens',
+      '  agent-2   1d 0h 17m',
+    ].join('\n')
+    const b = [
+      '✽ Pondering… (3m 43s · ↓ 215.2k tokens · esc to interrupt)',
+      '  agent-1 · 3m 43s · ↓ 215.2k tokens',
+      '  agent-2   1d 0h 18m',
+    ].join('\n')
     expect(normalizeForHash(a)).toBe(normalizeForHash(b))
   })
 
-  test('a substantive change still differs', () => {
-    const a = '● Bash(git status)\n  3m 38s · ↓ 214.9k tokens'
-    const b = '● Bash(bun test)\n  3m 43s · ↓ 215.2k tokens'
+  test('numbers with units outside status rows are kept verbatim', () => {
+    for (const [a, b] of [
+      ['Timeout: 20s', 'Timeout: 30s'],
+      ['retry in 5m', 'retry in 10m'],
+      ['built at 14:05', 'built at 14:07'],
+      ['coverage 81%', 'coverage 84%'],
+      ['Read 120 tokens of input', 'Read 900 tokens of input'],
+    ] as const) {
+      expect(normalizeForHash(a)).not.toBe(normalizeForHash(b))
+    }
+  })
+
+  test('a substantive change next to a status row still differs', () => {
+    const a = '● Bash(git status)\n  agent-1 · 3m 38s · ↓ 214.9k tokens'
+    const b = '● Bash(bun test)\n  agent-1 · 3m 43s · ↓ 215.2k tokens'
     expect(normalizeForHash(a)).not.toBe(normalizeForHash(b))
   })
 })
 
 describe('TmuxMirror — flood control', () => {
-  test('a counter-only pane change produces no edit', async () => {
+  test('a counter-only pane change produces no edit (until the 5-min refresh)', async () => {
     const stub = makeStubApi()
     const clock = { t: 1_000_000 }
-    const live = livePane('● Bash(bun test)\n  agent-1 · 3m 38s · ↓ 214.9k tokens · 1d 0h 17m')
+    const pane = (i: number): string =>
+      `● Bash(bun test)\n  agent-1 · 3m ${38 + i}s · ↓ ${214 + i}.9k tokens\n  agent-2   1d 0h ${17 + i}m`
+    const live = livePane(pane(0))
     const mirror = makeMirror(stub.api, live.exec, clock)
     await mirror.start()
     expect(stub.ops.filter((o) => o.method === 'sendMessage').length).toBe(1)
 
-    // Counters tick every poll for 5 minutes — well past every budget window.
-    for (let i = 1; i <= 60; i += 1) {
+    // Counters tick every 5s poll for 4m55s — well past every budget window.
+    let i = 0
+    while (i < 59) {
+      i += 1
       clock.t += 5_000
-      live.pane.text = `● Bash(bun test)\n  agent-1 · 3m ${38 + i}s · ↓ ${214 + i}.9k tokens · 1d 0h ${17 + i}m`
+      live.pane.text = pane(i)
       await mirror.onPoll()
     }
     expect(edits(stub.ops).length).toBe(0)
+
+    // Safety net: at 5 min the stale counters get ONE refresh, then quiet again.
+    i += 1
+    clock.t += 5_000
+    live.pane.text = pane(i)
+    await mirror.onPoll()
+    expect(edits(stub.ops).length).toBe(1)
+    expect(edits(stub.ops)[0]?.text).toContain(`1d 0h ${17 + i}m`)
+    for (let k = 0; k < 12; k += 1) {
+      i += 1
+      clock.t += 5_000
+      live.pane.text = pane(i)
+      await mirror.onPoll()
+    }
+    expect(edits(stub.ops).length).toBe(1)
+    await mirror.stop()
+  })
+
+  test('a real change like "Timeout: 20s" → "Timeout: 30s" produces an edit', async () => {
+    const stub = makeStubApi()
+    const clock = { t: 1_000_000 }
+    const live = livePane('● Bash(curl api)\n  Timeout: 20s')
+    const mirror = makeMirror(stub.api, live.exec, clock)
+    await mirror.start()
+    clock.t += 20_000
+    live.pane.text = '● Bash(curl api)\n  Timeout: 30s'
+    await mirror.onPoll()
+    expect(edits(stub.ops).length).toBe(1)
+    expect(edits(stub.ops)[0]?.text).toContain('Timeout: 30s')
+    await mirror.stop()
+  })
+
+  test('min_edit_interval_ms above 60s is honoured (not pruned with the 60s window)', async () => {
+    const stub = makeStubApi()
+    const clock = { t: 1_000_000 }
+    const live = livePane('v0')
+    const mirror = makeMirror(stub.api, live.exec, clock, { minEditIntervalMs: 120_000 })
+    await mirror.start()
+    const editTimes: number[] = []
+    for (let i = 1; i <= 60; i += 1) {
+      clock.t += 5_000
+      live.pane.text = `v${'z'.repeat(i)}`
+      const before = edits(stub.ops).length
+      await mirror.onPoll()
+      if (edits(stub.ops).length > before) editTimes.push(clock.t)
+    }
+    // 5 minutes of changes → edits at 5s, 125s, 245s.
+    expect(editTimes.length).toBe(3)
+    for (let k = 1; k < editTimes.length; k += 1) {
+      expect(editTimes[k]! - editTimes[k - 1]!).toBeGreaterThanOrEqual(120_000)
+    }
     await mirror.stop()
   })
 

@@ -562,8 +562,10 @@ const hudApi: HudTelegramApi = {
   // silence window, or a pin self-heal would silently starve the heartbeat.
   sendMessage: (chatId, text, opts) =>
     telegramApi.sendMessage(chatId, text, { ...opts, skipOutboundStamp: true }),
+  // background: HUD re-renders are non-essential — the flood gate skips
+  // them while a 429 is active instead of hitting the API.
   editMessageText: (chatId, messageId, text, opts) =>
-    telegramApi.editMessageText(chatId, messageId, text, opts),
+    telegramApi.editMessageText(chatId, messageId, text, { ...opts, background: true }),
   pinChatMessage: (chatId, messageId, opts) =>
     bot.api.pinChatMessage(chatId, messageId, opts).then(() => undefined),
   // bump() legs (status pin): delete goes through the safe wrapper (rate

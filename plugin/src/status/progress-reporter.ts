@@ -91,9 +91,8 @@ interface ChatProgressEntry {
 
 // HTML used as parse_mode for both send and edit so renderActivityBlock's
 // inline tags (<b>, <code>, <pre>) are rendered.
-const HTML_OPTS = { parse_mode: 'HTML' as const }
-// Progress-card edits are non-essential: the rate-limited layer's flood gate
-// skips them while a 429 is active instead of hitting the API.
+// Progress-card sends/edits are non-essential: the rate-limited layer's
+// flood gate skips them while a 429 is active instead of hitting the API.
 const EDIT_OPTS = { parse_mode: 'HTML' as const, background: true }
 
 // Tools that should never appear in the rolling activity card. Reads, greps,
@@ -373,7 +372,7 @@ export class ProgressReporter {
   private async executeFlush(entry: ChatProgressEntry, text: string): Promise<void> {
     if (entry.messageId === undefined) {
       try {
-        const sent = await this.telegramApi.sendMessage(entry.chatId, text, HTML_OPTS)
+        const sent = await this.telegramApi.sendMessage(entry.chatId, text, EDIT_OPTS)
         if (!entry.stopped) {
           entry.messageId = sent.message_id
           entry.lastRenderedText = text
