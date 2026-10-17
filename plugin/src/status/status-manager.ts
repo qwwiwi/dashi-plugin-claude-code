@@ -18,7 +18,7 @@
 
 import type { AppConfig } from '../config.js'
 import type { Logger } from '../log.js'
-import type { ChatAction, TelegramApi } from '../channel/tools.js'
+import type { ChatAction, EditOpts, TelegramApi } from '../channel/tools.js'
 import {
   shouldStreamForChat,
   type MultichatPolicy,
@@ -1137,14 +1137,16 @@ export class StatusManager {
       return
     }
     const parseMode: 'HTML' | undefined = entry.parseDowngraded ? undefined : 'HTML'
-    const opts: { parse_mode?: 'HTML' } = {}
+    // Tick edits are non-essential: `background` lets the rate-limited
+    // layer's flood gate skip them while a 429 is active (no API hit).
+    const opts: EditOpts = { background: true }
     if (parseMode !== undefined) opts.parse_mode = parseMode
     try {
       await this.telegramApi.editMessageText(
         entry.handle.chatId,
         entry.handle.messageId,
         text,
-        opts as { parse_mode: 'HTML' },
+        opts,
       )
       entry.lastText = text
       return
@@ -1215,7 +1217,7 @@ export class StatusManager {
                 entry.handle.chatId,
                 entry.handle.messageId,
                 text,
-                {} as { parse_mode: 'HTML' },
+                { background: true },
               )
               entry.lastText = text
               return
@@ -1305,6 +1307,12 @@ export class StatusManager {
           code: cls.code,
         })
         return
+      }
+      if (cls.kind === 'flood') {
+        // Park pulses AND edits for retry_after (the flood gate's local
+        // skip carries the remaining gate time) — same pause as edits.
+        const pauseSec = cls.retryAfterSec ?? 5
+        entry.pausedUntil = Math.max(entry.pausedUntil, this.now() + pauseSec * 1000)
       }
       this.log.debug('sendChatAction failed (ignored)', {
         chat_id: entry.handle.chatId,

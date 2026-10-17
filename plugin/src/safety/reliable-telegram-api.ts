@@ -32,7 +32,9 @@
 // by the time one escapes to this layer ~3 minutes of backoff are already
 // burned, and looping the whole inner stack again would amplify the stall to
 // ~10 minutes of head-of-line blocking. Escaped 429 → immediate dead-letter +
-// rethrow.
+// rethrow — EXCEPT for `background` calls (mirror / status / progress edits):
+// their 429s (real or the flood gate's local skip) are an expected pause
+// signal, not lost user content, so they rethrow WITHOUT a dead-letter record.
 //
 // On a transient failure we don't retry, or on pre_send exhaustion → write a
 // dead-letter record (chat_id, method, payload hash, error) under the
@@ -347,6 +349,7 @@ export function createReliableTelegramApi(
     idempotent: boolean,
     op: () => Promise<T>,
     describe: () => { method: string; chatId: string; body: string },
+    background = false,
   ): Promise<T> {
     let attempt = 0
     for (;;) {
@@ -358,6 +361,11 @@ export function createReliableTelegramApi(
         if (cls.kind === 'permanent') {
           // Bad body / genuine error — the caller recovers (reply-tool plain
           // retry) or surfaces it. No retry, no dead-letter.
+          throw err
+        }
+        if (background && cls.kind === 'rate_limited') {
+          // Expected pause signal for a non-essential surface — the caller
+          // parks itself for retry_after. Not lost content: no dead-letter.
           throw err
         }
         const retryable =
@@ -389,6 +397,7 @@ export function createReliableTelegramApi(
         false,
         () => raw.sendMessage(chatId, text, rest),
         () => ({ method: 'sendMessage', chatId, body: text }),
+        rest.background === true,
       )
       if (skipOutboundStamp !== true) stampOutbound(chatId)
       return res
@@ -429,6 +438,7 @@ export function createReliableTelegramApi(
           true,
           () => raw.editMessageText(chatId, messageId, text, editOpts),
           () => ({ method: 'editMessageText', chatId, body: text }),
+          editOpts.background === true,
         )
       } catch (err) {
         if (isNotModifiedError(err)) return

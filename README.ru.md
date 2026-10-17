@@ -317,6 +317,8 @@ Default-**OFF**, opt-in через config (в multichat — через флаг 
     "line_count": 50,
     "mode": "latest_inbound_only",
     "max_lines": 14,
+    "min_edit_interval_ms": 20000,
+    "max_edits_per_min": 3,
     "hide_segments": ["boot_banner", "inbound_warning", "footer_hints", "input_box"]
   }
 }
@@ -327,7 +329,8 @@ Default-**OFF**, opt-in через config (в multichat — через флаг 
 - Polls `tmux capture-pane -p -t <pane_target> -S -<line_count>` каждые `poll_interval_ms`.
 - ANSI/CSI/OSC/DCS sequences стрипаются, control-chars (кроме `\n`, `\t`) удаляются.
 - Текст проходит `redactSecrets` (раздел 10) → HTML-escape → оборачивается в `<pre>`.
-- Hash-based dedup: одинаковый poll → нет API-вызова.
+- Hash-based dedup: одинаковый poll → нет API-вызова. Хеш считается по нормализованному тексту: таймеры (`3m 38s`, `1d 0h 17m`), счётчики токенов (`↓ 214.9k tokens`), часы, проценты и спиннеры маскируются – смена одних счётчиков правку не вызывает.
+- Защита от флуда: не чаще одной правки в `min_edit_interval_ms` (default 20000) и не больше `max_edits_per_min` (default 3); изменение внутри окна уходит первым poll после него. 429 ставит зеркало на паузу на реальный `retry_after` (без потолка), а пока действует любой 429, общий flood gate бота пропускает правки зеркала/статуса/прогресса без вызова API.
 - `mode: latest_inbound_only` (default с PR #21) обрезает всё до последнего `← <channel>:` preview — видно только что агент делает после последнего сообщения вождя.
 - `max_lines` cap (default 14, диапазон 4..100, 0=off) — верх обрезается маркером `… +N lines`.
 - Edit «message to edit not found» → re-send; прочие 4xx **не** триггерят resend (защита от storm).

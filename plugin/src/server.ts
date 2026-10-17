@@ -645,6 +645,8 @@ if (config.tmux_mirror.enabled) {
       hideSegments: config.tmux_mirror.hide_segments,
       mode: config.tmux_mirror.mode,
       maxLines: config.tmux_mirror.max_lines,
+      minEditIntervalMs: config.tmux_mirror.min_edit_interval_ms,
+      maxEditsPerMinute: config.tmux_mirror.max_edits_per_min,
       redact: (text) => redactSecrets(text, apiSecrets),
       policy: multichatPolicy ?? null,
     })

@@ -19,6 +19,7 @@ import type {
 import type { Logger } from '../../src/log.js'
 import {
   createRateLimitedTelegramApi,
+  isFloodGateError,
   type RateLimitOptions,
 } from '../../src/safety/rate-limited-telegram-api.js'
 
@@ -399,17 +400,16 @@ describe('createRateLimitedTelegramApi — 429 retry-after', () => {
 })
 
 describe('createRateLimitedTelegramApi — retry_after clamp & edge values', () => {
-  test('retry_after over 60s is clamped to 60s', async () => {
+  test('retry_after over 60s is not slept on: the 429 surfaces at once', async () => {
     const clock = new FakeClock()
     const stub = makeStubApi(clock)
     const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
     stub.queueError('sendMessage', make429Error(300))
-    const p = api.sendMessage('100', 'hi', {})
-    await flushMicrotasks()
-    // Even though Telegram said 300s, we should retry after 60s.
-    await clock.tick(60_000)
-    await p
-    expect(stub.calls.length).toBe(1)
+    // Sleeping 60s into a 300s (or 7h) ban only queues doomed retries —
+    // the caller sees the 429 immediately, no virtual time passes.
+    await expect(api.sendMessage('100', 'hi', {})).rejects.toMatchObject({ error_code: 429 })
+    expect(stub.calls.length).toBe(0)
+    expect(clock.now()).toBe(0)
   })
 
   test('retry_after = 0 is treated as 1s fallback', async () => {
@@ -501,5 +501,84 @@ describe('createRateLimitedTelegramApi — pass-through methods', () => {
     await clock.tick(1000)
     await p
     expect(stub.calls.length).toBe(3)
+  })
+})
+
+describe('createRateLimitedTelegramApi — bot-wide flood gate', () => {
+  const BAN_S = 7 * 3600
+
+  test('background edit 429: one attempt, no retry sleep, real retry_after surfaces', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    stub.queueError('editMessageText', make429Error(BAN_S))
+    await expect(
+      api.editMessageText('100', 1, 'x', { background: true }),
+    ).rejects.toMatchObject({ error_code: 429, parameters: { retry_after: BAN_S } })
+    // No virtual time consumed → no sleep-and-retry happened.
+    expect(clock.now()).toBe(0)
+  })
+
+  test('while the gate is closed, background calls are skipped without touching the API', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    stub.queueError('editMessageText', make429Error(BAN_S))
+    await expect(api.editMessageText('100', 1, 'x', { background: true })).rejects.toBeDefined()
+
+    // 1h later — still inside the real (uncapped) 7h window.
+    await clock.tick(3600_000)
+    const err = await api
+      .editMessageText('100', 1, 'y', { background: true })
+      .catch((e: unknown) => e)
+    expect(isFloodGateError(err)).toBe(true)
+    expect((err as { parameters: { retry_after: number } }).parameters.retry_after).toBe(BAN_S - 3600)
+    await expect(api.sendChatAction('100', 'typing')).rejects.toMatchObject({ flood_gate: true })
+    await expect(
+      api.sendMessage('100', 'mirror', { background: true }),
+    ).rejects.toMatchObject({ flood_gate: true })
+    expect(stub.calls.length).toBe(0)
+
+    // Gate opens at retry_after → background traffic flows again.
+    await clock.tick((BAN_S - 3600) * 1000)
+    await api.editMessageText('100', 1, 'z', { background: true })
+    expect(stub.calls.map((c) => c.method)).toEqual(['editMessageText'])
+  })
+
+  test('user-facing sends still go out while the gate is closed, with a single attempt', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    let attempts = 0
+    const counting: TelegramApi = {
+      ...stub.api,
+      async sendMessage(chatId, text, opts) {
+        attempts += 1
+        return stub.api.sendMessage(chatId, text, opts)
+      },
+    }
+    const api = createRateLimitedTelegramApi(counting, stubLog, defaultOpts(clock))
+    stub.queueError('editMessageText', make429Error(BAN_S))
+    await expect(api.editMessageText('100', 1, 'x', { background: true })).rejects.toBeDefined()
+
+    // A reply is attempted (not skipped) …
+    await api.sendMessage('100', 'reply', {})
+    expect(attempts).toBe(1)
+    // … but a 429 on it is not retried while the gate is closed.
+    stub.queueError('sendMessage', make429Error(5))
+    await expect(api.sendMessage('100', 'reply 2', {})).rejects.toMatchObject({ error_code: 429 })
+    expect(attempts).toBe(2)
+    expect(clock.now()).toBe(0)
+  })
+
+  test('a 429 on a user-facing call also closes the gate for background calls', async () => {
+    const clock = new FakeClock()
+    const stub = makeStubApi(clock)
+    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+    stub.queueError('sendMessage', make429Error(BAN_S))
+    await expect(api.sendMessage('100', 'hi', {})).rejects.toMatchObject({ error_code: 429 })
+    await expect(
+      api.editMessageText('100', 1, 'x', { background: true }),
+    ).rejects.toMatchObject({ flood_gate: true })
+    expect(stub.calls.length).toBe(0)
   })
 })

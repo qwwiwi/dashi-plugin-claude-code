@@ -17,6 +17,6 @@ export interface TelegramApiForProgress {
     chatId: string,
     messageId: number,
     text: string,
-    opts: { parse_mode?: 'HTML' | 'MarkdownV2' },
+    opts: { parse_mode?: 'HTML' | 'MarkdownV2'; background?: boolean },
   ): Promise<void>
 }

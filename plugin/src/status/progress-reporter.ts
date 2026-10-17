@@ -92,6 +92,9 @@ interface ChatProgressEntry {
 // HTML used as parse_mode for both send and edit so renderActivityBlock's
 // inline tags (<b>, <code>, <pre>) are rendered.
 const HTML_OPTS = { parse_mode: 'HTML' as const }
+// Progress-card edits are non-essential: the rate-limited layer's flood gate
+// skips them while a 429 is active instead of hitting the API.
+const EDIT_OPTS = { parse_mode: 'HTML' as const, background: true }
 
 // Tools that should never appear in the rolling activity card. Reads, greps,
 // globs, and deferred-tool lookups are bookkeeping; the dashi-channel MCP
@@ -395,7 +398,7 @@ export class ProgressReporter {
     }
 
     try {
-      await this.telegramApi.editMessageText(entry.chatId, entry.messageId, text, HTML_OPTS)
+      await this.telegramApi.editMessageText(entry.chatId, entry.messageId, text, EDIT_OPTS)
       if (!entry.stopped) {
         entry.lastRenderedText = text
         entry.lastEditAtMs = this.now()
@@ -460,7 +463,7 @@ export class ProgressReporter {
       const text = this.renderFinal(entry)
       if (text && text !== entry.lastRenderedText) {
         try {
-          await this.telegramApi.editMessageText(entry.chatId, entry.messageId, text, HTML_OPTS)
+          await this.telegramApi.editMessageText(entry.chatId, entry.messageId, text, EDIT_OPTS)
           entry.lastRenderedText = text
         } catch (err) {
           this.log.warn('progress reporter final edit failed (ignored)', {
