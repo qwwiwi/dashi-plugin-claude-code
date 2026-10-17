@@ -99,18 +99,20 @@ export const PermissionPolicySchema = z
     scopes: z.record(z.string(), PolicyScopeSchema).optional(),
     // Operator downgrade of SPECIFIC built-in confirm rules (owner autonomy
     // policy 2026-06-09: cards only for what cannot be automated, e.g. sudo).
-    // Entries must name exact BUILTIN_CONFIRM_BASH rules — a typo fails
-    // validation loudly instead of silently disabling nothing.
+    // Entries must name exact BUILTIN_CONFIRM_BASH rules or one of the named
+    // OPT_IN_CONFIRM_DETECTORS — a typo fails validation loudly instead of
+    // silently disabling nothing.
     confirm_overrides: z
       .object({
         builtin_rules: z
           .array(z.string())
           .superRefine((rules, ctx) => {
+            const known = overridableConfirmRuleNames()
             for (const r of rules) {
-              if (!BUILTIN_CONFIRM_BASH.includes(r)) {
+              if (!known.includes(r)) {
                 ctx.addIssue({
                   code: z.ZodIssueCode.custom,
-                  message: `unknown built-in confirm rule: ${JSON.stringify(r)} (must be one of: ${BUILTIN_CONFIRM_BASH.join(', ')})`,
+                  message: `unknown built-in confirm rule: ${JSON.stringify(r)} (must be one of: ${known.join(', ')})`,
                 })
               }
             }
@@ -139,10 +141,15 @@ export interface PermissionPolicy {
   readonly scopes?: Readonly<Record<string, PolicyScope>>
   /**
    * Built-in confirm rules the operator explicitly downgrades to the normal
-   * policy flow (confirm -> allow -> default). Deny tiers and the
-   * pipe-to-interpreter evasion confirm are NEVER overridable. A compound
-   * command matching an overridden AND a non-overridden built-in rule still
-   * confirms.
+   * policy flow (confirm -> allow -> default). Deny tiers (built-in hard-deny,
+   * own-channel systemctl, operator deny) are NEVER overridable. The
+   * pipe-to-interpreter evasion detector (`pipe-interpreter`) and the git
+   * config/hook execution-surface detector (`git-exec-surface`) are
+   * overridable only by explicit operator opt-in (owner decision 2026-10-17),
+   * and then only for allowlisted simple shapes (gitLiftAllowed /
+   * pipeLiftAllowed — anything else still confirms); not listed, they confirm
+   * exactly as before. A compound command matching an
+   * overridden AND a non-overridden built-in rule still confirms.
    */
   readonly confirm_overrides?: { readonly builtin_rules?: readonly string[] }
 }
@@ -222,6 +229,27 @@ const BUILTIN_CONFIRM_BASH: readonly string[] = [
   'apt install',
   'apt-get install',
 ]
+
+// Named built-in confirm DETECTORS (not substring rules) that an operator may
+// downgrade via `confirm_overrides.builtin_rules` — overridable only by
+// explicit operator opt-in (owner decision 2026-10-17: the owner's agent runs
+// autonomously, no approval cards). Not listed → they confirm exactly as
+// before. When listed, a detector is lifted ONLY for an allowlisted simple
+// shape; anything else still confirms:
+//   * `pipe-interpreter` — `curl|wget <one URL> | sh|bash|python3`
+//     (pipeLiftAllowed).
+//   * `git-exec-surface` — one bare `git` segment with `-c` keys from an
+//     allowlist (user.*, color.*, advice.*, …) and an allowlisted subcommand,
+//     push only without force / delete (gitLiftAllowed).
+// Hard-deny (catastrophic shell, secret reads, own-channel systemctl, force
+// push) and the operator deny list run BEFORE this layer and are never
+// affected.
+const OPT_IN_CONFIRM_DETECTORS = ['pipe-interpreter', 'git-exec-surface'] as const
+
+/** Every name `confirm_overrides.builtin_rules` accepts. */
+function overridableConfirmRuleNames(): readonly string[] {
+  return [...BUILTIN_CONFIRM_BASH, ...OPT_IN_CONFIRM_DETECTORS]
+}
 
 // ── Catastrophic Bash detection (Codex Critical #4, 2026-06-09) ─────────
 //
@@ -1008,7 +1036,8 @@ function gitExecSurface(rawCommand: string): boolean {
 // (read-only diagnostics) and even on `grep -rn "systemctl" src/` (the word
 // as a search pattern) — both raised real confirm cards. Only MUTATING
 // systemd operations need the owner's tap; reads and mere mentions must
-// flow. Like gitExecSurface this check is non-overridable: a mutating
+// flow. This check is non-overridable (unlike gitExecSurface, which since
+// 2026-10-17 can be lifted by explicit operator opt-in): a mutating
 // systemctl (service stop/restart — including the agent's own comms
 // channel) always reaches the owner.
 //
@@ -1052,7 +1081,7 @@ function gitExecSurface(rawCommand: string): boolean {
 // MIGRATION (2026-06-10): the literal 'systemctl' entry left
 // BUILTIN_CONFIRM_BASH, so a confirm_overrides list naming it now fails
 // schema validation — delete that override; the verb-aware rule is
-// non-overridable by design (like gitExecSurface).
+// non-overridable by design.
 const SYSTEMCTL_READONLY_VERBS = new Set([
   'status', 'cat', 'show', 'help',
   'is-active', 'is-enabled', 'is-failed', 'is-system-running',
@@ -1922,6 +1951,516 @@ function bashConfirmEvasion(rawCommand: string): boolean {
   return bashEvasion(rawCommand, 0)
 }
 
+// ── git force-push: NON-overridable built-in DENY (owner hard rule) ──────
+//
+// The owner's hard rule is «never force-push». Until 2026-10-17 it lived only
+// in operator deny patterns (`git push --force`, `git push -f`) — plain
+// substrings that `git -C . push -f`, `git push origin +main`,
+// `git -c x=y push --force-with-lease` or a force-push alias walked past
+// (reviewers of PR #145). This detector runs in the hard-deny pass, so no
+// override and no operator allow can relax it. It is FAIL-CLOSED: two
+// independent checks are OR'ed.
+//   (1) LINEAR TEXT CHECK (forcePushText), on the raw and on the flattened
+//       (quotes dropped, ANSI-C decoded) command: a `git` / `git-push` /
+//       `send-pack` word AND a `push` / `send-pack` word AND a force marker
+//       (`--force…`, `--mirror`, a short flag cluster containing `f`, a
+//       `+`-prefixed refspec) ANYWHERE in the text. No parsing to get wrong;
+//       the price is accepted false positives (`git push && rm -f x`,
+//       `grep "git push -f" docs/` are denied — split such commands).
+//   (2) ARGV PARSER, per quote-aware segment: leading assignments,
+//       redirections and wrappers (sudo, env -C/-S, time -p, xargs -I {},
+//       timeout, nice, flock, parallel, find -exec, …) are skipped to the
+//       command word; git global options (`-C`, `-c`, `--git-dir`,
+//       `--work-tree`, …) are skipped to the subcommand; the git-core
+//       `git-push` form and `send-pack` are recognized; abbreviated force
+//       options (`--force-w`) are resolved; `-c remote.<r>.push=+…` /
+//       `remote.<r>.mirror=true` and alias / GIT_CONFIG_* / remote.*.push
+//       definitions of a forced push are denied when they appear in a git
+//       invocation (a bare `echo remote.origin.mirror=true` is data and is
+//       NOT denied); quoted shell bodies (`bash -c '…'`, `ssh h '…'`,
+//       `eval "…"`, `env -S '…'`) are re-parsed recursively.
+// Accepted residuals: a force-push alias defined BEFORE the session (e.g. in
+// ~/.gitconfig) is invisible at its call site — the classifier is pure and
+// never shells out to read git config; git reached through a variable
+// command word whose `push` token is itself variable.
+
+const FORCE_PUSH_LONG = ['force', 'force-with-lease', 'force-if-includes', 'mirror']
+
+// Per-wrapper option flags that consume a SEPARATE value token. Flags not
+// listed are skipped as standalone (`time -p`, `nohup`, `env -i`).
+const WRAPPER_VALUE_FLAGS: Readonly<Record<string, readonly string[]>> = {
+  sudo: ['-u', '-g', '-C', '-h', '-p', '-r', '-t', '-U', '-D', '--user', '--group', '--chdir'],
+  doas: ['-u', '-C'],
+  env: ['-C', '-u', '-S', '--chdir', '--unset', '--split-string'],
+  time: ['-f', '-o', '--format', '--output'],
+  xargs: ['-I', '-L', '-n', '-P', '-d', '-E', '-s', '-a', '--max-lines', '--max-args', '--max-procs', '--delimiter', '--eof', '--max-chars', '--arg-file'],
+  timeout: ['-s', '-k', '--signal', '--kill-after'],
+  nice: ['-n', '--adjustment'],
+  ionice: ['-c', '-n', '-p', '-P', '-u'],
+  stdbuf: ['-i', '-o', '-e'],
+  watch: ['-n', '-d', '--interval'],
+  flock: ['-w', '-E', '--timeout', '--conflict-exit-code'],
+  parallel: ['-j', '-S', '--jobs'],
+  exec: ['-a'],
+  nohup: [],
+  command: [],
+  builtin: [],
+  setsid: [],
+}
+// Wrappers that take ONE positional before the command (duration, lock file).
+const WRAPPER_POSITIONAL = new Set(['timeout', 'flock'])
+const CONTROL_WORDS = new Set(['if', 'then', 'else', 'elif', 'while', 'until', 'do', '!', '{'])
+const FIND_EXEC_FLAGS = new Set(['-exec', '-execdir', '-ok', '-okdir'])
+const REDIRECTION_RE = /^[0-9]*(?:<<<|<<|<>|<|>>|>\||>|&>>|&>|<&|>&)(.*)$/s
+// Value flags whose argument is itself shell code (`env -S '…'`, `sh -c '…'`).
+const CODE_STRING_FLAG_RE = /^(?:-[A-Za-z]*c|-S|--split-string)$/
+
+// Command words whose quoted arguments are themselves shell code.
+const CODE_RUNNER_HEADS = new Set(['eval', 'ssh', 'su', 'runuser', 'xargs', 'watch', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'parallel', 'flock'])
+const FORCE_MARKER_RE = /(?:^|[\s=!])(?:-[a-z]{0,16}f[a-z]{0,16}|--force[\w-]{0,32}|--mirror)(?=$|[\s;|&])/i
+const PLUS_REFSPEC_RE = /(?:^|[\s=])\+[\w*/:.@^~-]/
+
+/** A long option name (lowercased, without `--`, before `=`) that git push
+ *  resolves to a force mode. `--no-force…` is the negation (benign). */
+function isForceLongName(name: string): boolean {
+  if (name.startsWith('no-')) return false
+  if (name.startsWith('force')) return true
+  if (name.length < 2) return false
+  return FORCE_PUSH_LONG.some((t) => t.startsWith(name))
+}
+
+/** Does a `git push` argv (tokens AFTER the subcommand) request a force? */
+function pushArgsForce(args: readonly string[]): boolean {
+  for (const a of args) {
+    if (a.startsWith('--')) {
+      if (a === '--') continue
+      if (isForceLongName((a.slice(2).split('=')[0] as string).toLowerCase())) return true
+      continue
+    }
+    const cluster = /^-([A-Za-z]+)/.exec(a)
+    if (cluster) {
+      if ((cluster[1] as string).includes('f')) return true
+      continue
+    }
+    if (a.startsWith('+')) return true // `+src:dst` forced refspec
+  }
+  return false
+}
+
+/** Does a `git push` argv delete a remote ref (`--delete`, `-d`, `:dst`)? */
+function pushArgsDelete(args: readonly string[]): boolean {
+  for (const a of args) {
+    if (a.startsWith('--')) {
+      const name = (a.slice(2).split('=')[0] as string).toLowerCase()
+      if (name.length >= 3 && 'delete'.startsWith(name)) return true
+      if (name === 'prune') return true
+      continue
+    }
+    const cluster = /^-([A-Za-z]+)/.exec(a)
+    if (cluster) {
+      if ((cluster[1] as string).includes('d')) return true
+      continue
+    }
+    if (a.startsWith(':')) return true
+  }
+  return false
+}
+
+/** Index of the command word in a dequoted token list: skips `VAR=val`
+ *  assignments, redirections (`2>/dev/null`, `> f`), control words, wrapper
+ *  words with their flags / flag values / positional (duration, lock file),
+ *  `find … -exec`, and leading `(`/`{` grouping chars. */
+function commandWordAt(toks: readonly string[]): { word: string; idx: number } | null {
+  let k = 0
+  for (let guard = 0; guard < 32 && k < toks.length; guard += 1) {
+    const tok = (toks[k] as string).replace(/^[({]+/, '')
+    if (tok.length === 0) { k += 1; continue }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) { k += 1; continue }
+    const redir = REDIRECTION_RE.exec(tok)
+    if (redir) { k += (redir[1] as string).length === 0 ? 2 : 1; continue }
+    const base = (tok.split('/').pop() ?? tok).toLowerCase()
+    if (CONTROL_WORDS.has(base)) { k += 1; continue }
+    if (base === 'find') {
+      let j = k + 1
+      while (j < toks.length && !FIND_EXEC_FLAGS.has(toks[j] as string)) j += 1
+      if (j >= toks.length) return { word: tok, idx: k }
+      k = j + 1
+      continue
+    }
+    const valueFlags = WRAPPER_VALUE_FLAGS[base]
+    if (valueFlags !== undefined) {
+      k += 1
+      while (k < toks.length) {
+        const t = toks[k] as string
+        if (t === '--') { k += 1; break }
+        if (t.startsWith('-') && t.length > 1) { k += valueFlags.includes(t) ? 2 : 1; continue }
+        if (base === 'env' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { k += 1; continue }
+        break
+      }
+      if (WRAPPER_POSITIONAL.has(base) && k < toks.length) k += 1
+      continue
+    }
+    return { word: tok, idx: k }
+  }
+  return null
+}
+
+/** A git invocation normalized from a dequoted token list: the subcommand,
+ *  the args after it, and the values of global `-c` options. */
+interface GitInvocation {
+  readonly sub: string
+  readonly args: readonly string[]
+  readonly configs: readonly string[]
+}
+
+function normalizeGitInvocation(toks: readonly string[]): GitInvocation | null {
+  const cw = commandWordAt(toks)
+  if (cw === null) return null
+  const base = cw.word.split('/').pop() ?? cw.word
+  // git-core dashed form: `/usr/lib/git-core/git-push …` == `git push …`.
+  const dashed = /^git-([a-z][a-z-]*)$/.exec(base)
+  if (dashed) return { sub: dashed[1] as string, args: toks.slice(cw.idx + 1), configs: [] }
+  // A variable command word (`$G push -f`, `"$GIT" push --force`) cannot be
+  // resolved — treat it as git when a later operand is literally `push`.
+  if (base.startsWith('$')) {
+    const pushAt = toks.indexOf('push', cw.idx + 1)
+    if (pushAt < 0) return null
+    return { sub: 'push', args: toks.slice(pushAt + 1), configs: [] }
+  }
+  if (!isGitToken(cw.word)) return null
+  const configs: string[] = []
+  let i = cw.idx + 1
+  while (i < toks.length) {
+    const tok = toks[i] as string
+    if (tok.length === 0) { i += 1; continue }
+    if (tok[0] !== '-') break
+    if (tok === '-c') { configs.push(toks[i + 1] ?? ''); i += 2; continue }
+    if (tok.startsWith('-c') && tok.length > 2) { configs.push(tok.slice(2)); i += 1; continue }
+    if (GIT_VALUE_GLOBAL_FLAGS.has(tok) || tok === '--config-env') { i += 2; continue }
+    i += 1
+  }
+  if (i >= toks.length) return null
+  return { sub: toks[i] as string, args: toks.slice(i + 1), configs }
+}
+
+function isPushSub(sub: string): boolean {
+  return sub === 'push' || sub === 'send-pack'
+}
+
+/** Alias / GIT_CONFIG_* / remote.*.push definitions that smuggle a force push
+ *  past the call site. Checked on the flattened (quotes dropped) segment,
+ *  ONLY when the segment is a git invocation. */
+function forcePushDefinition(flatSegmentLower: string): boolean {
+  if (/\balias\.|git_config_(?:value_[0-9]+|parameters)/.test(flatSegmentLower)) {
+    if (/\bpush\b/.test(flatSegmentLower) && (FORCE_MARKER_RE.test(flatSegmentLower) || PLUS_REFSPEC_RE.test(flatSegmentLower))) {
+      return true
+    }
+  }
+  if (/\bremote\.[^\s=]{0,64}\.push\b/.test(flatSegmentLower) && PLUS_REFSPEC_RE.test(flatSegmentLower)) return true
+  if (/\bremote\.[^\s=]{0,64}\.mirror(?:\s+|\s*=\s*)(?:true|yes|on|1)\b/.test(flatSegmentLower)) return true
+  return false
+}
+
+const FP_GIT_WORD_RE = /(?:^|[^a-z0-9_.-])(?:git|git-push|git-send-pack|send-pack)(?![a-z0-9_-])/i
+const FP_PUSH_WORD_RE = /(?:^|[^a-z0-9_-])(?:push|send-pack)(?![a-z0-9_-])|(?:^|[^a-z0-9_.-])git-push(?![a-z0-9_-])/i
+// Force markers. The short-cluster `f` is case-SENSITIVE (`-F` is a different
+// flag); quantifiers are bounded so the scan stays linear.
+const FP_FORCE_RE =
+  /(?:^|[\s'"=(])--(?:force|mirror)(?![a-z0-9_])|(?:^|[\s'"=(])--force-|(?:^|[\s'"(])-[A-Za-z]{0,16}f[A-Za-z]{0,16}(?=$|[\s'";|&)])|(?:^|[\s'"=(])\+[\w*/:.@^~{-]/
+
+/** Fail-closed text check: git word + push word + force marker anywhere. */
+function forcePushText(s: string): boolean {
+  return FP_GIT_WORD_RE.test(s) && FP_PUSH_WORD_RE.test(s) && FP_FORCE_RE.test(s)
+}
+
+function segmentForcePush(segment: string, depth: number): boolean {
+  const toks = tokenizeQuoteAware(segment)
+  if (toks === null) return forcePushText(segment) // unbalanced → text, fail-closed
+  const inv = normalizeGitInvocation(toks)
+  if (inv !== null) {
+    if (forcePushDefinition(flattenIndirection(segment).toLowerCase())) return true
+    if (isPushSub(inv.sub)) {
+      if (pushArgsForce(inv.args)) return true
+      if (inv.configs.some((c) => /^remote\..*\.(?:push\s*=\s*\+|mirror\s*=\s*(?:true|yes|on|1)\b)/i.test(c))) return true
+    }
+  }
+  // Re-parse quoted strings that hold shell code: the argument of a `-c`-style
+  // or `env -S` flag, or any argument of a code-running command word (`eval`,
+  // `ssh host '…'`, `xargs`, `flock`, …). A quoted string elsewhere is data.
+  const cw = commandWordAt(toks)
+  const head = cw === null ? '' : (cw.word.split('/').pop() ?? cw.word).toLowerCase()
+  const codeRunner = CODE_RUNNER_HEADS.has(head)
+  for (let i = 0; i < toks.length; i += 1) {
+    const t = toks[i] as string
+    if (!/[\s;|&]/.test(t)) continue
+    const afterCodeFlag = i > 0 && CODE_STRING_FLAG_RE.test(toks[i - 1] as string)
+    if (!codeRunner && !afterCodeFlag) continue
+    if (depth >= 3) {
+      if (forcePushText(t)) return true
+      continue
+    }
+    if (commandForcePush(t, depth + 1)) return true
+  }
+  return false
+}
+
+function commandForcePush(command: string, depth: number): boolean {
+  const joined = stripLineContinuations(command)
+  const segs = segmentBashQuoteAware(joined)
+  if (segs === null) return forcePushText(joined)
+  return segs.some((s) => segmentForcePush(s, depth))
+}
+
+/** Built-in force-push hard-deny: text check OR argv parser, each on the raw
+ *  and on the flattened view. */
+export function gitForcePush(rawCommand: string): boolean {
+  const joined = stripLineContinuations(rawCommand)
+  const flat = flattenIndirection(joined)
+  if (forcePushText(joined) || forcePushText(flat)) return true
+  if (commandForcePush(joined, 0)) return true
+  return flat !== joined && commandForcePush(flat, 0)
+}
+
+const PD_DELETE_RE = /(?:^|[\s'"=(])(?:--delete(?![a-z0-9_-])|--prune(?![a-z0-9_-])|-[A-Za-z]{0,16}d[A-Za-z]{0,16}(?=$|[\s'";|&)]))|(?:^|\s):[\w*/.@^~-]/
+
+/** Remote-ref deletion by push (`git push origin :main`, `--delete`, `-d`,
+ *  `--prune`). Confirmed even when the `git push` built-in is overridden —
+ *  text check OR parser, fail-closed like gitForcePush. */
+export function gitPushDelete(rawCommand: string): boolean {
+  const joined = stripLineContinuations(rawCommand)
+  const flat = flattenIndirection(joined)
+  for (const v of [joined, flat]) {
+    if (FP_GIT_WORD_RE.test(v) && FP_PUSH_WORD_RE.test(v) && PD_DELETE_RE.test(v)) return true
+    const segs = segmentBashQuoteAware(v)
+    if (segs === null) return true
+    for (const s of segs) {
+      const toks = tokenizeQuoteAware(s)
+      if (toks === null) return true
+      const inv = normalizeGitInvocation(toks)
+      if (inv !== null && isPushSub(inv.sub) && pushArgsDelete(inv.args)) return true
+    }
+  }
+  return false
+}
+
+// ── Opt-in detector lifts are ALLOWLIST-only (PR #145 review, 2026-10-17) ──
+//
+// Listing `git-exec-surface` / `pipe-interpreter` in
+// confirm_overrides.builtin_rules does NOT turn the detector off. It relaxes
+// the detector ONLY for commands that match an exact allowlisted shape;
+// anything else keeps confirming. (A denylist of "complex" forms was tried
+// first and kept leaking under review — the allowlist is the design.)
+
+/** Shared shape gate: no expansion of any kind (`$`, backtick, `$(`,
+ *  `${IFS}`), no backslash, no newline, no redirection, grouping or list
+ *  operator outside quotes, balanced quotes, and exactly `pipes` top-level
+ *  single `|` (never `||` / `|&`). */
+function liftShapeOk(raw: string, pipes: number): boolean {
+  if (/[$`\\\n\r]/.test(raw)) return false
+  let quote: "'" | '"' | null = null
+  let seenPipes = 0
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i] as string
+    if (quote !== null) {
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue }
+    if ('<>;&(){}'.includes(ch)) return false
+    if (ch === '|') {
+      if (raw[i + 1] === '|' || raw[i + 1] === '&') return false
+      seenPipes += 1
+    }
+  }
+  return quote === null && seenPipes === pipes
+}
+
+const GIT_LIFT_SUBCOMMANDS = new Set([
+  'status', 'log', 'diff', 'show', 'add', 'commit', 'fetch', 'pull', 'checkout', 'switch',
+  'branch', 'merge', 'stash', 'tag', 'rev-parse', 'remote', 'push',
+])
+const GIT_LIFT_CONFIG_KEYS = new Set([
+  'user.name', 'user.email', 'init.defaultbranch', 'core.quotepath', 'pull.rebase', 'push.autosetupremote',
+])
+
+/** `-c key=value` whose key is on the lift allowlist. A bare `-c key` (no
+ *  `=`, i.e. value true) is rejected; `commit.gpgsign` only as `=false`. */
+function liftConfigAllowed(kv: string | undefined): boolean {
+  if (kv === undefined) return false
+  const eq = kv.indexOf('=')
+  if (eq <= 0) return false
+  const key = kv.slice(0, eq).toLowerCase()
+  const val = kv.slice(eq + 1)
+  if (key === 'commit.gpgsign') return val.toLowerCase() === 'false'
+  if (GIT_LIFT_CONFIG_KEYS.has(key)) return true
+  return /^(?:color|advice)\.[a-z0-9.-]+$/.test(key)
+}
+
+/**
+ * True only for the allowlisted shape a `git-exec-surface` lift relaxes:
+ * ONE simple segment (liftShapeOk), first word literally `git` (no env
+ * prefix, no GIT_* assignment, no wrapper), global options limited to
+ * `-c <allowlisted key>=<value>`, an allowlisted subcommand (status, log,
+ * diff, show, add, commit, fetch, pull, checkout, switch, branch, merge,
+ * stash, tag without delete, rev-parse, remote -v / remote show, push
+ * without any force / delete / mirror / prune flag, `+` refspec or colon
+ * refspec), no transport-program flags anywhere (`--upload-pack`,
+ * `--receive-pack`, `--exec`, fetch-family `-u`).
+ */
+/** True when `raw` holds an unquoted glob metachar (`* ? [ ]`); `{` is
+ *  already refused by liftShapeOk. A glob lets the shell expand a harmless
+ *  looking pattern into a path the allowlist never saw. */
+function hasUnquotedGlob(raw: string): boolean {
+  let quote: "'" | '"' | null = null
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i] as string
+    if (quote !== null) {
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue }
+    if ('*?[]'.includes(ch)) return true
+  }
+  return false
+}
+
+/** Per-subcommand option allowlist for the git lift. `flags` take no value;
+ *  `valued` take the next token (or `--long=value`). Options are matched
+ *  EXACTLY, so git's long-option abbreviations (`--e`, `--de`, `--pru`)
+ *  never match and the lift does not apply. `dashdash` permits a bare `--`. */
+interface GitLiftOptions {
+  readonly flags: ReadonlySet<string>
+  readonly valued: ReadonlySet<string>
+  readonly dashdash: boolean
+}
+
+function liftOpts(flags: readonly string[], valued: readonly string[], dashdash: boolean): GitLiftOptions {
+  return { flags: new Set(flags), valued: new Set(valued), dashdash }
+}
+
+const LOG_FLAGS = ['--oneline', '--stat', '--graph', '--decorate', '--all', '-p', '--patch', '--name-only', '--name-status']
+const GIT_LIFT_OPTIONS: ReadonlyMap<string, GitLiftOptions> = new Map([
+  ['status', liftOpts(['-s', '-b', '-sb', '--short', '--branch', '--porcelain'], [], false)],
+  ['log', liftOpts(LOG_FLAGS, ['-n', '--max-count', '--format', '--pretty'], true)],
+  ['show', liftOpts([...LOG_FLAGS, '-s', '--no-patch'], ['--format', '--pretty'], true)],
+  ['diff', liftOpts(['--stat', '--cached', '--staged', '--name-only', '--name-status', '--shortstat', '--numstat'], [], true)],
+  ['add', liftOpts(['-A', '--all', '-u', '--update'], [], true)],
+  ['commit', liftOpts(['-a', '--all', '-q', '--quiet'], ['-m', '--message', '-am'], false)],
+  ['fetch', liftOpts(['--all', '--tags', '-q', '--quiet'], [], false)],
+  ['pull', liftOpts(['--rebase', '--no-rebase', '--ff-only', '-q', '--quiet'], [], false)],
+  ['checkout', liftOpts(['-b'], [], true)],
+  ['switch', liftOpts(['-c', '--create'], [], false)],
+  ['branch', liftOpts(['-a', '-r', '-v', '-vv', '--list', '--show-current'], [], false)],
+  ['merge', liftOpts(['--ff-only', '--no-ff', '--no-edit'], [], false)],
+  ['stash', liftOpts([], ['-m', '--message'], false)],
+  ['tag', liftOpts(['-l', '--list', '-a'], ['-m', '--message'], false)],
+  ['rev-parse', liftOpts(['--short', '--abbrev-ref', '--show-toplevel', '--git-dir', '--is-inside-work-tree'], [], false)],
+  ['remote', liftOpts(['-v', '--verbose'], [], false)],
+  ['push', liftOpts(['-u', '--set-upstream'], [], false)],
+])
+
+/** Every option in `args` is on the subcommand's allowlist (exact match). */
+function liftArgsAllowed(sub: string, args: readonly string[]): boolean {
+  const opts = GIT_LIFT_OPTIONS.get(sub)
+  if (opts === undefined) return false
+  let endOfOptions = false
+  for (let j = 0; j < args.length; j += 1) {
+    const a = args[j] as string
+    if (endOfOptions || !a.startsWith('-')) continue
+    if (a === '--') {
+      if (!opts.dashdash) return false
+      endOfOptions = true
+      continue
+    }
+    const eq = a.startsWith('--') ? a.indexOf('=') : -1
+    if (eq !== -1) {
+      if (!opts.valued.has(a.slice(0, eq))) return false
+      continue
+    }
+    if (opts.flags.has(a)) continue
+    if (opts.valued.has(a) && j + 1 < args.length) { j += 1; continue }
+    return false
+  }
+  return true
+}
+
+export function gitLiftAllowed(rawCommand: string): boolean {
+  if (!liftShapeOk(rawCommand, 0)) return false
+  if (hasUnquotedGlob(rawCommand)) return false
+  const toks = tokenizeQuoteAware(rawCommand.trim())
+  if (toks === null || toks[0] !== 'git') return false
+  if (toks.slice(1).some((t) => t.startsWith('~') || t.includes('.git/'))) return false
+  let i = 1
+  while (i < toks.length && (toks[i] as string).startsWith('-')) {
+    if (toks[i] !== '-c' || !liftConfigAllowed(toks[i + 1])) return false
+    i += 2
+  }
+  const sub = toks[i]
+  if (sub === undefined || !GIT_LIFT_SUBCOMMANDS.has(sub)) return false
+  const args = toks.slice(i + 1)
+  if (!liftArgsAllowed(sub, args)) return false
+  if (args.some((a) => isAlwaysLongExecSurface(a) || /^--(?:upload|receive)/i.test(a))) return false
+  if ((sub === 'fetch' || sub === 'pull') && args.some((a) => /^-u/.test(a))) return false
+  if (sub === 'tag' && args.some((a) => /^--del/.test(a) || /^-[A-Za-z]*d/.test(a))) return false
+  if (sub === 'remote') {
+    const ok = (args.length === 1 && (args[0] === '-v' || args[0] === '--verbose')) ||
+      (args[0] === 'show' && args.slice(1).every((a) => !a.startsWith('-')))
+    if (!ok) return false
+  }
+  if (sub === 'push') {
+    if (pushArgsForce(args) || pushArgsDelete(args)) return false
+    if (args.some((a) => !a.startsWith('-') && a.includes(':'))) return false
+  }
+  return true
+}
+
+const PIPE_LIFT_INTERPRETERS = new Set(['sh', 'bash', 'python3'])
+const CURL_LIFT_LONG = new Set(['--fail', '--silent', '--show-error', '--location', '--compressed', '--tlsv1.2'])
+const WGET_LIFT_FLAGS = new Set(['-q', '-qO-', '-O-', '-qO', '-O', '-', '--quiet', '--output-document=-', '--https-only', '-nv', '--no-verbose'])
+const LIFT_URL_RE = /^https:\/\/[A-Za-z0-9._~:\/?#%=&+,;!*()'\[\]-]+$/
+const LIFT_PLAIN_ARG_RE = /^[A-Za-z0-9._\/=:,+-]+$/
+
+/**
+ * True only for the allowlisted shape a `pipe-interpreter` lift relaxes:
+ * exactly one pipe; producer `curl` (flags from `-fsSL` letters,
+ * --fail/--silent/--show-error/--location/--compressed/--tlsv1.2,
+ * `--proto =https`) or `wget` (-q/-O-/--quiet/…) with exactly ONE http(s)
+ * URL and nothing else; consumer exactly `sh`, `bash` or `python3`, or
+ * `sh|bash -s -- <plain args>`. No expansions, redirections, `@` file
+ * uploads or other operators anywhere (liftShapeOk).
+ */
+export function pipeLiftAllowed(rawCommand: string): boolean {
+  if (!liftShapeOk(rawCommand, 1)) return false
+  const segs = segmentBashQuoteAware(rawCommand)
+  if (segs === null || segs.length !== 2) return false
+  const prod = tokenizeQuoteAware(segs[0] as string)
+  const cons = tokenizeQuoteAware(segs[1] as string)
+  if (prod === null || cons === null || prod.length === 0 || cons.length === 0) return false
+  let urls = 0
+  const head = prod[0]
+  for (let i = 1; i < prod.length; i += 1) {
+    const t = prod[i] as string
+    if (LIFT_URL_RE.test(t) && !t.includes('@')) { urls += 1; continue }
+    if (head === 'curl') {
+      if (/^-[fsSL]+$/.test(t) || CURL_LIFT_LONG.has(t)) continue
+      if (t === '--proto' && prod[i + 1] === '=https') { i += 1; continue }
+      return false
+    }
+    if (head === 'wget') {
+      if (WGET_LIFT_FLAGS.has(t)) continue
+      return false
+    }
+    return false
+  }
+  if ((head !== 'curl' && head !== 'wget') || urls !== 1) return false
+  const interp = cons[0] as string
+  if (!PIPE_LIFT_INTERPRETERS.has(interp)) return false
+  if (cons.length === 1) return true
+  if (interp === 'python3' || cons[1] !== '-s') return false
+  if (cons.length === 2) return true
+  return cons[2] === '--' && cons.slice(3).every((a) => LIFT_PLAIN_ARG_RE.test(a))
+}
+
 /**
  * Minimal glob matcher supporting `*`, `?`, and `**`.
  *   * `**` matches across path separators (any chars incl. `/`).
@@ -2142,8 +2681,8 @@ export interface ClassifyInput {
  * obeys; an operator allow can no longer wave through sudo / git push / pipe-
  * to-interpreter):
  *   1. Validate shape — malformed tool name or malformed Bash → deny.
- *   2. Built-in hard-deny (secret paths, secret-bash, catastrophic bash) —
- *      operator cannot relax.
+ *   2. Built-in hard-deny (secret paths, secret-bash, catastrophic bash,
+ *      own-channel systemctl, git force push) — operator cannot relax.
  *   3. Operator deny (global ∪ scope).
  *   4. Built-in confirm bash (interpreter/exfil/destructive) — UNCONDITIONAL.
  *   5. Operator confirm.
@@ -2210,6 +2749,12 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     if (commandLower !== undefined && mutatesOwnChannel(commandLower)) {
       return { tier: 'deny', reason: 'mutating the agent own comms channel (systemctl) would sever the warchief link', matchedRule: 'builtin:deny:own-channel' }
     }
+    // Non-overridable HARD-DENY: force push in any spelling (owner hard rule
+    // «never force-push»; token-aware, see gitForcePush). The only change to
+    // default behavior introduced with the opt-in detector lifts (2026-10-17).
+    if (gitForcePush(rawCommand)) {
+      return { tier: 'deny', reason: 'force push is never allowed', matchedRule: 'builtin:deny:git-force-push' }
+    }
   }
 
   const scopeCfg = scope && policy.scopes ? policy.scopes[scope] : undefined
@@ -2226,7 +2771,10 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   // 4. Built-in confirm bash — no operator-ALLOW short-circuit (Codex
   // Critical #3); the only relaxation is the explicit, validated
   // confirm_overrides list, and a command matching ANY non-overridden rule
-  // still confirms. The evasion detector below is never overridable.
+  // still confirms. The two detectors below (pipe-interpreter evasion,
+  // git-exec-surface) are overridable only by explicit operator opt-in
+  // (owner decision 2026-10-17) — each by its own name; listing one never
+  // relaxes the other.
   if (commandLower !== undefined) {
     const overridden = policy.confirm_overrides?.builtin_rules ?? []
     const hits = matchAllBashRules(BUILTIN_CONFIRM_BASH, commandLower)
@@ -2238,15 +2786,56 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // the detector is quote/heredoc-aware and matches command names case-
     // insensitively itself, so lowercasing here would only re-introduce the
     // flag-case collapse (`-C`/`-c`) that bit gitExecSurface.
-    if (bashConfirmEvasion(rawCommand!)) {
-      return { tier: 'confirm', reason: 'pipe-to-interpreter download needs confirmation', matchedRule: 'builtin:confirm_bash:pipe-interpreter' }
+    const raw = rawCommand!
+    // Remote-ref deletion by push (`:main`, `--delete`) is never lifted: when
+    // the `git push` substring rule is overridden, it still confirms. Scoped
+    // to that override so defaults stay byte-identical (there the `git push`
+    // substring rule above already confirms).
+    if (overridden.includes('git push') && gitPushDelete(raw)) {
+      return { tier: 'confirm', reason: 'push that deletes a remote ref needs confirmation', matchedRule: 'builtin:confirm_bash:git-push-delete' }
     }
-    // Non-overridable: git config/hook execution surfaces (a downgraded
-    // `git push` must never become arbitrary local code execution). Pass the
-    // RAW command (commandLower !== undefined ⇒ rawCommand defined) so the
-    // case-sensitive `-c` check distinguishes `git -C` from `git -c`.
-    if (gitExecSurface(rawCommand!)) {
-      return { tier: 'confirm', reason: 'git config/hook execution surface needs confirmation', matchedRule: 'builtin:confirm_bash:git-exec-surface' }
+    //
+    // A listed detector is lifted ONLY for an allowlisted simple shape
+    // (pipeLiftAllowed / gitLiftAllowed); anything else still confirms. Not
+    // listed → exactly the old behavior (same reason, same rule id).
+    const pipeFires = bashConfirmEvasion(raw)
+    const pipeLifted = overridden.includes('pipe-interpreter')
+    const LIFT_NOTE = ' (the opt-in lift covers allowlisted simple commands only)'
+    if (pipeFires && (!pipeLifted || !pipeLiftAllowed(raw))) {
+      return {
+        tier: 'confirm',
+        reason: `pipe-to-interpreter download needs confirmation${pipeLifted ? LIFT_NOTE : ''}`,
+        matchedRule: 'builtin:confirm_bash:pipe-interpreter',
+      }
+    }
+    // Git config/hook execution surfaces (by default a downgraded `git push`
+    // must not become arbitrary local code execution). Pass the RAW command so
+    // the case-sensitive `-c` check distinguishes `git -C` from `git -c`.
+    const gitFires = gitExecSurface(raw)
+    const gitLifted = overridden.includes('git-exec-surface')
+    if (gitFires && (!gitLifted || !gitLiftAllowed(raw))) {
+      return {
+        tier: 'confirm',
+        reason: `git config/hook execution surface needs confirmation${gitLifted ? LIFT_NOTE : ''}`,
+        matchedRule: 'builtin:confirm_bash:git-exec-surface',
+      }
+    }
+    // A lift actually applied: re-run the hard-deny checks on the flattened
+    // view (adjacent quoted word parts joined, ANSI-C decoded) so a secret path
+    // or catastrophic command split by quotes (`.e""nv`, `r''m -rf /`) cannot
+    // ride a lifted detector. Scoped to the lift path so defaults are unchanged.
+    if (pipeFires || gitFires) {
+      const flat = flattenIndirection(stripLineContinuations(raw))
+      const flatCatastrophic = builtinBashHardDeny(flat)
+      if (flatCatastrophic) {
+        return { tier: 'deny', reason: `catastrophic command blocked: ${flatCatastrophic}`, matchedRule: `builtin:deny_bash:${flatCatastrophic}` }
+      }
+      if (bashReferencesSecret(flat, secretPathAllowlist)) {
+        return { tier: 'deny', reason: 'secret/credential reference in Bash command blocked', matchedRule: 'builtin:deny_bash_secret' }
+      }
+      if (mutatesOwnChannel(flat.toLowerCase())) {
+        return { tier: 'deny', reason: 'mutating the agent own comms channel (systemctl) would sever the warchief link', matchedRule: 'builtin:deny:own-channel' }
+      }
     }
     // (own-channel systemctl hard-deny was hoisted into the step-2b hard-deny
     // pass above so a co-located confirm builtin can't downgrade it — Codex HIGH.)

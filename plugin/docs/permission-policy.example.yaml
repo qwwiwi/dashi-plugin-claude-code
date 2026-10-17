@@ -13,11 +13,13 @@
 #
 # A built-in hard-deny ALWAYS fires regardless of this file: reads/writes of
 # .env, *.pem, *.key, .ssh, .aws, gcloud, /proc/*/environ, and catastrophic
-# shell (rm -rf /, fork bombs, mkfs, dd to a disk). You cannot un-deny those.
+# shell (rm -rf /, fork bombs, mkfs, dd to a disk), and force push in any
+# spelling (git-force-push). You cannot un-deny those.
 # A built-in confirm ALWAYS fires for sudo, git push, rm -rf, curl|sh,
 # base64 -d|sh, mutating systemctl (verb-aware: status/cat/show/list-* flow,
 # start/stop/restart/enable/… confirm), kill/pkill, docker, npm publish,
-# package installs — unless you explicitly allow-list the exact form below.
+# package installs — unless you explicitly name the rule under
+# `confirm_overrides` below (an allow rule alone does not lift it).
 
 version: 1
 
@@ -40,11 +42,16 @@ confirm:
     - "mcp__*__task_done"   # marking team tasks done is a real-world side effect
 
 # Operator deny — things you never want to happen, even by tap. Optional;
-# the built-in hard-deny already covers secrets and catastrophic shell.
+# the built-in hard-deny already covers secrets, catastrophic shell and force
+# push (git-force-push: text check OR argv parser, catches `git -C . push -f`,
+# `+refspec`, --force-with-lease, wrappers, force-push aliases defined in the
+# command; an alias already in ~/.gitconfig is a residual). Operator patterns are SUBSTRING
+# matches on the lowercased command — write them without the `git ` prefix so
+# `git -C dir push --force` is still caught.
 deny:
   bash_patterns:
-    - "git push --force"
-    - "git push -f"
+    - "push --force"
+    - "push -f"
   read_paths:
     - "**/secrets/**"
 
@@ -57,6 +64,42 @@ allow:
   bash_patterns:
     - "gh pr view"     # read-only gh subcommands you want silent
     - "bun test"
+
+# Built-in confirm downgrades (opt-in, off by default). Naming a built-in
+# confirm rule here drops it to the normal flow above (confirm -> allow ->
+# default_tier). Names must match exactly — a typo fails validation and the
+# whole file falls back to confirm-everything. Accepted names: the substring
+# rules ("sudo ", "rm -rf ", "rm -fr ", "git push", "git reset --hard",
+# "git clean -", "chmod -r", "chown -r", "kill ", "pkill", "docker ",
+# "npm publish", "pip install", "apt install", "apt-get install") and two
+# named detectors (overridable only by explicit operator opt-in, owner
+# decision 2026-10-17):
+#   pipe-interpreter  — curl|sh, base64 -d|sh and similar download-and-execute
+#   git-exec-surface  — git -c <key>=…, GIT_SSH_COMMAND / GIT_CONFIG_* env,
+#                       writes to .git/hooks or .git/config
+# A listed detector is lifted for ALLOWLISTED shapes only; anything else
+# still confirms:
+#   git-exec-surface — one segment, first word `git`, no wrapper / env prefix
+#     / redirection / expansion / operator; `-c` keys only user.name,
+#     user.email, color.*, advice.*, init.defaultBranch, core.quotepath,
+#     pull.rebase, push.autoSetupRemote, commit.gpgsign=false; subcommand
+#     status, log, diff, show, add, commit, fetch, pull, checkout, switch,
+#     branch, merge, stash, tag (no delete), rev-parse, remote -v / show, or
+#     push without force / delete / mirror / prune / `+` / colon refspecs.
+#   pipe-interpreter — `curl -fsSL <one URL> | sh|bash|python3` (or wget -qO-,
+#     or `| sh -s -- <plain args>`), nothing else in the command.
+# When a lift applies, secret-path and catastrophic checks re-run with
+# quote-split words joined (`.e""nv` -> `.env`). A push that deletes a remote
+# ref (`:main`, --delete) still confirms even with "git push" lifted.
+# SECURITY TRADE-OFF: a lifted simple download-and-execute still runs code
+# you have not seen. The built-in hard-deny (secrets, catastrophic shell,
+# own-channel systemctl, force push) and the deny list above are NEVER
+# affected. Listing one detector does not relax the other.
+# confirm_overrides:
+#   builtin_rules:
+#     - "git push"
+#     - "pipe-interpreter"
+#     - "git-exec-surface"
 
 # Per-scope overrides (keyed by CHAT_ID; "main" = the owner's DM session).
 # Scope rules are ADDITIVE to the globals above. Example: make the main

@@ -15,6 +15,57 @@ retroactively marks the state of `main` on 2026-06-14.
 
 ## [Unreleased]
 
+## [1.4.2] — 2026-10-17
+
+### Security
+- **`pipe-interpreter` and `git-exec-surface` are now overridable by explicit
+  operator opt-in** (owner decision 2026-10-17: the owner's agent runs
+  autonomously, without approval cards). Both detector confirms were
+  non-overridable; `confirm_overrides.builtin_rules` now also accepts these two
+  exact names (a typo still fails schema validation and drops the policy to
+  confirm-everything). When listed, `curl … | sh`-style download-and-execute
+  and git config/hook execution surfaces (`git -c`, `GIT_SSH_COMMAND` /
+  `GIT_CONFIG_*`, `.git/hooks` / `.git/config` writes) fall through to the
+  normal tiers — i.e. run silently under `default_tier: allow`. Not listed,
+  behavior is unchanged. Listing one detector does not relax the other; the
+  built-in hard-deny (secrets, catastrophic shell, own-channel `systemctl`) and
+  the operator `deny` list are untouched. The doctor surfaces a lifted
+  detector as a WARN, like `sudo`/`rm -rf`. Documented in README (EN + RU) and
+  the example policy.
+- **Detector lifts are allowlist-only** (PR #145 review: Fable, Codex,
+  Silvana, automated security review; a denylist of "complex" forms kept
+  leaking). A listed detector is skipped only for an exact allowlisted shape
+  and confirms on everything else. `git-exec-surface`: one segment, first word
+  `git`, no wrapper / env prefix / redirection / expansion / operator, `-c`
+  keys only from an allowlist (`user.name`, `user.email`, `color.*`,
+  `advice.*`, `init.defaultBranch`, `core.quotepath`, `pull.rebase`,
+  `push.autoSetupRemote`, `commit.gpgsign=false`), an allowlisted subcommand,
+  and push only without force / delete / mirror / prune / `+` / colon refspecs
+  (`gitLiftAllowed`). `pipe-interpreter`: `curl|wget <one URL> | sh|bash|python3`
+  with allowlisted flags only (`pipeLiftAllowed`). When a lift applies, the
+  secret-path, catastrophic and own-channel checks re-run on the command with
+  adjacent quoted word parts joined (`.e""nv` → `.env`). Not listed, both
+  detectors behave exactly as before (same rule id and reason).
+- **A push that deletes a remote ref is never lifted.** With the `git push`
+  rule overridden, `git push origin :main`, `--delete`, `-d`, `--prune`
+  still confirm (`git-push-delete`). In defaults the `git push` rule already
+  confirms them, unchanged.
+- **New built-in hard-deny `git-force-push` (not overridable, fail-closed).**
+  A linear text check (a `git` / `git-push` / `send-pack` word + a `push`
+  word + a force marker anywhere) is OR'ed with an argv parser that skips
+  assignments, redirections, wrappers with their flags (`time -p`,
+  `xargs -I {}`, `env -C` / `env -S`, `flock`, `parallel`, `find -exec`, …)
+  and git global options, resolves abbreviated force options, and catches
+  alias / `GIT_CONFIG_*` / `remote.*.push=+` / `remote.*.mirror` definitions
+  inside git invocations (not in plain data such as
+  `echo remote.origin.mirror=true`). Accepted false positives: `git push`
+  next to another `-f` flag, or a quoted mention of a force push. Residual:
+  a force-push alias already in `~/.gitconfig`. This is the only change to
+  default behavior in 1.4.2: force push used to confirm (`git push`
+  built-in) unless the operator denied it by substring. Docs now note that
+  operator deny is substring-based and recommend patterns without the
+  `git ` prefix.
+
 ### Fixed
 - **tmux mirror can no longer flood Telegram into a 429 ban.** Volatile pane
   counters (elapsed timers, token counters, clocks, spinners) changed the

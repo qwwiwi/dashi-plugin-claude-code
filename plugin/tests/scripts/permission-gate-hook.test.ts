@@ -190,6 +190,39 @@ describe('loadPolicy', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+  test('malformed confirm_overrides (typo / non-overridable name / wrong type) → confirm-everything fallback', () => {
+    const bad = [
+      'default_tier: allow\nconfirm_overrides:\n  builtin_rules:\n    - pipe-interpreters\n',
+      'default_tier: allow\nconfirm_overrides:\n  builtin_rules:\n    - git-force-push\n',
+      'default_tier: allow\nconfirm_overrides:\n  builtin_rules: git-exec-surface\n',
+      'default_tier: allow\nconfirm_overrides:\n  rules:\n    - git-exec-surface\n',
+    ]
+    for (const body of bad) {
+      const dir = mkdtempSync(join(tmpdir(), 'pgh-'))
+      try {
+        const p = join(dir, 'permission-policy.yaml')
+        writeFileSync(p, body)
+        const { policy, warning } = loadPolicy(p)
+        expect(policy.default_tier).toBe('confirm')
+        expect(policy.confirm_overrides).toBeUndefined()
+        expect(warning).toContain('schema invalid')
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  })
+  test('valid opt-in lift loads as written', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pgh-'))
+    try {
+      const p = join(dir, 'permission-policy.yaml')
+      writeFileSync(p, 'default_tier: allow\nconfirm_overrides:\n  builtin_rules:\n    - pipe-interpreter\n    - git-exec-surface\n')
+      const { policy, warning } = loadPolicy(p)
+      expect(warning).toBeUndefined()
+      expect(policy.confirm_overrides?.builtin_rules).toEqual(['pipe-interpreter', 'git-exec-surface'])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
   test('schema-invalid policy (wrong type) → confirm fallback', () => {
     const dir = mkdtempSync(join(tmpdir(), 'pgh-'))
     try {
