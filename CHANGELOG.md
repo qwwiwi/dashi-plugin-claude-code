@@ -15,6 +15,28 @@ retroactively marks the state of `main` on 2026-06-14.
 
 ## [Unreleased]
 
+### Security
+- **Full git lifts by explicit opt-in** (owner decision 2026-10-17: agents
+  write code and push without approval cards). Two new
+  `confirm_overrides.builtin_rules` names: `git-exec-surface:all` (the
+  git-exec-surface detector never confirms; the flattened secret /
+  catastrophic / own-channel re-check still runs) and `git-push-delete`
+  (together with `git push`, a push deleting a remote ref no longer confirms).
+  Not listed, behavior is unchanged. Force push, secrets, own-channel
+  `systemctl` and the operator deny list are untouched; `pipe-interpreter` has
+  no full lift. The doctor surfaces both as a WARN.
+
+### Fixed
+- **Push-delete check no longer reads file contents as a command.** The coarse
+  text check (git word + push word + delete marker anywhere) fired on heredoc
+  bodies and quoted strings — a `cat > f.go <<'EOF' … EOF` writing Go source
+  raised «push that deletes a remote ref needs confirmation». Bodies of
+  heredocs fed to `cat` / `tee` (nothing piped, substituted or grouped around
+  them) and quoted literals are now masked before the text check; quoted shell
+  code (`bash -c`, `ssh`, `eval`, `env -S`) is re-parsed recursively; an
+  ANSI-C `$'…'` quote or unbalanced quoting still fails closed. Only reachable
+  with `git push` overridden, so defaults are unchanged.
+
 ## [1.4.2] — 2026-10-17
 
 ### Security

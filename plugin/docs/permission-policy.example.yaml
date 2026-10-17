@@ -90,7 +90,13 @@ allow:
 #     or `| sh -s -- <plain args>`), nothing else in the command.
 # When a lift applies, secret-path and catastrophic checks re-run with
 # quote-split words joined (`.e""nv` -> `.env`). A push that deletes a remote
-# ref (`:main`, --delete) still confirms even with "git push" lifted.
+# ref (`:main`, --delete) still confirms even with "git push" lifted
+# (heredoc bodies fed to cat/tee and quoted strings are data, not a push).
+# Full git lifts (opt-in, owner decision 2026-10-17; agents that push without
+# cards):
+#   git-exec-surface:all — the git detector never confirms (any shape)
+#   git-push-delete      — with "git push": a remote-ref delete no longer confirms
+# Force push stays a hard deny either way; pipe-interpreter has no full lift.
 # SECURITY TRADE-OFF: a lifted simple download-and-execute still runs code
 # you have not seen. The built-in hard-deny (secrets, catastrophic shell,
 # own-channel systemctl, force push) and the deny list above are NEVER

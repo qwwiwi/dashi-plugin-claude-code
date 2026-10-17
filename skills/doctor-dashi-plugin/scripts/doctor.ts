@@ -961,7 +961,9 @@ export function checkSharedSettingsClean(homeRaw: string | null, selectedIsHome:
  * decision 2026-10-17) — lifting them lets download-and-execute and git
  * config/hook code execution run silently.
  */
-export const DANGEROUS_OVERRIDE_RULES: readonly string[] = ['sudo ', 'rm -rf ', 'rm -fr ', 'pipe-interpreter', 'git-exec-surface']
+export const DANGEROUS_OVERRIDE_RULES: readonly string[] = [
+  'sudo ', 'rm -rf ', 'rm -fr ', 'pipe-interpreter', 'git-exec-surface', 'git-exec-surface:all', 'git-push-delete',
+]
 
 /** The named detectors among DANGEROUS_OVERRIDE_RULES (lifted for allowlisted shapes only). */
 export const DETECTOR_OVERRIDE_RULES: readonly string[] = ['pipe-interpreter', 'git-exec-surface']

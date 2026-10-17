@@ -249,7 +249,22 @@ Accepted names: the substring rules (`sudo `, `rm -rf `, `rm -fr `, `git push`, 
 - `git-exec-surface`: the command must be one segment whose first word is literally `git` — no wrapper (`time`, `xargs`, `env`, `nice`, `nohup`, `find`, `flock`, `parallel`, `timeout`, `sudo`), no `GIT_*`/env prefix, no redirection, no expansion (`$`, backticks, `$(…)`, `${IFS}`), no pipe or `;`/`&&`/`||`. Global options are limited to `-c` with an allowlisted key: `user.name`, `user.email`, `color.*`, `advice.*`, `init.defaultBranch`, `core.quotepath`, `pull.rebase`, `push.autoSetupRemote`, and `commit.gpgsign=false`. The subcommand must be one of `status`, `log`, `diff`, `show`, `add`, `commit`, `fetch`, `pull`, `checkout`, `switch`, `branch`, `merge`, `stash`, `tag` (without delete), `rev-parse`, `remote -v` / `remote show`, or `push` without force, delete, mirror or prune flags and without `+` or colon refspecs. Transport-program flags (`--upload-pack`, `--receive-pack`, `--exec`, fetch `-u`) are never allowed.
 - `pipe-interpreter`: exactly `curl` (flags from `-fsSL`, `--fail`, `--silent`, `--show-error`, `--location`, `--compressed`, `--tlsv1.2`, `--proto =https`) or `wget` (`-q`, `-O-`, `--quiet`, …) with exactly one http(s) URL, piped once into `sh`, `bash` or `python3` (or `sh|bash -s -- <plain args>`). No expansions, redirections, `@file` uploads or other operators.
 
-When a lift does apply, the secret-path, catastrophic and own-channel checks are re-run on the command with adjacent quoted word parts joined (`.e""nv` → `.env`), so a secret path split by quotes cannot get through the lift. A push that deletes a remote ref (`git push origin :main`, `--delete`, `-d`, `--prune`) still confirms even when the `git push` rule is lifted.
+When a lift does apply, the secret-path, catastrophic and own-channel checks are re-run on the command with adjacent quoted word parts joined (`.e""nv` → `.env`), so a secret path split by quotes cannot get through the lift. A push that deletes a remote ref (`git push origin :main`, `--delete`, `-d`, `--prune`) still confirms even when the `git push` rule is lifted. Heredoc bodies fed to `cat`/`tee` and quoted strings are not read as a push (file contents are data); quoted shell code (`bash -c '…'`, `ssh host '…'`, `eval "…"`) still is.
+
+**Full git lifts (opt-in, owner decision 2026-10-17)** — for agents that write code and push without cards:
+
+- `git-exec-surface:all` — the git-exec-surface detector never confirms (any shape). The secret-path, catastrophic and own-channel re-check still runs.
+- `git-push-delete` — together with `git push`, a push that deletes a remote ref no longer confirms.
+
+```yaml
+confirm_overrides:
+  builtin_rules:
+    - "git push"
+    - "git-push-delete"
+    - "git-exec-surface:all"
+```
+
+Force push stays a hard deny with every lift listed; `pipe-interpreter` has no full lift.
 
 Listing one detector does not relax the other, and a compound command that also trips a non-listed rule still confirms. The built-in hard-deny (secret paths, catastrophic shell, mutating `systemctl` on the agent's own channel, force push) and the operator `deny` list run before this layer and are never affected. The doctor reports a lifted `sudo`/`rm -rf`/detector as a WARN.
 

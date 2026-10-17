@@ -148,7 +148,9 @@ export interface PermissionPolicy {
    * overridable only by explicit operator opt-in (owner decision 2026-10-17),
    * and then only for allowlisted simple shapes (gitLiftAllowed /
    * pipeLiftAllowed — anything else still confirms); not listed, they confirm
-   * exactly as before. A compound command matching an
+   * exactly as before. `git-exec-surface:all` lifts the git detector fully;
+   * `git-push-delete` stops a remote-ref-deleting push from confirming when
+   * `git push` is overridden. A compound command matching an
    * overridden AND a non-overridden built-in rule still confirms.
    */
   readonly confirm_overrides?: { readonly builtin_rules?: readonly string[] }
@@ -241,13 +243,19 @@ const BUILTIN_CONFIRM_BASH: readonly string[] = [
 //   * `git-exec-surface` — one bare `git` segment with `-c` keys from an
 //     allowlist (user.*, color.*, advice.*, …) and an allowlisted subcommand,
 //     push only without force / delete (gitLiftAllowed).
+//   * `git-exec-surface:all` — FULL lift (owner decision 2026-10-17: agents
+//     write code and push without cards): the git-exec-surface detector never
+//     confirms. Implies `git-exec-surface`.
+//   * `git-push-delete` — a push that deletes a remote ref (`git push origin
+//     :x`, `--delete`, `-d`, `--prune`) no longer confirms once `git push` is
+//     overridden too.
 // Hard-deny (catastrophic shell, secret reads, own-channel systemctl, force
 // push) and the operator deny list run BEFORE this layer and are never
-// affected.
-const OPT_IN_CONFIRM_DETECTORS = ['pipe-interpreter', 'git-exec-surface'] as const
+// affected. `pipe-interpreter` has NO full lift.
+const OPT_IN_CONFIRM_DETECTORS = ['pipe-interpreter', 'git-exec-surface', 'git-exec-surface:all', 'git-push-delete'] as const
 
 /** Every name `confirm_overrides.builtin_rules` accepts. */
-function overridableConfirmRuleNames(): readonly string[] {
+export function overridableConfirmRuleNames(): readonly string[] {
   return [...BUILTIN_CONFIRM_BASH, ...OPT_IN_CONFIRM_DETECTORS]
 }
 
@@ -2223,24 +2231,162 @@ export function gitForcePush(rawCommand: string): boolean {
 
 const PD_DELETE_RE = /(?:^|[\s'"=(])(?:--delete(?![a-z0-9_-])|--prune(?![a-z0-9_-])|-[A-Za-z]{0,16}d[A-Za-z]{0,16}(?=$|[\s'";|&)]))|(?:^|\s):[\w*/.@^~-]/
 
-/** Remote-ref deletion by push (`git push origin :main`, `--delete`, `-d`,
- *  `--prune`). Confirmed even when the `git push` built-in is overridden —
- *  text check OR parser, fail-closed like gitForcePush. */
-export function gitPushDelete(rawCommand: string): boolean {
-  const joined = stripLineContinuations(rawCommand)
-  const flat = flattenIndirection(joined)
-  for (const v of [joined, flat]) {
-    if (FP_GIT_WORD_RE.test(v) && FP_PUSH_WORD_RE.test(v) && PD_DELETE_RE.test(v)) return true
-    const segs = segmentBashQuoteAware(v)
-    if (segs === null) return true
-    for (const s of segs) {
-      const toks = tokenizeQuoteAware(s)
-      if (toks === null) return true
-      const inv = normalizeGitInvocation(toks)
-      if (inv !== null && isPushSub(inv.sub) && pushArgsDelete(inv.args)) return true
+// Heredoc commands whose body is plain DATA (it lands in a file / stdout).
+const HEREDOC_DATA_SINKS = new Set(['cat', 'tee'])
+const HEREDOC_OPEN_RE = /^<<(-?)[ \t]*(?:'([A-Za-z0-9_.-]+)'|"([A-Za-z0-9_.-]+)"|([A-Za-z0-9_.-]+))(?=[\s;&>]|$)/
+// Compound / grouping syntax that could pipe a cat's output into an
+// interpreter (`{ cat <<X … X\n} | bash`, `if …\nthen\ncat <<X …\nfi | sh`).
+const HEREDOC_COMPOUND_RE = /[(){}`]|(?:^|[\s;&|])(?:if|then|else|elif|fi|for|while|until|do|done|case|esac|select|function|coproc)(?=$|[\s;&|])/
+
+/**
+ * Length-preserving mask: the BODY of a heredoc that is plain data — fed to
+ * `cat` / `tee`, nothing piped, substituted or grouped around it — becomes
+ * blanks (newlines kept). An agent writing a source file with
+ * `cat > f.go <<'EOF' … EOF` must not have the file CONTENT read as a command
+ * (live false positive: Go source raised «push that deletes a remote ref»).
+ * CONSERVATIVE: on anything not recognised (unquoted body with `$(`/backtick,
+ * another command word, a pipe or substitution on the opener line, compound
+ * syntax anywhere, unterminated body, unbalanced quotes) the command is
+ * returned UNCHANGED, so the caller's fail-closed checks see the raw text.
+ * Accepted residual: two-step write-then-run (`cat > x.sh <<'E' … E; bash
+ * x.sh`) — the same residual as writing a script with the Write tool.
+ */
+function maskDataHeredocBodies(cmd: string): string {
+  if (!cmd.includes('<<')) return cmd
+  const out = cmd.split('')
+  const n = cmd.length
+  let masked = false
+  let segStart = 0
+  let i = 0
+  while (i < n) {
+    const ch = cmd[i] as string
+    if (ch === '\\') { i += 2; continue }
+    if (ch === '$' && cmd[i + 1] === "'") {
+      let j = i + 2
+      while (j < n && cmd[j] !== "'") j += cmd[j] === '\\' ? 2 : 1
+      if (j >= n) return cmd
+      i = j + 1
+      continue
     }
+    if (ch === "'") {
+      const j = cmd.indexOf("'", i + 1)
+      if (j < 0) return cmd
+      i = j + 1
+      continue
+    }
+    if (ch === '"') {
+      let j = i + 1
+      while (j < n && cmd[j] !== '"') j += cmd[j] === '\\' ? 2 : 1
+      if (j >= n) return cmd
+      i = j + 1
+      continue
+    }
+    if (ch === '#' && (i === 0 || /[\s;&|]/.test(cmd[i - 1] as string))) {
+      const nl = cmd.indexOf('\n', i)
+      if (nl < 0) break
+      i = nl
+      continue
+    }
+    if (ch === ';' || ch === '&' || ch === '|' || ch === '\n') { segStart = i + 1; i += 1; continue }
+    if (ch === '<' && cmd[i + 1] === '<') {
+      if (cmd[i + 2] === '<') { i += 3; continue } // here-string, not a heredoc
+      const m = HEREDOC_OPEN_RE.exec(cmd.slice(i))
+      if (m === null) return cmd
+      const strip = m[1] === '-'
+      const quotedDelim = m[2] ?? m[3]
+      const delim = (quotedDelim ?? m[4]) as string
+      const nl = cmd.indexOf('\n', i)
+      if (nl < 0) return cmd
+      const before = cmd.slice(segStart, i)
+      const tail = cmd.slice(i + m[0].length, nl)
+      const head = (before.trim().split(/\s+/)[0] ?? '').toLowerCase()
+      if (!HEREDOC_DATA_SINKS.has(head) || /[`()]/.test(before) || /[|`()<'"\\]/.test(tail)) return cmd
+      let lineStart = nl + 1
+      let bodyEnd = -1
+      let termEnd = -1
+      while (lineStart <= n) {
+        let le = cmd.indexOf('\n', lineStart)
+        if (le < 0) le = n
+        const line = strip ? cmd.slice(lineStart, le).replace(/^\t+/, '') : cmd.slice(lineStart, le)
+        if (line === delim) { bodyEnd = lineStart; termEnd = le; break }
+        if (le >= n) break
+        lineStart = le + 1
+      }
+      if (bodyEnd < 0) return cmd // unterminated → leave intact
+      const body = cmd.slice(nl + 1, bodyEnd)
+      // An unquoted delimiter expands the body: `$(…)` / backticks execute.
+      if (quotedDelim === undefined && /`|\$\(/.test(body)) return cmd
+      for (let k = nl + 1; k < bodyEnd; k += 1) if (cmd[k] !== '\n') out[k] = ' '
+      masked = true
+      i = termEnd
+      segStart = termEnd
+      continue
+    }
+    i += 1
+  }
+  if (!masked) return cmd
+  const result = out.join('')
+  const visible = maskQuotedLiterals(result)
+  if (visible === null || HEREDOC_COMPOUND_RE.test(visible)) return cmd
+  return result
+}
+
+/** Coarse text check: git word + push word + delete marker. Run on a view with
+ *  quoted literals and data-heredoc bodies blanked (see commandPushDelete). */
+function pushDeleteText(s: string): boolean {
+  return FP_GIT_WORD_RE.test(s) && FP_PUSH_WORD_RE.test(s) && PD_DELETE_RE.test(s)
+}
+
+function segmentPushDelete(segment: string, depth: number): boolean {
+  const toks = tokenizeQuoteAware(segment)
+  if (toks === null) return true // unbalanced → fail-closed
+  const inv = normalizeGitInvocation(toks)
+  if (inv !== null && isPushSub(inv.sub) && pushArgsDelete(inv.args)) return true
+  // Quoted strings that hold shell code (`bash -c '…'`, `ssh h '…'`,
+  // `eval "…"`, `env -S '…'`) are re-parsed recursively; a quoted string
+  // elsewhere is data (mirrors segmentForcePush).
+  const cw = commandWordAt(toks)
+  const head = cw === null ? '' : (cw.word.split('/').pop() ?? cw.word).toLowerCase()
+  const codeRunner = CODE_RUNNER_HEADS.has(head)
+  for (let i = 0; i < toks.length; i += 1) {
+    const t = toks[i] as string
+    if (!/[\s;|&]/.test(t)) continue
+    const afterCodeFlag = i > 0 && CODE_STRING_FLAG_RE.test(toks[i - 1] as string)
+    if (!codeRunner && !afterCodeFlag) continue
+    if (depth >= 3) {
+      if (pushDeleteText(t)) return true
+      continue
+    }
+    if (commandPushDelete(t, depth + 1)) return true
   }
   return false
+}
+
+function commandPushDelete(command: string, depth: number): boolean {
+  const joined = maskDataHeredocBodies(stripLineContinuations(command))
+  const visible = maskQuotedLiterals(joined)
+  if (visible === null) return true // unbalanced quotes → fail-closed
+  if (pushDeleteText(visible)) return true
+  const segs = segmentBashQuoteAware(joined)
+  if (segs === null) return true
+  return segs.some((s) => segmentPushDelete(s, depth))
+}
+
+/** Remote-ref deletion by push (`git push origin :main`, `--delete`, `-d`,
+ *  `--prune`). Confirmed when the `git push` built-in is overridden unless the
+ *  operator also lists `git-push-delete`. Text check OR parser, fail-closed:
+ *  the text check ignores quoted literals and data-heredoc bodies (file
+ *  contents are not commands); quoted shell-code bodies are re-parsed; an
+ *  ANSI-C `$'…'` quote (can encode `git` / `:ref`) falls back to the old
+ *  whole-text check on the flattened view. */
+export function gitPushDelete(rawCommand: string): boolean {
+  if (commandPushDelete(rawCommand, 0)) return true
+  if (!rawCommand.includes("$'")) return false
+  const flat = flattenIndirection(stripLineContinuations(rawCommand))
+  if (pushDeleteText(flat)) return true
+  const segs = segmentBashQuoteAware(flat)
+  if (segs === null) return true
+  return segs.some((s) => segmentPushDelete(s, 0))
 }
 
 // ── Opt-in detector lifts are ALLOWLIST-only (PR #145 review, 2026-10-17) ──
@@ -2808,11 +2954,12 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // insensitively itself, so lowercasing here would only re-introduce the
     // flag-case collapse (`-C`/`-c`) that bit gitExecSurface.
     const raw = rawCommand!
-    // Remote-ref deletion by push (`:main`, `--delete`) is never lifted: when
-    // the `git push` substring rule is overridden, it still confirms. Scoped
-    // to that override so defaults stay byte-identical (there the `git push`
-    // substring rule above already confirms).
-    if (overridden.includes('git push') && gitPushDelete(raw)) {
+    // Remote-ref deletion by push (`:main`, `--delete`): when the `git push`
+    // substring rule is overridden, it still confirms — unless the operator
+    // also lists `git-push-delete` (owner decision 2026-10-17). Scoped to that
+    // override so defaults stay byte-identical (there the `git push` substring
+    // rule above already confirms).
+    if (overridden.includes('git push') && !overridden.includes('git-push-delete') && gitPushDelete(raw)) {
       return { tier: 'confirm', reason: 'push that deletes a remote ref needs confirmation', matchedRule: 'builtin:confirm_bash:git-push-delete' }
     }
     //
@@ -2833,8 +2980,11 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // must not become arbitrary local code execution). Pass the RAW command so
     // the case-sensitive `-c` check distinguishes `git -C` from `git -c`.
     const gitFires = gitExecSurface(raw)
-    const gitLifted = overridden.includes('git-exec-surface')
-    if (gitFires && (!gitLifted || !gitLiftAllowed(raw))) {
+    // `git-exec-surface:all` is the full lift: the detector never confirms
+    // (the flattened hard-deny re-check below still runs).
+    const gitFullLift = overridden.includes('git-exec-surface:all')
+    const gitLifted = gitFullLift || overridden.includes('git-exec-surface')
+    if (gitFires && !gitFullLift && (!gitLifted || !gitLiftAllowed(raw))) {
       return {
         tier: 'confirm',
         reason: `git config/hook execution surface needs confirmation${gitLifted ? LIFT_NOTE : ''}`,
