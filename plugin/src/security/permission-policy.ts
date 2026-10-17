@@ -145,8 +145,9 @@ export interface PermissionPolicy {
    * own-channel systemctl, operator deny) are NEVER overridable. The
    * pipe-to-interpreter evasion detector (`pipe-interpreter`) and the git
    * config/hook execution-surface detector (`git-exec-surface`) are
-   * overridable only by explicit operator opt-in (owner decision 2026-10-17);
-   * not listed, they confirm exactly as before. A compound command matching an
+   * overridable only by explicit operator opt-in (owner decision 2026-10-17),
+   * and then only for simple commands (isComplexForLift — complex forms still
+   * confirm); not listed, they confirm exactly as before. A compound command matching an
    * overridden AND a non-overridden built-in rule still confirms.
    */
   readonly confirm_overrides?: { readonly builtin_rules?: readonly string[] }
@@ -232,14 +233,19 @@ const BUILTIN_CONFIRM_BASH: readonly string[] = [
 // downgrade via `confirm_overrides.builtin_rules` — overridable only by
 // explicit operator opt-in (owner decision 2026-10-17: the owner's agent runs
 // autonomously, no approval cards). Not listed → they confirm exactly as
-// before. Security trade-off when listed:
-//   * `pipe-interpreter` — `curl … | sh`-style download-and-execute flows to
-//     the normal tiers (allow under default_tier allow).
-//   * `git-exec-surface` — `git -c <key>=…`, GIT_SSH_COMMAND/GIT_CONFIG_*
-//     env, `.git/hooks` / `.git/config` writes flow to the normal tiers, so a
-//     downgraded `git push` can carry arbitrary local code execution.
-// Hard-deny (catastrophic shell, secret reads, own-channel systemctl) and the
-// operator deny list run BEFORE this layer and are never affected.
+// before. When listed, a detector is lifted for SIMPLE commands only
+// (isComplexForLift); on a complex command it still confirms:
+//   * `pipe-interpreter` — a plain `curl … | sh` flows to the normal tiers
+//     (allow under default_tier allow); nested `sh -c` / `eval` bodies,
+//     decode-into-interpreter, `/dev/tcp`, substitution into an interpreter
+//     still confirm.
+//   * `git-exec-surface` — `git -c <ordinary key>=…` flows to the normal
+//     tiers; aliases, program-running config keys / env (core.hooksPath,
+//     core.sshCommand, credential.helper, GIT_SSH_COMMAND, …), transport
+//     programs and `.git/hooks` / `.git/config` writes still confirm.
+// Hard-deny (catastrophic shell, secret reads, own-channel systemctl, force
+// push) and the operator deny list run BEFORE this layer and are never
+// affected.
 const OPT_IN_CONFIRM_DETECTORS = ['pipe-interpreter', 'git-exec-surface'] as const
 
 /** Every name `confirm_overrides.builtin_rules` accepts. */
@@ -1947,6 +1953,293 @@ function bashConfirmEvasion(rawCommand: string): boolean {
   return bashEvasion(rawCommand, 0)
 }
 
+// ── git force-push: NON-overridable built-in DENY (owner hard rule) ──────
+//
+// The owner's hard rule is «never force-push». Until 2026-10-17 it lived only
+// in operator deny patterns (`git push --force`, `git push -f`) — plain
+// substrings that `git -C . push -f`, `git push origin +main`,
+// `git -c x=y push --force-with-lease` or a force-push alias walked past
+// (reviewers of PR #145). This detector is TOKEN-aware and runs in the
+// hard-deny pass, so no override and no operator allow can relax it:
+//   * per top-level segment (quote-aware), the git invocation is normalized —
+//     leading `VAR=val` assignments and command wrappers stripped, git global
+//     options (`-C`, `-c`, `--git-dir`, `--work-tree`, …) skipped — and the
+//     git-core `git-push` form is recognized;
+//   * subcommand `push` + any force flag (`--force`, `-f` incl. clusters like
+//     `-uf`, `--force-with-lease`, `--force-if-includes`, their unambiguous
+//     prefixes, `--mirror`) or a `+`-prefixed refspec in ANY position → deny;
+//   * `-c remote.<r>.push=+…` / `remote.<r>.mirror=true` on a push → deny;
+//   * alias.* / GIT_CONFIG_VALUE_* / GIT_CONFIG_PARAMETERS definitions whose
+//     value contains `push` with a force marker → deny (the alias could never
+//     be seen at its call site), likewise `remote.<r>.push` defined with `+`;
+//   * quoted strings that hold shell code (`bash -c 'git push -f'`, `ssh h
+//     'git push -f'`, `eval "…"`) are re-parsed recursively (depth-capped,
+//     fail-closed regex at the cap).
+// The git word must be in COMMAND position (after wrappers) so a commit
+// message or `grep` pattern mentioning "git push --force" is not denied.
+// Accepted residuals: an alias defined earlier outside this gate (e.g. in
+// ~/.gitconfig before the session) and git reached through a variable command
+// word whose `push` token itself is variable.
+
+const FORCE_PUSH_LONG = ['force', 'force-with-lease', 'force-if-includes', 'mirror']
+// Wrapper words that may precede the real command word in a segment.
+const POSITIONAL_WRAPPERS = new Set([
+  ...COMMAND_WRAPPERS, 'time', 'xargs', 'timeout', 'watch', 'if', 'then', 'else', 'elif',
+  'while', 'until', 'do', '!', '{',
+])
+// Command words whose quoted arguments are themselves shell code.
+const CODE_RUNNER_HEADS = new Set(['eval', 'ssh', 'su', 'runuser', 'xargs', 'watch', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish'])
+const FORCE_MARKER_RE =/(?:^|[\s=!])(?:-[a-z]*f[a-z]*|--force[\w-]*|--mirror)(?=$|[\s;|&])/i
+const PLUS_REFSPEC_RE = /(?:^|[\s=])\+[\w*/:.@^~-]/
+
+/** A long option name (lowercased, without `--`, before `=`) that git push
+ *  resolves to a force mode. `--no-force…` is the negation (benign). */
+function isForceLongName(name: string): boolean {
+  if (name.startsWith('no-')) return false
+  if (name.startsWith('force')) return true
+  if (name.length < 2) return false
+  return FORCE_PUSH_LONG.some((t) => t.startsWith(name))
+}
+
+/** Does a `git push` argv (tokens AFTER the subcommand) request a force? */
+function pushArgsForce(args: readonly string[]): boolean {
+  for (const a of args) {
+    if (a.startsWith('--')) {
+      if (a === '--') continue
+      if (isForceLongName((a.slice(2).split('=')[0] as string).toLowerCase())) return true
+      continue
+    }
+    if (/^-[A-Za-z]+/.test(a)) {
+      const letters = (/^-([A-Za-z]+)/.exec(a) as RegExpExecArray)[1] as string
+      if (letters.includes('f')) return true
+      continue
+    }
+    if (a.startsWith('+')) return true // `+src:dst` forced refspec
+  }
+  return false
+}
+
+/** Index of the command word in a dequoted token list: skips `VAR=val`
+ *  assignments, wrapper words with their flags / flag values / durations, and
+ *  leading `(`/`{` grouping chars. Returns the token (grouping stripped) and
+ *  its index, or null. */
+function commandWordAt(toks: readonly string[]): { word: string; idx: number } | null {
+  let k = 0
+  for (let guard = 0; guard < 16 && k < toks.length; guard += 1) {
+    const raw = toks[k] as string
+    const tok = raw.replace(/^[({]+/, '')
+    if (tok.length === 0) { k += 1; continue }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) { k += 1; continue }
+    const base = (tok.split('/').pop() ?? tok).toLowerCase()
+    if (POSITIONAL_WRAPPERS.has(base)) {
+      k += 1
+      while (k < toks.length) {
+        const t = toks[k] as string
+        if (/^-/.test(t)) {
+          const takesValue = WRAPPER_VALUE_FLAG_RE.test(t)
+          k += takesValue ? 2 : 1
+          continue
+        }
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) || /^[0-9.]+[smhd]?$/i.test(t)) { k += 1; continue }
+        break
+      }
+      continue
+    }
+    return { word: tok, idx: k }
+  }
+  return null
+}
+
+/** A git invocation normalized from a dequoted token list: the subcommand,
+ *  the args after it, and the values of global `-c` options. */
+interface GitInvocation {
+  readonly sub: string
+  readonly args: readonly string[]
+  readonly configs: readonly string[]
+}
+
+function normalizeGitInvocation(toks: readonly string[]): GitInvocation | null {
+  const cw = commandWordAt(toks)
+  if (cw === null) return null
+  const base = cw.word.split('/').pop() ?? cw.word
+  // git-core dashed form: `/usr/lib/git-core/git-push …` == `git push …`.
+  const dashed = /^git-([a-z][a-z-]*)$/.exec(base)
+  if (dashed) return { sub: dashed[1] as string, args: toks.slice(cw.idx + 1), configs: [] }
+  // A variable command word (`$G push -f`, `"$GIT" push --force`) cannot be
+  // resolved — treat it as git when its first operand is literally `push`.
+  if (base.startsWith('$')) {
+    const pushAt = toks.indexOf('push', cw.idx + 1)
+    if (pushAt < 0) return null
+    return { sub: 'push', args: toks.slice(pushAt + 1), configs: [] }
+  }
+  if (!isGitToken(cw.word)) return null
+  const configs: string[] = []
+  let i = cw.idx + 1
+  while (i < toks.length) {
+    const tok = toks[i] as string
+    if (tok.length === 0) { i += 1; continue }
+    if (tok[0] !== '-') break
+    if (tok === '-c') { configs.push(toks[i + 1] ?? ''); i += 2; continue }
+    if (tok.startsWith('-c') && tok.length > 2) { configs.push(tok.slice(2)); i += 1; continue }
+    if (GIT_VALUE_GLOBAL_FLAGS.has(tok) || tok === '--config-env') { i += 2; continue }
+    i += 1
+  }
+  if (i >= toks.length) return null
+  return { sub: toks[i] as string, args: toks.slice(i + 1), configs }
+}
+
+/** Alias / GIT_CONFIG_* / remote.*.push definitions that smuggle a force push
+ *  past the call site. Checked on the flattened (quotes dropped) segment. */
+function forcePushDefinition(flatSegmentLower: string): boolean {
+  if (/\balias\.|git_config_(?:value_[0-9]+|parameters)/.test(flatSegmentLower)) {
+    if (/\bpush\b/.test(flatSegmentLower) && (FORCE_MARKER_RE.test(flatSegmentLower) || PLUS_REFSPEC_RE.test(flatSegmentLower))) {
+      return true
+    }
+  }
+  if (/\bremote\.[^\s=]{0,64}\.push\b/.test(flatSegmentLower) && PLUS_REFSPEC_RE.test(flatSegmentLower)) return true
+  if (/\bremote\.[^\s=]{0,64}\.mirror(?:\s+|\s*=\s*)(?:true|yes|on|1)\b/.test(flatSegmentLower)) return true
+  return false
+}
+
+/** Fail-closed text fallback (unparseable quoting / recursion cap): `git`, then
+ *  `push`, then a force marker, in that order. Linear (no nested `[\s\S]*`). */
+function forcePushText(s: string): boolean {
+  const lower = s.toLowerCase()
+  const g = lower.search(/\bgit\b/)
+  if (g < 0) return false
+  const afterGit = lower.slice(g)
+  const p = afterGit.search(/\bpush\b/)
+  if (p < 0) return false
+  return /\s-[a-z]{0,8}f|--force|--mirror|\s\+/.test(afterGit.slice(p))
+}
+
+function segmentForcePush(segment: string, depth: number): boolean {
+  if (forcePushDefinition(flattenIndirection(segment).toLowerCase())) return true
+  const toks = tokenizeQuoteAware(segment)
+  if (toks === null) return forcePushText(segment) // unbalanced → regex, fail-closed
+  const inv = normalizeGitInvocation(toks)
+  if (inv !== null && inv.sub === 'push') {
+    if (pushArgsForce(inv.args)) return true
+    if (inv.configs.some((c) => /^remote\..*\.(?:push\s*=\s*\+|mirror\s*=\s*(?:true|yes|on|1)\b)/i.test(c))) return true
+  }
+  // Re-parse quoted strings that hold shell code: the argument of a `-c`-style
+  // flag (`bash -c '…'`, `docker exec c sh -lc '…'`) or any argument of a
+  // code-running command word (`eval "…"`, `ssh host '…'`, `su -c`, `xargs`).
+  // A quoted string elsewhere (`grep "git push -f" docs/`, a commit message)
+  // is data and is not re-parsed.
+  const cw = commandWordAt(toks)
+  const head = cw === null ? '' : (cw.word.split('/').pop() ?? cw.word).toLowerCase()
+  const codeRunner = CODE_RUNNER_HEADS.has(head)
+  for (let i = 0; i < toks.length; i += 1) {
+    const t = toks[i] as string
+    if (!/[\s;|&]/.test(t)) continue
+    const afterDashC = i > 0 && /^-[A-Za-z]*c$/.test(toks[i - 1] as string)
+    if (!codeRunner && !afterDashC) continue
+    if (depth >= 3) {
+      if (forcePushText(t)) return true
+      continue
+    }
+    if (commandForcePush(t, depth + 1)) return true
+  }
+  return false
+}
+
+function commandForcePush(command: string, depth: number): boolean {
+  const joined = stripLineContinuations(command)
+  const segs = segmentBashQuoteAware(joined)
+  if (segs === null) return forcePushText(joined)
+  return segs.some((s) => segmentForcePush(s, depth))
+}
+
+/** Built-in force-push hard-deny (raw and ANSI-C/fragment-flattened views). */
+export function gitForcePush(rawCommand: string): boolean {
+  if (commandForcePush(rawCommand, 0)) return true
+  const flat = flattenIndirection(stripLineContinuations(rawCommand))
+  return flat !== rawCommand && commandForcePush(flat, 0)
+}
+
+// ── "Lift only the simple case" (PR #145 review, 2026-10-17) ─────────────
+//
+// Listing `pipe-interpreter` / `git-exec-surface` in
+// confirm_overrides.builtin_rules relaxes ONLY simple commands. The hard-deny
+// pass inspects the command word of each segment and the raw text; a lifted
+// detector used to be the last line of defence for bodies the hard-deny pass
+// cannot see into (a nested `sh -c` / `eval` body, a git `!`-alias, decoded
+// bytes, a socket). So when a listed detector fires on a COMPLEX command it
+// still confirms. Deliberately a flat predicate, not a shell interpreter:
+// any doubt → complex → confirm.
+
+const LIFT_INTERP_RE = new RegExp(`^(?:${INTERP_NAMES})$`, 'i')
+const LIFT_DECODERS = new Set(['base64', 'base32', 'basenc', 'xxd', 'openssl', 'uudecode', 'gpg'])
+const LIFT_INLINE_FLAG_RE = /^-[a-z]*[cepr]|^--(?:eval|print|command)\b/i
+// Git config keys / env vars that make git run a program, and git-dir writes.
+const LIFT_GIT_DANGER_RE =
+  /\balias\.|git_config_|=\s*!|\.git\/hooks|\.git\/config|git_dir|\bcore\.(?:hookspath|fsmonitor|sshcommand|pager|editor|askpass|gitproxy|alternaterefscommand)|\bcredential\.|\binclude(?:if)?\.|\bfilter\.|\bdiff\.external|\bdiff\.[^\s=]{0,64}\.(?:textconv|command)|\bmerge\.[^\s=]{0,64}\.driver|\bsequence\.editor|\bgpg\.|\buploadpack\.|\breceivepack\.|\bremote\.[^\s=]{0,64}\.(?:uploadpack|receivepack|proxy)|\bprotocol\.|\burl\.|\bpager\.|\bsubmodule\.[^\s=]{0,64}\.update|\bssh\.variant|\b(?:git_ssh|git_ssh_command|git_askpass|ssh_askpass|git_proxy_command|git_external_diff|git_exec_path|git_editor|git_pager|git_sequence_editor)\s*=/
+const LIFT_SOCKET_RE = /\/dev\/(?:tcp|udp)\//
+const LIFT_SUBST_RE = /\$\(|`|<\(|>\(/
+const LIFT_VAR_INLINE_RE = /\$\{?\w+\}?["']?\s+-[a-z]*c\b/
+
+/** Per-segment word scan of the flattened command: interpreter with an inline
+ *  body, eval/source, decoders next to interpreters, git fetch-family `-u`. */
+function liftSegmentFacts(flat: string): { interp: boolean; inline: boolean; evalSrc: boolean; decoder: boolean; gitUploadPack: boolean } {
+  const facts = { interp: false, inline: false, evalSrc: false, decoder: false, gitUploadPack: false }
+  const segs = segmentBashQuoteAware(flat) ?? segmentBash(flat)
+  for (const seg of segs) {
+    const words = seg.split(/\s+/).filter((w) => w.length > 0)
+    let interpAt = -1
+    for (let i = 0; i < words.length; i += 1) {
+      const w = (words[i] as string).replace(/^[({`$]+|[)}`]+$/g, '')
+      const base = (w.split('/').pop() ?? w).toLowerCase()
+      if (LIFT_INTERP_RE.test(base)) { facts.interp = true; if (interpAt < 0) interpAt = i }
+      // `.` is `source` only in command position (`find . …` is a path).
+      if (base === 'eval' || base === 'source' || (i === 0 && w === '.')) facts.evalSrc = true
+      if (LIFT_DECODERS.has(base)) facts.decoder = true
+      if (interpAt >= 0 && i > interpAt && LIFT_INLINE_FLAG_RE.test(w)) facts.inline = true
+      if (isAlwaysLongExecSurface(w)) facts.gitUploadPack = true
+    }
+    const toks = tokenizeQuoteAware(seg)
+    if (toks !== null) {
+      const gitAt = toks.findIndex((t) => isGitToken(t))
+      if (gitAt >= 0) {
+        const subIdx = gitSubcommandIndex(toks, gitAt)
+        const sub = subIdx < toks.length ? (toks[subIdx] as string) : ''
+        if (GIT_UPLOAD_PACK_U_SUBCOMMANDS.has(sub) && toks.some((t) => t === '-u' || (t.startsWith('-u') && t.length > 2))) {
+          facts.gitUploadPack = true
+        }
+      }
+    }
+  }
+  return facts
+}
+
+/**
+ * True when a command is too complex for an opt-in detector lift to apply:
+ * a nested shell / inline-code body (`sh -c`, `python3 -c`, `eval`), a git
+ * `!`-alias or alias / GIT_CONFIG_* definition, a git config key or env var
+ * that runs a program (core.hooksPath, core.fsmonitor, core.sshCommand,
+ * credential.helper, GIT_SSH_COMMAND, …), git transport-program flags,
+ * decode-into-interpreter, `/dev/tcp|udp`, process / command substitution
+ * next to an interpreter, writes into `.git/hooks` / `.git/config` /
+ * `$GIT_DIR`, unbalanced quoting or unresolved ANSI-C quoting. Fail-safe: any
+ * doubt returns true (the detector keeps confirming).
+ */
+export function isComplexForLift(rawCommand: string): boolean {
+  const joined = stripLineContinuations(rawCommand)
+  if (segmentBashQuoteAware(joined) === null) return true // unbalanced quoting
+  const flat = flattenIndirection(joined)
+  if (/\$'/.test(flat)) return true // unresolved ANSI-C quoting
+  const lower = joined.toLowerCase()
+  const flatLower = flat.toLowerCase()
+  for (const v of [lower, flatLower]) {
+    if (LIFT_GIT_DANGER_RE.test(v) || LIFT_SOCKET_RE.test(v) || LIFT_VAR_INLINE_RE.test(v)) return true
+  }
+  const f = liftSegmentFacts(flat)
+  if (f.inline || f.evalSrc || f.gitUploadPack) return true
+  if (f.decoder && f.interp) return true
+  if (LIFT_SUBST_RE.test(joined) && f.interp) return true
+  return false
+}
+
 /**
  * Minimal glob matcher supporting `*`, `?`, and `**`.
  *   * `**` matches across path separators (any chars incl. `/`).
@@ -2167,8 +2460,8 @@ export interface ClassifyInput {
  * obeys; an operator allow can no longer wave through sudo / git push / pipe-
  * to-interpreter):
  *   1. Validate shape — malformed tool name or malformed Bash → deny.
- *   2. Built-in hard-deny (secret paths, secret-bash, catastrophic bash) —
- *      operator cannot relax.
+ *   2. Built-in hard-deny (secret paths, secret-bash, catastrophic bash,
+ *      own-channel systemctl, git force push) — operator cannot relax.
  *   3. Operator deny (global ∪ scope).
  *   4. Built-in confirm bash (interpreter/exfil/destructive) — UNCONDITIONAL.
  *   5. Operator confirm.
@@ -2235,6 +2528,12 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     if (commandLower !== undefined && mutatesOwnChannel(commandLower)) {
       return { tier: 'deny', reason: 'mutating the agent own comms channel (systemctl) would sever the warchief link', matchedRule: 'builtin:deny:own-channel' }
     }
+    // Non-overridable HARD-DENY: force push in any spelling (owner hard rule
+    // «never force-push»; token-aware, see gitForcePush). The only change to
+    // default behavior introduced with the opt-in detector lifts (2026-10-17).
+    if (gitForcePush(rawCommand)) {
+      return { tier: 'deny', reason: 'force push is never allowed', matchedRule: 'builtin:deny:git-force-push' }
+    }
   }
 
   const scopeCfg = scope && policy.scopes ? policy.scopes[scope] : undefined
@@ -2266,16 +2565,51 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // the detector is quote/heredoc-aware and matches command names case-
     // insensitively itself, so lowercasing here would only re-introduce the
     // flag-case collapse (`-C`/`-c`) that bit gitExecSurface.
-    if (!overridden.includes('pipe-interpreter') && bashConfirmEvasion(rawCommand!)) {
-      return { tier: 'confirm', reason: 'pipe-to-interpreter download needs confirmation', matchedRule: 'builtin:confirm_bash:pipe-interpreter' }
+    //
+    // A listed detector is lifted ONLY for simple commands (isComplexForLift):
+    // on a complex command it still confirms. Not listed → exactly the old
+    // behavior (same reason, same rule id).
+    const raw = rawCommand!
+    const pipeFires = bashConfirmEvasion(raw)
+    const pipeLifted = overridden.includes('pipe-interpreter')
+    const COMPLEX_NOTE = ' (complex form: the opt-in lift covers simple commands only)'
+    let complex: boolean | undefined
+    const isComplex = (): boolean => (complex ??= isComplexForLift(raw))
+    if (pipeFires && (!pipeLifted || isComplex())) {
+      return {
+        tier: 'confirm',
+        reason: `pipe-to-interpreter download needs confirmation${pipeLifted ? COMPLEX_NOTE : ''}`,
+        matchedRule: 'builtin:confirm_bash:pipe-interpreter',
+      }
     }
     // Git config/hook execution surfaces (by default a downgraded `git push`
-    // must not become arbitrary local code execution). Overridable only by
-    // explicit operator opt-in (owner decision 2026-10-17). Pass the RAW
-    // command (commandLower !== undefined ⇒ rawCommand defined) so the
-    // case-sensitive `-c` check distinguishes `git -C` from `git -c`.
-    if (!overridden.includes('git-exec-surface') && gitExecSurface(rawCommand!)) {
-      return { tier: 'confirm', reason: 'git config/hook execution surface needs confirmation', matchedRule: 'builtin:confirm_bash:git-exec-surface' }
+    // must not become arbitrary local code execution). Pass the RAW command so
+    // the case-sensitive `-c` check distinguishes `git -C` from `git -c`.
+    const gitFires = gitExecSurface(raw)
+    const gitLifted = overridden.includes('git-exec-surface')
+    if (gitFires && (!gitLifted || isComplex())) {
+      return {
+        tier: 'confirm',
+        reason: `git config/hook execution surface needs confirmation${gitLifted ? COMPLEX_NOTE : ''}`,
+        matchedRule: 'builtin:confirm_bash:git-exec-surface',
+      }
+    }
+    // A lift actually applied: re-run the hard-deny checks on the flattened
+    // view (adjacent quoted word parts joined, ANSI-C decoded) so a secret path
+    // or catastrophic command split by quotes (`.e""nv`, `r''m -rf /`) cannot
+    // ride a lifted detector. Scoped to the lift path so defaults are unchanged.
+    if (pipeFires || gitFires) {
+      const flat = flattenIndirection(stripLineContinuations(raw))
+      const flatCatastrophic = builtinBashHardDeny(flat)
+      if (flatCatastrophic) {
+        return { tier: 'deny', reason: `catastrophic command blocked: ${flatCatastrophic}`, matchedRule: `builtin:deny_bash:${flatCatastrophic}` }
+      }
+      if (bashReferencesSecret(flat, secretPathAllowlist)) {
+        return { tier: 'deny', reason: 'secret/credential reference in Bash command blocked', matchedRule: 'builtin:deny_bash_secret' }
+      }
+      if (mutatesOwnChannel(flat.toLowerCase())) {
+        return { tier: 'deny', reason: 'mutating the agent own comms channel (systemctl) would sever the warchief link', matchedRule: 'builtin:deny:own-channel' }
+      }
     }
     // (own-channel systemctl hard-deny was hoisted into the step-2b hard-deny
     // pass above so a co-located confirm builtin can't downgrade it — Codex HIGH.)

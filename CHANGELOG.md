@@ -32,6 +32,31 @@ retroactively marks the state of `main` on 2026-06-14.
   the operator `deny` list are untouched. The doctor surfaces a lifted
   detector as a WARN, like `sudo`/`rm -rf`. Documented in README (EN + RU) and
   the example policy.
+- **A detector lift covers simple commands only** (PR #145 review: Fable,
+  Codex, automated security review). A listed detector still confirms on a
+  complex command (`isComplexForLift`): nested `sh|bash|zsh|dash -c` /
+  `python3 -c` / `node -e` / `eval` bodies, git `!`-aliases and `alias.*` /
+  `GIT_CONFIG_*` definitions, program-running git config keys or env
+  (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`, `credential.helper`,
+  `GIT_SSH_COMMAND`, …), `--upload-pack` / `--exec` / fetch `-u`,
+  decode-into-interpreter, `/dev/tcp` / `/dev/udp`, process or command
+  substitution next to an interpreter, writes into `.git/hooks` /
+  `.git/config` / `$GIT_DIR`, unbalanced or ANSI-C quoting. When a lift does
+  apply, the secret-path, catastrophic and own-channel checks re-run on the
+  command with adjacent quoted word parts joined (`.e""nv` → `.env`). Not
+  listed, both detectors behave exactly as before (same rule id and reason).
+- **New built-in hard-deny `git-force-push` (not overridable).** Token-aware:
+  git argv is normalized (env assignments, wrappers, `-C` / `-c` /
+  `--git-dir` / `--work-tree`, the git-core `git-push` form) and a push with
+  `--force`, `-f` (also in clusters), `--force-with-lease`,
+  `--force-if-includes`, `--mirror` or a `+` refspec in any position is
+  denied; so are `alias.*` / `GIT_CONFIG_VALUE_*` / `GIT_CONFIG_PARAMETERS`
+  definitions of a forced push and `remote.<r>.push=+…` /
+  `remote.<r>.mirror=true`. Quoted shell bodies (`bash -c`, `ssh`, `eval`)
+  are parsed recursively. This is the only change to default behavior in
+  1.4.2: force push used to confirm (`git push` built-in) unless the operator
+  denied it by substring. Docs now note that operator deny is substring-based
+  and recommend patterns without the `git ` prefix.
 
 ### Fixed
 - **tmux mirror can no longer flood Telegram into a 429 ban.** Volatile pane

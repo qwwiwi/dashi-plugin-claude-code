@@ -963,6 +963,13 @@ export function checkSharedSettingsClean(homeRaw: string | null, selectedIsHome:
  */
 export const DANGEROUS_OVERRIDE_RULES: readonly string[] = ['sudo ', 'rm -rf ', 'rm -fr ', 'pipe-interpreter', 'git-exec-surface']
 
+/** The named detectors among DANGEROUS_OVERRIDE_RULES (lifted for simple commands only). */
+export const DETECTOR_OVERRIDE_RULES: readonly string[] = ['pipe-interpreter', 'git-exec-surface']
+
+/** What a detector lift does NOT relax (mirrors isComplexForLift in the gate). */
+export const DETECTOR_LIFT_NOTE =
+  '; a lifted detector relaxes SIMPLE commands only — nested sh -c / eval bodies, git aliases and alias / GIT_CONFIG_* definitions, program-running git config or env (core.hooksPath, core.sshCommand, credential.helper, GIT_SSH_COMMAND, …), decode-into-interpreter, /dev/tcp, substitution into an interpreter and .git/hooks / .git/config writes still confirm'
+
 /**
  * One YAML scalar item: quoted → cut at the closing quote (a `#` inside quotes
  * is data); bare → strip the ` # comment` tail. A trailing comment used to
@@ -1068,7 +1075,7 @@ export function checkPermissionPolicy(policyText: string | null, policyPath: str
       id: 'permission-policy-risky-override',
       title: 'confirm_overrides lifts sudo / rm -rf / exec detectors (ultra-autonomy)',
       status: 'warn',
-      detail: `confirm_overrides lifts ${dangerous.join(', ')} to run silently — deliberate under ultra-autonomy; catastrophic forms (rm -rf /, fork bomb, secrets, own-channel systemctl) and the operator deny list stay enforced in code regardless`,
+      detail: `confirm_overrides lifts ${dangerous.join(', ')} to run silently — deliberate under ultra-autonomy; catastrophic forms (rm -rf /, fork bomb, secrets, own-channel systemctl, force push) and the operator deny list stay enforced in code regardless${dangerous.some((d) => DETECTOR_OVERRIDE_RULES.includes(d)) ? DETECTOR_LIFT_NOTE : ''}`,
       fix: 'intended? leave it. If not, remove these from confirm_overrides.builtin_rules',
     })
   } else if (opaque) {
