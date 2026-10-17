@@ -2307,10 +2307,89 @@ function liftConfigAllowed(kv: string | undefined): boolean {
  * refspec), no transport-program flags anywhere (`--upload-pack`,
  * `--receive-pack`, `--exec`, fetch-family `-u`).
  */
+/** True when `raw` holds an unquoted glob metachar (`* ? [ ]`); `{` is
+ *  already refused by liftShapeOk. A glob lets the shell expand a harmless
+ *  looking pattern into a path the allowlist never saw. */
+function hasUnquotedGlob(raw: string): boolean {
+  let quote: "'" | '"' | null = null
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i] as string
+    if (quote !== null) {
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue }
+    if ('*?[]'.includes(ch)) return true
+  }
+  return false
+}
+
+/** Per-subcommand option allowlist for the git lift. `flags` take no value;
+ *  `valued` take the next token (or `--long=value`). Options are matched
+ *  EXACTLY, so git's long-option abbreviations (`--e`, `--de`, `--pru`)
+ *  never match and the lift does not apply. `dashdash` permits a bare `--`. */
+interface GitLiftOptions {
+  readonly flags: ReadonlySet<string>
+  readonly valued: ReadonlySet<string>
+  readonly dashdash: boolean
+}
+
+function liftOpts(flags: readonly string[], valued: readonly string[], dashdash: boolean): GitLiftOptions {
+  return { flags: new Set(flags), valued: new Set(valued), dashdash }
+}
+
+const LOG_FLAGS = ['--oneline', '--stat', '--graph', '--decorate', '--all', '-p', '--patch', '--name-only', '--name-status']
+const GIT_LIFT_OPTIONS: ReadonlyMap<string, GitLiftOptions> = new Map([
+  ['status', liftOpts(['-s', '-b', '-sb', '--short', '--branch', '--porcelain'], [], false)],
+  ['log', liftOpts(LOG_FLAGS, ['-n', '--max-count', '--format', '--pretty'], true)],
+  ['show', liftOpts([...LOG_FLAGS, '-s', '--no-patch'], ['--format', '--pretty'], true)],
+  ['diff', liftOpts(['--stat', '--cached', '--staged', '--name-only', '--name-status', '--shortstat', '--numstat'], [], true)],
+  ['add', liftOpts(['-A', '--all', '-u', '--update'], [], true)],
+  ['commit', liftOpts(['-a', '--all', '-q', '--quiet'], ['-m', '--message', '-am'], false)],
+  ['fetch', liftOpts(['--all', '--tags', '-q', '--quiet'], [], false)],
+  ['pull', liftOpts(['--rebase', '--no-rebase', '--ff-only', '-q', '--quiet'], [], false)],
+  ['checkout', liftOpts(['-b'], [], true)],
+  ['switch', liftOpts(['-c', '--create'], [], false)],
+  ['branch', liftOpts(['-a', '-r', '-v', '-vv', '--list', '--show-current'], [], false)],
+  ['merge', liftOpts(['--ff-only', '--no-ff', '--no-edit'], [], false)],
+  ['stash', liftOpts([], ['-m', '--message'], false)],
+  ['tag', liftOpts(['-l', '--list', '-a'], ['-m', '--message'], false)],
+  ['rev-parse', liftOpts(['--short', '--abbrev-ref', '--show-toplevel', '--git-dir', '--is-inside-work-tree'], [], false)],
+  ['remote', liftOpts(['-v', '--verbose'], [], false)],
+  ['push', liftOpts(['-u', '--set-upstream'], [], false)],
+])
+
+/** Every option in `args` is on the subcommand's allowlist (exact match). */
+function liftArgsAllowed(sub: string, args: readonly string[]): boolean {
+  const opts = GIT_LIFT_OPTIONS.get(sub)
+  if (opts === undefined) return false
+  let endOfOptions = false
+  for (let j = 0; j < args.length; j += 1) {
+    const a = args[j] as string
+    if (endOfOptions || !a.startsWith('-')) continue
+    if (a === '--') {
+      if (!opts.dashdash) return false
+      endOfOptions = true
+      continue
+    }
+    const eq = a.startsWith('--') ? a.indexOf('=') : -1
+    if (eq !== -1) {
+      if (!opts.valued.has(a.slice(0, eq))) return false
+      continue
+    }
+    if (opts.flags.has(a)) continue
+    if (opts.valued.has(a) && j + 1 < args.length) { j += 1; continue }
+    return false
+  }
+  return true
+}
+
 export function gitLiftAllowed(rawCommand: string): boolean {
   if (!liftShapeOk(rawCommand, 0)) return false
+  if (hasUnquotedGlob(rawCommand)) return false
   const toks = tokenizeQuoteAware(rawCommand.trim())
   if (toks === null || toks[0] !== 'git') return false
+  if (toks.slice(1).some((t) => t.startsWith('~') || t.includes('.git/'))) return false
   let i = 1
   while (i < toks.length && (toks[i] as string).startsWith('-')) {
     if (toks[i] !== '-c' || !liftConfigAllowed(toks[i + 1])) return false
@@ -2319,6 +2398,7 @@ export function gitLiftAllowed(rawCommand: string): boolean {
   const sub = toks[i]
   if (sub === undefined || !GIT_LIFT_SUBCOMMANDS.has(sub)) return false
   const args = toks.slice(i + 1)
+  if (!liftArgsAllowed(sub, args)) return false
   if (args.some((a) => isAlwaysLongExecSurface(a) || /^--(?:upload|receive)/i.test(a))) return false
   if ((sub === 'fetch' || sub === 'pull') && args.some((a) => /^-u/.test(a))) return false
   if (sub === 'tag' && args.some((a) => /^--del/.test(a) || /^-[A-Za-z]*d/.test(a))) return false
@@ -2337,7 +2417,7 @@ export function gitLiftAllowed(rawCommand: string): boolean {
 const PIPE_LIFT_INTERPRETERS = new Set(['sh', 'bash', 'python3'])
 const CURL_LIFT_LONG = new Set(['--fail', '--silent', '--show-error', '--location', '--compressed', '--tlsv1.2'])
 const WGET_LIFT_FLAGS = new Set(['-q', '-qO-', '-O-', '-qO', '-O', '-', '--quiet', '--output-document=-', '--https-only', '-nv', '--no-verbose'])
-const LIFT_URL_RE = /^https?:\/\/[A-Za-z0-9._~:\/?#%=&+,;!*()'\[\]-]+$/
+const LIFT_URL_RE = /^https:\/\/[A-Za-z0-9._~:\/?#%=&+,;!*()'\[\]-]+$/
 const LIFT_PLAIN_ARG_RE = /^[A-Za-z0-9._\/=:,+-]+$/
 
 /**
