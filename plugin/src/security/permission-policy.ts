@@ -2263,6 +2263,8 @@ export function gitPushDelete(rawCommand: string): boolean {
 // the command confirms — plus an argv pass that confirms when a config KEY
 // cannot be resolved (variable / substitution in the key position).
 // Over-confirming a benign mention (`git log --grep core.pager`) is accepted.
+// Under `:all` it runs on every command that mentions git (gitCommandMentioned),
+// not only when git-exec-surface fired. BEST-EFFORT denylist, not a sandbox.
 
 // Config keys whose value git executes. Owner list (2026-10-17) plus
 // safe-side extras that execute too: core.askpass / gitproxy /
@@ -2287,13 +2289,34 @@ const GIT_CODE_EXEC_KEY_RE = new RegExp(
     'uploadpack\\.packobjectshook',
     'include(?:if)?\\.',
     'protocol\\.(?:[^\\s=]*\\.)?allow',
+    // fix-loop 2 (Fable): tool paths, submodule update commands, send-email
+    // programs, instaweb, init templates (they install hooks).
+    '(?:difftool|mergetool|browser|man)\\.[^\\s=]*\\.path',
+    'submodule\\.[^\\s=]*\\.update',
+    'sendemail\\.(?:[^\\s=]*\\.)?(?:smtpserver|sendmailcmd)',
+    'instaweb\\.',
+    'init\\.templatedir',
   ].join('|'),
 )
 // `alias.<x>` whose value is a shell command (`!…`) or unresolvable (`$`, backtick).
 const GIT_ALIAS_EXEC_RE = /alias\.[^\s=]+(?:=|\s+)[!$`]/
+// Any `-c key=!…` value (git runs `!` values as shell commands for several
+// keys) and an alias whose value comes from the environment (`--config-env`,
+// any of its `--config-e…` prefixes): the value is unknowable.
+const GIT_BANG_VALUE_RE = /(?:^|\s)-c\s*[^\s=]+=\s*!/
+const GIT_CONFIG_ENV_ALIAS_RE = /--config-(?:e(?:nv?)?)?[=\s]+alias\./
+// Transport-program flags abbreviated to any unambiguous-looking prefix
+// (`--upl=`, `--rec=`, `--upload-p`), anywhere in the flattened text —
+// including inside `$(…)` / `<(…)`. Conservative: `--re` / `--rec` also
+// prefix `--recurse-submodules`; spelling that option out in full passes.
+const GIT_TRANSPORT_ABBREV_RE = new RegExp(
+  `--(?:${[...new Set(LONG_EXEC_PREFIX_TARGETS.flatMap((t) => Array.from({ length: t.length - 1 }, (_, i) => t.slice(0, i + 2))))]
+    .sort((a, b) => b.length - a.length)
+    .join('|')})(?![a-z0-9_])`,
+)
 // Env vars that make git run a program, and every GIT_CONFIG_* assignment.
 const GIT_CODE_EXEC_ENV_RE =
-  /(?:^|[^a-z0-9_])(?:git_ssh|git_ssh_command|git_external_diff|git_pager|git_editor|git_sequence_editor|git_askpass|ssh_askpass|git_proxy_command|git_config_[a-z0-9_]*)\s*=/
+  /(?:^|[^a-z0-9_])(?:git_ssh|git_ssh_command|git_external_diff|git_pager|git_editor|git_sequence_editor|git_askpass|ssh_askpass|git_proxy_command|git_allow_protocol|git_config_[a-z0-9_]*)\s*=/
 // Transport-program flags and git's exec path.
 const GIT_TRANSPORT_EXEC_RE = /--upload-pack|--receive-pack|--exec(?![a-z0-9_-])|--exec-path=/
 // Hook installs and direct .git/config writes (they can set any key above).
@@ -2313,6 +2336,13 @@ function transportExecToken(tok: string): boolean {
   return name.length >= 2 && LONG_EXEC_PREFIX_TARGETS.some((t) => t.startsWith(name))
 }
 
+/** A `<key>=<value>` whose value is a `!` shell command. */
+function bangValue(kv: string | undefined): boolean {
+  if (kv === undefined) return false
+  const eq = kv.indexOf('=')
+  return eq >= 0 && kv.slice(eq + 1).trimStart().startsWith('!')
+}
+
 /** A config key that cannot be resolved statically. */
 function unresolvedKey(kv: string | undefined): boolean {
   if (kv === undefined) return true
@@ -2330,13 +2360,29 @@ function segmentCodeExec(segment: string, depth: number): boolean {
   if (head.startsWith('$') && configish) return true
   const inv = normalizeGitInvocation(toks)
   if (inv !== null) {
-    if (inv.configs.some(unresolvedKey)) return true
+    if (inv.configs.some((c) => unresolvedKey(c) || bangValue(c))) return true
     for (let i = 0; i < toks.length; i += 1) {
       const t = toks[i] as string
       if (transportExecToken(t)) return true
       if (t.startsWith('--conf')) {
         const v = t.includes('=') ? t.slice(t.indexOf('=') + 1) : toks[i + 1]
-        if (unresolvedKey(v)) return true
+        if (unresolvedKey(v) || bangValue(v)) return true
+        // `--config-env=<key>=<ENV>`: the value is unknowable — an alias via
+        // the environment can be a `!` shell alias.
+        const name = (t.slice(2).split('=')[0] as string).toLowerCase()
+        if (name.length >= 7 && 'config-env'.startsWith(name) && (v ?? '').toLowerCase().startsWith('alias.')) return true
+      }
+    }
+    // `git clone -c <k>=<v>` / `-c<k>=<v>` / `--config[=]<k>=<v>`: config set
+    // AFTER the subcommand (applied to the new repo before checkout).
+    if (inv.sub === 'clone') {
+      for (let i = 0; i < inv.args.length; i += 1) {
+        const a = inv.args[i] as string
+        let v: string | undefined | null = null
+        if (a === '-c') v = inv.args[i + 1]
+        else if (a.startsWith('-c') && a.length > 2) v = a.slice(2)
+        else if (isConfigFamilyToken(a)) v = a.includes('=') ? a.slice(a.indexOf('=') + 1) : inv.args[i + 1]
+        if (v !== null && (unresolvedKey(v) || bangValue(v))) return true
       }
     }
     if (GIT_UPLOAD_PACK_U_SUBCOMMANDS.has(inv.sub) && inv.args.some((a) => /^-[A-Za-z]*u/.test(a))) return true
@@ -2346,6 +2392,9 @@ function segmentCodeExec(segment: string, depth: number): boolean {
         if (GIT_CONFIG_VALUE_OPTS.has(a)) { i += 1; continue }
         if (a.startsWith('-')) continue
         if (unresolvedKey(a)) return true
+        // `git config <key> !…` — a shell-command value.
+        const val = inv.args[i + 1]
+        if (val !== undefined && val.startsWith('!')) return true
         break
       }
     }
@@ -2369,7 +2418,20 @@ function commandCodeExec(command: string, depth: number): boolean {
   return segs.some((s) => segmentCodeExec(s, depth))
 }
 
+/** The command mentions git (a `git` / `git-*` word) or sets a git program env var. */
+export function gitCommandMentioned(rawCommand: string): boolean {
+  const flat = flattenIndirection(stripLineContinuations(rawCommand)).toLowerCase()
+  return /(?:^|[^a-z0-9_.-])git(?:-[a-z][a-z-]*)?(?![a-z0-9_.-])/.test(flat) || flat.includes('.git/') || GIT_CODE_EXEC_ENV_RE.test(flat)
+}
+
 /**
+ * BEST-EFFORT denylist, not a sandbox (under `default_tier: allow` an agent
+ * can run programs directly anyway — `:all` is for trusted agents).
+ * Known gaps (follow-up ticket): GIT_EXEC_PATH, GIT_TEMPLATE_DIR,
+ * `--template=`, GIT_DIR / `--git-dir` / `-C` into an untrusted repo,
+ * HOME / XDG_CONFIG_HOME swaps, writes to ~/.gitconfig, difftool
+ * `--extcmd` / `-x`.
+ *
  * True when a command touches a git surface that EXECUTES a program: a
  * code-running config key (set via `-c`, `--config-env`, `git config`,
  * GIT_CONFIG_*, a .git/config write), an `alias.*` shell alias, a program-
@@ -2385,15 +2447,18 @@ export function gitCodeExecSurface(rawCommand: string): boolean {
   if (
     GIT_CODE_EXEC_KEY_RE.test(flat) ||
     GIT_ALIAS_EXEC_RE.test(flat) ||
+    GIT_BANG_VALUE_RE.test(flat) ||
+    GIT_CONFIG_ENV_ALIAS_RE.test(flat) ||
     GIT_CODE_EXEC_ENV_RE.test(flat) ||
     GIT_TRANSPORT_EXEC_RE.test(flat) ||
+    GIT_TRANSPORT_ABBREV_RE.test(flat) ||
     GIT_HOOK_OR_CONFIG_FILE_RE.test(flat)
   ) {
     return true
   }
   // Inside a substitution the argv pass cannot see git (`x=$(git -c "$k=v" …)`):
   // any `-c` whose key part is unresolvable confirms.
-  if (/\$\(|[<>]\(|`/.test(joined) && /(?:^|\s)-c\s*[^\s=]*[$`]/.test(flatRaw)) return true
+  if (/\$\(|[<>]\(|`/.test(joined) && /(?:^|\s)(?:-c\s*|--conf[a-z-]*[=\s]+)[^\s=]*[$`]/.test(flatRaw)) return true
   if (commandCodeExec(joined, 0)) return true
   // ANSI-C quoting: also run the argv pass on the decoded view.
   return joined.includes("$'") && commandCodeExec(flatRaw, 0)
@@ -2995,7 +3060,11 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // The flattened hard-deny re-check below still runs.
     const gitFullLift = overridden.includes('git-exec-surface:all')
     const gitLifted = gitFullLift || overridden.includes('git-exec-surface')
-    if (gitFires && gitFullLift && gitCodeExecSurface(raw)) {
+    // Under `:all` the code-exec guard runs even when git-exec-surface did
+    // not fire (`git config core.pager x`, `GIT_PAGER=x git log`), but only
+    // for commands that mention git or set a git program env var, so non-git
+    // work (`#include.h`, `build.cmd`) keeps flowing. Defaults are untouched.
+    if (gitFullLift && (gitFires || gitCommandMentioned(raw)) && gitCodeExecSurface(raw)) {
       return {
         tier: 'confirm',
         reason: 'git config/hook execution surface needs confirmation (git-exec-surface:all still guards config, env and flags that run a program)',

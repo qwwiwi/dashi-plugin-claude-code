@@ -918,6 +918,8 @@ describe('permission policy lint', () => {
     expect(both?.detail).not.toContain('ALLOWLISTED SIMPLE commands only')
     expect(both?.detail).toContain('still confirm')
     expect(both?.detail).toContain('core.pager')
+    expect(both?.detail).toContain('BEST-EFFORT')
+    expect(both?.detail).toContain('trusted agents')
     // pipe-interpreter next to :all keeps its own allowlist note.
     const pipeAll = checkPermissionPolicy('confirm_overrides:\n  builtin_rules:\n    - "pipe-interpreter"\n    - "git-exec-surface:all"\n', '/p')
       .find((x) => x.id === 'permission-policy-risky-override')

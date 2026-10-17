@@ -255,13 +255,15 @@ When a lift does apply, the secret-path, catastrophic and own-channel checks are
 
 - `git-push-delete` — together with `git push`, a push that deletes a remote ref no longer confirms (the conservative check above is skipped entirely).
 - `git-exec-surface:all` — every git-exec-surface hit passes regardless of shape (wrappers, env prefixes, redirections, expansions, several segments, any `-c` key) **except surfaces that make git run a program**, which still confirm:
-  - config keys set via `-c`, `--config-env`, `git config`, `GIT_CONFIG_*` or a `.git/config` write: `alias.*` whose value starts with `!`, `core.pager`, `core.sshCommand`, `core.hooksPath`, `core.fsmonitor`, `core.editor`, `sequence.editor`, `*.command` / `*.cmd`, `filter.*.clean|smudge|process`, `diff.*.textconv`, `diff.external`, `credential.helper`, `gpg.program`, plus `core.askpass`, `core.gitProxy`, `pager.*`, `merge.*.driver`, `remote.*.uploadpack|receivepack`, `include.path` / `includeIf`, `protocol.*.allow`;
-  - a config key that cannot be resolved (`git -c "$k=v"`, a variable git command word with config flags);
-  - env vars `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_PROXY_COMMAND` and any `GIT_CONFIG_*` assignment;
-  - transport-program flags `--upload-pack`, `--receive-pack`, `-u` (clone/fetch/pull/ls-remote), `--exec`, `--exec-path=`;
-  - writes to `.git/hooks`.
+  - config keys set via `-c`, `--config-env`, `git config`, `GIT_CONFIG_*` or a `.git/config` write: `alias.*` whose value starts with `!`, `core.pager`, `core.sshCommand`, `core.hooksPath`, `core.fsmonitor`, `core.editor`, `sequence.editor`, `*.command` / `*.cmd`, `filter.*.clean|smudge|process`, `diff.*.textconv`, `diff.external`, `credential.helper`, `gpg.program`, plus `core.askpass`, `core.gitProxy`, `pager.*`, `merge.*.driver`, `remote.*.uploadpack|receivepack`, `include.path` / `includeIf`, `protocol.*.allow`, `difftool|mergetool|browser|man.*.path`, `submodule.*.update`, `sendemail.smtpServer|sendmailCmd`, `instaweb.*`, `init.templateDir`, and **any** key whose value starts with `!`;
+  - a config key that cannot be resolved (`git -c "$k=v"`, `git clone -c`/`--config` with a variable key, a variable git command word with config flags), and an `alias.*` set through `--config-env` (the value is unknowable);
+  - env vars `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_PROXY_COMMAND`, `GIT_ALLOW_PROTOCOL` and any `GIT_CONFIG_*` assignment;
+  - transport-program flags `--upload-pack`, `--receive-pack` and their abbreviations (`--upl=`, `--rec=`, `--upload-p`, anywhere, including inside `$(…)` / `<(…)`), `-u` (clone/fetch/pull/ls-remote), `--exec`, `--exec-path=`;
+  - writes to `.git/hooks` and `.git/config`.
 
-  The secret-path, catastrophic and own-channel re-check still runs after the lift.
+  Under `:all` this guard runs on every command that mentions git (or sets one of the env vars above), even when git-exec-surface itself did not fire — e.g. `git config core.pager x` or `GIT_PAGER=x git log` confirm under `:all` though they pass by default. The secret-path, catastrophic and own-channel re-check still runs after the lift.
+
+  **This guard is BEST-EFFORT — a denylist, not a sandbox.** With `default_tier: allow` an agent can run any program directly anyway, so `git-exec-surface:all` is for trusted agents only. Known gaps (follow-up ticket): `GIT_EXEC_PATH`, `GIT_TEMPLATE_DIR`, `--template=`, `GIT_DIR` / `--git-dir` / `-C` into an untrusted repository, `HOME` / `XDG_CONFIG_HOME` swaps, writes to `~/.gitconfig`, `git difftool --extcmd` / `-x`.
 
 ```yaml
 confirm_overrides:

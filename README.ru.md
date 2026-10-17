@@ -245,13 +245,15 @@ confirm_overrides:
 
 - `git-push-delete` — вместе с `git push`: push, удаляющий ветку на удалённом репозитории, больше не просит подтверждение (консервативная проверка выше пропускается целиком).
 - `git-exec-surface:all` — любое срабатывание git-exec-surface проходит независимо от формы (обёртки, env-префиксы, перенаправления, подстановки, несколько сегментов, любой ключ `-c`), **кроме поверхностей, через которые git запускает программу**, — они по-прежнему просят подтверждение:
-  - ключи конфига через `-c`, `--config-env`, `git config`, `GIT_CONFIG_*` или запись в `.git/config`: `alias.*` со значением на `!`, `core.pager`, `core.sshCommand`, `core.hooksPath`, `core.fsmonitor`, `core.editor`, `sequence.editor`, `*.command` / `*.cmd`, `filter.*.clean|smudge|process`, `diff.*.textconv`, `diff.external`, `credential.helper`, `gpg.program`, а также `core.askpass`, `core.gitProxy`, `pager.*`, `merge.*.driver`, `remote.*.uploadpack|receivepack`, `include.path` / `includeIf`, `protocol.*.allow`;
-  - ключ конфига, который нельзя вычислить статически (`git -c "$k=v"`, git через переменную с флагами конфига);
-  - переменные `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_PROXY_COMMAND` и любое присваивание `GIT_CONFIG_*`;
-  - флаги транспортной программы `--upload-pack`, `--receive-pack`, `-u` (clone/fetch/pull/ls-remote), `--exec`, `--exec-path=`;
-  - запись в `.git/hooks`.
+  - ключи конфига через `-c`, `--config-env`, `git config`, `GIT_CONFIG_*` или запись в `.git/config`: `alias.*` со значением на `!`, `core.pager`, `core.sshCommand`, `core.hooksPath`, `core.fsmonitor`, `core.editor`, `sequence.editor`, `*.command` / `*.cmd`, `filter.*.clean|smudge|process`, `diff.*.textconv`, `diff.external`, `credential.helper`, `gpg.program`, а также `core.askpass`, `core.gitProxy`, `pager.*`, `merge.*.driver`, `remote.*.uploadpack|receivepack`, `include.path` / `includeIf`, `protocol.*.allow`, `difftool|mergetool|browser|man.*.path`, `submodule.*.update`, `sendemail.smtpServer|sendmailCmd`, `instaweb.*`, `init.templateDir` и **любой** ключ со значением на `!`;
+  - ключ конфига, который нельзя вычислить статически (`git -c "$k=v"`, `git clone -c`/`--config` с ключом из переменной, git через переменную с флагами конфига), и `alias.*`, заданный через `--config-env` (значение неизвестно);
+  - переменные `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_PROXY_COMMAND`, `GIT_ALLOW_PROTOCOL` и любое присваивание `GIT_CONFIG_*`;
+  - флаги транспортной программы `--upload-pack`, `--receive-pack` и их сокращения (`--upl=`, `--rec=`, `--upload-p` — где угодно, в том числе внутри `$(…)` / `<(…)`), `-u` (clone/fetch/pull/ls-remote), `--exec`, `--exec-path=`;
+  - запись в `.git/hooks` и `.git/config`.
 
-  Повторная проверка секретных путей, катастрофических команд и своего канала после снятия остаётся.
+  При `:all` эта защита проверяет каждую команду, где упомянут git (или задана одна из переменных выше), даже если сам git-exec-surface не сработал: например, `git config core.pager x` или `GIT_PAGER=x git log` при `:all` просят подтверждение, хотя по умолчанию проходят. Повторная проверка секретных путей, катастрофических команд и своего канала после снятия остаётся.
+
+  **Эта защита работает по принципу «насколько получится» — это список запретов, а не песочница.** При `default_tier: allow` агент и так может запустить любую программу напрямую, поэтому `git-exec-surface:all` — только для доверенных агентов. Известные пробелы (отдельный тикет): `GIT_EXEC_PATH`, `GIT_TEMPLATE_DIR`, `--template=`, `GIT_DIR` / `--git-dir` / `-C` в недоверенный репозиторий, подмена `HOME` / `XDG_CONFIG_HOME`, запись в `~/.gitconfig`, `git difftool --extcmd` / `-x`.
 
 ```yaml
 confirm_overrides:

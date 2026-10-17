@@ -978,7 +978,7 @@ const PIPE_LIFT_NOTE =
 
 /** What `git-exec-surface:all` lifts and what it still guards (mirrors gitCodeExecSurface). */
 export const FULL_GIT_LIFT_NOTE =
-  '; git-exec-surface:all lifts every git config/env/flag hit EXCEPT those that run a program — code-executing config keys (alias.*=!…, core.pager, core.sshCommand, core.hooksPath, core.fsmonitor, core.editor, sequence.editor, *.command/*.cmd, filter.*, diff.*.textconv, diff.external, credential.helper, gpg.program, include.path, …), GIT_SSH_COMMAND/GIT_EXTERNAL_DIFF/GIT_PAGER/GIT_EDITOR/GIT_ASKPASS/GIT_CONFIG_*, --upload-pack/--receive-pack/-u/--exec, hook and .git/config writes — those still confirm'
+  '; git-exec-surface:all lifts every git config/env/flag hit EXCEPT those that run a program — code-executing config keys (alias.*=!…, core.pager, core.sshCommand, core.hooksPath, core.fsmonitor, core.editor, sequence.editor, *.command/*.cmd, filter.*, diff.*.textconv, diff.external, credential.helper, gpg.program, include.path, tool *.path, submodule.*.update, any `!` value, …), unresolvable keys, GIT_SSH_COMMAND/GIT_EXTERNAL_DIFF/GIT_PAGER/GIT_EDITOR/GIT_ASKPASS/GIT_CONFIG_*, --upload-pack/--receive-pack (and abbreviations)/-u/--exec, hook and .git/config writes — those still confirm. This guard is BEST-EFFORT (a denylist, not a sandbox; known gaps: GIT_EXEC_PATH, GIT_TEMPLATE_DIR, --template=, GIT_DIR, ~/.gitconfig writes, --extcmd) — with default_tier allow an agent can run programs directly anyway, so list :all only for trusted agents'
 
 /** Push-delete opt-in note. */
 const PUSH_DELETE_NOTE = '; git-push-delete (with git push) lets a push delete a remote ref without confirmation'
