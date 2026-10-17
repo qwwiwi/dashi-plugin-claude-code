@@ -911,6 +911,18 @@ describe('permission policy lint', () => {
       expect(c?.detail).toContain(name)
       expect(c?.detail).not.toContain('ALLOWLISTED SIMPLE commands only')
     }
+    // With :all listed next to git-exec-surface, the git part is NOT described
+    // as allowlist-only; it says what still confirms.
+    const both = checkPermissionPolicy('confirm_overrides:\n  builtin_rules:\n    - "git-exec-surface"\n    - "git-exec-surface:all"\n', '/p')
+      .find((x) => x.id === 'permission-policy-risky-override')
+    expect(both?.detail).not.toContain('ALLOWLISTED SIMPLE commands only')
+    expect(both?.detail).toContain('still confirm')
+    expect(both?.detail).toContain('core.pager')
+    // pipe-interpreter next to :all keeps its own allowlist note.
+    const pipeAll = checkPermissionPolicy('confirm_overrides:\n  builtin_rules:\n    - "pipe-interpreter"\n    - "git-exec-surface:all"\n', '/p')
+      .find((x) => x.id === 'permission-policy-risky-override')
+    expect(pipeAll?.detail).toContain('a lifted pipe-interpreter relaxes ALLOWLISTED SIMPLE commands only')
+    expect(pipeAll?.detail).not.toContain('git-exec-surface: one bare')
     // Lifting only sudo does not print the detector note.
     const s = checkPermissionPolicy('confirm_overrides:\n  builtin_rules:\n    - "sudo "\n', '/p').find((x) => x.id === 'permission-policy-risky-override')
     expect(s?.detail).not.toContain('ALLOWLISTED SIMPLE commands only')

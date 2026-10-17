@@ -148,7 +148,8 @@ export interface PermissionPolicy {
    * overridable only by explicit operator opt-in (owner decision 2026-10-17),
    * and then only for allowlisted simple shapes (gitLiftAllowed /
    * pipeLiftAllowed — anything else still confirms); not listed, they confirm
-   * exactly as before. `git-exec-surface:all` lifts the git detector fully;
+   * exactly as before. `git-exec-surface:all` lifts the git detector except
+   * for surfaces that execute a program (gitCodeExecSurface);
    * `git-push-delete` stops a remote-ref-deleting push from confirming when
    * `git push` is overridden. A compound command matching an
    * overridden AND a non-overridden built-in rule still confirms.
@@ -243,9 +244,12 @@ const BUILTIN_CONFIRM_BASH: readonly string[] = [
 //   * `git-exec-surface` — one bare `git` segment with `-c` keys from an
 //     allowlist (user.*, color.*, advice.*, …) and an allowlisted subcommand,
 //     push only without force / delete (gitLiftAllowed).
-//   * `git-exec-surface:all` — FULL lift (owner decision 2026-10-17: agents
-//     write code and push without cards): the git-exec-surface detector never
-//     confirms. Implies `git-exec-surface`.
+//   * `git-exec-surface:all` — full lift (owner decision 2026-10-17: agents
+//     write code and push without cards): every git-exec-surface hit passes
+//     EXCEPT a surface that runs a program (code-executing config keys,
+//     `alias.*=!…`, GIT_SSH_COMMAND / GIT_PAGER / GIT_CONFIG_* and friends,
+//     transport-program flags, hook / .git/config writes — gitCodeExecSurface).
+//     Implies `git-exec-surface`.
 //   * `git-push-delete` — a push that deletes a remote ref (`git push origin
 //     :x`, `--delete`, `-d`, `--prune`) no longer confirms once `git push` is
 //     overridden too.
@@ -2231,162 +2235,168 @@ export function gitForcePush(rawCommand: string): boolean {
 
 const PD_DELETE_RE = /(?:^|[\s'"=(])(?:--delete(?![a-z0-9_-])|--prune(?![a-z0-9_-])|-[A-Za-z]{0,16}d[A-Za-z]{0,16}(?=$|[\s'";|&)]))|(?:^|\s):[\w*/.@^~-]/
 
-// Heredoc commands whose body is plain DATA (it lands in a file / stdout).
-const HEREDOC_DATA_SINKS = new Set(['cat', 'tee'])
-const HEREDOC_OPEN_RE = /^<<(-?)[ \t]*(?:'([A-Za-z0-9_.-]+)'|"([A-Za-z0-9_.-]+)"|([A-Za-z0-9_.-]+))(?=[\s;&>]|$)/
-// Compound / grouping syntax that could pipe a cat's output into an
-// interpreter (`{ cat <<X … X\n} | bash`, `if …\nthen\ncat <<X …\nfi | sh`).
-const HEREDOC_COMPOUND_RE = /[(){}`]|(?:^|[\s;&|])(?:if|then|else|elif|fi|for|while|until|do|done|case|esac|select|function|coproc)(?=$|[\s;&|])/
-
-/**
- * Length-preserving mask: the BODY of a heredoc that is plain data — fed to
- * `cat` / `tee`, nothing piped, substituted or grouped around it — becomes
- * blanks (newlines kept). An agent writing a source file with
- * `cat > f.go <<'EOF' … EOF` must not have the file CONTENT read as a command
- * (live false positive: Go source raised «push that deletes a remote ref»).
- * CONSERVATIVE: on anything not recognised (unquoted body with `$(`/backtick,
- * another command word, a pipe or substitution on the opener line, compound
- * syntax anywhere, unterminated body, unbalanced quotes) the command is
- * returned UNCHANGED, so the caller's fail-closed checks see the raw text.
- * Accepted residual: two-step write-then-run (`cat > x.sh <<'E' … E; bash
- * x.sh`) — the same residual as writing a script with the Write tool.
- */
-function maskDataHeredocBodies(cmd: string): string {
-  if (!cmd.includes('<<')) return cmd
-  const out = cmd.split('')
-  const n = cmd.length
-  let masked = false
-  let segStart = 0
-  let i = 0
-  while (i < n) {
-    const ch = cmd[i] as string
-    if (ch === '\\') { i += 2; continue }
-    if (ch === '$' && cmd[i + 1] === "'") {
-      let j = i + 2
-      while (j < n && cmd[j] !== "'") j += cmd[j] === '\\' ? 2 : 1
-      if (j >= n) return cmd
-      i = j + 1
-      continue
+/** Remote-ref deletion by push (`git push origin :main`, `--delete`, `-d`,
+ *  `--prune`). Confirmed even when the `git push` built-in is overridden —
+ *  text check OR parser, fail-closed like gitForcePush. */
+export function gitPushDelete(rawCommand: string): boolean {
+  const joined = stripLineContinuations(rawCommand)
+  const flat = flattenIndirection(joined)
+  for (const v of [joined, flat]) {
+    if (FP_GIT_WORD_RE.test(v) && FP_PUSH_WORD_RE.test(v) && PD_DELETE_RE.test(v)) return true
+    const segs = segmentBashQuoteAware(v)
+    if (segs === null) return true
+    for (const s of segs) {
+      const toks = tokenizeQuoteAware(s)
+      if (toks === null) return true
+      const inv = normalizeGitInvocation(toks)
+      if (inv !== null && isPushSub(inv.sub) && pushArgsDelete(inv.args)) return true
     }
-    if (ch === "'") {
-      const j = cmd.indexOf("'", i + 1)
-      if (j < 0) return cmd
-      i = j + 1
-      continue
-    }
-    if (ch === '"') {
-      let j = i + 1
-      while (j < n && cmd[j] !== '"') j += cmd[j] === '\\' ? 2 : 1
-      if (j >= n) return cmd
-      i = j + 1
-      continue
-    }
-    if (ch === '#' && (i === 0 || /[\s;&|]/.test(cmd[i - 1] as string))) {
-      const nl = cmd.indexOf('\n', i)
-      if (nl < 0) break
-      i = nl
-      continue
-    }
-    if (ch === ';' || ch === '&' || ch === '|' || ch === '\n') { segStart = i + 1; i += 1; continue }
-    if (ch === '<' && cmd[i + 1] === '<') {
-      if (cmd[i + 2] === '<') { i += 3; continue } // here-string, not a heredoc
-      const m = HEREDOC_OPEN_RE.exec(cmd.slice(i))
-      if (m === null) return cmd
-      const strip = m[1] === '-'
-      const quotedDelim = m[2] ?? m[3]
-      const delim = (quotedDelim ?? m[4]) as string
-      const nl = cmd.indexOf('\n', i)
-      if (nl < 0) return cmd
-      const before = cmd.slice(segStart, i)
-      const tail = cmd.slice(i + m[0].length, nl)
-      const head = (before.trim().split(/\s+/)[0] ?? '').toLowerCase()
-      if (!HEREDOC_DATA_SINKS.has(head) || /[`()]/.test(before) || /[|`()<'"\\]/.test(tail)) return cmd
-      let lineStart = nl + 1
-      let bodyEnd = -1
-      let termEnd = -1
-      while (lineStart <= n) {
-        let le = cmd.indexOf('\n', lineStart)
-        if (le < 0) le = n
-        const line = strip ? cmd.slice(lineStart, le).replace(/^\t+/, '') : cmd.slice(lineStart, le)
-        if (line === delim) { bodyEnd = lineStart; termEnd = le; break }
-        if (le >= n) break
-        lineStart = le + 1
-      }
-      if (bodyEnd < 0) return cmd // unterminated → leave intact
-      const body = cmd.slice(nl + 1, bodyEnd)
-      // An unquoted delimiter expands the body: `$(…)` / backticks execute.
-      if (quotedDelim === undefined && /`|\$\(/.test(body)) return cmd
-      for (let k = nl + 1; k < bodyEnd; k += 1) if (cmd[k] !== '\n') out[k] = ' '
-      masked = true
-      i = termEnd
-      segStart = termEnd
-      continue
-    }
-    i += 1
   }
-  if (!masked) return cmd
-  const result = out.join('')
-  const visible = maskQuotedLiterals(result)
-  if (visible === null || HEREDOC_COMPOUND_RE.test(visible)) return cmd
-  return result
+  return false
 }
 
-/** Coarse text check: git word + push word + delete marker. Run on a view with
- *  quoted literals and data-heredoc bodies blanked (see commandPushDelete). */
-function pushDeleteText(s: string): boolean {
-  return FP_GIT_WORD_RE.test(s) && FP_PUSH_WORD_RE.test(s) && PD_DELETE_RE.test(s)
+// ── `git-exec-surface:all` still guards code execution (PR #147 review) ──
+//
+// The full lift relaxes every git-exec-surface hit EXCEPT the ones that make
+// git run a program the command names. Checked fail-closed on the flattened
+// (quotes dropped, ANSI-C decoded, lowercased) text — a mention anywhere in
+// the command confirms — plus an argv pass that confirms when a config KEY
+// cannot be resolved (variable / substitution in the key position).
+// Over-confirming a benign mention (`git log --grep core.pager`) is accepted.
+
+// Config keys whose value git executes. Owner list (2026-10-17) plus
+// safe-side extras that execute too: core.askpass / gitproxy /
+// alternateRefsCommand, pager.<cmd>, *.cmd (difftool / mergetool),
+// merge.*.driver, remote.*.uploadpack / receivepack / vcs,
+// uploadpack.packObjectsHook, include.path / includeIf (pull in a config file
+// with any key), protocol.*.allow (enables the `ext::` transport).
+const GIT_CODE_EXEC_KEY_RE = new RegExp(
+  [
+    'core\\.(?:pager|sshcommand|hookspath|fsmonitor|editor|askpass|gitproxy|alternaterefscommand)',
+    'sequence\\.editor',
+    '(?:^|[^a-z0-9_.-])pager\\.',
+    '\\.command(?![a-z0-9_-])',
+    '\\.cmd(?![a-z0-9_-])',
+    'filter\\.[^\\s=]*\\.(?:clean|smudge|process)',
+    'diff\\.[^\\s=]*\\.textconv',
+    'diff\\.external',
+    'credential\\.(?:[^\\s=]*\\.)?helper',
+    'gpg\\.(?:[^\\s=]*\\.)?program',
+    'merge\\.[^\\s=]*\\.driver',
+    'remote\\.[^\\s=]*\\.(?:uploadpack|receivepack|vcs)',
+    'uploadpack\\.packobjectshook',
+    'include(?:if)?\\.',
+    'protocol\\.(?:[^\\s=]*\\.)?allow',
+  ].join('|'),
+)
+// `alias.<x>` whose value is a shell command (`!…`) or unresolvable (`$`, backtick).
+const GIT_ALIAS_EXEC_RE = /alias\.[^\s=]+(?:=|\s+)[!$`]/
+// Env vars that make git run a program, and every GIT_CONFIG_* assignment.
+const GIT_CODE_EXEC_ENV_RE =
+  /(?:^|[^a-z0-9_])(?:git_ssh|git_ssh_command|git_external_diff|git_pager|git_editor|git_sequence_editor|git_askpass|ssh_askpass|git_proxy_command|git_config_[a-z0-9_]*)\s*=/
+// Transport-program flags and git's exec path.
+const GIT_TRANSPORT_EXEC_RE = /--upload-pack|--receive-pack|--exec(?![a-z0-9_-])|--exec-path=/
+// Hook installs and direct .git/config writes (they can set any key above).
+const GIT_HOOK_OR_CONFIG_FILE_RE = /\.git\/hooks|\.git\/config/
+
+// `git config` options that consume the next token as their value.
+const GIT_CONFIG_VALUE_OPTS = new Set(['-f', '--file', '--blob', '--type', '--default', '--comment', '--value'])
+
+/** Long transport flag token (`--upload-pack`, `--receive-pack` down to 2-char
+ *  prefixes, `--exec`, `--exec-path=<x>`), dequoted. `--config-env` is NOT
+ *  here: under the full lift it is judged by its key. */
+function transportExecToken(tok: string): boolean {
+  if (!tok.startsWith('--')) return false
+  if (/^--exec-path=.+/.test(tok)) return true
+  const name = (tok.slice(2).split('=')[0] as string).toLowerCase()
+  if (name === 'exec') return true
+  return name.length >= 2 && LONG_EXEC_PREFIX_TARGETS.some((t) => t.startsWith(name))
 }
 
-function segmentPushDelete(segment: string, depth: number): boolean {
+/** A config key that cannot be resolved statically. */
+function unresolvedKey(kv: string | undefined): boolean {
+  if (kv === undefined) return true
+  const key = kv.split('=')[0] as string
+  return key.length === 0 || /[$`]/.test(key)
+}
+
+function segmentCodeExec(segment: string, depth: number): boolean {
   const toks = tokenizeQuoteAware(segment)
   if (toks === null) return true // unbalanced → fail-closed
-  const inv = normalizeGitInvocation(toks)
-  if (inv !== null && isPushSub(inv.sub) && pushArgsDelete(inv.args)) return true
-  // Quoted strings that hold shell code (`bash -c '…'`, `ssh h '…'`,
-  // `eval "…"`, `env -S '…'`) are re-parsed recursively; a quoted string
-  // elsewhere is data (mirrors segmentForcePush).
   const cw = commandWordAt(toks)
   const head = cw === null ? '' : (cw.word.split('/').pop() ?? cw.word).toLowerCase()
+  const configish = toks.some((t) => t === '-c' || t.startsWith('--conf') || t === 'config')
+  // A variable command word (`"$GIT" -c "$k=v" log`) cannot be resolved.
+  if (head.startsWith('$') && configish) return true
+  const inv = normalizeGitInvocation(toks)
+  if (inv !== null) {
+    if (inv.configs.some(unresolvedKey)) return true
+    for (let i = 0; i < toks.length; i += 1) {
+      const t = toks[i] as string
+      if (transportExecToken(t)) return true
+      if (t.startsWith('--conf')) {
+        const v = t.includes('=') ? t.slice(t.indexOf('=') + 1) : toks[i + 1]
+        if (unresolvedKey(v)) return true
+      }
+    }
+    if (GIT_UPLOAD_PACK_U_SUBCOMMANDS.has(inv.sub) && inv.args.some((a) => /^-[A-Za-z]*u/.test(a))) return true
+    if (inv.sub === 'config') {
+      for (let i = 0; i < inv.args.length; i += 1) {
+        const a = inv.args[i] as string
+        if (GIT_CONFIG_VALUE_OPTS.has(a)) { i += 1; continue }
+        if (a.startsWith('-')) continue
+        if (unresolvedKey(a)) return true
+        break
+      }
+    }
+  }
+  // Quoted shell code (`bash -c '…'`, `eval "…"`, `ssh h '…'`) is re-parsed.
   const codeRunner = CODE_RUNNER_HEADS.has(head)
   for (let i = 0; i < toks.length; i += 1) {
     const t = toks[i] as string
     if (!/[\s;|&]/.test(t)) continue
     const afterCodeFlag = i > 0 && CODE_STRING_FLAG_RE.test(toks[i - 1] as string)
     if (!codeRunner && !afterCodeFlag) continue
-    if (depth >= 3) {
-      if (pushDeleteText(t)) return true
-      continue
-    }
-    if (commandPushDelete(t, depth + 1)) return true
+    if (depth >= 3) return true
+    if (commandCodeExec(t, depth + 1)) return true
   }
   return false
 }
 
-function commandPushDelete(command: string, depth: number): boolean {
-  const joined = maskDataHeredocBodies(stripLineContinuations(command))
-  const visible = maskQuotedLiterals(joined)
-  if (visible === null) return true // unbalanced quotes → fail-closed
-  if (pushDeleteText(visible)) return true
-  const segs = segmentBashQuoteAware(joined)
+function commandCodeExec(command: string, depth: number): boolean {
+  const segs = segmentBashQuoteAware(stripLineContinuations(command))
   if (segs === null) return true
-  return segs.some((s) => segmentPushDelete(s, depth))
+  return segs.some((s) => segmentCodeExec(s, depth))
 }
 
-/** Remote-ref deletion by push (`git push origin :main`, `--delete`, `-d`,
- *  `--prune`). Confirmed when the `git push` built-in is overridden unless the
- *  operator also lists `git-push-delete`. Text check OR parser, fail-closed:
- *  the text check ignores quoted literals and data-heredoc bodies (file
- *  contents are not commands); quoted shell-code bodies are re-parsed; an
- *  ANSI-C `$'…'` quote (can encode `git` / `:ref`) falls back to the old
- *  whole-text check on the flattened view. */
-export function gitPushDelete(rawCommand: string): boolean {
-  if (commandPushDelete(rawCommand, 0)) return true
-  if (!rawCommand.includes("$'")) return false
-  const flat = flattenIndirection(stripLineContinuations(rawCommand))
-  if (pushDeleteText(flat)) return true
-  const segs = segmentBashQuoteAware(flat)
-  if (segs === null) return true
-  return segs.some((s) => segmentPushDelete(s, 0))
+/**
+ * True when a command touches a git surface that EXECUTES a program: a
+ * code-running config key (set via `-c`, `--config-env`, `git config`,
+ * GIT_CONFIG_*, a .git/config write), an `alias.*` shell alias, a program-
+ * running env var, a transport-program flag, or a hook install. These still
+ * confirm under `git-exec-surface:all`; everything else that git-exec-surface
+ * flags is lifted. Fail-closed: unresolvable config keys, a variable command
+ * word with config flags, and unparseable quoting all confirm.
+ */
+export function gitCodeExecSurface(rawCommand: string): boolean {
+  const joined = stripLineContinuations(rawCommand)
+  const flatRaw = flattenIndirection(joined)
+  const flat = flatRaw.toLowerCase()
+  if (
+    GIT_CODE_EXEC_KEY_RE.test(flat) ||
+    GIT_ALIAS_EXEC_RE.test(flat) ||
+    GIT_CODE_EXEC_ENV_RE.test(flat) ||
+    GIT_TRANSPORT_EXEC_RE.test(flat) ||
+    GIT_HOOK_OR_CONFIG_FILE_RE.test(flat)
+  ) {
+    return true
+  }
+  // Inside a substitution the argv pass cannot see git (`x=$(git -c "$k=v" …)`):
+  // any `-c` whose key part is unresolvable confirms.
+  if (/\$\(|[<>]\(|`/.test(joined) && /(?:^|\s)-c\s*[^\s=]*[$`]/.test(flatRaw)) return true
+  if (commandCodeExec(joined, 0)) return true
+  // ANSI-C quoting: also run the argv pass on the decoded view.
+  return joined.includes("$'") && commandCodeExec(flatRaw, 0)
 }
 
 // ── Opt-in detector lifts are ALLOWLIST-only (PR #145 review, 2026-10-17) ──
@@ -2980,10 +2990,18 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // must not become arbitrary local code execution). Pass the RAW command so
     // the case-sensitive `-c` check distinguishes `git -C` from `git -c`.
     const gitFires = gitExecSurface(raw)
-    // `git-exec-surface:all` is the full lift: the detector never confirms
-    // (the flattened hard-deny re-check below still runs).
+    // `git-exec-surface:all` is the full lift: everything the detector flags
+    // passes EXCEPT a surface that executes a program (gitCodeExecSurface).
+    // The flattened hard-deny re-check below still runs.
     const gitFullLift = overridden.includes('git-exec-surface:all')
     const gitLifted = gitFullLift || overridden.includes('git-exec-surface')
+    if (gitFires && gitFullLift && gitCodeExecSurface(raw)) {
+      return {
+        tier: 'confirm',
+        reason: 'git config/hook execution surface needs confirmation (git-exec-surface:all still guards config, env and flags that run a program)',
+        matchedRule: 'builtin:confirm_bash:git-exec-surface',
+      }
+    }
     if (gitFires && !gitFullLift && (!gitLifted || !gitLiftAllowed(raw))) {
       return {
         tier: 'confirm',

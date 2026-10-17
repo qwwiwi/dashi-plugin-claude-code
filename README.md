@@ -249,12 +249,19 @@ Accepted names: the substring rules (`sudo `, `rm -rf `, `rm -fr `, `git push`, 
 - `git-exec-surface`: the command must be one segment whose first word is literally `git` — no wrapper (`time`, `xargs`, `env`, `nice`, `nohup`, `find`, `flock`, `parallel`, `timeout`, `sudo`), no `GIT_*`/env prefix, no redirection, no expansion (`$`, backticks, `$(…)`, `${IFS}`), no pipe or `;`/`&&`/`||`. Global options are limited to `-c` with an allowlisted key: `user.name`, `user.email`, `color.*`, `advice.*`, `init.defaultBranch`, `core.quotepath`, `pull.rebase`, `push.autoSetupRemote`, and `commit.gpgsign=false`. The subcommand must be one of `status`, `log`, `diff`, `show`, `add`, `commit`, `fetch`, `pull`, `checkout`, `switch`, `branch`, `merge`, `stash`, `tag` (without delete), `rev-parse`, `remote -v` / `remote show`, or `push` without force, delete, mirror or prune flags and without `+` or colon refspecs. Transport-program flags (`--upload-pack`, `--receive-pack`, `--exec`, fetch `-u`) are never allowed.
 - `pipe-interpreter`: exactly `curl` (flags from `-fsSL`, `--fail`, `--silent`, `--show-error`, `--location`, `--compressed`, `--tlsv1.2`, `--proto =https`) or `wget` (`-q`, `-O-`, `--quiet`, …) with exactly one http(s) URL, piped once into `sh`, `bash` or `python3` (or `sh|bash -s -- <plain args>`). No expansions, redirections, `@file` uploads or other operators.
 
-When a lift does apply, the secret-path, catastrophic and own-channel checks are re-run on the command with adjacent quoted word parts joined (`.e""nv` → `.env`), so a secret path split by quotes cannot get through the lift. A push that deletes a remote ref (`git push origin :main`, `--delete`, `-d`, `--prune`) still confirms even when the `git push` rule is lifted. Heredoc bodies fed to `cat`/`tee` and quoted strings are not read as a push (file contents are data); quoted shell code (`bash -c '…'`, `ssh host '…'`, `eval "…"`) still is.
+When a lift does apply, the secret-path, catastrophic and own-channel checks are re-run on the command with adjacent quoted word parts joined (`.e""nv` → `.env`), so a secret path split by quotes cannot get through the lift. A push that deletes a remote ref (`git push origin :main`, `--delete`, `-d`, `--prune`) still confirms even when the `git push` rule is lifted. This check is deliberately conservative: it also confirms when the words appear in a heredoc body or a quoted string, because such text is often executed later (`eval "$x"`, `… | sh`, `xargs git push`, `bash <<<`, write-then-run).
 
 **Full git lifts (opt-in, owner decision 2026-10-17)** — for agents that write code and push without cards:
 
-- `git-exec-surface:all` — the git-exec-surface detector never confirms (any shape). The secret-path, catastrophic and own-channel re-check still runs.
-- `git-push-delete` — together with `git push`, a push that deletes a remote ref no longer confirms.
+- `git-push-delete` — together with `git push`, a push that deletes a remote ref no longer confirms (the conservative check above is skipped entirely).
+- `git-exec-surface:all` — every git-exec-surface hit passes regardless of shape (wrappers, env prefixes, redirections, expansions, several segments, any `-c` key) **except surfaces that make git run a program**, which still confirm:
+  - config keys set via `-c`, `--config-env`, `git config`, `GIT_CONFIG_*` or a `.git/config` write: `alias.*` whose value starts with `!`, `core.pager`, `core.sshCommand`, `core.hooksPath`, `core.fsmonitor`, `core.editor`, `sequence.editor`, `*.command` / `*.cmd`, `filter.*.clean|smudge|process`, `diff.*.textconv`, `diff.external`, `credential.helper`, `gpg.program`, plus `core.askpass`, `core.gitProxy`, `pager.*`, `merge.*.driver`, `remote.*.uploadpack|receivepack`, `include.path` / `includeIf`, `protocol.*.allow`;
+  - a config key that cannot be resolved (`git -c "$k=v"`, a variable git command word with config flags);
+  - env vars `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_PROXY_COMMAND` and any `GIT_CONFIG_*` assignment;
+  - transport-program flags `--upload-pack`, `--receive-pack`, `-u` (clone/fetch/pull/ls-remote), `--exec`, `--exec-path=`;
+  - writes to `.git/hooks`.
+
+  The secret-path, catastrophic and own-channel re-check still runs after the lift.
 
 ```yaml
 confirm_overrides:
