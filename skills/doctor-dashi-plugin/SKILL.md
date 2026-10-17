@@ -75,8 +75,9 @@ hooks + token leak, the **hook profile** (a tmux-mirror-only setup is NOT
 punished for the feeder hooks it deliberately lacks; feeders are demanded only
 when the state config enables a hook-driven status/progress surface), the
 **permission gate deep checks** (ask-relay registered next to the gate, the
-policy file the gate points at exists, `confirm_overrides` does not lift
-`sudo`/`rm -rf`, default tier, the unit carries `--permission-mode
+policy file the gate points at exists, `confirm_overrides` lifting
+`sudo`/`rm -rf` or the opt-in detectors `pipe-interpreter`/`git-exec-surface`
+is surfaced as a WARN, default tier, the unit carries `--permission-mode
 bypassPermissions`), **multichat** (per-chat policy parses, terminal mirror is
 DM-only — a public chat with `tmux_mirror: true` is a FAIL, every chat dir has
 a policy entry, spawn-chat-shell forwards `TMUX_PANE`), **security hygiene**

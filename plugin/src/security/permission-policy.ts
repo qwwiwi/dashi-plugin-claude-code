@@ -99,18 +99,20 @@ export const PermissionPolicySchema = z
     scopes: z.record(z.string(), PolicyScopeSchema).optional(),
     // Operator downgrade of SPECIFIC built-in confirm rules (owner autonomy
     // policy 2026-06-09: cards only for what cannot be automated, e.g. sudo).
-    // Entries must name exact BUILTIN_CONFIRM_BASH rules — a typo fails
-    // validation loudly instead of silently disabling nothing.
+    // Entries must name exact BUILTIN_CONFIRM_BASH rules or one of the named
+    // OPT_IN_CONFIRM_DETECTORS — a typo fails validation loudly instead of
+    // silently disabling nothing.
     confirm_overrides: z
       .object({
         builtin_rules: z
           .array(z.string())
           .superRefine((rules, ctx) => {
+            const known = overridableConfirmRuleNames()
             for (const r of rules) {
-              if (!BUILTIN_CONFIRM_BASH.includes(r)) {
+              if (!known.includes(r)) {
                 ctx.addIssue({
                   code: z.ZodIssueCode.custom,
-                  message: `unknown built-in confirm rule: ${JSON.stringify(r)} (must be one of: ${BUILTIN_CONFIRM_BASH.join(', ')})`,
+                  message: `unknown built-in confirm rule: ${JSON.stringify(r)} (must be one of: ${known.join(', ')})`,
                 })
               }
             }
@@ -139,10 +141,13 @@ export interface PermissionPolicy {
   readonly scopes?: Readonly<Record<string, PolicyScope>>
   /**
    * Built-in confirm rules the operator explicitly downgrades to the normal
-   * policy flow (confirm -> allow -> default). Deny tiers and the
-   * pipe-to-interpreter evasion confirm are NEVER overridable. A compound
-   * command matching an overridden AND a non-overridden built-in rule still
-   * confirms.
+   * policy flow (confirm -> allow -> default). Deny tiers (built-in hard-deny,
+   * own-channel systemctl, operator deny) are NEVER overridable. The
+   * pipe-to-interpreter evasion detector (`pipe-interpreter`) and the git
+   * config/hook execution-surface detector (`git-exec-surface`) are
+   * overridable only by explicit operator opt-in (owner decision 2026-10-17);
+   * not listed, they confirm exactly as before. A compound command matching an
+   * overridden AND a non-overridden built-in rule still confirms.
    */
   readonly confirm_overrides?: { readonly builtin_rules?: readonly string[] }
 }
@@ -222,6 +227,25 @@ const BUILTIN_CONFIRM_BASH: readonly string[] = [
   'apt install',
   'apt-get install',
 ]
+
+// Named built-in confirm DETECTORS (not substring rules) that an operator may
+// downgrade via `confirm_overrides.builtin_rules` — overridable only by
+// explicit operator opt-in (owner decision 2026-10-17: the owner's agent runs
+// autonomously, no approval cards). Not listed → they confirm exactly as
+// before. Security trade-off when listed:
+//   * `pipe-interpreter` — `curl … | sh`-style download-and-execute flows to
+//     the normal tiers (allow under default_tier allow).
+//   * `git-exec-surface` — `git -c <key>=…`, GIT_SSH_COMMAND/GIT_CONFIG_*
+//     env, `.git/hooks` / `.git/config` writes flow to the normal tiers, so a
+//     downgraded `git push` can carry arbitrary local code execution.
+// Hard-deny (catastrophic shell, secret reads, own-channel systemctl) and the
+// operator deny list run BEFORE this layer and are never affected.
+const OPT_IN_CONFIRM_DETECTORS = ['pipe-interpreter', 'git-exec-surface'] as const
+
+/** Every name `confirm_overrides.builtin_rules` accepts. */
+function overridableConfirmRuleNames(): readonly string[] {
+  return [...BUILTIN_CONFIRM_BASH, ...OPT_IN_CONFIRM_DETECTORS]
+}
 
 // ── Catastrophic Bash detection (Codex Critical #4, 2026-06-09) ─────────
 //
@@ -1008,7 +1032,8 @@ function gitExecSurface(rawCommand: string): boolean {
 // (read-only diagnostics) and even on `grep -rn "systemctl" src/` (the word
 // as a search pattern) — both raised real confirm cards. Only MUTATING
 // systemd operations need the owner's tap; reads and mere mentions must
-// flow. Like gitExecSurface this check is non-overridable: a mutating
+// flow. This check is non-overridable (unlike gitExecSurface, which since
+// 2026-10-17 can be lifted by explicit operator opt-in): a mutating
 // systemctl (service stop/restart — including the agent's own comms
 // channel) always reaches the owner.
 //
@@ -1052,7 +1077,7 @@ function gitExecSurface(rawCommand: string): boolean {
 // MIGRATION (2026-06-10): the literal 'systemctl' entry left
 // BUILTIN_CONFIRM_BASH, so a confirm_overrides list naming it now fails
 // schema validation — delete that override; the verb-aware rule is
-// non-overridable by design (like gitExecSurface).
+// non-overridable by design.
 const SYSTEMCTL_READONLY_VERBS = new Set([
   'status', 'cat', 'show', 'help',
   'is-active', 'is-enabled', 'is-failed', 'is-system-running',
@@ -2226,7 +2251,10 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   // 4. Built-in confirm bash — no operator-ALLOW short-circuit (Codex
   // Critical #3); the only relaxation is the explicit, validated
   // confirm_overrides list, and a command matching ANY non-overridden rule
-  // still confirms. The evasion detector below is never overridable.
+  // still confirms. The two detectors below (pipe-interpreter evasion,
+  // git-exec-surface) are overridable only by explicit operator opt-in
+  // (owner decision 2026-10-17) — each by its own name; listing one never
+  // relaxes the other.
   if (commandLower !== undefined) {
     const overridden = policy.confirm_overrides?.builtin_rules ?? []
     const hits = matchAllBashRules(BUILTIN_CONFIRM_BASH, commandLower)
@@ -2238,14 +2266,15 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // the detector is quote/heredoc-aware and matches command names case-
     // insensitively itself, so lowercasing here would only re-introduce the
     // flag-case collapse (`-C`/`-c`) that bit gitExecSurface.
-    if (bashConfirmEvasion(rawCommand!)) {
+    if (!overridden.includes('pipe-interpreter') && bashConfirmEvasion(rawCommand!)) {
       return { tier: 'confirm', reason: 'pipe-to-interpreter download needs confirmation', matchedRule: 'builtin:confirm_bash:pipe-interpreter' }
     }
-    // Non-overridable: git config/hook execution surfaces (a downgraded
-    // `git push` must never become arbitrary local code execution). Pass the
-    // RAW command (commandLower !== undefined ⇒ rawCommand defined) so the
+    // Git config/hook execution surfaces (by default a downgraded `git push`
+    // must not become arbitrary local code execution). Overridable only by
+    // explicit operator opt-in (owner decision 2026-10-17). Pass the RAW
+    // command (commandLower !== undefined ⇒ rawCommand defined) so the
     // case-sensitive `-c` check distinguishes `git -C` from `git -c`.
-    if (gitExecSurface(rawCommand!)) {
+    if (!overridden.includes('git-exec-surface') && gitExecSurface(rawCommand!)) {
       return { tier: 'confirm', reason: 'git config/hook execution surface needs confirmation', matchedRule: 'builtin:confirm_bash:git-exec-surface' }
     }
     // (own-channel systemctl hard-deny was hoisted into the step-2b hard-deny

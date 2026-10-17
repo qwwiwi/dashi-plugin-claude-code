@@ -230,6 +230,22 @@ DASHI_SECRET_PATH_ALLOWLIST=/home/you/.claude-lab/myagent/secrets/example.key
 
 Several paths are separated by `:` or `,`; entries may be absolute or `~/…` (expanded against `HOME`). For a listed path, Bash may run **only** a standalone `test -s <path>` (unquoted, `'…'` or `"…"`, or unquoted `~/…` when the path is under `HOME`). Everything else stays denied: reading, copying, suffixes, child paths, neighbours, `$(…)` derivations, compound commands, and `Read`/`Grep` of the file. Unset (the default) means no exception. Restart the channel after changing it.
 
+### Lifting built-in confirms (`confirm_overrides.builtin_rules`)
+
+Built-in confirm rules can be dropped to the normal policy flow (operator confirm → allow → `default_tier`) only by naming them exactly in the policy file:
+
+```yaml
+confirm_overrides:
+  builtin_rules:
+    - "git push"
+    - "pipe-interpreter"
+    - "git-exec-surface"
+```
+
+Accepted names: the substring rules (`sudo `, `rm -rf `, `rm -fr `, `git push`, `git reset --hard`, `git clean -`, `chmod -r`, `chown -r`, `kill `, `pkill`, `docker `, `npm publish`, `pip install`, `apt install`, `apt-get install`) and two named detectors that are **overridable only by explicit operator opt-in** (owner decision 2026-10-17): `pipe-interpreter` (`curl … | sh`, `base64 -d | sh` and similar download-and-execute) and `git-exec-surface` (`git -c <key>=…`, `GIT_SSH_COMMAND` / `GIT_CONFIG_*` env, writes to `.git/hooks` / `.git/config`). An unknown name fails validation and the whole policy falls back to confirm-everything. Not listed, every rule confirms exactly as before.
+
+**Security trade-off:** listing a detector lets those code-execution surfaces run silently under `default_tier: allow`. Listing one detector does not relax the other, and a compound command that also trips a non-listed rule still confirms. The built-in hard-deny (secret paths, catastrophic shell, mutating `systemctl` on the agent's own channel) and the operator `deny` list run before this layer and are never affected. The doctor reports a lifted `sudo`/`rm -rf`/detector as a WARN.
+
 ### AskUserQuestion relay (PR #28)
 
 The `AskUserQuestion` tool renders in Telegram as an inline keyboard (`src/channel/ask-user-question.ts` + `src/telegram/ask-user-question.ts`):
@@ -510,7 +526,7 @@ bun skills/doctor-dashi-plugin/scripts/doctor.ts --plugin-dir "$PWD"
 
 On the first launch, Claude Code asks 2 interactive questions (allow external imports + dev channels) — **once**; answer `1` to both.
 
-> **Migration doctor.** If you are moving an agent off the legacy gateway — or fixing a bot that misbehaves — start with the [`doctor-dashi-plugin`](skills/doctor-dashi-plugin/SKILL.md) skill. It diagnoses the whole bridge: toolchain floors, workspace placement (identity drift), dev-vs-runtime copy (multi-agent aware), settings/hook registration with hook-profile awareness (a tmux-mirror-only setup is not punished for feeder hooks it deliberately lacks), the permission gate (ask-relay, policy file, `confirm_overrides` must never lift `sudo`/`rm -rf`), multichat (terminal mirror is DM-only, per-chat policy coverage), security hygiene (webhook must bind loopback only; the env file holding the bot token must not be world-readable), MCP comms consistency, the Telegram allowlist, fleet isolation (`--fleet`), and live-session signals (welcome hang, expired auth, 409 conflict, crash loop). It is read-only — it never restarts a service or prints a secret. On a systemd host `bun skills/doctor-dashi-plugin/scripts/doctor.ts` with no flags autodetects the unit, env, session and state config. Exit codes: `0` no FAIL, `1` at least one FAIL, `2` usage.
+> **Migration doctor.** If you are moving an agent off the legacy gateway — or fixing a bot that misbehaves — start with the [`doctor-dashi-plugin`](skills/doctor-dashi-plugin/SKILL.md) skill. It diagnoses the whole bridge: toolchain floors, workspace placement (identity drift), dev-vs-runtime copy (multi-agent aware), settings/hook registration with hook-profile awareness (a tmux-mirror-only setup is not punished for feeder hooks it deliberately lacks), the permission gate (ask-relay, policy file, `confirm_overrides` lifting `sudo`/`rm -rf` or the opt-in detectors `pipe-interpreter`/`git-exec-surface` is surfaced as a WARN), multichat (terminal mirror is DM-only, per-chat policy coverage), security hygiene (webhook must bind loopback only; the env file holding the bot token must not be world-readable), MCP comms consistency, the Telegram allowlist, fleet isolation (`--fleet`), and live-session signals (welcome hang, expired auth, 409 conflict, crash loop). It is read-only — it never restarts a service or prints a secret. On a systemd host `bun skills/doctor-dashi-plugin/scripts/doctor.ts` with no flags autodetects the unit, env, session and state config. Exit codes: `0` no FAIL, `1` at least one FAIL, `2` usage.
 >
 > **Do migrations and bridge surgery from a terminal, not through Telegram.** This work modifies the bridge that delivers your Telegram messages. If it breaks halfway, Telegram goes dark and you lose the channel you were issuing instructions through. Open a terminal session on the host (`tmux attach -t channel-<agent>` for inspection, a separate `claude` session for the work), make the change, run the doctor, send a test message — and only then walk away. Fix bugs and errors the same way: doctor first, then the reference for the failing check.
 

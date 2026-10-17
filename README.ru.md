@@ -220,6 +220,22 @@ DASHI_SECRET_PATH_ALLOWLIST=/home/you/.claude-lab/myagent/secrets/example.key
 
 Несколько путей — через `:` или `,`; запись — абсолютный путь или `~/…` (раскрывается по `HOME`). Для указанного пути Bash может выполнить **только** отдельную команду `test -s <путь>` (без кавычек, в `'…'` или `"…"`, либо `~/…` без кавычек, если путь внутри `HOME`). Всё остальное по-прежнему запрещено: чтение, копирование, суффиксы, дочерние пути, соседи, выводы через `$(…)`, составные команды, а также `Read`/`Grep` этого файла. Не задано (по умолчанию) — исключений нет. После изменения перезапустите канал.
 
+### Снятие встроенных подтверждений (`confirm_overrides.builtin_rules`)
+
+Встроенное правило подтверждения переходит в обычный поток политики (операторский confirm → allow → `default_tier`), только если оно точно названо в policy-файле:
+
+```yaml
+confirm_overrides:
+  builtin_rules:
+    - "git push"
+    - "pipe-interpreter"
+    - "git-exec-surface"
+```
+
+Допустимые имена: подстрочные правила (`sudo `, `rm -rf `, `rm -fr `, `git push`, `git reset --hard`, `git clean -`, `chmod -r`, `chown -r`, `kill `, `pkill`, `docker `, `npm publish`, `pip install`, `apt install`, `apt-get install`) и два именованных детектора, которые **снимаются только явным opt-in оператора** (решение владельца 2026-10-17): `pipe-interpreter` (`curl … | sh`, `base64 -d | sh` и похожие «скачай и выполни») и `git-exec-surface` (`git -c <ключ>=…`, env `GIT_SSH_COMMAND` / `GIT_CONFIG_*`, запись в `.git/hooks` / `.git/config`). Неизвестное имя валит валидацию, и вся политика откатывается в «подтверждать всё». Не указано — правило подтверждает ровно как раньше.
+
+**Компромисс по безопасности:** снятый детектор пропускает эти пути выполнения кода молча при `default_tier: allow`. Снятие одного детектора не ослабляет другой, а составная команда, задевшая неснятое правило, по-прежнему просит подтверждение. Встроенный hard-deny (секретные пути, катастрофические команды, мутирующий `systemctl` собственного канала агента) и операторский список `deny` работают до этого слоя и не затрагиваются. Доктор показывает снятые `sudo`/`rm -rf`/детекторы как WARN.
+
 ### AskUserQuestion relay (PR #28)
 
 Tool `AskUserQuestion` рендерится в Telegram как инлайн-клавиатура (`src/channel/ask-user-question.ts` + `src/telegram/ask-user-question.ts`):
@@ -499,7 +515,7 @@ bun skills/doctor-dashi-plugin/scripts/doctor.ts --plugin-dir "$PWD"
 
 При первом запуске Claude Code задаст 2 интерактивных вопроса (allow external imports + dev channels) — **разово**, ответьте `1` на оба.
 
-> **Доктор — обязательный инструмент переезда и дебага.** Read-only скилл [`doctor-dashi-plugin`](skills/doctor-dashi-plugin/SKILL.md) диагностирует весь мост: toolchain, размещение workspace (дрейф идентичности), dev-vs-runtime копию (учитывает несколько агентов на хосте), hooks с учётом профиля (mirror-конфигурация без feeder-хуков — корректна, доктор её не ругает), permission gate (ask-relay, policy-файл, `confirm_overrides` не может снимать `sudo`/`rm -rf`), мультичат (terminal mirror только в DM, покрытие per-chat policy), гигиену безопасности (webhook слушает ТОЛЬКО loopback — `0.0.0.0` это FAIL; env-файл с токеном не world-readable), консистентность MCP, allowlist, флот (`--fleet`) и живую сессию (welcome-hang, auth, 409, crash loop). Ничего не перезапускает, секретов не печатает. Коды выхода: `0` — нет FAIL, `1` — есть FAIL, `2` — usage.
+> **Доктор — обязательный инструмент переезда и дебага.** Read-only скилл [`doctor-dashi-plugin`](skills/doctor-dashi-plugin/SKILL.md) диагностирует весь мост: toolchain, размещение workspace (дрейф идентичности), dev-vs-runtime копию (учитывает несколько агентов на хосте), hooks с учётом профиля (mirror-конфигурация без feeder-хуков — корректна, доктор её не ругает), permission gate (ask-relay, policy-файл, снятие через `confirm_overrides` правил `sudo`/`rm -rf` или opt-in детекторов `pipe-interpreter`/`git-exec-surface` показывается как WARN), мультичат (terminal mirror только в DM, покрытие per-chat policy), гигиену безопасности (webhook слушает ТОЛЬКО loopback — `0.0.0.0` это FAIL; env-файл с токеном не world-readable), консистентность MCP, allowlist, флот (`--fleet`) и живую сессию (welcome-hang, auth, 409, crash loop). Ничего не перезапускает, секретов не печатает. Коды выхода: `0` — нет FAIL, `1` — есть FAIL, `2` — usage.
 >
 > **Железное правило: миграцию и любую хирургию моста делайте из терминала Claude Code, НЕ через Telegram.** Эта работа меняет тот самый мост, который доставляет ваши Telegram-сообщения. Сломается на середине — Telegram замолчит, и канал, через который вы давали команды, исчезнет вместе с возможностью починить. Откройте терминальную сессию на хосте (`tmux attach -t channel-<agent>` для осмотра, отдельная `claude`-сессия для работы), внесите изменение, прогоните доктора, отправьте тестовое сообщение — и только потом уходите. Баги и ошибки чините так же: сначала доктор, потом reference по упавшему чеку.
 

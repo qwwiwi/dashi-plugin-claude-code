@@ -17,7 +17,8 @@
 # A built-in confirm ALWAYS fires for sudo, git push, rm -rf, curl|sh,
 # base64 -d|sh, mutating systemctl (verb-aware: status/cat/show/list-* flow,
 # start/stop/restart/enable/… confirm), kill/pkill, docker, npm publish,
-# package installs — unless you explicitly allow-list the exact form below.
+# package installs — unless you explicitly name the rule under
+# `confirm_overrides` below (an allow rule alone does not lift it).
 
 version: 1
 
@@ -57,6 +58,28 @@ allow:
   bash_patterns:
     - "gh pr view"     # read-only gh subcommands you want silent
     - "bun test"
+
+# Built-in confirm downgrades (opt-in, off by default). Naming a built-in
+# confirm rule here drops it to the normal flow above (confirm -> allow ->
+# default_tier). Names must match exactly — a typo fails validation and the
+# whole file falls back to confirm-everything. Accepted names: the substring
+# rules ("sudo ", "rm -rf ", "rm -fr ", "git push", "git reset --hard",
+# "git clean -", "chmod -r", "chown -r", "kill ", "pkill", "docker ",
+# "npm publish", "pip install", "apt install", "apt-get install") and two
+# named detectors (overridable only by explicit operator opt-in, owner
+# decision 2026-10-17):
+#   pipe-interpreter  — curl|sh, base64 -d|sh and similar download-and-execute
+#   git-exec-surface  — git -c <key>=…, GIT_SSH_COMMAND / GIT_CONFIG_* env,
+#                       writes to .git/hooks or .git/config
+# SECURITY TRADE-OFF: listing a detector lets arbitrary code execution through
+# those surfaces run silently under default_tier allow. The built-in
+# hard-deny (secrets, catastrophic shell, own-channel systemctl) and the deny
+# list above are NEVER affected. Listing one detector does not relax the other.
+# confirm_overrides:
+#   builtin_rules:
+#     - "git push"
+#     - "pipe-interpreter"
+#     - "git-exec-surface"
 
 # Per-scope overrides (keyed by CHAT_ID; "main" = the owner's DM session).
 # Scope rules are ADDITIVE to the globals above. Example: make the main

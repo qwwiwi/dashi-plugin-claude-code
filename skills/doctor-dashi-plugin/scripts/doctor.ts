@@ -954,8 +954,14 @@ export function checkSharedSettingsClean(homeRaw: string | null, selectedIsHome:
 // line-based extraction — no YAML dependency, conservative on misses.
 // ---------------------------------------------------------------------------
 
-/** Built-in confirm rules that must NEVER be lifted via confirm_overrides. */
-export const DANGEROUS_OVERRIDE_RULES: readonly string[] = ['sudo ', 'rm -rf ', 'rm -fr ']
+/**
+ * Built-in confirm rules whose lift via confirm_overrides is surfaced as a WARN
+ * (eyes-open elevation). `pipe-interpreter` / `git-exec-surface` are the named
+ * detectors that became overridable by explicit operator opt-in (owner
+ * decision 2026-10-17) — lifting them lets download-and-execute and git
+ * config/hook code execution run silently.
+ */
+export const DANGEROUS_OVERRIDE_RULES: readonly string[] = ['sudo ', 'rm -rf ', 'rm -fr ', 'pipe-interpreter', 'git-exec-surface']
 
 /**
  * One YAML scalar item: quoted → cut at the closing quote (a `#` inside quotes
@@ -1060,21 +1066,21 @@ export function checkPermissionPolicy(policyText: string | null, policyPath: str
     // safety hole. We still surface it so an UNINTENDED lift is visible.
     out.push({
       id: 'permission-policy-risky-override',
-      title: 'confirm_overrides lifts sudo / rm -rf (ultra-autonomy)',
+      title: 'confirm_overrides lifts sudo / rm -rf / exec detectors (ultra-autonomy)',
       status: 'warn',
-      detail: `confirm_overrides lifts ${dangerous.join(', ')} to run silently — deliberate under ultra-autonomy; catastrophic forms (rm -rf /, secrets) stay hard-denied in code regardless`,
+      detail: `confirm_overrides lifts ${dangerous.join(', ')} to run silently — deliberate under ultra-autonomy; catastrophic forms (rm -rf /, fork bomb, secrets, own-channel systemctl) and the operator deny list stay enforced in code regardless`,
       fix: 'intended? leave it. If not, remove these from confirm_overrides.builtin_rules',
     })
   } else if (opaque) {
     out.push({
       id: 'permission-policy-risky-override',
-      title: 'confirm_overrides does not lift sudo / rm -rf',
+      title: 'confirm_overrides does not lift sudo / rm -rf / exec detectors',
       status: 'warn',
       detail: 'confirm_overrides is present in a form this lint cannot read (flow/one-line YAML) — review it by hand',
       fix: 'use the block form (confirm_overrides: / builtin_rules: / - "rule") so the doctor can lint it',
     })
   } else {
-    out.push({ id: 'permission-policy-risky-override', title: 'confirm_overrides does not lift sudo / rm -rf', status: 'pass', detail: overrides.length > 0 ? `overrides: ${overrides.join(', ')}` : 'no confirm_overrides' })
+    out.push({ id: 'permission-policy-risky-override', title: 'confirm_overrides does not lift sudo / rm -rf / exec detectors', status: 'pass', detail: overrides.length > 0 ? `overrides: ${overrides.join(', ')}` : 'no confirm_overrides' })
   }
   const tier = extractTopLevelScalar(policyText, 'default_tier')
   out.push(

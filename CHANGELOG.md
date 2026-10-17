@@ -15,6 +15,24 @@ retroactively marks the state of `main` on 2026-06-14.
 
 ## [Unreleased]
 
+## [1.4.2] — 2026-10-17
+
+### Security
+- **`pipe-interpreter` and `git-exec-surface` are now overridable by explicit
+  operator opt-in** (owner decision 2026-10-17: the owner's agent runs
+  autonomously, without approval cards). Both detector confirms were
+  non-overridable; `confirm_overrides.builtin_rules` now also accepts these two
+  exact names (a typo still fails schema validation and drops the policy to
+  confirm-everything). When listed, `curl … | sh`-style download-and-execute
+  and git config/hook execution surfaces (`git -c`, `GIT_SSH_COMMAND` /
+  `GIT_CONFIG_*`, `.git/hooks` / `.git/config` writes) fall through to the
+  normal tiers — i.e. run silently under `default_tier: allow`. Not listed,
+  behavior is unchanged. Listing one detector does not relax the other; the
+  built-in hard-deny (secrets, catastrophic shell, own-channel `systemctl`) and
+  the operator `deny` list are untouched. The doctor surfaces a lifted
+  detector as a WARN, like `sudo`/`rm -rf`. Documented in README (EN + RU) and
+  the example policy.
+
 ### Fixed
 - **tmux mirror can no longer flood Telegram into a 429 ban.** Volatile pane
   counters (elapsed timers, token counters, clocks, spinners) changed the

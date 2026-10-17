@@ -894,6 +894,14 @@ describe('permission policy lint', () => {
     const ok = 'confirm_overrides:\n  builtin_rules:\n    - "git push"\n'
     expect(checkPermissionPolicy(ok, '/p').find((c) => c.id === 'permission-policy-risky-override')?.status).toBe('pass')
   })
+  test('lifting pipe-interpreter / git-exec-surface → WARN (opt-in detectors, owner decision 2026-10-17)', () => {
+    for (const name of ['pipe-interpreter', 'git-exec-surface']) {
+      const y = `confirm_overrides:\n  builtin_rules:\n    - "${name}"\n`
+      const c = checkPermissionPolicy(y, '/p').find((x) => x.id === 'permission-policy-risky-override')
+      expect(c?.status).toBe('warn')
+      expect(c?.detail).toContain(name)
+    }
+  })
   test('default_tier allow → warn; confirm → pass; unset → pass', () => {
     expect(checkPermissionPolicy('default_tier: allow\n', '/p').find((c) => c.id === 'permission-policy-default-tier')?.status).toBe('warn')
     expect(checkPermissionPolicy('default_tier: confirm\n', '/p').find((c) => c.id === 'permission-policy-default-tier')?.status).toBe('pass')
