@@ -2043,3 +2043,44 @@ describe('lift: per-subcommand option allowlist, globs, ~ and .git/, https only 
     })
   }
 })
+
+describe('lift: optional-argument options never swallow the next token (security review of #145)', () => {
+  const LIFTED: PermissionPolicy = {
+    default_tier: 'allow',
+    confirm_overrides: { builtin_rules: ['pipe-interpreter', 'git-exec-surface', 'git push', 'rm -rf '] },
+  }
+  const REJECTED: [string, string][] = [
+    ['bare --pretty then --output into .git/hooks', 'git -c user.name=x log --pretty --output=.git/hooks/x'],
+    ['bare --pretty then --output', 'git -c user.name=x log --pretty --output=out.txt'],
+    ['bare --format then --output', 'git -c user.name=x show --format --output=x'],
+    ['bare --format alone', 'git -c user.name=x log --format'],
+    ['-n consumes an option', 'git -c user.name=x log -n --output=x'],
+    ['--max-count consumes an option', 'git -c user.name=x log --max-count --output=x'],
+    ['-m consumes --amend', 'git -c user.name=x commit -m --amend'],
+    ['--message consumes an option', 'git -c user.name=x commit --message --no-verify'],
+    ['tag -m consumes an option', 'git -c user.name=x tag -a v1 -m --file=x'],
+    ['stash -m consumes an option', 'git -c user.name=x stash -m --all'],
+    ['valued option with no value', 'git -c user.name=x log -n'],
+  ]
+  for (const [name, cmd] of REJECTED) {
+    test(`git lift does not apply: ${name}`, () => {
+      expect(gitLiftAllowed(cmd)).toBe(false)
+      expect(classify('Bash', { command: cmd }, LIFTED).tier).not.toBe('allow')
+    })
+  }
+  const STILL_LIFTED = [
+    'git -c user.name=x log --pretty=oneline -n 5',
+    'git -c user.name=x log --pretty --oneline',
+    'git -c user.name=x log --format=%h --max-count=3',
+    'git -c user.name=x show --pretty=short',
+    'git -c user.name=x commit -m "msg"',
+    'git -c user.name=x commit --message=msg',
+    'git -c user.name=x tag -a v1 -m "release"',
+  ]
+  for (const cmd of STILL_LIFTED) {
+    test(`git lift still applies: ${cmd}`, () => {
+      expect(gitLiftAllowed(cmd)).toBe(true)
+      expect(classify('Bash', { command: cmd }, LIFTED).tier).toBe('allow')
+    })
+  }
+})
