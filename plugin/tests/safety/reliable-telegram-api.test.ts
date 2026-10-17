@@ -267,6 +267,25 @@ describe('non-idempotent send retry policy', () => {
     expect(h.deadLetters[0]?.error_class).toBe('rate_limited')
   })
 
+  test('429 on a background edit/send (mirror, status) — rethrow WITHOUT dead-letter', async () => {
+    const stub = makeStub({
+      sendMessage: () => grammyError(429, 'slow', 25200),
+      editMessageTextSeq: [grammyError(429, 'slow', 25200)],
+    })
+    const h = harness()
+    const api = createReliableTelegramApi(stub.api, silentLog, h.opts)
+    await expect(
+      api.editMessageText('100', 1, 'pane', { parse_mode: 'HTML', background: true }),
+    ).rejects.toMatchObject({ error_code: 429 })
+    await expect(api.sendMessage('100', 'pane', { background: true })).rejects.toMatchObject({
+      error_code: 429,
+    })
+    expect(stub.editCalls).toBe(1)
+    expect(stub.sendMessageCalls).toBe(1)
+    expect(h.waits).toEqual([])
+    expect(h.deadLetters).toEqual([])
+  })
+
   test('permanent 4xx — no retry, no dead-letter, throws', async () => {
     const stub = makeStub({ sendMessage: () => grammyError(400, "can't parse entities") })
     const h = harness()

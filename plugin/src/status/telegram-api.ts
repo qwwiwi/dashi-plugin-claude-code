@@ -11,12 +11,12 @@ export interface TelegramApiForProgress {
   sendMessage(
     chatId: string,
     text: string,
-    opts: { parse_mode?: 'HTML' | 'MarkdownV2'; reply_to_message_id?: number },
+    opts: { parse_mode?: 'HTML' | 'MarkdownV2'; reply_to_message_id?: number; background?: boolean },
   ): Promise<{ message_id: number }>
   editMessageText(
     chatId: string,
     messageId: number,
     text: string,
-    opts: { parse_mode?: 'HTML' | 'MarkdownV2' },
+    opts: { parse_mode?: 'HTML' | 'MarkdownV2'; background?: boolean },
   ): Promise<void>
 }

@@ -196,9 +196,10 @@ describe('TmuxMirror — send error classification', () => {
     await mirror.stop()
   })
 
-  test('send returning 429 with retry_after logs and drops; mirror NOT disabled', async () => {
+  test('send returning 429 with retry_after pauses (not disables) the mirror', async () => {
     const stub = makeStubApi()
     const exec = makeExec([ok('first'), ok('second')])
+    let t = 1_000_000
     const mirror = new TmuxMirror({
       api: stub.api,
       log: stubLog,
@@ -207,6 +208,7 @@ describe('TmuxMirror — send error classification', () => {
       pollIntervalMs: 1000,
       lineCount: 50,
       exec,
+      now: () => t,
     })
     stub.queueSendError(
       new TelegramError(429, 'Too Many Requests: flood control', {
@@ -218,7 +220,12 @@ describe('TmuxMirror — send error classification', () => {
     expect(mirror.status().disabled).toBeUndefined()
     expect(mirror.status().lastError).toContain('flood')
 
-    // Second poll succeeds and lands a messageId.
+    // Paused for retry_after (5s): a poll inside the window is a no-op.
+    expect(mirror.status().pausedUntil).toBe(t + 5000)
+    await mirror.onPoll()
+    expect(mirror.status().messageId).toBeUndefined()
+    // After the window the next poll succeeds and lands a messageId.
+    t += 5000
     await mirror.onPoll()
     expect(mirror.status().messageId).toBeDefined()
     expect(mirror.status().disabled).toBeUndefined()

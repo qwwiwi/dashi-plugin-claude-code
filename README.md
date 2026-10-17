@@ -327,6 +327,8 @@ Default **OFF**, opt-in via config (in multichat — via the `tmux_mirror` flag 
     "line_count": 50,
     "mode": "latest_inbound_only",
     "max_lines": 14,
+    "min_edit_interval_ms": 20000,
+    "max_edits_per_min": 3,
     "hide_segments": ["boot_banner", "inbound_warning", "footer_hints", "input_box"]
   }
 }
@@ -337,7 +339,8 @@ Behavior:
 - Polls `tmux capture-pane -p -t <pane_target> -S -<line_count>` every `poll_interval_ms`.
 - ANSI/CSI/OSC/DCS sequences are stripped, control chars (except `\n`, `\t`) removed.
 - The text passes through `redactSecrets` (section 10) → HTML-escape → wrapped in `<pre>`.
-- Hash-based dedup: an identical poll → no API call.
+- Hash-based dedup: an identical poll → no API call. The hash runs over a normalised body: only Claude Code's volatile status rows (spinner row, `esc to interrupt`, agent rows `<elapsed> · ↓ <n>k tokens`, a trailing elapsed column like `1d 0h 17m`) get their counters masked; every other line is hashed verbatim, so `Timeout: 20s` → `Timeout: 30s` still edits. A counter-only change refreshes at most once every 5 minutes.
+- Flood control: at most one edit per `min_edit_interval_ms` (default 20000) and `max_edits_per_min` (default 3); a change inside the window ships on the first poll after it. A 429 pauses the mirror for the real `retry_after` (no cap), and while any 429 is active the bot-wide flood gate skips mirror/status/progress edits without calling the API.
 - `mode: latest_inbound_only` (default since PR #21) trims everything up to the last `← <channel>:` preview — you only see what the agent is doing after the operator's last message.
 - `max_lines` cap (default 14, range 4..100, 0=off) — the top is trimmed with a `… +N lines` marker.
 - An edit `"message to edit not found"` → re-send; other 4xx do **not** trigger a resend (storm protection).

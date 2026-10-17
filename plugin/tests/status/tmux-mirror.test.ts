@@ -201,7 +201,9 @@ describe('TmuxMirror — lifecycle', () => {
       paneTarget: 'channel-thrall:0.0',
       pollIntervalMs: 1000,
       lineCount: 50,
-      exec,
+      exec,      // Edit budget off: this test pins the hash-diff → edit path only.
+      minEditIntervalMs: 0,
+      maxEditsPerMinute: 0,
     })
     await mirror.start()
     await mirror.onPoll()

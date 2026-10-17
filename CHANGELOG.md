@@ -13,6 +13,29 @@ Versions before 1.0.0 were not tracked — the project shipped ~60 merged PRs
 between 2026-05-14 and 2026-06-14 without a version discipline. 1.0.0
 retroactively marks the state of `main` on 2026-06-14.
 
+## [Unreleased]
+
+### Fixed
+- **tmux mirror can no longer flood Telegram into a 429 ban.** Volatile pane
+  counters (elapsed timers, token counters, clocks, spinners) changed the
+  dedup hash on almost every 5s poll, giving up to 12 edits/min to one
+  message and a ~7h bot-wide 429 ban that the mirror kept hitting. Now:
+  the hash masks counters only inside Claude Code's volatile status rows
+  (spinner row, `esc to interrupt`, agent `<elapsed> · ↓ <n>k tokens` rows,
+  a trailing elapsed column) – other lines stay verbatim – and a
+  counter-only change refreshes at most every 5 minutes; mirror edits are spaced by
+  `tmux_mirror.min_edit_interval_ms` (default 20000) and capped by
+  `tmux_mirror.max_edits_per_min` (default 3); a 429 pauses the mirror for
+  the real `retry_after`.
+- **Bot-wide flood gate in the rate-limited layer.** Any 429 closes the gate
+  until the real `retry_after` (no 60s cap). While it is closed, `background`
+  calls (mirror / status / progress edits, chat-action pulses) are skipped
+  without calling the API (status cancel / TTL / supersede edits, status
+  bubble sends, progress, task-mirror and HUD edits included), and
+  user-facing calls get a single attempt. A
+  `retry_after` above 60s is no longer slept on in-process. Background 429s
+  are not dead-lettered.
+
 ## [1.4.1] — 2026-10-11
 
 ### Fixed

@@ -20,6 +20,25 @@
 //     next successful capture.
 //   editMessageText returns 4xx «message not found» → forget messageId so
 //     the next poll re-sends. (Tests cover error_code 400.)
+//   429 (real, or the rate-limited layer's local flood-gate skip) → pause
+//     ALL mirror I/O until now + the REAL retry_after. Mirror calls are
+//     `background`, so the rate-limited layer never retries them in-process.
+//
+// Flood control (incident 2026-10-16: ~12 edits/min to one message earned a
+// ~7h bot-wide 429 ban that the mirror then kept hitting):
+//   • the dedup hash runs over a NORMALISED body (normalizeForHash). Only
+//     Claude Code's own volatile status rows are touched — the spinner row,
+//     rows carrying "esc to interrupt", agent rows "<elapsed> · ↓ <n>k
+//     tokens", and an elapsed column at a row's tail. Inside those rows the
+//     counters are masked; every other line is hashed verbatim, so a real
+//     change like "Timeout: 20s" → "Timeout: 30s" still edits;
+//   • safety net: when only masked counters moved, the mirror still refreshes
+//     once every `forceRefreshMs` (default 5 min) so the counters never go
+//     stale for long;
+//   • at most one edit per `minEditIntervalMs` (default 20s) and at most
+//     `maxEditsPerMinute` (default 3) in any rolling 60s window. A change that
+//     arrives inside the window is NOT dropped — lastHash stays stale, so the
+//     first poll after the window opens ships the latest pane.
 //   safe-telegram-api already applies a redactor on the outbound path, but
 //     we run our own pass first so the queued payload is already redacted
 //     by the time it sits in the rate-limit queue.
@@ -138,6 +157,15 @@ export interface TmuxMirrorOptions {
   // would not react if the chat-id field of TmuxMirror diverged from
   // the chat used to compute `enabled`.
   policy?: MultichatPolicy | null
+  // Minimum gap between two editMessageText calls. Default 20_000 ms. 0
+  // disables the gap (tests / debugging only).
+  minEditIntervalMs?: number
+  // Hard edit budget per rolling 60s window. Default 3. 0 disables.
+  maxEditsPerMinute?: number
+  // Counter-only refresh cadence: when the normalised body is unchanged but
+  // the raw one differs, refresh after this long anyway. Default 300_000.
+  // 0 disables the refresh.
+  forceRefreshMs?: number
 }
 
 export interface TmuxMirrorStatus {
@@ -152,10 +180,22 @@ export interface TmuxMirrorStatus {
   lastHash?: string
   lastError?: string
   lastPollAt?: number
+  // Epoch ms until which the mirror is parked after a 429. Present only
+  // while the pause is active.
+  pausedUntil?: number
 }
 
-// Telegram HTML parse mode keeps `<pre>` formatting intact.
-const HTML_OPTS = { parse_mode: 'HTML' as const }
+// Telegram HTML parse mode keeps `<pre>` formatting intact. `background`
+// marks every mirror call as non-essential for the rate-limited layer's
+// flood gate (skipped while a 429 is active, never retried in-process).
+const HTML_OPTS = { parse_mode: 'HTML' as const, background: true }
+
+export const DEFAULT_MIN_EDIT_INTERVAL_MS = 20_000
+export const DEFAULT_MAX_EDITS_PER_MINUTE = 3
+export const DEFAULT_FORCE_REFRESH_MS = 5 * 60_000
+const EDIT_WINDOW_MS = 60_000
+// Pause applied when Telegram's 429 carried no retry_after.
+const DEFAULT_FLOOD_PAUSE_S = 30
 
 // Debounce window for bump(). A burst of inbound messages within this
 // window collapses to a single delete+resend, avoiding both Telegram
@@ -197,6 +237,60 @@ function htmlEscape(text: string): string {
 
 function hash(text: string): string {
   return createHash('sha256').update(text).digest('hex').slice(0, 16)
+}
+
+// Spinner frames Claude Code (and braille spinners) draw at a row's start.
+const SPINNER_CLASS = '[\\u2800-\\u28FF✻✽✶✳✢✺✹✸✷⋆∗*·●]'
+// One elapsed-time unit: "3m", "38s", "1d", "450ms", "2.4s".
+const UNIT = String.raw`\d+(?:\.\d+)?(?:ms|[dhms])\b`
+
+// Rows Claude Code rewrites on every tick. Only these are normalised.
+const VOLATILE_ROW_PATTERNS: ReadonlyArray<RegExp> = [
+  // Spinner / status row: "✻ Cogitating… (3m 38s · ↓ 214.9k tokens …)".
+  /esc to interrupt/i,
+  // (`<pre>` may prefix the body's first row.)
+  new RegExp(String.raw`^(?:<pre>)?\s*${SPINNER_CLASS}\s+[A-Z][A-Za-z]*…`),
+  // Agent row: "<elapsed> · ↓ <n>k tokens".
+  new RegExp(String.raw`${UNIT}(?:\s+${UNIT})*\s*·\s*[↑↓]\s*\d[\d.,]*\s*[kKmM]?\s+tokens?\b`),
+  // Elapsed column at the row's tail, ≥2 units, set off by "·" or a column
+  // gap: "agent-2   1d 0h 17m". A single unit after one space
+  // ("Timeout: 20s") is deliberately NOT matched.
+  // (`</pre>` may close the body's last row.)
+  new RegExp(String.raw`(?:·|\s{2,})\s*${UNIT}(?:\s+${UNIT})+\s*(?:</pre>)?$`),
+]
+
+// Masks applied INSIDE a volatile row. Order matters: token counters and
+// durations run before the bare-number rules they would otherwise feed.
+const ROW_MASKS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/[↑↓]?\s*\d[\d.,]*\s*[kKmM]?\s+tokens?\b/g, '#tok'],
+  [new RegExp(String.raw`${UNIT}(?:\s+${UNIT})*`, 'g'), '#t'],
+  [/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, '#clk'],
+  [/\b\d+(?:\.\d+)?\s*%/g, '#pct'],
+  [/\b[A-Z][A-Za-z]*…/g, '#verb'],
+  [new RegExp(SPINNER_CLASS, 'g'), ''],
+]
+
+function isVolatileRow(line: string): boolean {
+  return VOLATILE_ROW_PATTERNS.some((re) => re.test(line))
+}
+
+/**
+ * Normalise a rendered mirror body for change detection only (the body that
+ * ships to Telegram is untouched). Only Claude Code's volatile status rows
+ * (spinner row, "esc to interrupt", agent "<elapsed> · ↓ <n>k tokens" rows,
+ * a trailing elapsed column) get their counters masked; every other line is
+ * kept verbatim, so real content changes always alter the hash.
+ */
+export function normalizeForHash(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => {
+      if (!isVolatileRow(line)) return line
+      let out = line
+      for (const [re, repl] of ROW_MASKS) out = out.replace(re, repl)
+      return out.replace(/\s+/g, ' ').trim()
+    })
+    .join('\n')
 }
 
 // Default exec lives in pane-capture (shared with TaskRealityMirror), imported
@@ -244,6 +338,8 @@ export class TmuxMirror {
   private readonly hideSegments: ReadonlyArray<SegmentType>
   private readonly mode: RenderMode
   private readonly maxLines: number
+  private readonly minEditIntervalMs: number
+  private readonly maxEditsPerMinute: number
 
   private timer: ReturnType<typeof setInterval> | null = null
   private enabled = false
@@ -269,6 +365,19 @@ export class TmuxMirror {
   // overlapping calls return early. Combined with hash-dedup this keeps
   // Telegram traffic O(1) per pane change rather than O(N) per poll.
   private inFlight = false
+  // 429 pause: no Telegram I/O (and no capture) while now() < pausedUntil.
+  private pausedUntil = 0
+  // Timestamps (this.now()) of recent edit ATTEMPTS — every attempt hits the
+  // API, so failed ones count against the budget too.
+  private editTimes: number[] = []
+  // Last edit attempt, kept apart from editTimes (which is pruned to the
+  // 60s window) so a minEditIntervalMs above 60s is still honoured.
+  private lastEditAttemptAt: number | undefined
+  // Raw (un-normalised) hash and time of the body currently on screen —
+  // drive the counter-only refresh safety net.
+  private lastRawHash: string | undefined
+  private lastShownAt: number | undefined
+  private readonly forceRefreshMs: number
 
   constructor(opts: TmuxMirrorOptions) {
     this.api = opts.api
@@ -286,6 +395,35 @@ export class TmuxMirror {
     this.mode = opts.mode ?? 'latest_inbound_only'
     this.maxLines = opts.maxLines ?? 14
     this.policy = opts.policy ?? null
+    this.minEditIntervalMs = opts.minEditIntervalMs ?? DEFAULT_MIN_EDIT_INTERVAL_MS
+    this.maxEditsPerMinute = opts.maxEditsPerMinute ?? DEFAULT_MAX_EDITS_PER_MINUTE
+    this.forceRefreshMs = opts.forceRefreshMs ?? DEFAULT_FORCE_REFRESH_MS
+  }
+
+  private isPaused(): boolean {
+    return this.now() < this.pausedUntil
+  }
+
+  // Park the mirror for the REAL retry_after (no cap). Only ever extends.
+  private pauseForFlood(retryAfterSec: number | undefined): number {
+    const sec =
+      retryAfterSec !== undefined && retryAfterSec > 0 ? retryAfterSec : DEFAULT_FLOOD_PAUSE_S
+    const until = this.now() + sec * 1000
+    if (until > this.pausedUntil) this.pausedUntil = until
+    return sec * 1000
+  }
+
+  // Edit budget: min gap since the last attempt AND rolling-window cap.
+  private editBudgetAvailable(t: number): boolean {
+    const last = this.lastEditAttemptAt
+    if (this.minEditIntervalMs > 0 && last !== undefined && t - last < this.minEditIntervalMs) {
+      return false
+    }
+    this.editTimes = this.editTimes.filter((x) => t - x < EDIT_WINDOW_MS)
+    if (this.maxEditsPerMinute > 0 && this.editTimes.length >= this.maxEditsPerMinute) {
+      return false
+    }
+    return true
   }
 
   // Per-chat fail-closed gate. Returns `false` when the configured
@@ -363,6 +501,7 @@ export class TmuxMirror {
     if (this.lastHash !== undefined) out.lastHash = this.lastHash
     if (this.lastError !== undefined) out.lastError = this.lastError
     if (this.lastPollAt !== undefined) out.lastPollAt = this.lastPollAt
+    if (this.isPaused()) out.pausedUntil = this.pausedUntil
     return out
   }
 
@@ -427,6 +566,9 @@ export class TmuxMirror {
     if (!this.isMirrorAllowed()) return
     if (!this.enabled) return
     if (this.disabled) return
+    // 429 pause: a delete+resend would hit the same flood. The mirror stays
+    // where it is; polling resumes once the pause expires.
+    if (this.isPaused()) return
     // Debounce: skip if we just bumped. Note: we DO clear the inbound
     // signal even when skipping — the goal is just to coalesce.
     const t = this.now()
@@ -439,6 +581,7 @@ export class TmuxMirror {
       const old = this.messageId
       this.messageId = undefined
       this.lastHash = undefined
+      this.lastRawHash = undefined
       try {
         await this.api.deleteMessage(this.chatId, old)
       } catch (err) {
@@ -536,6 +679,7 @@ export class TmuxMirror {
       this.messageId = undefined
     }
     this.lastHash = undefined
+    this.lastRawHash = undefined
   }
 
   // Disarm the polling interval. Shared by stop() and the
@@ -559,6 +703,7 @@ export class TmuxMirror {
     if (!this.isMirrorAllowed()) return
     if (!this.enabled) return
     if (this.disabled) return
+    if (this.isPaused()) return
     if (this.inFlight) return
     this.inFlight = true
     try {
@@ -581,10 +726,18 @@ export class TmuxMirror {
       if (!this.enabled) return
 
       const rendered = this.buildRendered(result)
-      const h = hash(rendered)
+      // Dedup on the NORMALISED body so counter-only ticks are no-ops.
+      const h = hash(normalizeForHash(rendered))
+      const rawH = hash(rendered)
       if (h === this.lastHash) {
-        // Identical body — skip the Telegram round-trip entirely.
-        return
+        // Identical (normalised) body — skip the Telegram round-trip.
+        // Safety net: if only masked counters moved, refresh anyway once
+        // forceRefreshMs has passed since the body on screen was shown.
+        if (rawH === this.lastRawHash) return
+        if (this.forceRefreshMs <= 0) return
+        if (this.lastShownAt !== undefined && this.now() - this.lastShownAt < this.forceRefreshMs) {
+          return
+        }
       }
 
       if (this.messageId === undefined) {
@@ -603,15 +756,25 @@ export class TmuxMirror {
           }
           this.messageId = sent.message_id
           this.lastHash = h
+          this.lastRawHash = rawH
+          this.lastShownAt = this.now()
         } catch (err) {
           this.handleSendError(err)
         }
         return
       }
 
+      // Budget gate. lastHash is left stale on purpose: the change is not
+      // lost, the first poll after the window opens ships the latest pane.
+      const t = this.now()
+      if (!this.editBudgetAvailable(t)) return
+      this.editTimes.push(t)
+      this.lastEditAttemptAt = t
       try {
         await this.api.editMessageText(this.chatId, this.messageId, rendered, HTML_OPTS)
         this.lastHash = h
+        this.lastRawHash = rawH
+        this.lastShownAt = this.now()
       } catch (err) {
         this.handleEditError(err)
       }
@@ -655,16 +818,19 @@ export class TmuxMirror {
           description: cls.description,
         })
         return
-      case 'flood':
-        // Rate-limit wrapper handles 429 transparently; reaching here
-        // means retries exhausted. Drop this poll and let the next one
-        // try again with a fresh budget.
-        this.lastError = `flood retry exhausted (retry_after=${cls.retryAfterSec ?? 'n/a'})`
-        this.log.warn('tmux mirror send 429 post-retry, dropping', {
+      case 'flood': {
+        // Mirror calls are background: the rate-limited layer does not
+        // retry them, so this is the first (or a gate-skipped) 429. Park
+        // ALL mirror I/O for the real retry_after.
+        const pausedMs = this.pauseForFlood(cls.retryAfterSec)
+        this.lastError = `flood 429, paused (retry_after=${cls.retryAfterSec ?? 'n/a'})`
+        this.log.warn('tmux mirror send 429, mirror paused', {
           chat_id: this.chatId,
           retry_after_s: cls.retryAfterSec,
+          paused_for_ms: pausedMs,
         })
         return
+      }
       case 'message_gone':
       case 'transient':
       case 'benign':
@@ -693,6 +859,7 @@ export class TmuxMirror {
       case 'message_gone':
         this.messageId = undefined
         this.lastHash = undefined
+        this.lastRawHash = undefined
         this.log.info('tmux mirror message gone, will resend next poll', {
           chat_id: this.chatId,
           description: cls.description,
@@ -717,13 +884,17 @@ export class TmuxMirror {
           description: cls.description,
         })
         return
-      case 'flood':
-        this.lastError = `flood retry exhausted (retry_after=${cls.retryAfterSec ?? 'n/a'})`
-        this.log.warn('tmux mirror edit 429 post-retry, dropping this poll', {
+      case 'flood': {
+        // See handleSendError — pause for the REAL retry_after, no retry.
+        const pausedMs = this.pauseForFlood(cls.retryAfterSec)
+        this.lastError = `flood 429, paused (retry_after=${cls.retryAfterSec ?? 'n/a'})`
+        this.log.warn('tmux mirror edit 429, mirror paused', {
           chat_id: this.chatId,
           retry_after_s: cls.retryAfterSec,
+          paused_for_ms: pausedMs,
         })
         return
+      }
       case 'transient':
         this.lastError = cls.description
         this.log.warn('tmux mirror editMessageText failed (ignored)', {

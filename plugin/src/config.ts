@@ -247,6 +247,13 @@ export const AppConfigSchema = z.object({
         message: 'max_lines must be 0 (disabled) or an integer in 4..100',
       })
       .default(14),
+    // Flood control (incident 2026-10-16, ~7h bot-wide 429 ban): minimum gap
+    // between two mirror edits, and a hard edit budget per rolling minute.
+    // poll_interval_ms stays the capture cadence; a pane change that lands
+    // inside the gap is shipped by the first poll after it. 0 disables
+    // (debug only — Telegram bans repeated edits of one message).
+    min_edit_interval_ms: z.number().int().min(0).default(20_000),
+    max_edits_per_min: z.number().int().min(0).max(20).default(3),
   }).default({}),
   // Multichat router (Phase 3, 2026-05-23). Default OFF. When enabled,
   // server.ts loads `chats/policy.yaml`, instantiates TmuxSessionPool +

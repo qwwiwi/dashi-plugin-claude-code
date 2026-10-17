@@ -116,6 +116,12 @@ export interface SendMessageOpts {
   // window. Consumed and STRIPPED by createReliableTelegramApi; never reaches
   // the wire.
   skipOutboundStamp?: boolean
+  // Non-essential surface (tmux mirror, status bubble, progress card). While
+  // the bot-wide flood gate is closed (an active 429 retry_after) the
+  // rate-limited layer skips the call WITHOUT touching the API and throws a
+  // locally-built 429; it is also never 429-retried in-process. The raw
+  // grammY adapter builds its params explicitly, so this never hits the wire.
+  background?: boolean
 }
 
 export interface EditOpts {
@@ -127,6 +133,8 @@ export interface EditOpts {
   // (commands/oob, channel/tools edit_message) pass no reply_markup and
   // Telegram leaves the existing keyboard untouched.
   reply_markup?: InlineKeyboardLike
+  // Non-essential edit (mirror / status / progress). See SendMessageOpts.background.
+  background?: boolean
 }
 
 export interface SendDocumentOpts {

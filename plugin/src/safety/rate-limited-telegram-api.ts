@@ -16,11 +16,24 @@
 //   3. 429 retry: on a grammY-shaped 429 (`error_code: 429`, optional
 //      `parameters.retry_after`), sleep the requested seconds + a small
 //      jitter and retry the SAME call. Bounded by `maxRetries` (default 3).
+//      A retry_after above MAX_RETRY_AFTER_S is NOT slept on in-process: the
+//      error surfaces immediately (sleeping 60s into a multi-hour ban only
+//      queued more doomed attempts — incident 2026-10-16, ~7h ban).
+//   4. Bot-wide flood gate: every 429 (any method) closes the gate until
+//      now + the REAL retry_after (uncapped). While it is closed:
+//        • `background` calls (mirror / status / progress edits, chat-action
+//          pulses) are skipped WITHOUT hitting the API — they throw a local
+//          429 whose retry_after is the remaining gate time, so callers'
+//          flood-pause logic parks them until the gate opens;
+//        • user-facing calls get exactly ONE attempt (no in-process retry).
+//      Background calls are never 429-retried in-process either: they fail
+//      fast so the caller pauses instead of holding a sleep.
 //
 // Methods that don't consume the send-bucket: editMessageText (Telegram's
 // edit limits are far more lenient), setMessageReaction, sendChatAction,
 // deleteMessage, downloadFile. They still get the 429 retry wrapper so a
-// stray 429 on an edit can recover without the caller seeing it.
+// stray 429 on an edit can recover without the caller seeing it (unless the
+// edit is `background`, see layer 4).
 //
 // Test seams: `opts.now` and `opts.sleep` replace the real clock and
 // setTimeout-based sleep, so tests can run instantly with deterministic
@@ -107,26 +120,60 @@ interface Grammy429 {
   parameters?: { retry_after?: number }
 }
 
-// Cap retry_after so one giant value from Telegram (or a hostile-shaped
-// error) can't lock a chat's FIFO queue for minutes on end. The per-chat
+// Longest retry_after we are willing to SLEEP on in-process. The per-chat
 // tail-promise chain blocks all subsequent sends to the same chat until the
 // in-flight op finishes, so worst-case stall = maxRetries × MAX_RETRY_AFTER_S.
-// With defaults (3 × 60s) that's a 3-minute ceiling; if Telegram really
-// needs longer, the bounded retries exhaust and the caller sees the 429.
+// A longer retry_after is not slept on at all: the caller sees the 429 at
+// once and the flood gate (layer 4) holds background traffic for the REAL
+// retry_after.
 const MAX_RETRY_AFTER_S = 60
+// Sanity ceiling for the flood gate only (a NaN-ish / absurd value must not
+// silence the bot for weeks). Real Telegram bans observed: up to ~7h.
+const MAX_FLOOD_GATE_S = 24 * 60 * 60
 
+// `retryAfter` = REAL value (seconds, ≥1, ceiling MAX_FLOOD_GATE_S);
+// callers decide whether it is short enough to sleep on in-process.
 function parse429(err: unknown): { retryAfter: number } | null {
   if (typeof err !== 'object' || err === null) return null
   const e = err as Grammy429
   if (e.error_code !== 429) return null
   const after = e.parameters?.retry_after
-  // Telegram's retry_after is in seconds. Coerce to a sane positive integer
-  // and clamp into [1, MAX_RETRY_AFTER_S].
+  // Telegram's retry_after is in seconds. Coerce to a sane positive integer.
   if (typeof after !== 'number' || !Number.isFinite(after) || after < 1) {
     return { retryAfter: 1 }
   }
-  return { retryAfter: Math.min(MAX_RETRY_AFTER_S, Math.ceil(after)) }
+  return { retryAfter: Math.min(MAX_FLOOD_GATE_S, Math.ceil(after)) }
 }
+
+/** Marker on the locally-built 429 thrown while the flood gate is closed. */
+export interface FloodGateError extends Error {
+  error_code: 429
+  description: string
+  parameters: { retry_after: number }
+  flood_gate: true
+}
+
+export function isFloodGateError(err: unknown): err is FloodGateError {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { flood_gate?: unknown }).flood_gate === true
+  )
+}
+
+function makeFloodGateError(method: string, remainingMs: number): FloodGateError {
+  const retryAfter = Math.max(1, Math.ceil(remainingMs / 1000))
+  const err = new Error(
+    `Too Many Requests: flood gate closed, ${method} skipped locally (retry after ${retryAfter})`,
+  ) as FloodGateError
+  err.error_code = 429
+  err.description = err.message
+  err.parameters = { retry_after: retryAfter }
+  err.flood_gate = true
+  return err
+}
+
+type CallMode = 'normal' | 'background'
 
 export function createRateLimitedTelegramApi(
   raw: TelegramApi,
@@ -149,6 +196,24 @@ export function createRateLimitedTelegramApi(
 
   const globalBucket = makeBucket(cfg.globalBurstCapacity, cfg.globalRefillPerSec, now())
   const chatState = new Map<string, ChatState>()
+  // Bot-wide flood gate (layer 4): epoch ms until which Telegram told us to
+  // back off. 0 / past = open. Only ever extended, never shortened.
+  let floodUntil = 0
+
+  function noteFlood(method: string, retryAfterS: number): void {
+    const until = now() + retryAfterS * 1000
+    if (until > floodUntil) {
+      floodUntil = until
+      log.warn('telegram 429, flood gate closed', {
+        method,
+        retry_after_s: retryAfterS,
+      })
+    }
+  }
+
+  function gateRemainingMs(): number {
+    return Math.max(0, floodUntil - now())
+  }
 
   function getChatState(chatId: string): ChatState {
     let s = chatState.get(chatId)
@@ -187,7 +252,20 @@ export function createRateLimitedTelegramApi(
   // `maxRetries` is the MAX NUMBER OF ATTEMPTS including the initial call.
   // Semantically: budget of how many times we hit Telegram for this op.
   // maxRetries=3 → up to 3 attempts (2 retries after the first failure).
-  async function withRetry<T>(method: string, op: () => Promise<T>): Promise<T> {
+  //
+  // Flood gate (layer 4): `background` calls are skipped outright while the
+  // gate is closed and are never retried; `normal` calls made while the gate
+  // is closed get a single attempt. Every 429 extends the gate.
+  async function withRetry<T>(
+    method: string,
+    op: () => Promise<T>,
+    mode: CallMode = 'normal',
+  ): Promise<T> {
+    const gated = gateRemainingMs()
+    if (mode === 'background' && gated > 0) {
+      throw makeFloodGateError(method, gated)
+    }
+    const maxAttempts = mode === 'background' || gated > 0 ? 1 : cfg.maxRetries
     let attempt = 0
     let lastErr: unknown
     while (true) {
@@ -197,8 +275,12 @@ export function createRateLimitedTelegramApi(
       } catch (err) {
         const r = parse429(err)
         if (r === null) throw err
+        noteFlood(method, r.retryAfter)
         lastErr = err
-        if (attempt >= cfg.maxRetries) break
+        if (attempt >= maxAttempts) break
+        // A long ban is not slept on in-process — the caller sees the 429
+        // now, and the gate keeps everything else off the API meanwhile.
+        if (r.retryAfter > MAX_RETRY_AFTER_S) break
         const jitter =
           cfg.jitterMaxMs > 0 ? Math.floor(Math.random() * cfg.jitterMaxMs) : 0
         const waitTotalMs = r.retryAfter * 1000 + jitter
@@ -216,7 +298,17 @@ export function createRateLimitedTelegramApi(
 
   // Serialize per-chat outbound work: each new op awaits the previous op
   // (without inheriting its error), then runs under the rate-limit gate.
-  async function enqueueSend<T>(chatId: string, op: () => Promise<T>): Promise<T> {
+  async function enqueueSend<T>(
+    chatId: string,
+    op: () => Promise<T>,
+    mode: CallMode = 'normal',
+  ): Promise<T> {
+    // Background sends never queue behind the per-chat FIFO while the gate
+    // is closed — skip before taking a token.
+    const gated = gateRemainingMs()
+    if (mode === 'background' && gated > 0) {
+      throw makeFloodGateError('send', gated)
+    }
     const state = getChatState(chatId)
     const prev = state.tail
     let release!: () => void
@@ -226,7 +318,7 @@ export function createRateLimitedTelegramApi(
     try {
       await prev.catch(() => {})
       await waitForCapacity(state)
-      return await withRetry('send', op)
+      return await withRetry('send', op, mode)
     } finally {
       release()
     }
@@ -238,7 +330,11 @@ export function createRateLimitedTelegramApi(
       text: string,
       sendOpts: SendMessageOpts,
     ): Promise<{ message_id: number }> {
-      return enqueueSend(chatId, () => raw.sendMessage(chatId, text, sendOpts))
+      return enqueueSend(
+        chatId,
+        () => raw.sendMessage(chatId, text, sendOpts),
+        sendOpts.background === true ? 'background' : 'normal',
+      )
     },
 
     // Rich messages consume the same per-chat send budget as a normal
@@ -270,8 +366,10 @@ export function createRateLimitedTelegramApi(
       text: string,
       editOpts: EditOpts,
     ): Promise<void> {
-      return withRetry('editMessageText', () =>
-        raw.editMessageText(chatId, messageId, text, editOpts),
+      return withRetry(
+        'editMessageText',
+        () => raw.editMessageText(chatId, messageId, text, editOpts),
+        editOpts.background === true ? 'background' : 'normal',
       )
     },
 
@@ -286,7 +384,12 @@ export function createRateLimitedTelegramApi(
     },
 
     async sendChatAction(chatId: string, action: ChatAction): Promise<void> {
-      return withRetry('sendChatAction', () => raw.sendChatAction(chatId, action))
+      // Typing pulses are pure decoration — always background.
+      return withRetry(
+        'sendChatAction',
+        () => raw.sendChatAction(chatId, action),
+        'background',
+      )
     },
 
     async sendDocument(

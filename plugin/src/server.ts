@@ -562,8 +562,10 @@ const hudApi: HudTelegramApi = {
   // silence window, or a pin self-heal would silently starve the heartbeat.
   sendMessage: (chatId, text, opts) =>
     telegramApi.sendMessage(chatId, text, { ...opts, skipOutboundStamp: true }),
+  // background: HUD re-renders are non-essential — the flood gate skips
+  // them while a 429 is active instead of hitting the API.
   editMessageText: (chatId, messageId, text, opts) =>
-    telegramApi.editMessageText(chatId, messageId, text, opts),
+    telegramApi.editMessageText(chatId, messageId, text, { ...opts, background: true }),
   pinChatMessage: (chatId, messageId, opts) =>
     bot.api.pinChatMessage(chatId, messageId, opts).then(() => undefined),
   // bump() legs (status pin): delete goes through the safe wrapper (rate
@@ -645,6 +647,8 @@ if (config.tmux_mirror.enabled) {
       hideSegments: config.tmux_mirror.hide_segments,
       mode: config.tmux_mirror.mode,
       maxLines: config.tmux_mirror.max_lines,
+      minEditIntervalMs: config.tmux_mirror.min_edit_interval_ms,
+      maxEditsPerMinute: config.tmux_mirror.max_edits_per_min,
       redact: (text) => redactSecrets(text, apiSecrets),
       policy: multichatPolicy ?? null,
     })
