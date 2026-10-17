@@ -2324,25 +2324,40 @@ function hasUnquotedGlob(raw: string): boolean {
   return false
 }
 
-/** Per-subcommand option allowlist for the git lift. `flags` take no value;
- *  `valued` take the next token (or `--long=value`). Options are matched
+/** Per-subcommand option allowlist for the git lift. `flags` take no value.
+ *  `valued` are ONLY options git really parses with a separate argument
+ *  (`-n`, `--max-count`, `-m`, `--message`): they consume the next token,
+ *  or take `--long=value`. `eqOnly` are optional-argument options git never
+ *  reads from the next token (`--pretty`, `--format`): accepted only as
+ *  `--long=value` (a bare `--pretty` is listed in `flags` on its own).
+ *  Putting an optional-argument option in `valued` would let the parser
+ *  swallow the next option (`--pretty --output=...`) that git then honours.
+ *  A consumed value that starts with `-` fails closed. Options are matched
  *  EXACTLY, so git's long-option abbreviations (`--e`, `--de`, `--pru`)
  *  never match and the lift does not apply. `dashdash` permits a bare `--`. */
 interface GitLiftOptions {
   readonly flags: ReadonlySet<string>
   readonly valued: ReadonlySet<string>
+  readonly eqOnly: ReadonlySet<string>
   readonly dashdash: boolean
 }
 
-function liftOpts(flags: readonly string[], valued: readonly string[], dashdash: boolean): GitLiftOptions {
-  return { flags: new Set(flags), valued: new Set(valued), dashdash }
+function liftOpts(
+  flags: readonly string[],
+  valued: readonly string[],
+  dashdash: boolean,
+  eqOnly: readonly string[] = [],
+): GitLiftOptions {
+  return { flags: new Set(flags), valued: new Set(valued), eqOnly: new Set(eqOnly), dashdash }
 }
+
+const PRETTY_EQ = ['--format', '--pretty']
 
 const LOG_FLAGS = ['--oneline', '--stat', '--graph', '--decorate', '--all', '-p', '--patch', '--name-only', '--name-status']
 const GIT_LIFT_OPTIONS: ReadonlyMap<string, GitLiftOptions> = new Map([
   ['status', liftOpts(['-s', '-b', '-sb', '--short', '--branch', '--porcelain'], [], false)],
-  ['log', liftOpts(LOG_FLAGS, ['-n', '--max-count', '--format', '--pretty'], true)],
-  ['show', liftOpts([...LOG_FLAGS, '-s', '--no-patch'], ['--format', '--pretty'], true)],
+  ['log', liftOpts([...LOG_FLAGS, '--pretty'], ['-n', '--max-count'], true, PRETTY_EQ)],
+  ['show', liftOpts([...LOG_FLAGS, '-s', '--no-patch', '--pretty'], [], true, PRETTY_EQ)],
   ['diff', liftOpts(['--stat', '--cached', '--staged', '--name-only', '--name-status', '--shortstat', '--numstat'], [], true)],
   ['add', liftOpts(['-A', '--all', '-u', '--update'], [], true)],
   ['commit', liftOpts(['-a', '--all', '-q', '--quiet'], ['-m', '--message', '-am'], false)],
@@ -2374,11 +2389,17 @@ function liftArgsAllowed(sub: string, args: readonly string[]): boolean {
     }
     const eq = a.startsWith('--') ? a.indexOf('=') : -1
     if (eq !== -1) {
-      if (!opts.valued.has(a.slice(0, eq))) return false
+      const name = a.slice(0, eq)
+      if (!opts.valued.has(name) && !opts.eqOnly.has(name)) return false
       continue
     }
     if (opts.flags.has(a)) continue
-    if (opts.valued.has(a) && j + 1 < args.length) { j += 1; continue }
+    if (opts.valued.has(a)) {
+      const value = args[j + 1]
+      if (value === undefined || value.startsWith('-')) return false
+      j += 1
+      continue
+    }
     return false
   }
   return true
