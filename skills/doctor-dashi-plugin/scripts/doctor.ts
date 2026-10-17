@@ -963,12 +963,12 @@ export function checkSharedSettingsClean(homeRaw: string | null, selectedIsHome:
  */
 export const DANGEROUS_OVERRIDE_RULES: readonly string[] = ['sudo ', 'rm -rf ', 'rm -fr ', 'pipe-interpreter', 'git-exec-surface']
 
-/** The named detectors among DANGEROUS_OVERRIDE_RULES (lifted for simple commands only). */
+/** The named detectors among DANGEROUS_OVERRIDE_RULES (lifted for allowlisted shapes only). */
 export const DETECTOR_OVERRIDE_RULES: readonly string[] = ['pipe-interpreter', 'git-exec-surface']
 
-/** What a detector lift does NOT relax (mirrors isComplexForLift in the gate). */
+/** What a detector lift relaxes (mirrors gitLiftAllowed / pipeLiftAllowed in the gate). */
 export const DETECTOR_LIFT_NOTE =
-  '; a lifted detector relaxes SIMPLE commands only — nested sh -c / eval bodies, git aliases and alias / GIT_CONFIG_* definitions, program-running git config or env (core.hooksPath, core.sshCommand, credential.helper, GIT_SSH_COMMAND, …), decode-into-interpreter, /dev/tcp, substitution into an interpreter and .git/hooks / .git/config writes still confirm'
+  '; a lifted detector relaxes ALLOWLISTED SIMPLE commands only — git-exec-surface: one bare `git -c <allowlisted key>=<value> <allowlisted subcommand>` (no wrapper, env prefix, redirection, expansion or operator; push without force/delete); pipe-interpreter: `curl|wget <one URL> | sh|bash|python3`; everything else still confirms'
 
 /**
  * One YAML scalar item: quoted → cut at the closing quote (a `#` inside quotes

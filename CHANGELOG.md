@@ -32,31 +32,39 @@ retroactively marks the state of `main` on 2026-06-14.
   the operator `deny` list are untouched. The doctor surfaces a lifted
   detector as a WARN, like `sudo`/`rm -rf`. Documented in README (EN + RU) and
   the example policy.
-- **A detector lift covers simple commands only** (PR #145 review: Fable,
-  Codex, automated security review). A listed detector still confirms on a
-  complex command (`isComplexForLift`): nested `sh|bash|zsh|dash -c` /
-  `python3 -c` / `node -e` / `eval` bodies, git `!`-aliases and `alias.*` /
-  `GIT_CONFIG_*` definitions, program-running git config keys or env
-  (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`, `credential.helper`,
-  `GIT_SSH_COMMAND`, …), `--upload-pack` / `--exec` / fetch `-u`,
-  decode-into-interpreter, `/dev/tcp` / `/dev/udp`, process or command
-  substitution next to an interpreter, writes into `.git/hooks` /
-  `.git/config` / `$GIT_DIR`, unbalanced or ANSI-C quoting. When a lift does
-  apply, the secret-path, catastrophic and own-channel checks re-run on the
-  command with adjacent quoted word parts joined (`.e""nv` → `.env`). Not
-  listed, both detectors behave exactly as before (same rule id and reason).
-- **New built-in hard-deny `git-force-push` (not overridable).** Token-aware:
-  git argv is normalized (env assignments, wrappers, `-C` / `-c` /
-  `--git-dir` / `--work-tree`, the git-core `git-push` form) and a push with
-  `--force`, `-f` (also in clusters), `--force-with-lease`,
-  `--force-if-includes`, `--mirror` or a `+` refspec in any position is
-  denied; so are `alias.*` / `GIT_CONFIG_VALUE_*` / `GIT_CONFIG_PARAMETERS`
-  definitions of a forced push and `remote.<r>.push=+…` /
-  `remote.<r>.mirror=true`. Quoted shell bodies (`bash -c`, `ssh`, `eval`)
-  are parsed recursively. This is the only change to default behavior in
-  1.4.2: force push used to confirm (`git push` built-in) unless the operator
-  denied it by substring. Docs now note that operator deny is substring-based
-  and recommend patterns without the `git ` prefix.
+- **Detector lifts are allowlist-only** (PR #145 review: Fable, Codex,
+  Silvana, automated security review; a denylist of "complex" forms kept
+  leaking). A listed detector is skipped only for an exact allowlisted shape
+  and confirms on everything else. `git-exec-surface`: one segment, first word
+  `git`, no wrapper / env prefix / redirection / expansion / operator, `-c`
+  keys only from an allowlist (`user.name`, `user.email`, `color.*`,
+  `advice.*`, `init.defaultBranch`, `core.quotepath`, `pull.rebase`,
+  `push.autoSetupRemote`, `commit.gpgsign=false`), an allowlisted subcommand,
+  and push only without force / delete / mirror / prune / `+` / colon refspecs
+  (`gitLiftAllowed`). `pipe-interpreter`: `curl|wget <one URL> | sh|bash|python3`
+  with allowlisted flags only (`pipeLiftAllowed`). When a lift applies, the
+  secret-path, catastrophic and own-channel checks re-run on the command with
+  adjacent quoted word parts joined (`.e""nv` → `.env`). Not listed, both
+  detectors behave exactly as before (same rule id and reason).
+- **A push that deletes a remote ref is never lifted.** With the `git push`
+  rule overridden, `git push origin :main`, `--delete`, `-d`, `--prune`
+  still confirm (`git-push-delete`). In defaults the `git push` rule already
+  confirms them, unchanged.
+- **New built-in hard-deny `git-force-push` (not overridable, fail-closed).**
+  A linear text check (a `git` / `git-push` / `send-pack` word + a `push`
+  word + a force marker anywhere) is OR'ed with an argv parser that skips
+  assignments, redirections, wrappers with their flags (`time -p`,
+  `xargs -I {}`, `env -C` / `env -S`, `flock`, `parallel`, `find -exec`, …)
+  and git global options, resolves abbreviated force options, and catches
+  alias / `GIT_CONFIG_*` / `remote.*.push=+` / `remote.*.mirror` definitions
+  inside git invocations (not in plain data such as
+  `echo remote.origin.mirror=true`). Accepted false positives: `git push`
+  next to another `-f` flag, or a quoted mention of a force push. Residual:
+  a force-push alias already in `~/.gitconfig`. This is the only change to
+  default behavior in 1.4.2: force push used to confirm (`git push`
+  built-in) unless the operator denied it by substring. Docs now note that
+  operator deny is substring-based and recommend patterns without the
+  `git ` prefix.
 
 ### Fixed
 - **tmux mirror can no longer flood Telegram into a 429 ban.** Volatile pane

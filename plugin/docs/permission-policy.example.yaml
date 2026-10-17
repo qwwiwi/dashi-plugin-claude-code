@@ -43,8 +43,9 @@ confirm:
 
 # Operator deny — things you never want to happen, even by tap. Optional;
 # the built-in hard-deny already covers secrets, catastrophic shell and force
-# push (git-force-push: token-aware, catches `git -C . push -f`, `+refspec`,
-# --force-with-lease, force-push aliases). Operator patterns are SUBSTRING
+# push (git-force-push: text check OR argv parser, catches `git -C . push -f`,
+# `+refspec`, --force-with-lease, wrappers, force-push aliases defined in the
+# command; an alias already in ~/.gitconfig is a residual). Operator patterns are SUBSTRING
 # matches on the lowercased command — write them without the `git ` prefix so
 # `git -C dir push --force` is still caught.
 deny:
@@ -76,16 +77,20 @@ allow:
 #   pipe-interpreter  — curl|sh, base64 -d|sh and similar download-and-execute
 #   git-exec-surface  — git -c <key>=…, GIT_SSH_COMMAND / GIT_CONFIG_* env,
 #                       writes to .git/hooks or .git/config
-# A listed detector is lifted for SIMPLE commands only: plain `curl … | sh`,
-# `git -c user.name=x commit`. It still confirms on complex forms: nested
-# `sh -c` / `python3 -c` / `eval` bodies, git `!`-aliases and alias.* /
-# GIT_CONFIG_* definitions, program-running git config or env
-# (core.hooksPath, core.fsmonitor, core.sshCommand, credential.helper,
-# GIT_SSH_COMMAND, …), --upload-pack / --exec, decode-into-interpreter
-# (base64 -d / xxd -r / openssl -d), /dev/tcp, substitution into an
-# interpreter, writes to .git/hooks / .git/config / $GIT_DIR. When a lift
-# applies, secret-path and catastrophic checks re-run with quote-split words
-# joined (`.e""nv` -> `.env`).
+# A listed detector is lifted for ALLOWLISTED shapes only; anything else
+# still confirms:
+#   git-exec-surface — one segment, first word `git`, no wrapper / env prefix
+#     / redirection / expansion / operator; `-c` keys only user.name,
+#     user.email, color.*, advice.*, init.defaultBranch, core.quotepath,
+#     pull.rebase, push.autoSetupRemote, commit.gpgsign=false; subcommand
+#     status, log, diff, show, add, commit, fetch, pull, checkout, switch,
+#     branch, merge, stash, tag (no delete), rev-parse, remote -v / show, or
+#     push without force / delete / mirror / prune / `+` / colon refspecs.
+#   pipe-interpreter — `curl -fsSL <one URL> | sh|bash|python3` (or wget -qO-,
+#     or `| sh -s -- <plain args>`), nothing else in the command.
+# When a lift applies, secret-path and catastrophic checks re-run with
+# quote-split words joined (`.e""nv` -> `.env`). A push that deletes a remote
+# ref (`:main`, --delete) still confirms even with "git push" lifted.
 # SECURITY TRADE-OFF: a lifted simple download-and-execute still runs code
 # you have not seen. The built-in hard-deny (secrets, catastrophic shell,
 # own-channel systemctl, force push) and the deny list above are NEVER

@@ -900,12 +900,12 @@ describe('permission policy lint', () => {
       const c = checkPermissionPolicy(y, '/p').find((x) => x.id === 'permission-policy-risky-override')
       expect(c?.status).toBe('warn')
       expect(c?.detail).toContain(name)
-      expect(c?.detail).toContain('SIMPLE commands only')
+      expect(c?.detail).toContain('ALLOWLISTED SIMPLE commands only')
       expect(c?.detail).toContain('force push')
     }
     // Lifting only sudo does not print the detector note.
     const s = checkPermissionPolicy('confirm_overrides:\n  builtin_rules:\n    - "sudo "\n', '/p').find((x) => x.id === 'permission-policy-risky-override')
-    expect(s?.detail).not.toContain('SIMPLE commands only')
+    expect(s?.detail).not.toContain('ALLOWLISTED SIMPLE commands only')
   })
   test('default_tier allow → warn; confirm → pass; unset → pass', () => {
     expect(checkPermissionPolicy('default_tier: allow\n', '/p').find((c) => c.id === 'permission-policy-default-tier')?.status).toBe('warn')
