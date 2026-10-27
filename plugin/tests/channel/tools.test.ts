@@ -17,6 +17,7 @@ import {
 } from '../../src/channel/tools.js'
 import type { AppConfig, StatePaths } from '../../src/config.js'
 import { createLogger } from '../../src/log.js'
+import { createRichLatch } from '../../src/safety/rich-latch.js'
 
 // Silent logger to keep test output clean.
 const silentLog = createLogger('test', { stream: { write: () => true } as unknown as NodeJS.WritableStream })
@@ -854,5 +855,243 @@ describe('autonomy tool — fix-loop-2', () => {
     expect(status.isError).toBeUndefined()
     expect(status.content[0]?.text).toContain('L-wl')
     rmSync(deps.statePaths.root, { recursive: true, force: true })
+  })
+})
+
+// Issue #149: edit_message must render a body exactly as reply does, so a
+// status edited in place never shows bare ``` / ** to the owner.
+describe('edit_message renders like reply (#149)', () => {
+  const CHAT = '164795011'
+  const STATUS_MD = [
+    '**Статус**',
+    '',
+    '- шаг 1 готов',
+    '- шаг 2 в работе',
+    '',
+    '```',
+    'bun test',
+    '```',
+  ].join('\n')
+
+  interface Captured {
+    text: string
+    parse_mode: string | undefined
+  }
+
+  function capturingDeps(): { deps: ToolDeps; sent: Captured[]; edited: Captured[] } {
+    const sent: Captured[] = []
+    const edited: Captured[] = []
+    const deps = makeDeps({
+      telegramApi: makeStubApi({
+        sendMessage: async (_chatId: string, text: string, opts: SendMessageOpts) => {
+          sent.push({ text, parse_mode: opts.parse_mode })
+          return { message_id: 1 }
+        },
+        editMessageText: async (_chatId: string, _messageId: number, text: string, opts: EditOpts) => {
+          edited.push({ text, parse_mode: opts.parse_mode })
+        },
+      }),
+    })
+    return { deps, sent, edited }
+  }
+
+  async function replyThenEdit(args: Record<string, unknown>): Promise<{ sent: Captured[]; edited: Captured[] }> {
+    const { deps, sent, edited } = capturingDeps()
+    const r = await callTool(callReq('reply', { chat_id: CHAT, ...args }), deps)
+    const e = await callTool(callReq('edit_message', { chat_id: CHAT, message_id: '42', ...args }), deps)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    expect(r.isError).toBeUndefined()
+    expect(e.isError).toBeUndefined()
+    return { sent, edited }
+  }
+
+  test('markdown status (code block + bold + list) edits with the same text and parse_mode as reply', async () => {
+    const { sent, edited } = await replyThenEdit({ text: STATUS_MD })
+    expect(sent.length).toBe(1)
+    expect(edited.length).toBe(1)
+    expect(edited[0]).toEqual(sent[0]!)
+    expect(edited[0]!.parse_mode).toBe('HTML')
+    expect(edited[0]!.text).not.toContain('```')
+    expect(edited[0]!.text).not.toContain('**')
+    expect(edited[0]!.text).toContain('<b>Статус</b>')
+    expect(edited[0]!.text).toContain('<pre>')
+  })
+
+  test('plain text without markdown passes through unchanged, same as reply', async () => {
+    const { sent, edited } = await replyThenEdit({ text: 'просто текст без разметки' })
+    expect(edited[0]).toEqual(sent[0]!)
+    expect(edited[0]!.text).toBe('просто текст без разметки')
+  })
+
+  test("format 'text' sends the body verbatim with no parse_mode, same as reply", async () => {
+    const { sent, edited } = await replyThenEdit({ text: STATUS_MD, format: 'text' })
+    expect(edited[0]).toEqual(sent[0]!)
+    expect(edited[0]).toEqual({ text: STATUS_MD, parse_mode: undefined })
+  })
+
+  test("format 'markdownv2' still passes through raw with parse_mode MarkdownV2", async () => {
+    const body = '*bold* \\- item'
+    const { sent, edited } = await replyThenEdit({ text: body, format: 'markdownv2' })
+    expect(edited[0]).toEqual(sent[0]!)
+    expect(edited[0]).toEqual({ text: body, parse_mode: 'MarkdownV2' })
+  })
+
+  test("format 'html' and 'rich' are accepted and render like reply", async () => {
+    for (const format of ['html', 'rich']) {
+      const { sent, edited } = await replyThenEdit({ text: STATUS_MD, format })
+      expect(edited[0]).toEqual(sent[0]!)
+      expect(edited[0]!.parse_mode).toBe('HTML')
+    }
+  })
+
+  test('rendered HTML longer than one Telegram message is a tool error, nothing is edited', async () => {
+    const { deps, edited } = capturingDeps()
+    const res = await callTool(
+      callReq('edit_message', { chat_id: CHAT, message_id: '42', text: '**' + 'a'.repeat(4200) + '**' }),
+      deps,
+    )
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('4096')
+    expect(edited.length).toBe(0)
+  })
+
+  test('Telegram HTML parse failure retries the edit once as plain text', async () => {
+    const edited: Captured[] = []
+    const deps = makeDeps({
+      telegramApi: makeStubApi({
+        editMessageText: async (_chatId: string, _messageId: number, text: string, opts: EditOpts) => {
+          edited.push({ text, parse_mode: opts.parse_mode })
+          if (opts.parse_mode === 'HTML') {
+            throw new Error("Bad Request: can't parse entities: Unsupported start tag")
+          }
+        },
+      }),
+    })
+    const res = await callTool(callReq('edit_message', { chat_id: CHAT, message_id: '42', text: STATUS_MD }), deps)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    expect(res.isError).toBeUndefined()
+    expect(edited.length).toBe(2)
+    expect(edited[1]).toEqual({ text: STATUS_MD, parse_mode: undefined })
+  })
+
+  test('edit_message inputSchema format matches reply (enum + default)', () => {
+    const tools = listTools()
+    const fmt = (n: string): unknown =>
+      (tools.find((t) => t.name === n)?.inputSchema as { properties: Record<string, unknown> }).properties.format
+    const replyFmt = fmt('reply') as { enum: string[]; default: string }
+    const editFmt = fmt('edit_message') as { enum: string[]; default: string }
+    expect(editFmt.enum).toEqual(replyFmt.enum)
+    expect(editFmt.default).toBe(replyFmt.default)
+  })
+})
+
+// Codex review of #149: the rich-edit gate and the retry ladder need direct
+// coverage, not only the happy legacy path above.
+describe('edit_message rich gate and retry (#149 review)', () => {
+  const CHAT = '164795011'
+  // A markdown table is the canonical rich-eligible construct.
+  const TABLE_MD = ['| шаг | статус |', '| --- | --- |', '| 1 | готов |', '| 2 | в работе |'].join('\n')
+
+  interface EditCall {
+    text: string
+    parse_mode: string | undefined
+  }
+
+  function richDeps(): { deps: ToolDeps; richEdits: string[]; legacyEdits: EditCall[] } {
+    const richEdits: string[] = []
+    const legacyEdits: EditCall[] = []
+    const deps = makeDeps({
+      config: makeConfig({ richMessages: { enabled: true, perChatOptOut: [] } }),
+      richLatch: createRichLatch(),
+      telegramApi: makeStubApi({
+        editRichMessage: async (_chatId: string, _messageId: number, rawMarkdown: string) => {
+          richEdits.push(rawMarkdown)
+          return { ok: true as const }
+        },
+        editMessageText: async (_chatId: string, _messageId: number, text: string, opts: EditOpts) => {
+          legacyEdits.push({ text, parse_mode: opts.parse_mode })
+        },
+      }),
+    })
+    return { deps, richEdits, legacyEdits }
+  }
+
+  for (const format of [undefined, 'html', 'rich'] as const) {
+    test(`rich-eligible table with richMessages on goes through editRichMessage (format ${format ?? 'default'})`, async () => {
+      const { deps, richEdits, legacyEdits } = richDeps()
+      const args: Record<string, unknown> = { chat_id: CHAT, message_id: '42', text: TABLE_MD }
+      if (format !== undefined) args.format = format
+      const res = await callTool(callReq('edit_message', args), deps)
+      rmSync(deps.statePaths.root, { recursive: true, force: true })
+      expect(res.isError).toBeUndefined()
+      expect(res.content[0]?.text).toBe('edited (id: 42)')
+      expect(richEdits.length).toBe(1)
+      expect(richEdits[0]).toContain('| --- | --- |')
+      expect(legacyEdits.length).toBe(0)
+    })
+  }
+
+  test("format 'text' bypasses the rich gate and edits the table verbatim with no parse_mode", async () => {
+    const { deps, richEdits, legacyEdits } = richDeps()
+    const res = await callTool(
+      callReq('edit_message', { chat_id: CHAT, message_id: '42', text: TABLE_MD, format: 'text' }),
+      deps,
+    )
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    expect(res.isError).toBeUndefined()
+    expect(richEdits.length).toBe(0)
+    expect(legacyEdits).toEqual([{ text: TABLE_MD, parse_mode: undefined }])
+  })
+
+  test("format 'markdownv2' bypasses the rich gate and edits raw with parse_mode MarkdownV2", async () => {
+    const { deps, richEdits, legacyEdits } = richDeps()
+    const res = await callTool(
+      callReq('edit_message', { chat_id: CHAT, message_id: '42', text: TABLE_MD, format: 'markdownv2' }),
+      deps,
+    )
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    expect(res.isError).toBeUndefined()
+    expect(richEdits.length).toBe(0)
+    expect(legacyEdits).toEqual([{ text: TABLE_MD, parse_mode: 'MarkdownV2' }])
+  })
+
+  function failingEditDeps(fail: (opts: EditOpts) => Error | undefined): { deps: ToolDeps; attempts: EditCall[] } {
+    const attempts: EditCall[] = []
+    const deps = makeDeps({
+      telegramApi: makeStubApi({
+        editMessageText: async (_chatId: string, _messageId: number, text: string, opts: EditOpts) => {
+          attempts.push({ text, parse_mode: opts.parse_mode })
+          const err = fail(opts)
+          if (err) throw err
+        },
+      }),
+    })
+    return { deps, attempts }
+  }
+
+  test('a non-parse Telegram error makes exactly one attempt and returns a tool error', async () => {
+    const { deps, attempts } = failingEditDeps(() => new Error('Bad Request: message to edit not found'))
+    const res = await callTool(callReq('edit_message', { chat_id: CHAT, message_id: '42', text: '**готово**' }), deps)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('message to edit not found')
+    expect(attempts.length).toBe(1)
+    expect(attempts[0]!.parse_mode).toBe('HTML')
+  })
+
+  test('a parse error whose plain-text fallback also fails stops after two attempts with a tool error', async () => {
+    const { deps, attempts } = failingEditDeps((opts) =>
+      opts.parse_mode === 'HTML'
+        ? new Error("Bad Request: can't parse entities: Unsupported start tag")
+        : new Error('Bad Request: message is too long'),
+    )
+    const res = await callTool(callReq('edit_message', { chat_id: CHAT, message_id: '42', text: '**готово**' }), deps)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('message is too long')
+    expect(attempts.length).toBe(2)
+    expect(attempts[0]!.parse_mode).toBe('HTML')
+    expect(attempts[1]).toEqual({ text: '**готово**', parse_mode: undefined })
   })
 })

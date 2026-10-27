@@ -47,7 +47,7 @@ import {
   isTelegramHtmlParseError,
   markdownToTelegramHtml,
 } from '../format/html.js'
-import { splitMessage } from '../format/chunk.js'
+import { splitMessage, TELEGRAM_MAX_MESSAGE } from '../format/chunk.js'
 import { assertSendableFile, isPhotoExtension } from '../security/paths.js'
 import {
   buildRichMessagePayload,
@@ -436,7 +436,7 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'edit_message',
     description:
-      "Edit a message the bot previously sent. Useful for interim progress updates. Edits don't trigger push notifications — send a new reply when a long task completes so the user's device pings.",
+      "Edit a message the bot previously sent. Useful for interim progress updates. Renders text exactly like reply (same format values and default). Edits don't trigger push notifications — send a new reply when a long task completes so the user's device pings.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -445,9 +445,10 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         text: { type: 'string' },
         format: {
           type: 'string',
-          enum: ['text', 'markdownv2'],
+          enum: ['text', 'markdownv2', 'html', 'rich'],
+          default: 'html',
           description:
-            "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            "Rendering mode, same as reply. Default: 'html' — markdown (**bold**, `code`, ```fenced```, lists, [text](url)) is converted to Telegram's HTML subset, so an edited status looks exactly like the reply that sent it. An edit is ONE message: a body that renders past 4096 chars is refused with a tool error (no chunking). On parse error the edit retries once as plain text. 'text' bypasses conversion. 'markdownv2' passes raw — caller escapes per Telegram rules. 'rich' just forces the same rich-edit gate as 'html'.",
         },
       },
       required: ['chat_id', 'message_id', 'text'],
@@ -1036,6 +1037,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         const editRichBody = hardenSoftBreaks(args.text)
         const editRichEligible =
           config.richMessages.enabled &&
+          args.format !== 'text' &&
           args.format !== 'markdownv2' &&
           needsRichRendering(editRichBody) &&
           !hasDetailsMathCrashShape(editRichBody) &&
@@ -1057,9 +1059,33 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           }
         }
 
+        // Legacy path — renders exactly like reply (#149): 'html' / 'rich'
+        // convert markdown → Telegram HTML, 'text' / 'markdownv2' ship raw.
+        // An edit is ONE message, so there is no chunking: a body past
+        // Telegram's cap is refused loudly instead of truncated.
+        const renderHtml = args.format === 'html' || args.format === 'rich'
+        const editBody = renderHtml ? markdownToTelegramHtml(args.text) : args.text
+        if (editBody.length > TELEGRAM_MAX_MESSAGE) {
+          return toolError(
+            name,
+            `edited text renders to ${editBody.length} chars, over Telegram's ${TELEGRAM_MAX_MESSAGE}-char limit for one message — shorten it or send the rest with reply`,
+          )
+        }
         const opts: EditOpts = {}
-        if (args.format === 'markdownv2') opts.parse_mode = 'MarkdownV2'
-        await telegramApi.editMessageText(args.chat_id, messageId, args.text, opts)
+        if (renderHtml) opts.parse_mode = 'HTML'
+        else if (args.format === 'markdownv2') opts.parse_mode = 'MarkdownV2'
+        try {
+          await telegramApi.editMessageText(args.chat_id, messageId, editBody, opts)
+        } catch (err) {
+          if (!renderHtml || !isTelegramHtmlParseError(err)) throw err
+          // Telegram rejected our HTML — retry once as plain text so the
+          // update still lands. The PRE-render text, like the guest path:
+          // raw <b> tag soup reads worse than unrendered markdown.
+          log.warn('telegram HTML parse failed on edit, retrying as plain text', {
+            error: err instanceof Error ? err.message : String(err),
+          })
+          await telegramApi.editMessageText(args.chat_id, messageId, args.text, {})
+        }
         return { content: [{ type: 'text', text: `edited (id: ${args.message_id})` }] }
       }
 
