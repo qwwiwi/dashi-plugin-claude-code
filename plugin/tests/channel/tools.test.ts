@@ -17,6 +17,7 @@ import {
 } from '../../src/channel/tools.js'
 import type { AppConfig, StatePaths } from '../../src/config.js'
 import { createLogger } from '../../src/log.js'
+import { createRichLatch } from '../../src/safety/rich-latch.js'
 
 // Silent logger to keep test output clean.
 const silentLog = createLogger('test', { stream: { write: () => true } as unknown as NodeJS.WritableStream })
@@ -982,5 +983,115 @@ describe('edit_message renders like reply (#149)', () => {
     const editFmt = fmt('edit_message') as { enum: string[]; default: string }
     expect(editFmt.enum).toEqual(replyFmt.enum)
     expect(editFmt.default).toBe(replyFmt.default)
+  })
+})
+
+// Codex review of #149: the rich-edit gate and the retry ladder need direct
+// coverage, not only the happy legacy path above.
+describe('edit_message rich gate and retry (#149 review)', () => {
+  const CHAT = '164795011'
+  // A markdown table is the canonical rich-eligible construct.
+  const TABLE_MD = ['| шаг | статус |', '| --- | --- |', '| 1 | готов |', '| 2 | в работе |'].join('\n')
+
+  interface EditCall {
+    text: string
+    parse_mode: string | undefined
+  }
+
+  function richDeps(): { deps: ToolDeps; richEdits: string[]; legacyEdits: EditCall[] } {
+    const richEdits: string[] = []
+    const legacyEdits: EditCall[] = []
+    const deps = makeDeps({
+      config: makeConfig({ richMessages: { enabled: true, perChatOptOut: [] } }),
+      richLatch: createRichLatch(),
+      telegramApi: makeStubApi({
+        editRichMessage: async (_chatId: string, _messageId: number, rawMarkdown: string) => {
+          richEdits.push(rawMarkdown)
+          return { ok: true as const }
+        },
+        editMessageText: async (_chatId: string, _messageId: number, text: string, opts: EditOpts) => {
+          legacyEdits.push({ text, parse_mode: opts.parse_mode })
+        },
+      }),
+    })
+    return { deps, richEdits, legacyEdits }
+  }
+
+  for (const format of [undefined, 'html', 'rich'] as const) {
+    test(`rich-eligible table with richMessages on goes through editRichMessage (format ${format ?? 'default'})`, async () => {
+      const { deps, richEdits, legacyEdits } = richDeps()
+      const args: Record<string, unknown> = { chat_id: CHAT, message_id: '42', text: TABLE_MD }
+      if (format !== undefined) args.format = format
+      const res = await callTool(callReq('edit_message', args), deps)
+      rmSync(deps.statePaths.root, { recursive: true, force: true })
+      expect(res.isError).toBeUndefined()
+      expect(res.content[0]?.text).toBe('edited (id: 42)')
+      expect(richEdits.length).toBe(1)
+      expect(richEdits[0]).toContain('| --- | --- |')
+      expect(legacyEdits.length).toBe(0)
+    })
+  }
+
+  test("format 'text' bypasses the rich gate and edits the table verbatim with no parse_mode", async () => {
+    const { deps, richEdits, legacyEdits } = richDeps()
+    const res = await callTool(
+      callReq('edit_message', { chat_id: CHAT, message_id: '42', text: TABLE_MD, format: 'text' }),
+      deps,
+    )
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    expect(res.isError).toBeUndefined()
+    expect(richEdits.length).toBe(0)
+    expect(legacyEdits).toEqual([{ text: TABLE_MD, parse_mode: undefined }])
+  })
+
+  test("format 'markdownv2' bypasses the rich gate and edits raw with parse_mode MarkdownV2", async () => {
+    const { deps, richEdits, legacyEdits } = richDeps()
+    const res = await callTool(
+      callReq('edit_message', { chat_id: CHAT, message_id: '42', text: TABLE_MD, format: 'markdownv2' }),
+      deps,
+    )
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    expect(res.isError).toBeUndefined()
+    expect(richEdits.length).toBe(0)
+    expect(legacyEdits).toEqual([{ text: TABLE_MD, parse_mode: 'MarkdownV2' }])
+  })
+
+  function failingEditDeps(fail: (opts: EditOpts) => Error | undefined): { deps: ToolDeps; attempts: EditCall[] } {
+    const attempts: EditCall[] = []
+    const deps = makeDeps({
+      telegramApi: makeStubApi({
+        editMessageText: async (_chatId: string, _messageId: number, text: string, opts: EditOpts) => {
+          attempts.push({ text, parse_mode: opts.parse_mode })
+          const err = fail(opts)
+          if (err) throw err
+        },
+      }),
+    })
+    return { deps, attempts }
+  }
+
+  test('a non-parse Telegram error makes exactly one attempt and returns a tool error', async () => {
+    const { deps, attempts } = failingEditDeps(() => new Error('Bad Request: message to edit not found'))
+    const res = await callTool(callReq('edit_message', { chat_id: CHAT, message_id: '42', text: '**готово**' }), deps)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('message to edit not found')
+    expect(attempts.length).toBe(1)
+    expect(attempts[0]!.parse_mode).toBe('HTML')
+  })
+
+  test('a parse error whose plain-text fallback also fails stops after two attempts with a tool error', async () => {
+    const { deps, attempts } = failingEditDeps((opts) =>
+      opts.parse_mode === 'HTML'
+        ? new Error("Bad Request: can't parse entities: Unsupported start tag")
+        : new Error('Bad Request: message is too long'),
+    )
+    const res = await callTool(callReq('edit_message', { chat_id: CHAT, message_id: '42', text: '**готово**' }), deps)
+    rmSync(deps.statePaths.root, { recursive: true, force: true })
+    expect(res.isError).toBe(true)
+    expect(res.content[0]?.text).toContain('message is too long')
+    expect(attempts.length).toBe(2)
+    expect(attempts[0]!.parse_mode).toBe('HTML')
+    expect(attempts[1]).toEqual({ text: '**готово**', parse_mode: undefined })
   })
 })
