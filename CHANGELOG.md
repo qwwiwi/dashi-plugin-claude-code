@@ -15,6 +15,15 @@ retroactively marks the state of `main` on 2026-06-14.
 
 ## [Unreleased]
 
+### Fixed
+- `edit_message` renders text exactly like `reply` (#149): same `format`
+  values (`text`/`markdownv2`/`html`/`rich`) and the same `html` default, so
+  markdown (code blocks, bold, lists) is converted to Telegram HTML instead of
+  showing raw backticks. A body that renders past 4096 chars is refused with a
+  tool error (an edit is one message); an HTML parse failure retries the edit
+  once as plain text. Explicit `format: 'text'` no longer enters the rich-edit
+  gate, matching `reply`.
+
 ## [1.4.2] — 2026-10-17
 
 ### Security

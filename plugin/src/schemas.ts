@@ -113,7 +113,11 @@ export const EditMessageArgsSchema = z.object({
   chat_id: z.string().min(1),
   message_id: z.string().min(1),
   text: z.string().min(1),
-  format: z.enum(['text', 'markdownv2']).optional(),
+  // Same values and default as ReplyArgsSchema.format (#149): an edited
+  // status must render exactly like the reply that created it. 'html' (the
+  // default) converts markdown via markdownToTelegramHtml; 'rich' joins the
+  // same rich-edit gate as 'html'; 'text' / 'markdownv2' pass through raw.
+  format: z.enum(['text', 'markdownv2', 'html', 'rich']).default('html'),
 })
 export type EditMessageArgs = z.infer<typeof EditMessageArgsSchema>
 
