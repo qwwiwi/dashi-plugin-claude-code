@@ -118,14 +118,53 @@ const DISCORD_WEBHOOK_RE =
   /(discord(?:app)?\.com\/api\/webhooks\/\d+\/)[A-Za-z0-9_-]+/gi
 const SLACK_WEBHOOK_RE = /(hooks\.slack\.com\/services\/)[A-Za-z0-9/]+/gi
 
-// IPv4 — keep first and last octet (helps debugging) and mask the middle
-// two. Loopback (127.*) and 0.* placeholders are pure debug noise; the
-// callback returns the raw match unchanged for those so operators can read
-// "127.0.0.1" verbatim. Port of activity-renderer.ts:62-73.
-const IPV4_RE = /\b(\d{1,3})\.\d{1,3}\.\d{1,3}\.(\d{1,3})\b/g
-function ipv4Replacer(full: string, first: string, last: string): string {
-  if (first === '127' || first === '0') return full
-  return `${first}.***.***.${last}`
+// IPv4 — mask ONLY private/internal ranges plus any operator-configured host
+// IP(s); PUBLIC addresses pass through in full. Rationale: public IPs that show
+// up in operator messages are values people NEED to read whole — a static-host
+// or CDN A-record, a client's current DNS host, etc. Blanket middle-octet
+// masking broke DNS-guidance workflows. What actually warrants hiding is a
+// deployment's own server address and internal (RFC1918/CGNAT/link-local)
+// topology. Loopback (127.*) and 0.* stay verbatim as debug noise.
+const IPV4_RE = /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g
+// Extra host IP(s) to mask alongside the private ranges — typically the
+// deployment's own public server address, which an operator may not want
+// echoed into chat or logs. Supplied via the DASHI_OWN_HOST_IPS env var as a
+// comma-separated list; empty by default, so with nothing configured every
+// public IP is shown in full. Deliberately NOT hardcoded: a specific
+// deployment's server address is not a value that belongs in shared source.
+// Read per call so the list can change without restarting the process.
+function ownHostIps(): ReadonlySet<string> {
+  return new Set(
+    (process.env.DASHI_OWN_HOST_IPS ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  )
+}
+function isPrivateIpv4(a: number, b: number): boolean {
+  if (a === 10) return true // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true // 172.16.0.0/12
+  if (a === 192 && b === 168) return true // 192.168.0.0/16
+  if (a === 169 && b === 254) return true // 169.254.0.0/16 link-local
+  if (a === 100 && b >= 64 && b <= 127) return true // 100.64.0.0/10 CGNAT
+  return false
+}
+function ipv4Replacer(full: string): string {
+  const parts = full.split('.')
+  if (parts.length !== 4) return full
+  const nums = parts.map((p) => Number.parseInt(p, 10))
+  const a = nums[0]
+  const b = nums[1]
+  const d = nums[3]
+  // Guards double as noUncheckedIndexedAccess narrowing. A malformed octet
+  // (> 255 — e.g. a version string "999.1.2.3") is not an IP; leave it be.
+  if (a === undefined || b === undefined || d === undefined) return full
+  if (nums.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return full
+  if (a === 127 || a === 0) return full // loopback / placeholder — show
+  if (ownHostIps().has(full) || isPrivateIpv4(a, b)) {
+    return `${a}.***.***.${d}`
+  }
+  return full // public IP — shown in full (DNS records people must read)
 }
 
 // Secret paths.
@@ -241,7 +280,7 @@ const RULES: ReadonlyArray<RedactionRule> = [
   { pattern: JWT_RE, replacement: '[REDACTED]' },
   { pattern: DISCORD_WEBHOOK_RE, replacement: '$1[REDACTED]' },
   { pattern: SLACK_WEBHOOK_RE, replacement: '$1[REDACTED]' },
-  // 4. IPv4 — middle-octet mask.
+  // 4. IPv4 — mask private/internal + own-host only; public IPs shown.
   { pattern: IPV4_RE, replacement: ipv4Replacer },
   // 5. Secret paths.
   { pattern: SECRET_PATH_TILDE_RE, replacement: '$1secrets/***' },
