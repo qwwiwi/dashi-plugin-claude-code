@@ -417,6 +417,12 @@ function bottomChrome(text: string): string {
 // the structural tail with the two mode markers so idle is recognised in every
 // mode; the busy guard below still wins when the interrupt hint is present.
 //
+// A later build replaced manual mode's `? for shortcuts` footer with a plain
+// `⏸ manual mode on` status line (live pane, 2026-09-20) — same idle state, new
+// wording, same regression pattern as the multi-agent tail above (classifyPane
+// falls to 'unknown', /new and /compact refuse with "не удалось определить
+// состояние сессии"). Matched as a literal marker alongside the others.
+//
 // Ordering is load-bearing: DIALOG is checked BEFORE BUSY, because a native
 // permission dialog can ALSO render an "esc to interrupt" hint while a tool runs
 // behind it — but a dialog needs an explicit answer, never a blind Enter, so
@@ -462,6 +468,7 @@ export function classifyPane(text: string): PaneState {
   if (
     (chrome.includes('shift+tab to cycle') ||
       chrome.includes('? for shortcuts') ||
+      chrome.includes('manual mode on') ||
       /←[^\S\n]+for agents[^\S\n]+·[^\S\n]+↓[^\S\n]+to manage/i.test(chrome)) &&
     !chrome.includes('esc to interrupt')
   ) {
