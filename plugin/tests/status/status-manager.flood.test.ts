@@ -124,6 +124,8 @@ function makeRaw(): { api: TelegramApi; calls: string[]; failNextEdit(): void } 
     async deleteMessage() {
       calls.push('deleteMessage')
     },
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     async answerGuestQuery() {},
   }
   return { api, calls, failNextEdit: () => (failEdit = true) }

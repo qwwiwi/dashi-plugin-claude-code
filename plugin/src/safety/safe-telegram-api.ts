@@ -27,6 +27,7 @@ import type {
   InlineKeyboardLike,
   SendDocumentOpts,
   SendMessageOpts,
+  SendWidgetParams,
   SendRichMessageOpts,
   SendRichMessageResult,
   EditRichMessageResult,
@@ -269,6 +270,25 @@ export function createSafeTelegramApi(
         safeOpts.reply_markup = redactReplyMarkup(opts.reply_markup, extraSecrets)
       }
       return raw.editMessageText(chatId, messageId, safeText, safeOpts)
+    },
+
+    // Widget html / caption / chat_data are caller text that lands in a chat:
+    // redact all three. The html is NOT run through validateTelegramHtml (it is
+    // a full document, not the Telegram HTML subset). The tool measures sizes
+    // before this layer; redaction replaces a secret with a short placeholder,
+    // so a size change is bounded by the secret's length.
+    async sendWidget(chatId: string, params: SendWidgetParams): Promise<{ message_id: number }> {
+      const safe: SendWidgetParams = {
+        ...params,
+        html: redactSecrets(params.html, extraSecrets),
+        caption: redactSecrets(params.caption, extraSecrets),
+      }
+      if (params.chat_data !== undefined) safe.chat_data = redactSecrets(params.chat_data, extraSecrets)
+      return raw.sendWidget(chatId, safe)
+    },
+
+    async editWidgetData(chatId: string, messageId: number, chatData: string): Promise<void> {
+      return raw.editWidgetData(chatId, messageId, redactSecrets(chatData, extraSecrets))
     },
 
     // ─── Pass-through methods ────────────────────────────────────────

@@ -149,6 +149,8 @@ function makeStubApi(clock: FakeClock): StubApi {
       maybeThrow('deleteMessage')
       calls.push({ method: 'deleteMessage', chatId, messageId, ts: clock.now() })
     },
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     async answerGuestQuery(_guestQueryId, text, _opts) {
       maybeThrow('answerGuestQuery')
       calls.push({ method: 'answerGuestQuery', text, ts: clock.now() })

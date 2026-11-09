@@ -91,6 +91,8 @@ function makeTelegramApi(): TelegramApi {
     sendPhoto: fail('sendPhoto') as TelegramApi['sendPhoto'],
     downloadFile: fail('downloadFile') as TelegramApi['downloadFile'],
     deleteMessage: fail('deleteMessage') as TelegramApi['deleteMessage'],
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     answerGuestQuery: fail('answerGuestQuery') as TelegramApi['answerGuestQuery'],
   }
 }

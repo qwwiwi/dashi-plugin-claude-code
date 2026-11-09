@@ -74,6 +74,7 @@ import type {
   SendMessageOpts,
   SendRichMessageOpts,
   SendRichMessageResult,
+  SendWidgetParams,
   TelegramApi,
 } from '../channel/tools.js'
 
@@ -425,6 +426,21 @@ export function createReliableTelegramApi(
       const res = await raw.sendRichMessage(chatId, rawMarkdown, richOpts)
       if ('message_id' in res) stampOutbound(chatId)
       return res
+    },
+
+    async sendWidget(chatId, params: SendWidgetParams): Promise<{ message_id: number }> {
+      // NOT retried: a widget send is non-idempotent and its transient errors
+      // are ambiguous (the card may have landed) — a retry could show the owner
+      // two widgets. A failure surfaces to the agent as an honest tool error.
+      const res = await raw.sendWidget(chatId, params)
+      stampOutbound(chatId)
+      return res
+    },
+
+    async editWidgetData(chatId, messageId, chatData): Promise<void> {
+      // State edit: no ping, not stamped; forwarded verbatim (the rate-limited
+      // layer below owns 429 handling).
+      return raw.editWidgetData(chatId, messageId, chatData)
     },
 
     async editMessageText(chatId, messageId, text, editOpts: EditOpts): Promise<void> {

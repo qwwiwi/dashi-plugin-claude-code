@@ -113,6 +113,8 @@ function makeStub(program: {
       return { path: '/x' }
     },
     async deleteMessage(): Promise<void> {},
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     async answerGuestQuery(): Promise<void> {},
   }
   return stub

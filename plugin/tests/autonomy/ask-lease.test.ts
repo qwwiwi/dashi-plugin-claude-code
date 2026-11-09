@@ -76,6 +76,8 @@ function fakeTelegram(state: Sends): TelegramApi {
     async downloadFile(_id: string, _d: string): Promise<DownloadResult> {
       return { path: '/tmp/x' }
     },
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     async answerGuestQuery() {},
     async deleteMessage() {},
   }

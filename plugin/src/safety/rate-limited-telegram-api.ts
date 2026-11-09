@@ -49,6 +49,7 @@ import type {
   SendMessageOpts,
   SendRichMessageOpts,
   SendRichMessageResult,
+  SendWidgetParams,
   TelegramApi,
 } from '../channel/tools.js'
 
@@ -358,6 +359,17 @@ export function createRateLimitedTelegramApi(
       richOpts: SendRichMessageOpts,
     ): Promise<SendRichMessageResult> {
       return enqueueSend(chatId, () => raw.sendRichMessage(chatId, rawMarkdown, richOpts))
+    },
+
+    // A widget is one new outbound bubble: same per-chat FIFO + bucket + 429
+    // retry as sendMessage. The state edit targets a message already on
+    // screen, so it skips the send queue like editMessageText.
+    async sendWidget(chatId: string, params: SendWidgetParams): Promise<{ message_id: number }> {
+      return enqueueSend(chatId, () => raw.sendWidget(chatId, params))
+    },
+
+    async editWidgetData(chatId: string, messageId: number, chatData: string): Promise<void> {
+      return withRetry('editWidgetData', () => raw.editWidgetData(chatId, messageId, chatData))
     },
 
     async editMessageText(

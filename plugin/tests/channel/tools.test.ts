@@ -47,6 +47,8 @@ function makeStubApi(overrides: Partial<TelegramApi> = {}): TelegramApi {
     deleteMessage: async (_chatId: string, _messageId: number) => {
       /* noop */
     },
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     answerGuestQuery: async (_guestQueryId: string, _text: string, _opts: AnswerGuestQueryOpts) => {
       /* noop */
     },
@@ -155,7 +157,7 @@ function callReq(name: string, args: Record<string, unknown>): CallToolRequest {
 }
 
 describe('listTools', () => {
-  test('returns 6 tools with stable order: reply, react, download_attachment, edit_message, status, autonomy', () => {
+  test('returns 8 tools with stable order: reply, react, download_attachment, edit_message, status, autonomy, send_widget, edit_widget_data', () => {
     const tools = listTools()
     expect(tools.map(t => t.name)).toEqual([
       'reply',
@@ -164,6 +166,8 @@ describe('listTools', () => {
       'edit_message',
       'status',
       'autonomy',
+      'send_widget',
+      'edit_widget_data',
     ])
   })
 

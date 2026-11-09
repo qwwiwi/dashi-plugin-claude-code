@@ -15,6 +15,16 @@ retroactively marks the state of `main` on 2026-06-14.
 
 ## [Unreleased]
 
+### Added
+- `send_widget` and `edit_widget_data` MCP tools (#151, slice 1): Bot API
+  `sendWidget` / `editMessageWidgetData` through grammY's raw escape hatch (no
+  dependency change). Sizes (32768 bytes html, 4096 bytes after zlib level 9,
+  no NUL, 1024 bytes chat_data), a required caption and the private-chat-only
+  rule are checked before the call; a Bot API error is returned to the agent
+  with secrets redacted and is never retried. Send and state update only
+  (`allow_queries` is not set). Ships `plugin/templates/status.html`, a compact
+  dark status card driven by `TelegramWidget.chatData`. See
+  `plugin/docs/widgets.md`.
 ### Fixed
 - `edit_message` renders text exactly like `reply` (#149): same `format`
   values (`text`/`markdownv2`/`html`/`rich`) and the same `html` default, so

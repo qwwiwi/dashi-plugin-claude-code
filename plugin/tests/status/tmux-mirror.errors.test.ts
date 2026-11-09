@@ -86,6 +86,8 @@ function makeStubApi(): {
         throw err
       }
     },
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     async answerGuestQuery() {
       /* not exercised by mirror tests */
     },
