@@ -1,67 +1,95 @@
 <!doctype html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{box-sizing:border-box}
-body{margin:0;padding:10px 12px;background:#12151a;color:#e4e7eb;font:13px/1.3 system-ui,sans-serif}
-h2{margin:10px 0 3px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#8a94a0}
-h2:first-child{margin-top:0}
-.t{display:flex;justify-content:space-between;gap:8px}
-.t span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.t b{font-weight:600;color:#aeb7c2}
-.r{margin:4px 0}
-.b{height:5px;margin-top:2px;border-radius:3px;background:#242a33;overflow:hidden}
-.b i{display:block;height:100%;background:#4c8dff}
-.s-d i{background:#3fb97b}
-.s-f i{background:#e5534b}
-.s-b i{background:#d9a441}
-.s-q i{background:#5b6573}
-.j .t em{font-style:normal;font-size:11px;color:#8a94a0}
-.l{margin-top:10px;padding-top:6px;border-top:1px solid #242a33;font-size:11px;color:#8a94a0}
+:root{color-scheme:light;background:#fff;color:#242321;font-family:system-ui}
+body{margin:0;padding:8px;background:#fff;font:13px/16px system-ui}
+.card{padding:6px 8px;margin-bottom:6px;border:1px solid #dedcd9;background:#fff;border-radius:0;min-width:0}
+h2{margin:0 0 4px;font-size:11px;line-height:14px;font-weight:500;letter-spacing:.04em;color:#777571}
+.cut{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row,.top{display:flex;align-items:center;gap:6px;min-width:0}
+.row{height:16px}
+.name{flex:1;min-width:0}
+.pct{flex:none;width:32px;text-align:right;font-size:11px;font-weight:500}
+.cells{display:flex;gap:2px;width:58px;flex:none}
+.cells i{height:4px;flex:1;background:#dedcd9}
+.cells .on{background:#f4511e}
+.job{height:20px}
+.state{flex:none;color:#777571;font-size:10px}
+.bar{height:3px;background:#dedcd9;margin-top:1px}
+.bar i{display:block;height:100%;background:#f4511e}
+.s-d .bar i{background:#2f7a4f}
+.s-f .bar i{background:#c8361b}
+.s-q .bar i{background:#777571}
+.s-b .bar i{background:#242321}
+.empty{padding:8px;background:#f7f6f5;color:#777571;border:1px solid #dedcd9}
+.foot{padding-top:4px;border-top:1px solid #dedcd9;color:#777571;font-size:10px;line-height:14px}
 </style>
 <div id="a"></div>
 <script>
 const root = document.getElementById('a')
-const STATE = { r: 'run', q: 'queue', d: 'done', f: 'fail', b: 'block' }
+const states = {r:'run',q:'queue',d:'done',f:'fail',b:'block'}
+const demo = {m:[['Этапы',[['Подготовка',100],['Выполнение',60],['Проверка',20]]]],j:[['Обработка данных',42,'r'],['Проверка результата',0,'q']],l:'Лимиты: 2 / 8'}
 const el = (tag, cls, text) => {
   const e = document.createElement(tag)
   if (cls) e.className = cls
-  if (text !== undefined) e.textContent = text
+  if (text !== undefined) e.append(text)
   return e
 }
-const pct = (v) => Math.max(0, Math.min(100, Math.round(Number(v) || 0)))
-const row = (cls, name, v, extra) => {
-  const r = el('div', 'r ' + cls)
-  const t = el('div', 't')
-  t.append(el('span', '', name), extra || el('b', '', pct(v) + '%'))
-  const bar = el('div', 'b')
-  const fill = el('i')
-  fill.style.width = pct(v) + '%'
-  bar.append(fill)
-  r.append(t, bar)
-  return r
+const list = v => Array.isArray(v) ? v : []
+const label = (v, fallback) => typeof v === 'string' && v.trim() ? v : fallback
+const pct = v => typeof v === 'number' && Number.isFinite(v) ? Math.max(0,Math.min(100,Math.round(v))) : 0
+const section = title => {
+  const e = el('div','card')
+  e.append(el('h2','cut','[ '+title+' ]'))
+  root.append(e)
+  return e
 }
 const render = () => {
   let d = {}
-  try {
-    d = JSON.parse(TelegramWidget.chatData || '{}') || {}
-  } catch (e) {}
-  root.textContent = ''
-  for (const g of d.m || []) {
-    root.append(el('h2', '', g[0]))
-    for (const r of g[1] || []) root.append(row('', r[0], r[1]))
+  if (typeof TelegramWidget === 'undefined') d = demo
+  else {
+    try { d = JSON.parse(TelegramWidget.chatData) } catch (e) {}
   }
-  if ((d.j || []).length) root.append(el('h2', '', 'jobs'))
-  for (const j of d.j || []) {
-    const s = el('em', '', pct(j[1]) + '% ' + (STATE[j[2]] || ''))
-    root.append(row('j s-' + j[2], j[0], j[1], s))
+  if (!d || typeof d !== 'object' || Array.isArray(d)) d = {}
+  while (root.firstChild) root.removeChild(root.firstChild)
+  let rows = 0, hidden = 0
+  const groups = list(d.m).filter(Array.isArray)
+  hidden += Math.max(0,groups.length-3)
+  for (const g of groups.slice(0,3)) {
+    const card = section(label(g[0],'Этапы'))
+    const items = list(g[1]).filter(Array.isArray)
+    hidden += Math.max(0,items.length-5)
+    for (const r of items.slice(0,5)) {
+      const p = pct(r[1]), line = el('div','row'), bar = el('div','cells')
+      for (let i=0;i<5;i++) bar.append(el('i',i < Math.round(p/20) ? 'on' : ''))
+      line.append(el('span','name cut',label(r[0],'Без названия')),bar,el('b','pct',p+'%'))
+      card.append(line)
+      rows++
+    }
+    if (!items.length) card.append(el('div','cut','нет данных'))
   }
-  if (d.l) root.append(el('div', 'l', d.l))
+  const jobs = list(d.j).filter(Array.isArray)
+  hidden += Math.max(0,jobs.length-8)
+  if (jobs.length) {
+    const card = section('Задачи')
+    for (const j of jobs.slice(0,8)) {
+      const s = typeof j[2] === 'string' && /^[rqdfb]$/.test(j[2]) ? j[2] : 'q'
+      const p = pct(j[1]), job = el('div','job s-'+s), top = el('div','top')
+      top.append(el('span','name cut',label(j[0],'Без названия')),el('span','state',states[s]),el('b','pct',p+'%'))
+      const bar = el('div','bar'), fill = el('i')
+      fill.style.width = p+'%'
+      bar.append(fill)
+      job.append(top,bar)
+      card.append(job)
+      rows++
+    }
+  }
+  if (!rows && !groups.length) root.append(el('div','empty','нет данных'))
+  const footer = label(d.l,'')
+  if (footer || hidden) root.append(el('div','foot cut',(hidden ? 'ещё: '+hidden+(footer ? ' · ' : '') : '')+footer))
 }
 render()
-// Re-render whenever the bot changes the state via editMessageWidgetData.
-if (typeof TelegramWidget.addEventListener === 'function') {
-  TelegramWidget.addEventListener('chatDataChanged', render)
+if (typeof TelegramWidget !== 'undefined' && typeof TelegramWidget.onEvent === 'function') {
+  TelegramWidget.onEvent('chatDataChanged',render)
 }
-window.addEventListener('chatDataChanged', render)
 </script>
