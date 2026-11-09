@@ -186,3 +186,68 @@ function pruneOutboundDeadLetters(dir: string): void {
     // best-effort — a readdir failure must not fail the dead-letter write
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// statusWidgetCard — the model-free status card the plugin keeps editing
+// ─────────────────────────────────────────────────────────────────────
+
+export interface StatusWidgetCard {
+  chatId: string
+  messageId: number
+}
+
+function statusWidgetCardPath(paths: StatePaths): string {
+  return join(paths.root, 'status-widget.json')
+}
+
+/**
+ * Read the tracked card (chat id + message id). A missing or corrupt file reads
+ * as undefined: the service then sends a fresh card, which is the safe outcome.
+ */
+export function readStatusWidgetCard(paths: StatePaths): StatusWidgetCard | undefined {
+  const file = statusWidgetCardPath(paths)
+  if (!existsSync(file)) return undefined
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const rec = parsed as Record<string, unknown>
+    const { chatId, messageId } = rec
+    if (typeof chatId !== 'string' || chatId === '') return undefined
+    if (typeof messageId !== 'number' || !Number.isInteger(messageId) || messageId <= 0) return undefined
+    return { chatId, messageId }
+  } catch {
+    return undefined
+  }
+}
+
+/** Atomic write (tmp + fsync + rename), 0o600 like the other state files. */
+export function writeStatusWidgetCard(paths: StatePaths, card: StatusWidgetCard): void {
+  const file = statusWidgetCardPath(paths)
+  const tmp = join(paths.root, `status-widget.tmp.${process.pid}.${Date.now()}`)
+  const fd = openSync(tmp, 'w', 0o600)
+  try {
+    writeSync(fd, JSON.stringify({ chatId: card.chatId, messageId: card.messageId }))
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+  try {
+    renameSync(tmp, file)
+  } catch (err) {
+    try {
+      unlinkSync(tmp)
+    } catch {
+      // best-effort
+    }
+    throw err
+  }
+}
+
+/** Forget the tracked card. Idempotent. */
+export function clearStatusWidgetCard(paths: StatePaths): void {
+  try {
+    unlinkSync(statusWidgetCardPath(paths))
+  } catch {
+    // already gone
+  }
+}

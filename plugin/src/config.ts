@@ -387,6 +387,41 @@ export const AppConfigSchema = z.object({
     enabled: z.boolean().default(true),
     perChatOptOut: z.array(z.string()).default([]),
   }).default({}),
+  // Model-free status card (#151): the plugin itself runs `command` on a timer
+  // and keeps ONE private-chat widget up to date, with no model involvement.
+  // Default OFF. OPTIONAL block (no `.default({})`), like `hud`, so existing
+  // config literals stay valid. `command` is an argv array run WITHOUT a shell;
+  // its stdout is the card state JSON (see docs/widgets.md).
+  status_widget: z.object({
+    enabled: z.boolean().default(false),
+    chat_id: z.union([z.string(), z.number()]).transform((v) => String(v)).optional(),
+    command: z.array(z.string().min(1)).default([]),
+    interval_sec: z.number().int().min(15).default(60),
+    timeout_ms: z.number().int().min(100).max(60_000).default(5000),
+  }).superRefine((w, ctx) => {
+    // Widgets work only in a private chat with the bot (positive integer id).
+    if (w.chat_id !== undefined && !/^[1-9]\d*$/.test(w.chat_id)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['chat_id'],
+        message: 'status_widget.chat_id must be a private chat id (a positive integer); groups, supergroups and channels are not supported by widgets',
+      })
+    }
+    if (w.enabled && w.chat_id === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['chat_id'],
+        message: 'status_widget.chat_id required when status_widget.enabled=true',
+      })
+    }
+    if (w.enabled && w.command.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['command'],
+        message: 'status_widget.command (a non-empty argv array) required when status_widget.enabled=true',
+      })
+    }
+  }).optional(),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
 

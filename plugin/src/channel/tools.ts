@@ -174,6 +174,10 @@ export interface SendWidgetParams {
   chat_data?: string
   width?: number
   height?: number
+  // Wrapper-only flag (never sent to Telegram): the reliable layer strips it
+  // and skips the outbound-activity stamp, so an internal send (the model-free
+  // status card) does not count as the model talking to the owner.
+  skipOutboundStamp?: boolean
 }
 
 export interface DownloadResult {

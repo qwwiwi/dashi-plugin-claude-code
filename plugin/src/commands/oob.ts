@@ -1,7 +1,8 @@
 // Out-of-band (OOB) commands handled by the plugin BEFORE a channel
 // notification is sent to Claude.
 //
-// Control commands: /help, /status, /stop, /compact, /new, /mirror, /keys, /cc.
+// Control commands: /help, /status, /stop, /compact, /new, /mirror, /keys, /cc,
+// /lease, /card.
 // The session-driving controls (/stop, /compact, /new-confirm, /cc, /keys) act
 // on the agent's tmux pane through the RELIABLE injection layer in keys.ts
 // (probe → optionally interrupt → send → confirm), never a blind Enter.
@@ -18,6 +19,8 @@
 // Handling notes:
 //   - /help and /status reply directly to Telegram and DO NOT wake Claude
 //     (no channel notification).
+//   - /card sends a FRESH model-free status card (the plugin's own status
+//     widget service) and never wakes Claude either.
 //   - /compact injects Claude Code's own /compact into the pane via
 //     sendControlCommand and reports the REAL result (ok/busy/dialog/…).
 //   - /new is one-tap-with-confirm: a bare /new posts a confirmation card;
@@ -57,7 +60,7 @@ import {
 import { grantLease, parseLeaseCommandArgs } from '../autonomy/grant.js'
 
 export type OobCommandName =
-  | 'help' | 'status' | 'stop' | 'compact' | 'new' | 'mirror' | 'keys' | 'cc' | 'lease'
+  | 'help' | 'status' | 'stop' | 'compact' | 'new' | 'mirror' | 'keys' | 'cc' | 'lease' | 'card'
 
 const KNOWN_COMMANDS = new Set<OobCommandName>([
   'help',
@@ -69,6 +72,7 @@ const KNOWN_COMMANDS = new Set<OobCommandName>([
   'keys',
   'cc',
   'lease',
+  'card',
 ])
 
 // Sub-actions for /mirror. We accept the bare command (= same as `status`),
@@ -178,6 +182,11 @@ export interface OobContext {
     captureExec?: KeysCaptureExec
     sleep?: (ms: number) => Promise<void>
   }
+  // /card — the model-free status card service. Undefined when
+  // status_widget.enabled=false; the handler then explains.
+  statusWidget?: {
+    sendFresh(chatId: string): Promise<{ ok: true } | { ok: false; reason: string }>
+  }
   // Identity bits surfaced by /status.
   botId?: number
   stateDir?: string
@@ -234,6 +243,7 @@ function helpText(): string {
     + '<code>/mirror on|off|status</code> — управлять зеркалом терминала (tmux, обновляется в реальном времени)\n'
     + '<code>/keys</code> — панель кнопок: тап = нажатие в сессии (ответить на нативный диалог Claude Code; есть ⌫ backspace и 🧹 clear)\n'
     + '<code>/cc</code> — панель команд Claude Code (тап = выполнить); либо <code>/cc &lt;команда&gt;</code>: <code>/cc model opus</code>\n'
+    + '<code>/card</code> — прислать свежую карточку статуса (без участия модели)\n'
     + '<code>/lease &lt;scope&gt;</code> — выдать мандат автономии (напр. <code>/lease деплой стейджинга; ttl=48h</code>); без аргумента — список активных\n\n'
     + '<i>примечание: /stop — best-effort: посылает Escape в сессию, но не может '
     + 'гарантировать прерывание посреди вызова инструмента.</i>'
@@ -256,6 +266,7 @@ export const BOT_COMMANDS: ReadonlyArray<BotCommandSpec> = [
   { command: 'keys', description: 'панель кнопок для подтверждений (нажатия в сессию)' },
   { command: 'cc', description: 'панель команд Claude Code (тап) или /cc <команда>' },
   { command: 'lease', description: 'выдать мандат автономии: /lease <scope>[; ttl=48h]' },
+  { command: 'card', description: 'свежая карточка статуса (без участия модели)' },
 ]
 
 // Format process uptime seconds as a compact human string (e.g. `2h 15m`).
@@ -544,6 +555,47 @@ export async function handleOobCommand(
         handled: true,
         command: 'status',
         replyToTelegram: { text: await statusText(ctx), parseMode: 'HTML' },
+      }
+    }
+
+    case 'card': {
+      // Model-free: the status service runs its own command and sends the
+      // card itself. No channel notification, ever.
+      ctx.log.info('oob /card', { chat_id: ctx.chatId })
+      if (!ctx.statusWidget) {
+        return {
+          handled: true,
+          command: 'card',
+          replyToTelegram: {
+            text: '<b>карточка статуса</b> — отключена в конфиге\n\nУстанови <code>status_widget.enabled = true</code> (chat_id, command) и перезапусти плагин.',
+            parseMode: 'HTML',
+          },
+        }
+      }
+      try {
+        const res = await ctx.statusWidget.sendFresh(ctx.chatId)
+        if (res.ok) return { handled: true, command: 'card' }
+        return {
+          handled: true,
+          command: 'card',
+          replyToTelegram: {
+            text: `<b>карточка статуса</b> — не отправлена: ${escapeHtml(res.reason)}`,
+            parseMode: 'HTML',
+          },
+        }
+      } catch (err) {
+        ctx.log.warn('oob /card failed', {
+          chat_id: ctx.chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+        return {
+          handled: true,
+          command: 'card',
+          replyToTelegram: {
+            text: '<b>карточка статуса</b> — ошибка, подробности в логе плагина.',
+            parseMode: 'HTML',
+          },
+        }
       }
     }
 

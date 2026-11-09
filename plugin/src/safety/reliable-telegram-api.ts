@@ -462,8 +462,9 @@ export function createReliableTelegramApi(
       // NOT retried: a widget send is non-idempotent and its transient errors
       // are ambiguous (the card may have landed) — a retry could show the owner
       // two widgets. A failure surfaces to the agent as an honest tool error.
-      const res = await raw.sendWidget(chatId, params)
-      stampOutbound(chatId)
+      const { skipOutboundStamp, ...rest } = params
+      const res = await raw.sendWidget(chatId, rest)
+      if (skipOutboundStamp !== true) stampOutbound(chatId)
       return res
     },
 
