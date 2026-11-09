@@ -141,6 +141,20 @@ export function createSafeTelegramApi(
     return { text: validated.text, parseMode }
   }
 
+  // Fail-closed guard for widget code/state (see sendWidget). The message names
+  // the field and the offset of the first change; the matched value is never
+  // echoed (it is, by definition, secret-looking).
+  const assertUnchangedByRedaction = (field: 'html' | 'chat_data', text: string): void => {
+    const redacted = redactSecrets(text, extraSecrets)
+    if (redacted === text) return
+    let offset = 0
+    const limit = Math.min(text.length, redacted.length)
+    while (offset < limit && text[offset] === redacted[offset]) offset += 1
+    throw new Error(
+      `${field} looks like it contains a secret at offset ${offset}; redaction would silently change the widget ${field === 'html' ? 'code' : 'state'}, so nothing was sent — remove or split the secret-looking value`,
+    )
+  }
+
   return {
     async sendMessage(chatId: string, text: string, opts: SendMessageOpts): Promise<{ message_id: number }> {
       const { text: safeText, parseMode } = sanitize(text, opts.parse_mode)
@@ -272,23 +286,26 @@ export function createSafeTelegramApi(
       return raw.editMessageText(chatId, messageId, safeText, safeOpts)
     },
 
-    // Widget html / caption / chat_data are caller text that lands in a chat:
-    // redact all three. The html is NOT run through validateTelegramHtml (it is
-    // a full document, not the Telegram HTML subset). The tool measures sizes
-    // before this layer; redaction replaces a secret with a short placeholder,
-    // so a size change is bounded by the secret's length.
+    // Widget html and chat_data are CODE and STATE, not prose: redaction must
+    // never silently rewrite them (a masked identifier in a <script> is broken
+    // JavaScript the caller would be told was sent fine). If the redactor would
+    // change either, the call FAILS closed with the offset — never the value —
+    // and nothing is sent. The caption is plain fallback text: it is redacted
+    // like any normal message. The final size limits are enforced again at the
+    // last layer (createTelegramApi), after every transformation.
     async sendWidget(chatId: string, params: SendWidgetParams): Promise<{ message_id: number }> {
+      assertUnchangedByRedaction('html', params.html)
+      if (params.chat_data !== undefined) assertUnchangedByRedaction('chat_data', params.chat_data)
       const safe: SendWidgetParams = {
         ...params,
-        html: redactSecrets(params.html, extraSecrets),
         caption: redactSecrets(params.caption, extraSecrets),
       }
-      if (params.chat_data !== undefined) safe.chat_data = redactSecrets(params.chat_data, extraSecrets)
       return raw.sendWidget(chatId, safe)
     },
 
     async editWidgetData(chatId: string, messageId: number, chatData: string): Promise<void> {
-      return raw.editWidgetData(chatId, messageId, redactSecrets(chatData, extraSecrets))
+      assertUnchangedByRedaction('chat_data', chatData)
+      return raw.editWidgetData(chatId, messageId, chatData)
     },
 
     // ─── Pass-through methods ────────────────────────────────────────

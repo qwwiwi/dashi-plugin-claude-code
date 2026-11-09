@@ -26,15 +26,40 @@ Both go through the same chat allowlist gate as `reply` / `edit_message`
 | `html` after zlib level 9 | at most 4096 bytes | names the measured size |
 | `html` | no NUL (`\u0000`) | refused |
 | `chat_data` | at most 1024 bytes UTF-8 | names the measured size |
-| `caption` | required, not empty: it is the text clients without widget support show | refused |
-| `width`, `height` | positive integers when given | refused |
+| `caption` | required, not empty, at most 1024 characters: it is the text clients without widget support show (always sent, even when the client supports widgets) | refused |
+| `width`, `height` | positive integers when given. Telegram clamps the bubble: width 200-600, height 50-600 | refused |
 | `chat_id` | positive (private chat). Group, supergroup and channel ids are negative and refused: in production widgets work only in a private chat with the bot | refused |
+
+Every size rule is checked twice: early in the tool (precise message) and again
+at the last layer before the HTTP call, on the payload that really goes out, so
+a transformation in between can never push a widget over a limit.
 
 Cyrillic and other multi-byte text counts by bytes (two bytes per Cyrillic
 letter), so a label budget is half what the character count suggests.
 
-The widget code never changes after sending. Only `chat_data` does; the widget
-reads `TelegramWidget.chatData` and re-renders on the `chatDataChanged` event.
+`edit_widget_data` with an empty string for `chat_data` REMOVES the value:
+`TelegramWidget.chatData` becomes `null`. The edit is idempotent: the plugin
+retries a transient failure and treats `message is not modified` as success.
+
+## What a widget can and cannot do (Bot API docs)
+
+- Bubble size: width 200-600, height 50-600. Nothing inside scrolls.
+- In production a widget works only in a private chat with the bot.
+- No network: no `fetch`, no external fonts, images or scripts, no `<link>`.
+- No form controls (`<input>`, `<button>`, `<textarea>`, `<form>`).
+- The caption is always sent for old clients that cannot render widgets.
+
+The widget code never changes after sending. Only `chat_data` does.
+Widget-side API:
+
+```
+TelegramWidget.chatData                      // string, or null when there is no state
+TelegramWidget.onEvent('chatDataChanged', cb) // cb runs after every edit_widget_data
+TelegramWidget.offEvent('chatDataChanged', cb)
+```
+
+Read `TelegramWidget.chatData` once at start, then re-render inside the
+`chatDataChanged` callback.
 
 ## Errors
 
@@ -45,10 +70,13 @@ two cards. The only retry in the path is the existing rate-limit layer, which
 waits out a 429 `retry_after` a bounded number of times, as for every other
 send.
 
-The safe layer redacts secrets in `html`, `caption` and `chat_data` before the
-call. The redactor masks any run of 24 or more letters, digits or underscores,
-so keep identifiers in widget code shorter than that (the bundled template does,
-and a test pins it).
+The safe layer redacts secrets in the `caption`, as for any message. It never
+rewrites `html` or `chat_data`: masking a string inside widget code would break
+the script while the send looked fine. If the redactor would change either, the
+call fails with `looks like a secret at offset N` (the matched value is not
+echoed) and nothing is sent. The redactor flags any run of 24 or more letters,
+digits or underscores, so keep identifiers in widget code shorter than that (the
+bundled template does, and a test pins it).
 
 ## Ready template: `templates/status.html`
 

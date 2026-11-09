@@ -64,7 +64,7 @@ import {
 import { analyzeFormat, formatHint } from '../format/format-check.js'
 import type { RichLatch } from '../safety/rich-latch.js'
 import { redactSecrets } from '../safety/redact.js'
-import { checkWidgetChat, checkWidgetChatData, checkWidgetHtml } from './widget.js'
+import { checkWidgetChat, checkWidgetPayload } from './widget.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // MCP request/response types we touch. We narrow rather than import deep
@@ -338,6 +338,10 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       await bot.api.editMessageText(chatId, messageId, text, other)
     },
     async sendWidget(chatId, params) {
+      // Last layer before HTTP: re-check every size rule on the payload that
+      // actually goes out (anything upstream may have transformed it).
+      const tooBig = checkWidgetPayload(params)
+      if (tooBig !== undefined) throw new Error(tooBig)
       const body: Record<string, unknown> = { chat_id: chatId, html: params.html, caption: params.caption }
       if (params.chat_data !== undefined) body.chat_data = params.chat_data
       if (params.width !== undefined) body.width = params.width
@@ -352,6 +356,8 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       return { message_id: messageId }
     },
     async editWidgetData(chatId, messageId, chatData) {
+      const tooBig = checkWidgetPayload({ chat_data: chatData })
+      if (tooBig !== undefined) throw new Error(tooBig)
       // Result (the edited Message or true) is deliberately not parsed.
       await rawBotMethod(bot, 'editMessageWidgetData')({
         chat_id: chatId,
@@ -574,13 +580,13 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'send_widget',
     description:
-      "Send an interactive HTML widget (Bot API sendWidget) to a PRIVATE chat with the bot; returns the sent message id. The widget code is fixed at send time — afterwards only its state (chat_data) changes, via edit_widget_data. Limits (checked before sending): html ≤ 32768 bytes UTF-8 AND ≤ 4096 bytes after zlib level 9, no NUL character; chat_data ≤ 1024 bytes UTF-8. Inside the widget read the state from TelegramWidget.chatData and re-render on the chatDataChanged event. caption is REQUIRED: clients without widget support show it instead of the widget. Production Telegram supports widgets only in a private chat with the bot, so group chat ids (negative) are refused. Taps/queries are NOT enabled: the widget cannot send anything back to the bot. A ready dark status card lives in templates/status.html of the plugin.",
+      "Send an interactive HTML widget (Bot API sendWidget) to a PRIVATE chat with the bot; returns the sent message id. The widget code is fixed at send time — afterwards only its state (chat_data) changes, via edit_widget_data. Limits (checked before sending): html ≤ 32768 bytes UTF-8 AND ≤ 4096 bytes after zlib level 9, no NUL character; chat_data ≤ 1024 bytes UTF-8. Inside the widget read the state from TelegramWidget.chatData and re-render on the chatDataChanged event. caption is REQUIRED (≤ 1024 characters): clients without widget support show it instead of the widget. Production Telegram supports widgets only in a private chat with the bot, so group chat ids (negative) are refused. Taps/queries are NOT enabled: the widget cannot send anything back to the bot. A ready dark status card lives in templates/status.html of the plugin.",
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string', description: 'Private chat id (positive), from the inbound <channel> meta' },
         html: { type: 'string', description: 'Widget document. ≤ 32768 bytes UTF-8 and ≤ 4096 bytes after zlib level 9; no NUL.' },
-        caption: { type: 'string', description: 'Required fallback text for clients without widget support.' },
+        caption: { type: 'string', description: 'Required fallback text for clients without widget support. At most 1024 characters.' },
         chat_data: { type: 'string', description: 'Initial widget state, a string (usually compact JSON), ≤ 1024 bytes UTF-8.' },
         width: { type: 'integer', description: 'Optional widget width, positive integer.' },
         height: { type: 'integer', description: 'Optional widget height, positive integer.' },
@@ -591,13 +597,13 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'edit_widget_data',
     description:
-      'Change the state (chat_data) of a widget already sent with send_widget (Bot API editMessageWidgetData). The widget code never changes. chat_data ≤ 1024 bytes UTF-8 (replaces the previous state); the widget re-renders on its chatDataChanged event. Private chats only. Edits do not push-notify.',
+      'Change the state (chat_data) of a widget already sent with send_widget (Bot API editMessageWidgetData). The widget code never changes. chat_data ≤ 1024 bytes UTF-8 (replaces the previous state; an empty string removes it); the widget re-renders on its chatDataChanged event. Private chats only. Edits do not push-notify.',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string' },
         message_id: { type: 'string', description: 'Message id returned by send_widget.' },
-        chat_data: { type: 'string', description: 'New widget state, ≤ 1024 bytes UTF-8.' },
+        chat_data: { type: 'string', description: 'New widget state, ≤ 1024 bytes UTF-8. An empty string REMOVES the value (TelegramWidget.chatData becomes null).' },
       },
       required: ['chat_id', 'message_id', 'chat_data'],
     },
@@ -1366,10 +1372,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         } catch (err) {
           return toolError(name, err instanceof Error ? err.message : String(err))
         }
-        const refusal =
-          checkWidgetChat(args.chat_id) ??
-          checkWidgetHtml(args.html) ??
-          (args.chat_data !== undefined ? checkWidgetChatData(args.chat_data) : undefined)
+        const refusal = checkWidgetChat(args.chat_id) ?? checkWidgetPayload(args)
         if (refusal !== undefined) return toolError(name, refusal)
 
         const params: SendWidgetParams = { html: args.html, caption: args.caption }
@@ -1395,7 +1398,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         } catch (err) {
           return toolError(name, err instanceof Error ? err.message : String(err))
         }
-        const refusal = checkWidgetChat(args.chat_id) ?? checkWidgetChatData(args.chat_data)
+        const refusal = checkWidgetChat(args.chat_id) ?? checkWidgetPayload({ chat_data: args.chat_data })
         if (refusal !== undefined) return toolError(name, refusal)
         try {
           await telegramApi.editWidgetData(args.chat_id, Number(args.message_id), args.chat_data)

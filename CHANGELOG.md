@@ -26,6 +26,12 @@ retroactively marks the state of `main` on 2026-06-14.
   dark status card driven by `TelegramWidget.chatData`. See
   `plugin/docs/widgets.md`.
 ### Fixed
+- Widgets (#151, review fix loop 1): a secret-looking string in widget `html` or
+  `chat_data` now fails the call with its offset instead of being masked into
+  broken code; every size limit is re-checked on the final payload at the last
+  layer; the caption is limited to 1024 characters; `edit_widget_data` retries
+  transient errors and treats `message is not modified` as success; an empty
+  `chat_data` removes the state (documented).
 - `edit_message` renders text exactly like `reply` (#149): same `format`
   values (`text`/`markdownv2`/`html`/`rich`) and the same `html` default, so
   markdown (code blocks, bold, lists) is converted to Telegram HTML instead of

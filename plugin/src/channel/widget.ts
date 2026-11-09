@@ -6,7 +6,8 @@
 // Limits (https://core.telegram.org/bots/widgets):
 //   html       <= 32768 bytes UTF-8, AND <= 4096 bytes after zlib level 9,
 //              no NUL character
-//   chat_data  <= 1024 bytes UTF-8
+//   chat_data  <= 1024 bytes UTF-8 (an empty string REMOVES the value)
+//   caption    <= 1024 characters
 // Widgets only work in a private chat with the bot in production.
 
 import { deflateSync } from 'zlib'
@@ -14,6 +15,7 @@ import { deflateSync } from 'zlib'
 export const WIDGET_HTML_MAX_BYTES = 32768
 export const WIDGET_HTML_MAX_ZLIB_BYTES = 4096
 export const WIDGET_CHAT_DATA_MAX_BYTES = 1024
+export const WIDGET_CAPTION_MAX_CHARS = 1024
 
 export function utf8Bytes(text: string): number {
   return Buffer.byteLength(text, 'utf8')
@@ -57,4 +59,29 @@ export function checkWidgetChat(chatId: string): string | undefined {
   const n = Number(chatId)
   if (Number.isFinite(n) && n > 0) return undefined
   return `chat ${chatId} is not a private chat — in production Telegram supports widgets only in a private chat with the bot (positive chat id)`
+}
+
+// caption is the fallback text for old clients: 0-1024 characters (Bot API
+// sendWidget). Counted in UTF-16 code units (String.length) — the stricter of
+// the possible readings, so an accepted caption can never be over the limit.
+export function checkWidgetCaption(caption: string): string | undefined {
+  if (caption.length > WIDGET_CAPTION_MAX_CHARS) {
+    return `caption is ${caption.length} characters, over the ${WIDGET_CAPTION_MAX_CHARS}-character limit — shorten the fallback text`
+  }
+  return undefined
+}
+
+// ONE place that knows every size rule of the FINAL payload. The tool calls it
+// early for a precise refusal; the raw API layer (the last layer before HTTP)
+// calls it again on whatever actually goes out, so the two cannot drift.
+export function checkWidgetPayload(p: {
+  html?: string | undefined
+  caption?: string | undefined
+  chat_data?: string | undefined
+}): string | undefined {
+  return (
+    (p.html !== undefined ? checkWidgetHtml(p.html) : undefined) ??
+    (p.caption !== undefined ? checkWidgetCaption(p.caption) : undefined) ??
+    (p.chat_data !== undefined ? checkWidgetChatData(p.chat_data) : undefined)
+  )
 }

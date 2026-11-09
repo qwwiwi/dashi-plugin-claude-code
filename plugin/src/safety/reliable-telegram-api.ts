@@ -438,9 +438,21 @@ export function createReliableTelegramApi(
     },
 
     async editWidgetData(chatId, messageId, chatData): Promise<void> {
-      // State edit: no ping, not stamped; forwarded verbatim (the rate-limited
-      // layer below owns 429 handling).
-      return raw.editWidgetData(chatId, messageId, chatData)
+      // IDEMPOTENT, like editMessageText: setting the same state twice is
+      // harmless, so pre_send AND ambiguous errors retry, and «message is not
+      // modified» (a retry after a delivered-but-unanswered first attempt, or
+      // the same state again) IS success. Not stamped as outbound: a state
+      // edit does not ping.
+      try {
+        await withRetry(
+          true,
+          () => raw.editWidgetData(chatId, messageId, chatData),
+          () => ({ method: 'editWidgetData', chatId, body: chatData }),
+        )
+      } catch (err) {
+        if (isNotModifiedError(err)) return
+        throw err
+      }
     },
 
     async editMessageText(chatId, messageId, text, editOpts: EditOpts): Promise<void> {
