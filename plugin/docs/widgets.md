@@ -80,44 +80,93 @@ bundled template does, and a test pins it).
 
 ## Ready template: `templates/status.html`
 
-A compact dark status card: milestone groups (title, rows of label and percent
-bar), a list of jobs (name, percent, state) and a limits line. No network, no
-external assets, no inputs. About 2.4 KB raw and 1.2 KB after zlib level 9
-(a test measures it against the 4096-byte limit).
+A compact light status card: groups of progress rows (label, cell bar,
+percent), a jobs block (name, state, percent bar) and a footer line. No
+network, no external assets, no inputs. About 7.5 KB raw and 3.3 KB after zlib
+level 9 (a test measures both against the 32768 and 4096 byte limits).
 
 Send it by passing the file text as `html` and the state as `chat_data`:
 
 ```
 send_widget({ chat_id, html: <contents of templates/status.html>,
-              caption: "Status: 3 milestones, 8 jobs",
+              caption: "Status: 3 groups, 5 jobs",
               chat_data: '{"m":[...],"j":[...],"l":"..."}' })
 edit_widget_data({ chat_id, message_id, chat_data: '{"m":[...],"j":[...],"l":"..."}' })
 ```
 
-### `chat_data` shape (short keys, JSON string)
+### `chat_data` shape (short keys, one compact JSON string)
 
 ```
 {
-  "m": [ [ "<group title>", [ ["<row label>", <percent 0-100>], ... ] ], ... ],
-  "j": [ ["<job name>", <percent 0-100>, "<state>"], ... ],
-  "l": "<limits line>"
+  "m": [ [ "<group title>", [ ["<row label>", <percent>], ... ] ], ... ],
+  "j": [ ["<job name>", <percent>, "<state>", <details?>], ... ],
+  "l": "<footer line>"
 }
 ```
 
-- `m`: milestone groups. Each group is `[title, rows]`, each row is `[label, percent]`.
-- `j`: jobs, `[name, percent, state]`. `state` is one letter: `r` running, `q`
-  queued, `d` done, `f` failed, `b` blocked.
-- `l`: one free-text line shown at the bottom (for example the usage limits).
-- Every key is optional; an empty or invalid `chat_data` renders an empty card.
-- Percent is clamped to 0..100. All text is inserted as text, never as HTML.
+- `m`: groups, each `[title, rows]`, each row `[label, percent]`. The card
+  shows the groups the producer sends; it infers no status.
+- `j`: jobs, `[name, percent, state, details?]`. `state` is one letter: `r`
+  running, `q` queued, `d` done, `f` failed, `b` blocked (shown as run / queue /
+  done / fail / block; an unknown letter is shown as queue). The fourth element
+  is optional, so three-item jobs stay valid.
+- `details` (optional object): `m` model name, `t` minutes (a number, 0 or more),
+  `s` current step, `r` last result.
+- `l`: one free-text footer line (for example usage limits).
+- Every key is optional. Labels and text are strings, percents and minutes are
+  finite numbers. A percent is rounded and clamped to 0..100, a malformed one
+  becomes 0. All text is inserted as text, never as HTML.
+- Bad state never blanks the card: `{}`, an empty or invalid `chat_data`, wrong
+  types and null tuples render the visible empty state `нет данных`, and the next
+  valid `chat_data` renders normally. Without the `TelegramWidget` bridge (the
+  file opened in a browser) the card shows built-in demo data.
 
-Size budget (the 1024-byte `chat_data` limit is the tight one). Measured by the
-tests for the maximum realistic card, 3 groups x 5 rows + 8 jobs + limits line:
+### Capacity and overflow
 
-| Labels | `chat_data` size |
+| What | Shown | Overflow |
+|---|---|---|
+| groups | 3 | the rest are counted in the footer as `+N` |
+| rows per group | 8 | `+N` is appended to that group's title |
+| jobs | 5 | the rest are counted in the footer as `+N` |
+
+The footer reads `+N · <l>` when something is hidden and `l` is given. Titles,
+labels and details are single-line and cut with an ellipsis; nothing wraps or
+scrolls. The full card (3 groups of 8 + 5 + 5 rows and 5 jobs) is 515 px high,
+within the 600 px bubble limit.
+
+### Tap a job to open it
+
+A tap on a job opens its details (Модель, Минут, Шаг, Итог; a job without
+details shows `нет данных`). While a job is open, the groups collapse to their
+title and the mean percent of their rows; a second tap on the same job (or any
+new `chat_data`) closes it. Each shown detail appears once: the running job's
+step line under its bar is hidden while that job is open, because the detail
+list already carries the step. When no click events arrive, the first running
+job's step stays visible under its bar, so the step is readable without a tap.
+
+### The caller keeps `chat_data` under 1024 bytes
+
+The 1024-byte `chat_data` limit is the tight one and the template cannot shrink
+the state for you: the caller must measure the FINAL serialized string in bytes
+(not characters; Cyrillic is two bytes per letter) and drop rows or shorten
+labels until it fits. `send_widget` and `edit_widget_data` refuse an oversized
+state with the measured size. Budgets from the template (no footer; titles, row
+labels and job names of 11 Cyrillic letters, percent 50, state `r`):
+
+| Card | `chat_data` size |
 |---|---|
-| Latin, up to 16 characters | 639 bytes |
-| Cyrillic, up to 12 characters | 868 bytes |
+| 18 rows (8+5+5), 5 jobs, no details | 810 bytes |
+| same, two jobs with details (model, minutes, step and result of 11 letters) | 968 bytes |
+| 11 rows (4+4+3), all five jobs with details | 995 bytes |
+| 12 rows, all five jobs with details | 1025 bytes (too large) |
 
-So the card fits without any placeholder substitution at send time. Keep
-Cyrillic labels at 12 characters or fewer, or drop rows, when the card is full.
+A footer adds 7 bytes plus its UTF-8 text; escaping and longer text cost extra.
+The display capacity (3 x 8 rows, 5 jobs) is a layout limit, not a promise that
+it fits the byte limit.
+
+### Widget-side events
+
+The template reads `TelegramWidget.chatData` once at start and re-renders in the
+`TelegramWidget.onEvent('chatDataChanged', ...)` callback, the same bridge call
+this document describes above. A job tap is an ordinary DOM click handler on the
+job row, not a bridge event.

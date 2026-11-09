@@ -112,7 +112,7 @@ const render = (local = false) => {
       bar.append(fill)
       job.append(top,bar)
       const detail = j[3] && typeof j[3] === 'object' && !Array.isArray(j[3]) ? j[3] : {}
-      if (index === active && label(detail.s,'')) job.append(el('div','step cut',detail.s))
+      if (index === active && index !== opened && label(detail.s,'')) job.append(el('div','step cut',detail.s))
       if (expanded && index === opened) {
         const box = el('div','detail')
         const fields = []
