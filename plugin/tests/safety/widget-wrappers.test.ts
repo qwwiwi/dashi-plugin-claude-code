@@ -205,3 +205,111 @@ describe('reliable wrapper', () => {
     expect(seen.edit).toHaveLength(1)
   })
 })
+
+// N1 (fix loop 2): the retry of one widget edit must not let a NEWER edit of
+// the same widget overtake it. The whole operation (attempts + backoff) is
+// serialized per widget (chat + message); different widgets stay independent.
+describe('reliable wrapper — N1: per-widget edit order across retries', () => {
+  const transient = (): Error => Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })
+
+  /** Fake clock: every backoff sleep parks until the test releases it. */
+  function gate(): { sleep: (ms: number) => Promise<void>; release: () => void; sleeping: () => number } {
+    const waiters: Array<() => void> = []
+    return {
+      sleep: () => new Promise<void>(resolve => void waiters.push(resolve)),
+      release: () => waiters.splice(0).forEach(w => w()),
+      sleeping: () => waiters.length,
+    }
+  }
+
+  const tick = async (): Promise<void> => {
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+  }
+
+  /** Raw api: failures[key] = how many leading attempts of that chat_data fail. */
+  function fake(failures: Record<string, number>): {
+    raw: TelegramApi
+    calls: string[]
+    applied: Map<string, string>
+  } {
+    const calls: string[] = []
+    const applied = new Map<string, string>()
+    const left = { ...failures }
+    const raw = {
+      async editWidgetData(chatId: string, messageId: number, chatData: string) {
+        calls.push(`${chatId}:${messageId}=${chatData}`)
+        if ((left[chatData] ?? 0) > 0) {
+          left[chatData] = (left[chatData] ?? 0) - 1
+          throw transient()
+        }
+        applied.set(`${chatId}:${messageId}`, chatData)
+      },
+    } as unknown as TelegramApi
+    return { raw, calls, applied }
+  }
+
+  test('an older edit that retries is applied before the newer one; the final state is the newer', async () => {
+    const { raw, calls, applied } = fake({ old: 1 })
+    const g = gate()
+    const api = createReliableTelegramApi(raw, log, { sleep: g.sleep })
+
+    const first = api.editWidgetData('1', 5, 'old')
+    await tick()
+    expect(g.sleeping()).toBe(1) // old failed once, parked in backoff
+    const second = api.editWidgetData('1', 5, 'new')
+    await tick()
+    g.release()
+    await Promise.all([first, second])
+
+    expect(calls).toEqual(['1:5=old', '1:5=old', '1:5=new'])
+    expect(applied.get('1:5')).toBe('new')
+  })
+
+  test('edits of different widgets do not wait for each other', async () => {
+    const { raw, calls, applied } = fake({ a: 1 })
+    const g = gate()
+    const api = createReliableTelegramApi(raw, log, { sleep: g.sleep })
+
+    const slow = api.editWidgetData('1', 5, 'a') // parked in backoff
+    await tick()
+    await api.editWidgetData('1', 6, 'b') // other message: must finish now
+    await api.editWidgetData('2', 5, 'c') // other chat: must finish now
+    expect(applied.get('1:6')).toBe('b')
+    expect(applied.get('2:5')).toBe('c')
+    expect(applied.has('1:5')).toBe(false)
+    g.release()
+    await slow
+    expect(applied.get('1:5')).toBe('a')
+    expect(calls.filter(c => c.startsWith('1:5'))).toEqual(['1:5=a', '1:5=a'])
+  })
+
+  test('an exhausted edit rejects and does not block the next edit of the same widget', async () => {
+    const { raw, calls, applied } = fake({ old: 99 })
+    const g = gate()
+    const api = createReliableTelegramApi(raw, log, { sleep: g.sleep })
+
+    const first = api.editWidgetData('1', 5, 'old')
+    const firstResult = first.then(
+      () => 'ok',
+      (e: unknown) => (e as Error).message,
+    )
+    await tick()
+    const second = api.editWidgetData('1', 5, 'new')
+    for (let i = 0; i < 4; i++) {
+      await tick()
+      g.release()
+    }
+    expect(await firstResult).toContain('ECONNRESET')
+    await second
+    expect(calls).toEqual(['1:5=old', '1:5=old', '1:5=old', '1:5=new'])
+    expect(applied.get('1:5')).toBe('new')
+  })
+
+  test('a later edit after a settled one still runs (the queue does not leak or wedge)', async () => {
+    const { raw, applied } = fake({})
+    const api = createReliableTelegramApi(raw, log, { sleep: async () => {} })
+    await api.editWidgetData('1', 5, 'x')
+    await api.editWidgetData('1', 5, 'y')
+    expect(applied.get('1:5')).toBe('y')
+  })
+})

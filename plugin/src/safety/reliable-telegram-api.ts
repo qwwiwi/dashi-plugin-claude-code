@@ -389,6 +389,36 @@ export function createReliableTelegramApi(
     }
   }
 
+  // Per-widget serialization (N1). A widget edit is a full-state overwrite, so
+  // the COMPLETE operation of an edit — every attempt and every backoff — runs
+  // before the next edit of the same widget (chat + message) starts. Without
+  // it the inner FIFO is released during backoff and an older edit can retry
+  // after a newer one already landed (old -> new -> old). Keyed per widget, so
+  // different widgets never wait for each other; no global lock. A failed
+  // edit only passes its turn on: the next edit starts after it settles.
+  const widgetTails = new Map<string, Promise<void>>()
+
+  async function serializeWidget<T>(
+    chatId: string,
+    messageId: number,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const key = `${chatId}:${messageId}`
+    const prev = widgetTails.get(key) ?? Promise.resolve()
+    const result = prev.then(run)
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    widgetTails.set(key, tail)
+    try {
+      return await result
+    } finally {
+      // Drop the entry once nobody queued behind us (no unbounded growth).
+      if (widgetTails.get(key) === tail) widgetTails.delete(key)
+    }
+  }
+
   return {
     async sendMessage(chatId, text, sendOpts: SendMessageOpts): Promise<{ message_id: number }> {
       // Strip the wrapper-only flag so it never travels downstream (the safe
@@ -444,10 +474,12 @@ export function createReliableTelegramApi(
       // the same state again) IS success. Not stamped as outbound: a state
       // edit does not ping.
       try {
-        await withRetry(
-          true,
-          () => raw.editWidgetData(chatId, messageId, chatData),
-          () => ({ method: 'editWidgetData', chatId, body: chatData }),
+        await serializeWidget(chatId, messageId, () =>
+          withRetry(
+            true,
+            () => raw.editWidgetData(chatId, messageId, chatData),
+            () => ({ method: 'editWidgetData', chatId, body: chatData }),
+          ),
         )
       } catch (err) {
         if (isNotModifiedError(err)) return
