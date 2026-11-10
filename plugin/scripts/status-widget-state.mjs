@@ -4,7 +4,8 @@
 // The plugin's status_widget service runs a command and reads the card state
 // JSON from its stdout. This script is one such command: plain Node/Bun, no
 // dependencies. It prints ONE compact JSON object, guaranteed <= 1024 bytes
-// UTF-8 (the Bot API chat_data limit).
+// UTF-8 (the Bot API chat_data limit). The limit counts the JSON itself: stdout
+// carries no trailing newline.
 //
 // Usage:
 //   status-widget-state.mjs --milestones <file> [--jobs-cmd '<json argv array>']
@@ -282,7 +283,9 @@ export function main(argv) {
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    process.stdout.write(`${main(process.argv.slice(2))}\n`)
+    // No trailing newline: stdout is exactly the JSON, so the 1024-byte limit
+    // means the same thing here and in the service (which trims anyway).
+    process.stdout.write(main(process.argv.slice(2)))
   } catch (err) {
     process.stderr.write(`status-widget-state: ${err instanceof Error ? err.message : String(err)}\n`)
     process.exit(err instanceof InputError ? 2 : 1)

@@ -151,15 +151,20 @@ the state for you: the caller must measure the FINAL serialized string in bytes
 (not characters; Cyrillic is two bytes per letter) and drop rows or shorten
 labels until it fits. `send_widget` and `edit_widget_data` refuse an oversized
 state with the measured size. Budgets from the template (no footer; titles, row
-labels and job names of 11 Cyrillic letters, percent 50, state `r`):
+labels and job names of 11 Cyrillic letters, percent 50, state `r`; every
+detailed job carries model `local`, 12 minutes, and a step and a result of 11
+Cyrillic letters each). The sizes below are the byte lengths of the serialized
+JSON from a real run (a test rebuilds these cards and compares):
 
 | Card | `chat_data` size |
 |---|---|
 | 18 rows (8+5+5), 5 jobs, no details | 810 bytes |
-| same, two jobs with details (model, minutes, step and result of 11 letters) | 968 bytes |
+| same, two jobs with details | 968 bytes |
 | 11 rows (4+4+3), all five jobs with details | 995 bytes |
-| 12 rows, all five jobs with details | 1025 bytes (too large) |
+| 12 rows (4+4+4), all five jobs with details | 1025 bytes (too large) |
 
+A model name of 11 Cyrillic letters instead of `local` costs 17 more bytes per
+detailed job in UTF-8 (11 rows, five detailed jobs: 1080 bytes, too large).
 A footer adds 7 bytes plus its UTF-8 text; escaping and longer text cost extra.
 The display capacity (3 x 8 rows, 5 jobs) is a layout limit, not a promise that
 it fits the byte limit.
@@ -234,6 +239,21 @@ needs a plugin restart.
    existing reliable path: serialized per widget, retried on transient errors.
 4. «message to edit not found» / «message can't be edited»: the stored message
    is forgotten and a fresh card is sent on the next tick.
+5. Uncertain send latch. Before every send the plugin saves a pending attempt
+   (id and time) in `status-widget.json`. Delivery confirmed: the card is
+   tracked. Provably not delivered (connection never made, rate limit, an
+   explicit 4xx answer, a local validation refusal): the earlier record is
+   restored and the next tick may send again. Anything else (timeout, reset,
+   5xx, an unknown error, an answer without a message id) leaves the attempt
+   pending: Telegram may have delivered the card, and a second send would show
+   two. While pending, ticks run no command and make no API call, also after a
+   restart, with no expiry. `/card` is the explicit recovery (see below).
+6. A state file that cannot be saved or read blocks automatic work in the same
+   way; it is never treated as an empty record. An old record with only chat id
+   and message id loads as a tracked card.
+7. Shutdown: the service stops for good, aborts a running command, drops queued
+   work and waits up to 1.5 s for a send that is already in flight, so its
+   message id is saved before the process exits.
 
 ### Failure behaviour
 
@@ -257,6 +277,18 @@ users as the other out-of-band commands (allowed user, private chat, chat on
 the allowlist) and only in the configured `chat_id`. If the command is failing,
 the last good state is used; with no state at all the answer says so. With
 `status_widget` off it answers that the card is disabled in config.
+
+In the uncertain state `/card` is the way out: it overwrites the pending attempt
+with a new one and sends a card, accepting that the owner may then see two. A
+confirmed send resumes the timer; another unclear answer latches again. The
+reply never says the card was «not sent» when the outcome is unknown: it says
+the card could have arrived, that updates are paused to avoid a duplicate, and
+that `/card` sends a new one.
+
+The command runs in its own process group. On a timeout, a stdout overflow or a
+shutdown the whole group gets SIGTERM and, 200 ms later, SIGKILL, so a producer
+that starts its own children leaves none behind (a descendant that moves into a
+new session or group is outside this).
 
 ### Example producer: `scripts/status-widget-state.mjs`
 
