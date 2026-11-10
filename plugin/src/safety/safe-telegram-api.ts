@@ -37,6 +37,7 @@ import { redactSecrets } from './redact.js'
 import { validateTelegramHtml } from './html-validator.js'
 import { richErrorClass, isNotModifiedError } from '../format/rich.js'
 import type { RichLatch } from './rich-latch.js'
+import { WidgetPreSendError } from './pre-send-error.js'
 
 /**
  * Walk an inline keyboard and redact every button's `text` and `url`
@@ -150,7 +151,7 @@ export function createSafeTelegramApi(
     let offset = 0
     const limit = Math.min(text.length, redacted.length)
     while (offset < limit && text[offset] === redacted[offset]) offset += 1
-    throw new Error(
+    throw new WidgetPreSendError(
       `${field} looks like it contains a secret at offset ${offset}; redaction would silently change the widget ${field === 'html' ? 'code' : 'state'}, so nothing was sent — remove or split the secret-looking value`,
     )
   }

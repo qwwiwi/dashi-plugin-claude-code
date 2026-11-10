@@ -191,42 +191,94 @@ function pruneOutboundDeadLetters(dir: string): void {
 // statusWidgetCard — the model-free status card the plugin keeps editing
 // ─────────────────────────────────────────────────────────────────────
 
-export interface StatusWidgetCard {
-  chatId: string
-  messageId: number
+export interface StatusWidgetPending {
+  // Random id of the send attempt that was persisted BEFORE the API call.
+  attemptId: string
+  // Epoch milliseconds when the attempt started (informational, never an expiry).
+  startedAt: number
 }
+
+// Persisted status card state machine:
+//   EMPTY      no record, or messageId null with no pending attempt;
+//   TRACKED    messageId set, pending null;
+//   UNCERTAIN  pending set: a send was started and its outcome is not known.
+// While UNCERTAIN the previously tracked messageId is kept.
+export interface StatusWidgetRecord {
+  version: 1
+  chatId: string
+  messageId: number | null
+  pending: StatusWidgetPending | null
+}
+
+export type StatusWidgetLoad =
+  | { kind: 'empty' }
+  | { kind: 'record'; record: StatusWidgetRecord }
+  | { kind: 'unreadable'; error: string }
 
 function statusWidgetCardPath(paths: StatePaths): string {
   return join(paths.root, 'status-widget.json')
 }
 
-/**
- * Read the tracked card (chat id + message id). A missing or corrupt file reads
- * as undefined: the service then sends a fresh card, which is the safe outcome.
- */
-export function readStatusWidgetCard(paths: StatePaths): StatusWidgetCard | undefined {
+function isRecordObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+function isPositiveInt(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v > 0
+}
+
+// Parse the file content; undefined = not a valid record. The legacy shape
+// (chat id + message id only) loads as TRACKED.
+function parseStatusWidgetRecord(parsed: unknown): StatusWidgetRecord | undefined {
+  if (!isRecordObject(parsed)) return undefined
+  const { chatId } = parsed
+  if (typeof chatId !== 'string' || chatId === '') return undefined
+  if (!('version' in parsed)) {
+    if (!isPositiveInt(parsed.messageId)) return undefined
+    return { version: 1, chatId, messageId: parsed.messageId, pending: null }
+  }
+  if (parsed.version !== 1) return undefined
+  const messageId = parsed.messageId
+  if (messageId !== null && !isPositiveInt(messageId)) return undefined
+  const rawPending = parsed.pending
+  if (rawPending === null) return { version: 1, chatId, messageId, pending: null }
+  if (!isRecordObject(rawPending)) return undefined
+  const { attemptId, startedAt } = rawPending
+  if (typeof attemptId !== 'string' || attemptId === '') return undefined
+  if (typeof startedAt !== 'number' || !Number.isFinite(startedAt)) return undefined
+  return { version: 1, chatId, messageId, pending: { attemptId, startedAt } }
+}
+
+// Read the persisted card record. A missing file is EMPTY. Anything that
+// cannot be read or parsed is reported as `unreadable` and NEVER as empty:
+// reading damage as «no card» would make the service send a duplicate.
+export function readStatusWidgetRecord(paths: StatePaths): StatusWidgetLoad {
   const file = statusWidgetCardPath(paths)
-  if (!existsSync(file)) return undefined
+  let text: string
   try {
-    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
-    const rec = parsed as Record<string, unknown>
-    const { chatId, messageId } = rec
-    if (typeof chatId !== 'string' || chatId === '') return undefined
-    if (typeof messageId !== 'number' || !Number.isInteger(messageId) || messageId <= 0) return undefined
-    return { chatId, messageId }
+    text = readFileSync(file, 'utf8')
+  } catch (err) {
+    if ((err as { code?: unknown }).code === 'ENOENT') return { kind: 'empty' }
+    return { kind: 'unreadable', error: err instanceof Error ? err.message : String(err) }
+  }
+  try {
+    const record = parseStatusWidgetRecord(JSON.parse(text))
+    if (record === undefined) return { kind: 'unreadable', error: 'status widget record has an unexpected shape' }
+    return { kind: 'record', record }
   } catch {
-    return undefined
+    return { kind: 'unreadable', error: 'status widget record is not valid JSON' }
   }
 }
 
-/** Atomic write (tmp + fsync + rename), 0o600 like the other state files. */
-export function writeStatusWidgetCard(paths: StatePaths, card: StatusWidgetCard): void {
+// Atomic write (tmp + fsync + rename + directory fsync), 0o600 like the other
+// state files. THROWS on any failure: the caller decides what an unsaved
+// record means (the status service stops its automatic work).
+export function writeStatusWidgetRecord(paths: StatePaths, record: StatusWidgetRecord): void {
   const file = statusWidgetCardPath(paths)
   const tmp = join(paths.root, `status-widget.tmp.${process.pid}.${Date.now()}`)
   const fd = openSync(tmp, 'w', 0o600)
   try {
-    writeSync(fd, JSON.stringify({ chatId: card.chatId, messageId: card.messageId }))
+    writeSync(fd, JSON.stringify(record))
     fsyncSync(fd)
   } finally {
     closeSync(fd)
@@ -241,13 +293,22 @@ export function writeStatusWidgetCard(paths: StatePaths, card: StatusWidgetCard)
     }
     throw err
   }
+  // Make the rename itself durable: a crash right after the send must not
+  // lose the pending attempt.
+  const dirFd = openSync(paths.root, 'r')
+  try {
+    fsyncSync(dirFd)
+  } finally {
+    closeSync(dirFd)
+  }
 }
 
-/** Forget the tracked card. Idempotent. */
-export function clearStatusWidgetCard(paths: StatePaths): void {
+// Forget the tracked card. Idempotent for a missing file; any other failure throws.
+export function clearStatusWidgetRecord(paths: StatePaths): void {
   try {
     unlinkSync(statusWidgetCardPath(paths))
-  } catch {
-    // already gone
+  } catch (err) {
+    if ((err as { code?: unknown }).code === 'ENOENT') return
+    throw err
   }
 }

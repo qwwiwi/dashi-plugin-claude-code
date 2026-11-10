@@ -16,8 +16,12 @@ import {
   type CommandResult,
   type CommandRunner,
   type StatusWidgetStore,
-  type StoredCard,
 } from '../../src/status/status-widget.js'
+
+interface StoredCard {
+  chatId: string
+  messageId: number
+}
 
 const CHAT = '111111111'
 const HTML = '<!doctype html><div id="a"></div>'
@@ -78,9 +82,15 @@ function makeRig(opts: { stored?: StoredCard; html?: string; redact?: (t: string
     return next
   }
   const store: StatusWidgetStore = {
-    read: () => rig.stored.card,
-    write: (card) => {
-      rig.stored.card = card
+    load: () =>
+      rig.stored.card === undefined
+        ? { kind: 'empty' }
+        : { kind: 'record', record: { version: 1, chatId: rig.stored.card.chatId, messageId: rig.stored.card.messageId, pending: null } },
+    save: (rec) => {
+      // `card` is the TRACKED card: a pending attempt keeps the previous one.
+      if (rec.pending === null) {
+        rig.stored.card = rec.messageId === null ? undefined : { chatId: rec.chatId, messageId: rec.messageId }
+      }
       rig.stored.writes += 1
     },
     clear: () => {
@@ -273,7 +283,7 @@ describe('status widget service: failures keep the old card', () => {
       runner: async () => {
         throw new Error('runner exploded')
       },
-      store: { read: () => undefined, write: () => {}, clear: () => {} },
+      store: { load: () => ({ kind: 'empty' }), save: () => {}, clear: () => {} },
       html: HTML,
       redact: (t) => t,
       log: { debug() {}, info() {}, warn() {}, error() {} },

@@ -202,6 +202,37 @@ describe('/card handling', () => {
     expect(res.notifyChannel).toBeUndefined()
   })
 
+  test('the failure reply never claims the card was not sent (the outcome may be unknown)', async () => {
+    const ctx: OobContext = {
+      chatId: String(OWNER),
+      senderId: String(OWNER),
+      config: makeConfig(),
+      telegramApi: makeApi([]),
+      log: silentLog,
+      statusWidget: { sendFresh: async () => ({ ok: false, reason: 'ответ Телеграма не получен' }) },
+    }
+    const res = await handleOobCommand(parseOobCommand('/card')!, ctx)
+    expect(res.replyToTelegram?.text).not.toContain('не отправлена')
+  })
+
+  test('an uncertain send explains the state: the card may have arrived, updates are paused, /card resumes', async () => {
+    const ctx: OobContext = {
+      chatId: String(OWNER),
+      senderId: String(OWNER),
+      config: makeConfig(),
+      telegramApi: makeApi([]),
+      log: silentLog,
+      statusWidget: { sendFresh: async () => ({ ok: false, reason: 'ответ Телеграма не получен', uncertain: true }) },
+    }
+    const res = await handleOobCommand(parseOobCommand('/card')!, ctx)
+    const text = res.replyToTelegram?.text ?? ''
+    expect(text).toContain('ответ Телеграма не получен')
+    expect(text).toContain('могла дойти')
+    expect(text).toContain('дубль')
+    expect(text).toContain('/card')
+    expect(text).not.toContain('не отправлена')
+  })
+
   test('a throwing service never throws out of the handler', async () => {
     const ctx: OobContext = {
       chatId: String(OWNER),

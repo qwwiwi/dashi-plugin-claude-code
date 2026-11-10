@@ -93,7 +93,7 @@ export type OutboundErrorClass = 'pre_send' | 'ambiguous' | 'rate_limited'
 
 // Pull an HTTP-ish status code from the many shapes an error can take (grammY
 // GrammyError.error_code, a fetch Response-ish .status/.statusCode).
-function extractStatusCode(err: unknown): number | undefined {
+export function extractStatusCode(err: unknown): number | undefined {
   if (typeof err !== 'object' || err === null) return undefined
   const e = err as Record<string, unknown>
   if (typeof e.error_code === 'number') return e.error_code

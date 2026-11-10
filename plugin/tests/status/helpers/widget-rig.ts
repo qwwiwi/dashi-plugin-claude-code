@@ -8,9 +8,10 @@ import { redactSecrets } from '../../../src/safety/redact.js'
 import {
   createStatusWidgetService,
   type CommandResult,
-  type CommandRunOptions,
+  type StatusWidgetLoad,
   type StatusWidgetService,
 } from '../../../src/status/status-widget.js'
+import type { CommandRunOptions } from '../../../src/status/status-widget-runner.js'
 
 export const CHAT = '111111111'
 export const HTML = '<!doctype html><div id="a"></div>'
@@ -143,7 +144,7 @@ export function makeRig(opts: { record?: TestRecord; corrupt?: boolean } = {}): 
 
   const store = {
     // New interface: persisted state machine record.
-    load: () => {
+    load: (): StatusWidgetLoad => {
       if (rig.corrupt) return { kind: 'unreadable', error: 'corrupt' }
       if (rig.record === undefined) return { kind: 'empty' }
       return { kind: 'record', record: structuredClone(rig.record) }
@@ -157,12 +158,6 @@ export function makeRig(opts: { record?: TestRecord; corrupt?: boolean } = {}): 
     clear: () => {
       rig.record = undefined
       rig.clears += 1
-    },
-    // LEGACY (base commit interface: card only); dropped together with the old code.
-    read: () => (rig.record !== undefined && rig.record.messageId !== null && rig.record.pending === null ? { chatId: rig.record.chatId, messageId: rig.record.messageId } : undefined),
-    write: (card: { chatId: string; messageId: number }) => {
-      if (rig.failSave?.(trackedRecord(card.messageId, card.chatId))) throw new Error('disk full')
-      rig.record = trackedRecord(card.messageId, card.chatId)
     },
   }
 
@@ -217,7 +212,7 @@ export function makeRig(opts: { record?: TestRecord; corrupt?: boolean } = {}): 
           if (loopFn === fn) loopFn = undefined
         }
       },
-    } as unknown as Parameters<typeof createStatusWidgetService>[0])
+    })
   rig.svc = rig.build()
   return rig
 }

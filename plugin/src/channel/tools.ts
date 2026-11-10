@@ -65,6 +65,7 @@ import { analyzeFormat, formatHint } from '../format/format-check.js'
 import type { RichLatch } from '../safety/rich-latch.js'
 import { redactSecrets } from '../safety/redact.js'
 import { checkWidgetChat, checkWidgetPayload } from './widget.js'
+import { WidgetPreSendError } from '../safety/pre-send-error.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // MCP request/response types we touch. We narrow rather than import deep
@@ -345,7 +346,7 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       // Last layer before HTTP: re-check every size rule on the payload that
       // actually goes out (anything upstream may have transformed it).
       const tooBig = checkWidgetPayload(params)
-      if (tooBig !== undefined) throw new Error(tooBig)
+      if (tooBig !== undefined) throw new WidgetPreSendError(tooBig)
       const body: Record<string, unknown> = { chat_id: chatId, html: params.html, caption: params.caption }
       if (params.chat_data !== undefined) body.chat_data = params.chat_data
       if (params.width !== undefined) body.width = params.width

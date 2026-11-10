@@ -38,12 +38,12 @@ import {
 } from './config.js'
 import { createLogger } from './log.js'
 import {
-  clearStatusWidgetCard,
+  clearStatusWidgetRecord,
   ensureStateDirs,
   migrateLegacyAllowlist,
-  readStatusWidgetCard,
+  readStatusWidgetRecord,
   writeDeadLetter,
-  writeStatusWidgetCard,
+  writeStatusWidgetRecord,
 } from './state/store.js'
 import {
   callTool,
@@ -65,6 +65,7 @@ import { TaskMirror } from './status/task-mirror.js'
 import { TmuxMirror } from './status/tmux-mirror.js'
 import { createStatusWidgetService, isStatusWidgetChatAllowed, type StatusWidgetService } from './status/status-widget.js'
 import { runStatusCommand } from './status/status-widget-runner.js'
+import { runShutdownSequence } from './shutdown-sequence.js'
 import { defaultTmuxExec } from './status/pane-capture.js'
 import { TaskRealityMirror } from './status/task-reality-mirror.js'
 import { SessionInfoStore } from './status/session-info.js'
@@ -1352,9 +1353,9 @@ if (config.status_widget?.enabled === true && config.status_widget.chat_id !== u
         api: telegramApi,
         runner: runStatusCommand,
         store: {
-          read: () => readStatusWidgetCard(statePaths),
-          write: (card) => writeStatusWidgetCard(statePaths, card),
-          clear: () => clearStatusWidgetCard(statePaths),
+          load: () => readStatusWidgetRecord(statePaths),
+          save: (record) => writeStatusWidgetRecord(statePaths, record),
+          clear: () => clearStatusWidgetRecord(statePaths),
         },
         html,
         redact: (text) => redactSecrets(text, apiSecrets),
@@ -1463,7 +1464,9 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   log.info('shutting down')
-  statusWidget?.stop()
+  // Terminal: aborts the producer, settles queued work and drains a send that
+  // is already in flight (at most 1.5 s); awaited below with the other steps.
+  const stopWidget: Promise<unknown> = statusWidget?.stop() ?? Promise.resolve()
 
   // Best-effort: clean up any pulsing status messages so the chat doesn't
   // show a stale "Печатает..." after the bot dies. Errors are swallowed
@@ -1518,9 +1521,11 @@ function shutdown(): void {
   setTimeout(() => process.exit(0), 2000)
   const stopPoller = poller ? poller.stop() : Promise.resolve()
   const stopWebhook = webhookHandle ? webhookHandle.close() : Promise.resolve()
-  void Promise.all([stopPoller, stopWebhook])
-    .then(() => Promise.resolve(bot.stop()))
-    .finally(() => process.exit(0))
+  void runShutdownSequence({
+    steps: [stopPoller, stopWebhook, stopWidget],
+    stopBot: () => bot.stop(),
+    exit: () => process.exit(0),
+  })
 }
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)

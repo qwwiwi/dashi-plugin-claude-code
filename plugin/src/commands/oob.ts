@@ -185,7 +185,7 @@ export interface OobContext {
   // /card — the model-free status card service. Undefined when
   // status_widget.enabled=false; the handler then explains.
   statusWidget?: {
-    sendFresh(chatId: string): Promise<{ ok: true } | { ok: false; reason: string }>
+    sendFresh(chatId: string): Promise<{ ok: true } | { ok: false; reason: string; uncertain?: boolean }>
   }
   // Identity bits surfaced by /status.
   botId?: number
@@ -575,11 +575,16 @@ export async function handleOobCommand(
       try {
         const res = await ctx.statusWidget.sendFresh(ctx.chatId)
         if (res.ok) return { handled: true, command: 'card' }
+        // Outcome-neutral: a lost answer does not prove the card was not delivered.
+        const uncertainNote =
+          res.uncertain === true
+            ? '\n\nКарточка могла дойти. Автообновление остановлено, чтобы не прислать дубль. Команда /card отправит новую карточку и включит обновление снова.'
+            : ''
         return {
           handled: true,
           command: 'card',
           replyToTelegram: {
-            text: `<b>карточка статуса</b> — не отправлена: ${escapeHtml(res.reason)}`,
+            text: `<b>карточка статуса</b> — ${escapeHtml(res.reason)}${uncertainNote}`,
             parseMode: 'HTML',
           },
         }
