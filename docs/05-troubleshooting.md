@@ -325,7 +325,7 @@ sudo systemctl stop channel-<agent>
 # 2. Manual claude session с TTY
 sudo -u <service-user> -i
 tmux new-session -s channel-<agent>
-claude --dangerously-load-development-channels server:dashi-channel
+claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel
 # в prompt: /login → открыть URL → авторизоваться → Enter
 # detach: Ctrl-B, D
 
@@ -389,7 +389,7 @@ sudo systemctl start channel-<agent>
 }
 ```
 
-Destructive операции (`sudo rm`, `sudo systemctl stop|start|disable`, `sudo apt remove`) — продолжают спрашивать confirmation.
+Destructive операции (`sudo rm`, `sudo systemctl stop|start|disable`, `sudo apt remove`) — продолжают спрашивать confirmation только в opt-in профиле с подтверждениями. В автономном профиле по умолчанию эти ограничения задаются в файле правил агента (`CLAUDE.md`).
 
 **Урок:** AI-агенты галлюцинируют. Sudo + галлюцинация = катастрофа. Никогда не давай blanket `Bash(sudo:*)` на production хосте где у агента есть OAuth state, secrets, или живые сервисы рядом.
 
@@ -426,7 +426,7 @@ Systemd видит «exited 0» (потому что `tmux new-session -d` са�
    sudo -u <service-user> -i
    cd <WorkingDirectory из unit>
    source <EnvironmentFile>
-   claude --dangerously-load-development-channels server:dashi-channel
+   claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel
    ```
 
 3. Скорее всего одно из:
