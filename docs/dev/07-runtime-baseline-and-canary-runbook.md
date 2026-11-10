@@ -38,7 +38,7 @@ This document is an execution artifact for the tmux-first migration. It does not
 
 ### Current gateway behavior to preserve
 
-The deployed gateway currently uses `claude -p` per turn, with stream-json output and session tracking through `--session-id` / `--resume`. It also uses `--permission-mode bypassPermissions`, which must not become the default in the tmux/channel path.
+The deployed gateway currently uses `claude -p` per turn, with stream-json output and session tracking through `--session-id` / `--resume`. It also uses `--permission-mode bypassPermissions`. The previous requirement that this must not become the default in the tmux/channel path is superseded by the owner’s decision of 2026-11-10: autonomous mode is the default; confirmations are an opt-in profile.
 
 Parity surface observed in the deployed gateway:
 

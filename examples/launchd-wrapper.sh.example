@@ -40,9 +40,14 @@ TMUX_SESSION="channel-${AGENT}"
 # Проверьте `which tmux` и подставьте.
 TMUX_BIN="/opt/homebrew/bin/tmux"
 
+# Autonomous launch: bypassPermissions disables Claude Code action confirmations.
+# For confirmations, remove --permission-mode bypassPermissions; optionally add
+# --permission-gate to scripts/install-hooks.sh with your installation arguments
+# and set permission_gate.enabled=true in the plugin configuration.
+
 # Команда, которую запускаем внутри tmux. Можно заменить на полный путь к claude
 # если он не в PATH у launchd.
-CLAUDE_CMD="claude --dangerously-load-development-channels server:dashi-channel"
+CLAUDE_CMD="claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel"
 
 # Сколько секунд ждать первого welcome-промта (если он есть). 6 — эмпирически.
 WELCOME_DELAY_1=6

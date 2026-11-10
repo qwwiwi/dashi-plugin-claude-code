@@ -54,9 +54,20 @@ is inspected. `--fleet` adds cross-agent checks; it is not launchd discovery.
 
 ### macOS — launchd (also unusual Linux layouts)
 
-Inspect the actual plist label, wrapper, launch arguments, WorkingDirectory,
-env source and live process CWD. Supply their actual paths; launchd is not
-autodetected. Use the same absolute `doctor_skill_dir` assignment above:
+On macOS the doctor scans `~/Library/LaunchAgents/*.plist` using the system
+`plutil` and requires one exact `WorkingDirectory` match to `--plugin-dir`.
+It reads that agent's wrapper without executing it. Only a single literal
+absolute `ENV_FILE` source and literal tmux session are inferred; expansions,
+conditional/repeated assignments, shell `-c` launches and multiple matches
+produce **incomplete coverage**. Env values and wrapper contents are never
+printed. Literal `CLAUDE_CMD` launch mode and a literal tmux socket can also be
+recognized. The example wrapper uses variable expansion, so supply explicit
+inputs unless you have replaced those fields with literals. Discovery describes
+files on disk, not proof of the loaded launchd job. Verify the actual plist,
+wrapper, launch arguments and live process CWD separately.
+
+Explicit `--env` and `--session` always win; `--no-autodetect` disables discovery.
+For unusual layouts, use the same `doctor_skill_dir` assignment above:
 
 ```bash
 bun "$doctor_skill_dir/scripts/doctor.ts" \
@@ -78,7 +89,9 @@ if hooks or permission mode are configured there.
 For a DM, `--user` also checks chat membership with the same ID. For a group,
 provide its explicit `--chat`. Custom tmux sockets may require separate
 read-only inspection: no dedicated socket flag exists. The script tries the
-default socket, the detected systemd socket, then the session-name socket.
+default socket, the detected systemd/launchd socket, then the session-name socket.
+On macOS it retries `/usr/sbin/lsof` if `lsof` is missing from PATH, for both
+runtime CWD and listener probes.
 
 Add `--check-latest` for the optional upstream version lookup, `--json` for
 structured version/check output, or `--help` for all flags. `--queue-json` reads
@@ -137,6 +150,21 @@ Config readiness does not prove the runtime toggle or Telegram display. Ask
 the operator to send a real request and inspect both the rolling message and
 tasks in the pin. Never restart your own communication channel mid-session.
 
+## Autonomous profile and optional confirmations
+
+The supported default launch is `--permission-mode bypassPermissions` with no
+permission-gate hook. The `permission-gate` check is **OK** with detail
+`autonomous profile: confirmations off by design`; do not install a gate to
+"fix" this profile. This applies to CLI launch flags and a settings-only
+`permissions.defaultMode=bypassPermissions`, including fleet checks. An unused
+permission endpoint is not required for this profile.
+
+For an explicitly configured gate, `permission_gate.enabled=true` without its
+hook is FAIL (the configured gate never fires); a registered gate with the
+server-side flag disabled is FAIL (requests fail closed). Unreadable settings
+or config mean unverified coverage, not evidence of either mismatch. Secret
+leak checks and the separate optional relay checks still apply.
+
 ## What to do for FAIL / WARN
 
 Read the first causal failure, give the student one concrete next step, and
@@ -153,7 +181,7 @@ unused, not healthy.
 | `hook-*`, `channel-reminder-hook`, `fallback-reply-hook`, `mirror-hooks` | Ask the operator to install current hooks for this session's settings, chat and webhook URL using `plugin/scripts/install-hooks.sh`. Check helper paths; use the script's fix and README for required arguments. |
 | `settings-no-token`, `permission-gate-token` | Have the operator remove credentials from settings and keep them in private runtime env. Never repeat their values in output. |
 | `shared-settings-clean`, `fleet-shared-settings` | Have the operator scope channel hooks to the intended agent's session so other agents do not inherit them. |
-| `permission-gate`, `permission-gate-config-match` | Under bypass, a missing gate is FAIL even when bypass is only in settings. Have the operator register the gate and enable `permission_gate.enabled` in the selected config; never dismiss this as SKIP. |
+| `permission-gate`, `permission-gate-config-match` | Autonomous bypass without a gate is OK by design. For a real config/hook mismatch, have the operator align the optional gate: remove its hook and disable it for autonomy, or register the hook and enable `permission_gate.enabled` for requested confirmations. Unreadable settings/config require explicit verification. |
 | `permission-gate-mode`, `unit-permission-mode` | Verify actual launch mode and settings together; the headless gate expects bypass mode. Ask the operator to reconcile them outside this session. |
 | `permission-gate-ask-hook`, `permission-gate-ask-config-match` | Have the operator register the AskUserQuestion relay and align `ask_user_question.enabled` with it so questions reach Telegram. |
 | `gate-policy-path`, `permission-policy*` | Have the operator check the policy path, syntax and default tier. Review risky `confirm_overrides` deliberately: ordinary sudo/rm rules can be lifted; catastrophic forms retain separate hard denies. |
@@ -163,7 +191,7 @@ unused, not healthy.
 | `mirror-terminal`, `progress-surfaces` | Follow Mirror above; verify the private target and keep one intended progress surface to avoid duplicate messages. |
 | `multichat-dm-mirror`, `multichat-dirs`, `spawn-chat-shell-tmux-pane` | Have the operator reconcile actual policy/chat folders, keep terminal output private, and use the current spawn helper with TMUX_PANE forwarding. |
 | `comms-consistency` | Have the operator fix MCP JSON and enable the same intended servers in actual session settings; Gbrain is optional for students. |
-| `fleet-env-readable`, `fleet-env-keys`, `fleet-webhook-enabled`, `fleet-hook-ports`, `fleet-gate` | Resolve each named agent's env/config/hooks independently; confirm its own enabled webhook and gate, not another agent's files. |
+| `fleet-env-readable`, `fleet-env-keys`, `fleet-webhook-enabled`, `fleet-hook-ports`, `fleet-gate` | Resolve each named agent's env/config/hooks independently; confirm its own enabled webhook and any opt-in gate wiring, not another agent's files. |
 | `fleet-ports-unique`, `fleet-tokens-unique`, `fleet-sockets`, `fleet-size`, `fleet-state-dirs-unique`, `fleet-workspaces-unique` | Have the operator verify discovery and give each agent its own port, bot token, tmux socket, state directory and workspace. Do not print token values. |
 | `telegram-queue` | With existing 409 evidence, identify the competing consumer and let the operator coordinate stop/start. Do not issue getUpdates yourself. An empty saved queue does not prove delivery. |
 | `live-session`, `auth`, `welcome-hang` | Have the operator inspect the real tmux pane, authenticate or clear first-run prompts; repair launch errors from an external terminal. A visible marker or reaction alone does not prove replies. |
@@ -203,7 +231,7 @@ Read-only: no config edits, updates, restarts, hook execution, Telegram sends,
 permission POSTs, competing pollers or credential output. Do not conclude
 "healthy" without observed end-to-end delivery. Rich Messages diagnostics,
 secret-path exceptions, Guest Mode, removed private ElevenLabs broker tooling,
-and launchd autodetection are outside this script's coverage.
+and dynamic launchd wrappers are outside this script's coverage.
 
 For migration use [migration guide](../../docs/04-migration-from-gateway.md);
 for symptoms use [troubleshooting](../../docs/05-troubleshooting.md). The

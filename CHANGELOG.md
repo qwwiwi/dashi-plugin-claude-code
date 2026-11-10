@@ -15,7 +15,20 @@ retroactively marks the state of `main` on 2026-06-14.
 
 ## [Unreleased]
 
+### Changed
+- Installation templates, Linux/macOS guides and English/Russian launch examples
+  use the autonomous `--permission-mode bypassPermissions` profile by default;
+  agent-rule templates keep only the owner's secret/deletion/force-push red lines
+  and explain how to opt into confirmations.
+
 ### Fixed
+- Doctor accepts bypass without a gate as an autonomous profile, including fleet
+  checks; it still reports configured gate/hook mismatches and incomplete evidence.
+  macOS probes fall back to `/usr/sbin/lsof` and discover exact launchd
+  WorkingDirectory matches with conservative literal wrapper input inference.
+- Post-hook HTTP forwarding now fails open on a 3000 ms deadline; positive finite
+  `TELEGRAM_HOOK_TIMEOUT_MS` overrides the deadline. The standard hook profile
+  remains plugin-only, with the permission gate opt-in and no fallback reply hook.
 - Doctor resolves effective configuration and settings-only bypass permissions,
   validates current lifecycle/task/reminder hooks, explains private terminal mirror
   prerequisites, and checks DM chat membership when only a user ID is supplied.

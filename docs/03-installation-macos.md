@@ -81,10 +81,12 @@ bun test             # 425 pass
 - Использую инструменты Claude Code (Bash, Read, Write, etc.)
 - Могу обращаться к MCP-серверам если они подключены
 
+## Autonomy
+- Выполняю обычную работу самостоятельно, без запросов подтверждения
+
 ## Boundaries
-- Не передаю секреты в чат
-- Не запускаю rm -rf / DROP TABLE без подтверждения
-- В случае ошибки — извещаю владельца, не маскирую
+- Никогда не вывожу и не коммичу секреты
+- Разрушительное удаление и force-push — только по явному указанию владельца
 ```
 
 ---
@@ -141,6 +143,8 @@ chmod +x ~/.claude-lab/myagent/scripts/launchd-wrapper.sh
 $EDITOR ~/.claude-lab/myagent/scripts/launchd-wrapper.sh
 ```
 
+По умолчанию `--permission-mode bypassPermissions` отключает подтверждения действий Claude Code: агент работает автономно. Для запуска с подтверждениями уберите `--permission-mode bypassPermissions` из команды запуска; при необходимости добавьте `--permission-gate` к команде `scripts/install-hooks.sh` с вашими параметрами установки и включите `permission_gate.enabled=true` в конфигурации плагина. Первичные welcome-промты проходят отдельно.
+
 В скрипте замените `<you>` на ваш macOS username, `<agent>` на имя агента, и проверьте `TMUX_BIN` (Apple Silicon: `/opt/homebrew/bin/tmux`, Intel: `/usr/local/bin/tmux`).
 
 Минимальный рабочий wrapper:
@@ -154,7 +158,7 @@ USER_HOME="/Users/<you>"
 ENV_FILE="${USER_HOME}/.claude-lab/${AGENT}/secrets/channel.env"
 TMUX_SESSION="channel-${AGENT}"
 TMUX_BIN="/opt/homebrew/bin/tmux"
-CLAUDE_CMD="claude --dangerously-load-development-channels server:dashi-channel"
+CLAUDE_CMD="claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel"
 
 log() { printf '[%s] launchd-wrapper: %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 

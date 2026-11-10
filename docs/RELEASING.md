@@ -17,7 +17,7 @@ Consequences:
 - Git tags are **not** read by Claude Code; we tag purely for humans and
   `gh release`.
 - Our fleet runs the plugin as a development channel
-  (`claude --dangerously-load-development-channels server:dashi-channel`
+  (`claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel`
   with the launchd working dir at `plugin/`), so live agents pick up code on
   session restart regardless of the version field. The version is still
   meaningful: MCP identity, diagnostics, changelog anchoring, and any future

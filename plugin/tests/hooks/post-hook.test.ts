@@ -1,7 +1,9 @@
-// Phase 7 / T5 — unit tests around the post-hook request builder.
-// No real network: we exercise `buildHookRequest` directly.
+// Request-builder units and child-process coverage with a stalled transport.
 
-import { describe, expect, test } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { buildHookRequest } from '../../scripts/post-hook.js'
 
@@ -140,4 +142,107 @@ describe('buildHookRequest', () => {
     // …and lives only inside the header.
     expect(result.headers.Authorization).toBe('Bearer super-secret-token')
   })
+})
+
+const HOOK_SCRIPT = new URL('../../scripts/post-hook.ts', import.meta.url).pathname
+const PRIVATE_PAYLOAD = 'private-hook-payload-do-not-log'
+let fixtureDir: string
+let preloadPath: string
+
+beforeAll(async () => {
+  fixtureDir = await mkdtemp(join(tmpdir(), 'post-hook-timeout-'))
+  preloadPath = join(fixtureDir, 'stalled-fetch.ts')
+  // Loopback listeners are unavailable in the restricted test environment.
+  // Replace only the transport; the script uses real AbortSignal timers and
+  // runs unchanged in its own process with stdin/stdout/stderr pipes.
+  await writeFile(preloadPath, `
+globalThis.fetch = async (_url, init) => {
+  process.stderr.write('test-webhook-started\\n')
+  const signal = init?.signal
+  return new Promise((_resolve, reject) => {
+    const pendingConnection = setInterval(() => {}, 1000)
+    const abort = () => {
+      clearInterval(pendingConnection)
+      reject(signal.reason)
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) abort()
+  })
+}
+`)
+})
+
+afterAll(async () => {
+  if (fixtureDir) await rm(fixtureDir, { recursive: true, force: true })
+})
+
+// A killed child means the hook did not enforce its own deadline. The watchdog
+// keeps the regression test bounded even when run against the old implementation.
+async function runStalledHook(timeout?: string) {
+  const env = { ...process.env }
+  delete env.TELEGRAM_HOOK_TIMEOUT_MS
+  if (timeout !== undefined) env.TELEGRAM_HOOK_TIMEOUT_MS = timeout
+  Object.assign(env, {
+    TELEGRAM_WEBHOOK_URL: 'http://127.0.0.1:8089/hooks/agent',
+    TELEGRAM_WEBHOOK_TOKEN: TOKEN,
+    TELEGRAM_HOOK_CHAT_ID: '1',
+  })
+  const started = performance.now()
+  const child = Bun.spawn([process.execPath, '--preload', preloadPath, HOOK_SCRIPT], {
+    env,
+    stdin: new Blob([JSON.stringify({ ...baseHook(), prompt: PRIVATE_PAYLOAD })]),
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  let forcedKill = false
+  const watchdog = setTimeout(() => {
+    forcedKill = true
+    child.kill()
+  }, 4500)
+  try {
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ])
+    return { forcedKill, elapsed: performance.now() - started, exitCode, stdout, stderr }
+  } finally {
+    clearTimeout(watchdog)
+    child.kill()
+  }
+}
+
+function expectFailOpenTimeout(result: Awaited<ReturnType<typeof runStalledHook>>) {
+  expect(result.stderr).toContain('test-webhook-started')
+  expect(result.forcedKill).toBe(false)
+  expect(result.exitCode).toBe(0)
+  expect(result.stdout).toBe('')
+  expect(result.stderr).toContain('webhook fetch failed')
+  expect(result.stderr).not.toContain(TOKEN)
+  expect(result.stderr).not.toContain(PRIVATE_PAYLOAD)
+}
+
+describe('post-hook HTTP deadline', () => {
+  test('stalled webhook exits fail-open after the default 3000 ms', async () => {
+    const result = await runStalledHook()
+    expectFailOpenTimeout(result)
+    expect(result.elapsed).toBeGreaterThanOrEqual(2900)
+    expect(result.elapsed).toBeLessThan(4200)
+  }, 6000)
+
+  test('positive env override bounds a stalled webhook without stdout or secrets', async () => {
+    const result = await runStalledHook('120')
+    expectFailOpenTimeout(result)
+    expect(result.elapsed).toBeGreaterThanOrEqual(100)
+    expect(result.elapsed).toBeLessThan(1200)
+  }, 6000)
+
+  test('nonpositive, nonfinite and empty env values fall back to the 3000 ms deadline', async () => {
+    const results = await Promise.all(['0', '-1', 'NaN', 'Infinity', '-Infinity', '', '   '].map(runStalledHook))
+    for (const result of results) {
+      expectFailOpenTimeout(result)
+      expect(result.elapsed).toBeGreaterThanOrEqual(2900)
+      expect(result.elapsed).toBeLessThan(4200)
+    }
+  }, 6000)
 })

@@ -60,7 +60,7 @@
 | `ProgressReporter` | отдельное rolling-сообщение со строками активности (PreToolUse/PostToolUse/Stop) через `editMessageText` |
 | `TaskMirror` | третье rolling-сообщение — milestones из `TodoWrite` / `TaskCreate` / `TaskUpdate` |
 
-Запуск — два варианта: standalone Bun-процесс (`bun start`, быстрая проверка токена) или production через `claude --dangerously-load-development-channels server:dashi-channel` (Claude Code сам держит runtime плагина). См. раздел 12.
+Запуск — два варианта: standalone Bun-процесс (`bun start`, быстрая проверка токена) или production через `claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel` (Claude Code сам держит runtime плагина). См. раздел 12.
 
 ---
 
@@ -527,7 +527,7 @@ $EDITOR ~/.claude-lab/myagent/secrets/channel.env   # TELEGRAM_BOT_TOKEN, TELEGR
 
 # 5. Запуск (production-вариант — Claude Code держит runtime)
 set -a; . ~/.claude-lab/myagent/secrets/channel.env; set +a
-claude --dangerously-load-development-channels server:dashi-channel
+claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel
 
 # 6. ОБЯЗАТЕЛЬНО — установить hooks (иначе нет прогресса в Telegram)
 bash scripts/install-hooks.sh --settings ~/.claude/settings.json \
@@ -537,6 +537,8 @@ bash scripts/install-hooks.sh --settings ~/.claude/settings.json \
 #    (на systemd-хосте — без флагов: юнит/env/сессию он найдёт сам)
 bun ../skills/doctor-dashi-plugin/scripts/doctor.ts --plugin-dir "$PWD"
 ```
+
+По умолчанию `--permission-mode bypassPermissions` отключает подтверждения действий Claude Code: агент работает автономно. Для запуска с подтверждениями уберите `--permission-mode bypassPermissions` из команды запуска; при необходимости добавьте `--permission-gate` к команде `scripts/install-hooks.sh` с вашими параметрами установки и включите `permission_gate.enabled=true` в конфигурации плагина. Первичные welcome-промты проходят отдельно.
 
 При первом запуске Claude Code задаст 2 интерактивных вопроса (allow external imports + dev channels) — **разово**, ответьте `1` на оба.
 
@@ -614,6 +616,7 @@ bun ../skills/doctor-dashi-plugin/scripts/doctor.ts --plugin-dir "$PWD"
 |    Type=forking                                                |
 |    tmux -L channel-thrall                                      |
 |      claude session                                            |
+|        --permission-mode bypassPermissions
 |        --dangerously-load-development-channels server:dashi-channel
 |        workspace: /srv/agents/thrall   (CLAUDE.md = identity)  |
 |        plugin: /srv/agents/thrall/.claude/dashi-plugin-claude-code/plugin
@@ -804,7 +807,7 @@ Environment=HOME=/home/<service-user>
 Environment=PATH=/home/<service-user>/.bun/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=/srv/agents/arthas/.claude/dashi-plugin-claude-code/plugin
 EnvironmentFile=/etc/dashi-plugin/arthas/channel.env
-ExecStart=/usr/bin/tmux -L channel-arthas new-session -d -s channel-arthas 'claude --dangerously-load-development-channels server:dashi-channel'
+ExecStart=/usr/bin/tmux -L channel-arthas new-session -d -s channel-arthas 'claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel'
 ExecStartPost=/usr/local/bin/channel-confirm-arthas.sh
 ExecStop=/usr/bin/tmux -L channel-arthas kill-session -t channel-arthas
 Restart=on-failure

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import * as doctor from './doctor.ts'
 import { dirname, join, resolve } from 'path'
-import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'fs'
+import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync, mkdirSync, chmodSync } from 'fs'
 import { tmpdir } from 'os'
 import { spawnSync } from 'child_process'
 import { applyPatch } from '../../../plugin/scripts/patch-claude-settings.ts'
@@ -1131,20 +1132,18 @@ describe('extractChatPolicies — bleed hardening (review M2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Permission-gate HARDENING (2026-06-10). The gate is the SOLE confirm path
-// under bypassPermissions; the Silvana incident shipped a bypass session with
-// NO gate hook and the doctor only SKIPPED. These tests lock the class of
-// failure so it can never ship undetected again.
+// Autonomous profile: confirmations are deliberately off; an explicitly
+// configured gate must still match its hook registration.
 // ---------------------------------------------------------------------------
 
-describe('checkPermissionGate — incident lock (no gate under bypass = FAIL, not skip)', () => {
+describe('checkPermissionGate — autonomous profile and opt-in gate', () => {
   const settingsNoGate = { hooks: { PreToolUse: [hookEntry('dashi-channel-hook')] } }
 
-  test('no gate hook BUT unit runs bypassPermissions → FAIL (the Silvana incident)', () => {
+  test('bypass launch without a gate is supported and OK', () => {
     const checks = checkPermissionGate(settingsNoGate, existsSync0, /*unitBypass*/ true)
     const gate = checks.find((c) => c.id === 'permission-gate')
-    expect(gate?.status).toBe('fail')
-    expect(gate?.detail.toLowerCase()).toContain('bypass')
+    expect(gate?.status).toBe('pass')
+    expect(gate?.detail).toBe('autonomous profile: confirmations off by design')
   })
 
   test('no gate hook BUT permission_gate.enabled=true in state config → FAIL', () => {
@@ -1250,10 +1249,10 @@ describe('checkPermissionEndpoint — SAFE liveness probe (never POSTs the real 
 
 describe('fleet — Arthas-style bypass unit is detected as bypassPermissions:true', () => {
   for (const flag of ['--dangerously-skip-permissions', '--permission-mode=bypassPermissions', '--permission-mode bypassPermissions']) {
-    test(`missing gate fails for launch flag ${flag}`, () => {
+    test(`autonomous profile passes for launch flag ${flag}`, () => {
       const unit = parseUnitFile(`ExecStart=/usr/bin/tmux new-session -d 'claude ${flag}'`)
       const checks = checkPermissionGate({}, existsSync0, unit.bypassPermissions, false)
-      expect(checks.find((c) => c.id === 'permission-gate')?.status).toBe('fail')
+      expect(checks.find((c) => c.id === 'permission-gate')?.status).toBe('pass')
     })
   }
 
@@ -1268,7 +1267,7 @@ describe('fleet — Arthas-style bypass unit is detected as bypassPermissions:tr
   })
 })
 
-describe('checkFleet — every bypass agent has the gate enabled + hook registered', () => {
+describe('checkFleet — autonomous and opt-in gate profiles', () => {
   const base = (name: string): FleetAgent => ({
     name,
     unitPath: `/etc/systemd/system/channel-${name}.service`,
@@ -1294,7 +1293,7 @@ describe('checkFleet — every bypass agent has the gate enabled + hook register
     expect(checks.find((c) => c.id === 'fleet-gate')?.status).toBe('pass')
   })
 
-  test('a bypass agent missing the gate hook → fleet-gate FAIL (the Silvana incident, fleet-wide)', () => {
+  test('configured gate without hook remains a fleet mismatch', () => {
     const bad = { ...base('silvana'), gateHookRegistered: false }
     const checks = checkFleet([base('thrall'), bad], null)
     const fg = checks.find((c) => c.id === 'fleet-gate')
@@ -1306,6 +1305,18 @@ describe('checkFleet — every bypass agent has the gate enabled + hook register
     const bad = { ...base('silvana'), gateEnabled: false }
     const checks = checkFleet([base('thrall'), bad], null)
     expect(checks.find((c) => c.id === 'fleet-gate')?.status).toBe('fail')
+  })
+
+  test('autonomous bypass agents without gate pass fleet checks', () => {
+    const autonomous = { ...base('silvana'), gateEnabled: false, gateHookRegistered: false }
+    const result = checkFleet([autonomous], null).find((c) => c.id === 'fleet-gate')
+    expect(result?.status).toBe('pass')
+    expect(result?.detail).toContain('autonomous profile: confirmations off by design')
+  })
+
+  test('configured gate without hook fails even without bypass', () => {
+    const mismatch = { ...base('silvana'), bypassPermissions: false, gateHookRegistered: false }
+    expect(checkFleet([mismatch], null).find((c) => c.id === 'fleet-gate')?.status).toBe('fail')
   })
 
   test('non-bypass agents are exempt from the gate requirement', () => {
@@ -1370,11 +1381,11 @@ describe('plugin version provenance', () => {
   })
 })
 
-// Settings-only bypass must never skip a missing security gate.
+// Settings-only bypass supports the same autonomous profile as launch flags.
 describe('checkPermissionGate — settings bypass regression', () => {
-  test('missing gate fails when bypass is declared only in settings', () => {
+  test('autonomous profile passes when bypass is declared only in settings', () => {
     const checks = checkPermissionGate({ permissions: { defaultMode: 'bypassPermissions' } }, existsSync0, null, false)
-    expect(checks.find((c) => c.id === 'permission-gate')?.status).toBe('fail')
+    expect(checks.find((c) => c.id === 'permission-gate')?.status).toBe('pass')
   })
   test('launch bypass remains effective with another settings default', () => {
     const settings = { permissions: { defaultMode: 'default' }, hooks: { PreToolUse: [
@@ -1626,4 +1637,237 @@ describe('effective config access edge cases', () => {
     expect(result.config).toBeNull()
     expect(result.check.detail).toContain('duplicate env assignments')
   })
+})
+
+
+describe('autonomous profile CLI coverage', () => {
+  for (const readable of [true, false]) {
+    test(`bypass alone never requires the permission endpoint; settings readable=${readable}`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), 'doctor-autonomous-'))
+      try {
+        writeFileSync(join(fixture, 'config.json'), JSON.stringify({ webhook: { enabled: true, port: 65534 } }))
+        writeFileSync(join(fixture, 'channel.env'), 'TELEGRAM_CONFIG_FILE=config.json')
+        if (readable) writeFileSync(join(fixture, 'settings.json'), JSON.stringify({ permissions: { defaultMode: 'bypassPermissions' } }))
+        const units = join(fixture, 'units')
+        // A bypass launch also covers unreadable settings: missing evidence is a warning.
+        mkdirSync(units)
+        writeFileSync(join(units, 'channel-test.service'), `[Service]\nWorkingDirectory=${fixture}\nEnvironmentFile=${fixture}/channel.env\nExecStart=/usr/bin/tmux new-session -s test 'claude --permission-mode bypassPermissions'`)
+        const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'), '--json', '--plugin-dir', fixture,
+          '--fleet-dir', units, '--env', join(fixture, 'channel.env'), '--settings', join(fixture, 'settings.json')],
+          { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+        const report = JSON.parse(result.stdout) as { checks: Check[] }
+        expect(report.checks.some((c) => c.id === 'permission-endpoint')).toBe(false)
+        expect(report.checks.some((c) => c.id === 'permission-gate' && c.status === 'fail')).toBe(false)
+        if (readable) expect(report.checks.find((c) => c.id === 'permission-gate')?.status).toBe('pass')
+        else expect(report.checks.find((c) => c.id === 'settings-readable')?.status).toBe('warn')
+      } finally { rmSync(fixture, { recursive: true, force: true }) }
+    })
+  }
+})
+
+describe('macOS read-only launch discovery', () => {
+  const wrapper = [
+    '#!/bin/sh',
+    'ENV_FILE="/private/agent/channel.env"',
+    'TMUX_SESSION="channel-agent"',
+    'TMUX_BIN="/opt/homebrew/bin/tmux"',
+    'CLAUDE_CMD="claude --permission-mode bypassPermissions server:dashi-channel"',
+    '. "${ENV_FILE}"',
+    '"${TMUX_BIN}" -L channel-socket new-session -d -s "${TMUX_SESSION}" "${CLAUDE_CMD}"',
+  ].join('\n')
+
+  test('literal wrapper infers env, actual session, socket and launch mode without executing shell', () => {
+    const parsed = doctor.parseLaunchWrapper(wrapper)
+    expect(parsed.envPath).toBe('/private/agent/channel.env')
+    expect(parsed.sessionName).toBe('channel-agent')
+    expect(parsed.sockets).toEqual(['channel-socket'])
+    expect(parsed.bypassPermissions).toBe(true)
+  })
+
+  for (const value of ['"$HOME/channel.env"', '"$(touch /tmp/never-run-doctor)"', '"${ENV_FILE:-/fallback.env}"', '`pwd`', '"/one.env"\nENV_FILE="/two.env"', '"/one.env"\nif true; then ENV_FILE="/two.env"; fi']) {
+    test(`dynamic or ambiguous ENV_FILE is not inferred: ${value}`, () => {
+      expect(doctor.parseLaunchWrapper(wrapper.replace('"/private/agent/channel.env"', value)).envPath).toBeNull()
+    })
+  }
+  test('dynamic session and unused assignment are not guessed', () => {
+    expect(doctor.parseLaunchWrapper(wrapper.replace('"channel-agent"', '"channel-${AGENT}"')).sessionName).toBeNull()
+    expect(doctor.parseLaunchWrapper('TMUX_SESSION="unused"\nENV_FILE="/unused.env"').sessionName).toBeNull()
+    expect(doctor.parseLaunchWrapper('TMUX_SESSION="unused"\nENV_FILE="/unused.env"').envPath).toBeNull()
+  })
+  test('literal direct tmux session supported; multiple new-session commands are ambiguous', () => {
+    expect(doctor.parseLaunchWrapper('tmux new-session -s "literal-session" "claude"').sessionName).toBe('literal-session')
+    expect(doctor.parseLaunchWrapper(wrapper + '\ntmux new-session -s second claude').sessionName).toBeNull()
+  })
+  test('assignments inside conditional or function bodies are unknown even without indentation', () => {
+    for (const prefix of ['if false; then', 'configure() {', 'for item in one; do']) {
+      const parsed = doctor.parseLaunchWrapper(prefix + '\n' + wrapper + '\nfi')
+      expect(parsed.envPath).toBeNull()
+      expect(parsed.sessionName).toBeNull()
+      expect(parsed.bypassPermissions).toBeNull()
+    }
+  })
+  test('dynamic or unbound TMUX_BIN cannot identify an actual tmux launch', () => {
+    for (const source of [wrapper.replace('TMUX_BIN="/opt/homebrew/bin/tmux"', ''), wrapper.replace('TMUX_BIN="/opt/homebrew/bin/tmux"', 'TMUX_BIN="$(choose-command)"')]) {
+      expect(doctor.parseLaunchWrapper(source).sessionName).toBeNull()
+      expect(doctor.parseLaunchWrapper(source).bypassPermissions).toBeNull()
+    }
+  })
+  test('flags inside Claude argument text or after -- never establish bypass mode', () => {
+    for (const command of [
+      `CLAUDE_CMD='claude --append-system-prompt " --permission-mode bypassPermissions "'`,
+      `CLAUDE_CMD='claude -- --permission-mode bypassPermissions'`,
+      `CLAUDE_CMD='claude --append-system-prompt --permission-mode bypassPermissions'`,
+    ]) {
+      const source = wrapper.replace('CLAUDE_CMD="claude --permission-mode bypassPermissions server:dashi-channel"', command)
+      expect(doctor.parseLaunchWrapper(source).bypassPermissions).toBeNull()
+    }
+  })
+  test('repeated tmux sessions, dynamic sockets and conflicting modes are incomplete', () => {
+    expect(doctor.parseLaunchWrapper(wrapper.replace('-s "${TMUX_SESSION}"', '-s first -s second')).sessionName).toBeNull()
+    expect(doctor.parseLaunchWrapper(wrapper.replace('-L channel-socket', '-L "$(socket)"')).socketKnown).toBe(false)
+    expect(doctor.parseLaunchWrapper(wrapper.replace('claude --permission-mode bypassPermissions', 'claude --permission-mode bypassPermissions --permission-mode default')).bypassPermissions).toBeNull()
+  })
+  test('commented gate flags never establish bypass mode', () => {
+    expect(doctor.parseLaunchWrapper(wrapper.replace('claude --permission-mode bypassPermissions server:dashi-channel', 'claude server:dashi-channel') + '\n# --permission-mode bypassPermissions').bypassPermissions).toBe(false)
+  })
+
+  function withLaunchDir(run: (dir: string, readPlist: (p: string) => unknown) => void) {
+    const dir = mkdtempSync(join(tmpdir(), 'doctor-launchd-'))
+    try { run(dir, (p) => JSON.parse(readFileSync(p, 'utf8'))) }
+    finally { rmSync(dir, { recursive: true, force: true }) }
+  }
+  test('only the exact WorkingDirectory matches; wrapper/env values never reach diagnostic detail', () => {
+    withLaunchDir((dir, readPlist) => {
+      const script = join(dir, 'wrapper.sh')
+      writeFileSync(script, wrapper + '\nTELEGRAM_BOT_TOKEN="sentinel-private-value"')
+      writeFileSync(join(dir, 'unrelated.plist'), JSON.stringify({ WorkingDirectory: '/installed/plugin-old', ProgramArguments: [script] }))
+      writeFileSync(join(dir, 'agent.plist'), JSON.stringify({ WorkingDirectory: '/installed/plugin', ProgramArguments: ['/bin/sh', script] }))
+      const result = doctor.discoverLaunchd('/installed/plugin', dir, readPlist)
+      expect(result.envPath).toBe('/private/agent/channel.env')
+      expect(result.sessionName).toBe('channel-agent')
+      expect(result.wrapperPath).toBe(script)
+      expect(result.check.status).toBe('pass')
+      expect(JSON.stringify(result.check)).not.toContain('sentinel-private-value')
+      expect(JSON.stringify(result.check)).not.toContain('channel-agent')
+      expect(JSON.stringify(result.check)).not.toContain('/private/agent/channel.env')
+    })
+  })
+  test('multiple matching plists are incomplete, never first-match wins', () => {
+    withLaunchDir((dir, readPlist) => {
+      for (const name of ['a.plist', 'b.plist']) writeFileSync(join(dir, name), JSON.stringify({ WorkingDirectory: '/installed/plugin', ProgramArguments: ['/wrapper.sh'] }))
+      const result = doctor.discoverLaunchd('/installed/plugin', dir, readPlist)
+      expect(result.envPath).toBeNull()
+      expect(result.sessionName).toBeNull()
+      expect(result.check.status).toBe('warn')
+      expect(result.check.detail).toContain('incomplete coverage')
+    })
+  })
+  test('unreadable wrapper or shell -c launch is incomplete', () => {
+    withLaunchDir((dir, readPlist) => {
+      for (const args of [['/missing-wrapper.sh'], ['/bin/sh', '-c', 'exec /wrapper.sh']]) {
+        writeFileSync(join(dir, 'agent.plist'), JSON.stringify({ WorkingDirectory: '/installed/plugin', ProgramArguments: args }))
+        const result = doctor.discoverLaunchd('/installed/plugin', dir, readPlist)
+        expect(result.envPath).toBeNull()
+        expect(result.sessionName).toBeNull()
+        expect(result.check.status).toBe('warn')
+        expect(result.check.detail).toContain('incomplete coverage')
+      }
+    })
+  })
+  test('dynamic wrapper fields have incomplete coverage without leaking expressions', () => {
+    withLaunchDir((dir, readPlist) => {
+      const script = join(dir, 'wrapper.sh')
+      writeFileSync(script, wrapper.replace('"/private/agent/channel.env"', '"$(echo sentinel-secret)"'))
+      writeFileSync(join(dir, 'agent.plist'), JSON.stringify({ WorkingDirectory: '/installed/plugin', ProgramArguments: [script] }))
+      const result = doctor.discoverLaunchd('/installed/plugin', dir, readPlist)
+      expect(result.envPath).toBeNull()
+      expect(result.sessionName).toBe('channel-agent')
+      expect(result.check.status).toBe('warn')
+      expect(result.check.detail).toContain('incomplete coverage')
+      expect(JSON.stringify(result.check)).not.toContain('sentinel-secret')
+    })
+  })
+  test('unreadable plists/directory and absent match explicitly report incomplete coverage', () => {
+    withLaunchDir((dir, readPlist) => {
+      writeFileSync(join(dir, 'broken.plist'), 'not-a-plist')
+      for (const path of [dir, join(dir, 'absent')]) {
+        const result = doctor.discoverLaunchd('/installed/plugin', path, readPlist)
+        expect(result.check.status).toBe('warn')
+        expect(result.check.detail).toContain('incomplete coverage')
+      }
+    })
+  })
+  test('missing PATH lsof on macOS retries /usr/sbin/lsof', () => {
+    const commands: string[] = []
+    const result = doctor.probeLsof('macos', ['-a', '-p', '123', '-d', 'cwd', '-Fn'], (cmd, args) => {
+      commands.push(cmd)
+      expect(args).toEqual(['-a', '-p', '123', '-d', 'cwd', '-Fn'])
+      return cmd === '/usr/sbin/lsof' ? { code: 0, stdout: 'n/installed/plugin\n', stderr: '' } : { code: -1, stdout: '', stderr: '' }
+    })
+    expect(commands).toEqual(['lsof', '/usr/sbin/lsof'])
+    expect(result.stdout).toBe('n/installed/plugin\n')
+  })
+  test('working PATH lsof is used directly; Linux never probes macOS path', () => {
+    for (const os of ['macos', 'linux'] as const) {
+      const commands: string[] = []
+      doctor.probeLsof(os, [], (cmd) => { commands.push(cmd); return { code: os === 'linux' ? -1 : 0, stdout: '', stderr: '' } })
+      expect(commands).toEqual(['lsof'])
+    }
+  })
+})
+
+
+describe('macOS discovery CLI integration', () => {
+  for (const mode of ['inferred', 'explicit', 'disabled', 'dynamic']) {
+    test.skipIf(process.platform !== 'darwin')(`launchd discovery ${mode}`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), 'doctor-mac-cli-'))
+      try {
+        const launchDir = join(fixture, 'Library', 'LaunchAgents')
+        mkdirSync(launchDir, { recursive: true })
+        const pluginDir = join(fixture, 'plugin')
+        mkdirSync(pluginDir)
+        const envFile = join(fixture, 'inferred.env')
+        const explicitEnv = join(fixture, 'explicit.env')
+        writeFileSync(envFile, 'TELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=42')
+        writeFileSync(explicitEnv, 'TELEGRAM_ALLOWED_USER_IDS=43\nTELEGRAM_ALLOWED_CHAT_IDS=43')
+        writeFileSync(join(pluginDir, 'settings.json'), '{}')
+        const wrapperPath = join(fixture, 'wrapper.sh')
+        writeFileSync(wrapperPath, [
+          `ENV_FILE="${mode === 'dynamic' ? '${HOME}/sentinel.env' : envFile}"`,
+          'TMUX_SESSION="inferred-session"',
+          'TMUX_BIN="/opt/homebrew/bin/tmux"',
+          'CLAUDE_CMD="claude --permission-mode bypassPermissions server:dashi-channel"',
+          '. "${ENV_FILE}"',
+          '"${TMUX_BIN}" new-session -d -s "${TMUX_SESSION}" "${CLAUDE_CMD}"',
+        ].join('\n'))
+        const xmlEscape = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        writeFileSync(join(launchDir, 'test.plist'), `<?xml version="1.0"?><plist version="1.0"><dict><key>WorkingDirectory</key><string>${xmlEscape(pluginDir)}</string><key>ProgramArguments</key><array><string>${xmlEscape(wrapperPath)}</string></array></dict></plist>`)
+        writeFileSync(join(fixture, 'tmux'), '#!/bin/sh\nif [ "$1" = "-V" ]; then echo tmux; else echo "Listening for channel messages from: server:dashi-channel"; fi\n')
+        chmodSync(join(fixture, 'tmux'), 0o700)
+        const args = [join(import.meta.dir, 'doctor.ts'), '--json', '--plugin-dir', pluginDir, '--settings', join(pluginDir, 'settings.json'), '--user', mode === 'explicit' ? '43' : '42']
+        if (mode === 'explicit') args.push('--env', explicitEnv, '--session', 'explicit-session')
+        if (mode === 'disabled') args.push('--no-autodetect')
+        const result = spawnSync(process.execPath, args, { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+        const report = JSON.parse(result.stdout) as { checks: Check[] }
+        const check = (id: string) => report.checks.find((c) => c.id === id)
+        if (mode === 'disabled') {
+          expect(check('autodetect')).toBeUndefined()
+          expect(check('env-unknown')).toBeDefined()
+          expect(check('live-session')).toBeUndefined()
+        } else {
+          expect(check('autodetect')?.status).toBe(mode === 'dynamic' ? 'warn' : 'pass')
+          expect(check('live-session')?.title).toContain(mode === 'explicit' ? 'explicit-session' : 'inferred-session')
+          expect(check('permission-gate')?.status).toBe('pass')
+          if (mode === 'dynamic') {
+            expect(check('env-unknown')).toBeDefined()
+            expect(result.stdout).not.toContain('sentinel.env')
+          } else {
+            expect(check('env-unknown')).toBeUndefined()
+            expect(check('allowlist-user')?.status).toBe('pass')
+          }
+        }
+        expect(report.checks.some((c) => c.id === 'permission-endpoint')).toBe(false)
+      } finally { rmSync(fixture, { recursive: true, force: true }) }
+    })
+  }
 })
