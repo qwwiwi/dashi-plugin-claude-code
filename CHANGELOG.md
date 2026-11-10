@@ -15,6 +15,12 @@ retroactively marks the state of `main` on 2026-06-14.
 
 ## [Unreleased]
 
+### Fixed
+- Doctor reports installed manifest/package versions and an explicit update verdict;
+  upstream main-manifest lookup is opt-in (`--check-latest`) with source/time.
+
+## [Unreleased]
+
 ### Added
 - `send_widget` and `edit_widget_data` MCP tools (#151, slice 1): Bot API
   `sendWidget` / `editMessageWidgetData` through grammY's raw escape hatch (no

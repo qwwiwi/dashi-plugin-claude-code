@@ -189,6 +189,64 @@ export function checkVersion(
       }
 }
 
+export interface PluginVersionReport {
+  installed: string
+  packageVersion: string
+  latest: string
+  verdict: 'up to date' | 'outdated' | 'unknown'
+  source: string
+  checkedAt: string | null
+  consistent: boolean
+  installRoot: string | null
+}
+
+export const UPSTREAM_MANIFEST = 'https://raw.githubusercontent.com/qwwiwi/dashi-plugin-claude-code/main/.claude-plugin/plugin.json'
+
+function manifestVersion(value: unknown): string {
+  if (value === null || typeof value !== 'object') return 'UNKNOWN'
+  const v = (value as Record<string, unknown>)['version']
+  return typeof v === 'string' && /^\d+\.\d+\.\d+$/.test(v) ? v : 'UNKNOWN'
+}
+
+/** Only query the public manifest when explicitly requested; never send local data. */
+export async function pluginVersionReport(
+  pluginDir: string | null,
+  checkLatest: boolean,
+  read: (p: string) => string | null = readFileSafe,
+  fetchManifest: () => Promise<unknown> = async () => {
+    const response = await fetch(UPSTREAM_MANIFEST, { signal: AbortSignal.timeout(5000), redirect: 'error' })
+    if (!response.ok) throw new Error('upstream unavailable')
+    return response.json() as Promise<unknown>
+  },
+): Promise<PluginVersionReport> {
+  const root = pluginDir === null ? null : dirname(resolve(pluginDir))
+  const installed = root === null ? 'UNKNOWN' : manifestVersion(parseJsonSafe(read(join(root, '.claude-plugin/plugin.json'))))
+  const packageVersion = pluginDir === null ? 'UNKNOWN' : manifestVersion(parseJsonSafe(read(join(pluginDir, 'package.json'))))
+  let latest = 'UNKNOWN'
+  const checkedAt = checkLatest ? new Date().toISOString() : null
+  if (checkLatest) {
+    try { latest = manifestVersion(await fetchManifest()) } catch { /* Unavailable evidence stays unknown. */ }
+  }
+  const consistent = installed !== 'UNKNOWN' && installed === packageVersion
+  const a = parseSemver(installed)
+  const b = parseSemver(latest)
+  const comparison = a && b && consistent ? cmpSemver(a, b) : null
+  return {
+    installed, packageVersion, latest, consistent, installRoot: root,
+    verdict: comparison === 0 ? 'up to date' : comparison !== null && comparison < 0 ? 'outdated' : 'unknown',
+    source: UPSTREAM_MANIFEST, checkedAt,
+  }
+}
+
+export function versionCheck(v: PluginVersionReport): Check {
+  return {
+    id: 'plugin-version', title: 'Plugin version',
+    status: v.verdict === 'up to date' ? 'pass' : 'warn',
+    detail: `INSTALLED: ${v.installed} (plugin/package.json: ${v.packageVersion}; root: ${v.installRoot ?? 'UNKNOWN'}). LATEST: ${v.latest} (upstream main manifest, not a published-release check). Verdict: ${v.verdict}. Source: ${v.source}; checked: ${v.checkedAt ?? 'not requested'}.${v.consistent ? '' : ' Installed manifests missing, invalid or mismatched.'}`,
+    fix: 'Check https://github.com/qwwiwi/dashi-plugin-claude-code/blob/main/.claude-plugin/plugin.json manually or use --check-latest; confirm the actual installed root with --plugin-dir <installed-root>/plugin. For updates follow the skill Update section; a newer local version needs manual review.',
+  }
+}
+
 /**
  * Walk up from the plugin directory looking for the workspace CLAUDE.md.
  * The plugin MUST live inside `<workspace>/.claude/...` so Claude Code's
@@ -1762,6 +1820,7 @@ export function matchAgentForPlugin(agents: FleetAgent[], pluginDir: string): Fl
 
 interface Options {
   json: boolean
+  checkLatest?: boolean
   os: OS
   pluginDir: string
   /** True when --plugin-dir was given explicitly (autodetect must not override it). */
@@ -1805,6 +1864,9 @@ function parseArgs(argv: string[]): Options | { error: string } {
       return v
     }
     switch (a) {
+      case '--check-latest':
+        opts.checkLatest = true
+        break
       case '--json':
         opts.json = true
         break
@@ -1882,13 +1944,14 @@ Options:
                            verify the five isolation invariants ACROSS agents
                            (README section 14)
   --fleet-dir <path>       where to look for unit files (default: /etc/systemd/system)
+  --check-latest           opt-in GET of the public upstream main manifest (5s timeout)
   --json                   machine-readable output
   -h, --help               this help
 
 Read-only: never restarts a service, never writes config, never prints a secret.
 Exit 0 = no FAIL, 1 = at least one FAIL, 2 = usage error.`
 
-function gatherChecks(opts: Options): Check[] {
+async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: PluginVersionReport }> {
   const checks: Check[] = []
 
   // Pre-flight: toolchain
@@ -1970,11 +2033,13 @@ function gatherChecks(opts: Options): Check[] {
   // RUNTIME copy; patching a different checkout silently does nothing. On a
   // fleet host several plugin servers run at once — match by CWD across ALL
   // of them ("first pgrep PID" compared another agent's server, 2026-06-09).
+  let runtimeMatched = false
   const live = probe('pgrep', ['-f', 'bun.*src/server.ts'])
   const pids = live.stdout.trim().split(/\s+/).filter(Boolean)
   if (pids.length > 0) {
     const candidates: RuntimeCandidate[] = pids.map((p) => ({ pid: p, cwd: liveCwd(p, opts.os) }))
     const { match, others } = findMatchingRuntime(candidates, opts.pluginDir)
+    runtimeMatched = match !== null
     checks.push(
       match
         ? { id: 'dev-vs-runtime', title: 'Inspected plugin matches a running copy', status: 'pass', detail: `runtime CWD ${match.cwd} (PID ${match.pid})${others > 0 ? `; ${others} other channel server(s) on this host` : ''}` }
@@ -2236,10 +2301,12 @@ function gatherChecks(opts: Options): Check[] {
     }
   }
 
-  return checks
+  const version = await pluginVersionReport(opts.pluginDirExplicit || unitAgent !== null || runtimeMatched ? opts.pluginDir : null, opts.checkLatest === true)
+  checks.unshift(versionCheck(version))
+  return { checks, version }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2))
   if ('error' in parsed) {
     if (parsed.error === 'help') {
@@ -2249,15 +2316,15 @@ function main(): void {
     process.stderr.write(`${parsed.error}\n\n${USAGE}\n`)
     process.exit(2)
   }
-  const checks = gatherChecks(parsed)
+  const { checks, version } = await gatherChecks(parsed)
   // Redact at the single output boundary so BOTH the text and JSON paths are safe.
   const safe = checks.map(redactCheck)
   if (parsed.json) {
-    process.stdout.write(JSON.stringify({ os: parsed.os, summary: worstStatus(safe), checks: safe }, null, 2) + '\n')
+    process.stdout.write(JSON.stringify({ os: parsed.os, summary: worstStatus(safe), version: JSON.parse(redact(JSON.stringify(version))) as unknown, checks: safe }, null, 2) + '\n')
   } else {
     process.stdout.write(renderReport(safe) + '\n')
   }
   process.exit(checks.some((c) => c.status === 'fail') ? 1 : 0)
 }
 
-if (import.meta.main) main()
+if (import.meta.main) await main()

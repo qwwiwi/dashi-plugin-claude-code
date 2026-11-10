@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test'
 import { dirname, join } from 'path'
 import {
   checkAllowlist,
+  pluginVersionReport,
+  versionCheck,
   checkProgressSurfaces,
   findEnclosingClaudeMd,
   checkFleet,
@@ -1314,5 +1316,42 @@ describe('checkFleet — every bypass agent has the gate enabled + hook register
     const missing = { ...base('kaelthas'), gateHookRegistered: false }
     const checks = checkFleet([base('thrall'), unknown, missing], null)
     expect(checks.find((c) => c.id === 'fleet-gate')?.status).toBe('fail')
+  })
+})
+
+
+describe('plugin version provenance', () => {
+  const files = (manifest: string | null = '1.4.2', pkg: string | null = manifest) =>
+    (p: string): string | null => {
+      const v = p === '/installed/.claude-plugin/plugin.json' ? manifest : p === '/installed/plugin/package.json' ? pkg : null
+      return v === null ? null : JSON.stringify({ version: v })
+    }
+  test('uses the selected installed root, and never contacts upstream without opt-in', async () => {
+    const r = await pluginVersionReport('/installed/plugin', false, files(), async () => { throw new Error('must not fetch') })
+    expect(r.installed).toBe('1.4.2')
+    expect(r.latest).toBe('UNKNOWN')
+    expect(r.verdict).toBe('unknown')
+    expect(versionCheck(r).detail).toContain('INSTALLED: 1.4.2')
+    expect(versionCheck(r).fix).toContain('github.com/qwwiwi')
+  })
+  test('semantic comparison reports outdated and up to date with source and time', async () => {
+    const r = await pluginVersionReport('/installed/plugin', true, files('1.9.0'), async () => ({ version: '1.10.0' }))
+    expect(r.verdict).toBe('outdated')
+    expect(r.source).toContain('raw.githubusercontent.com')
+    expect(r.checkedAt).toMatch(/^\d{4}-/)
+    expect((await pluginVersionReport('/installed/plugin', true, files(), async () => ({ version: '1.4.2' }))).verdict).toBe('up to date')
+  })
+  test('mismatch, missing manifest, malformed latest, failure and newer local version never claim current', async () => {
+    const mismatch = await pluginVersionReport('/installed/plugin', true, files('1.4.2', '1.4.1'), async () => ({ version: '1.4.2' }))
+    expect(versionCheck(mismatch).status).toBe('warn')
+    expect(mismatch.verdict).toBe('unknown')
+    expect((await pluginVersionReport(null, true, files(), async () => ({ version: '1.4.2' }))).installed).toBe('UNKNOWN')
+    expect((await pluginVersionReport('/installed/plugin', true, files(null), async () => ({ version: '1.4.2' }))).verdict).toBe('unknown')
+    for (const fetcher of [async () => ({ version: 'not a version' }), async () => { throw new Error('network unavailable') }]) {
+      const r = await pluginVersionReport('/installed/plugin', true, files(), fetcher)
+      expect(r.latest).toBe('UNKNOWN')
+      expect(r.verdict).toBe('unknown')
+    }
+    expect((await pluginVersionReport('/installed/plugin', true, files('2.0.0'), async () => ({ version: '1.4.2' }))).verdict).toBe('unknown')
   })
 })
