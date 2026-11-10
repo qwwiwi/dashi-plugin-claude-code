@@ -15,6 +15,57 @@ retroactively marks the state of `main` on 2026-06-14.
 
 ## [Unreleased]
 
+### Breaking
+- `install.sh` no longer accepts `--bot-token TOKEN`: a secret in argv is readable
+  in `ps` and `/proc/<pid>/cmdline` and stays in shell history. Supply the token via
+  `TELEGRAM_BOT_TOKEN` or the hidden prompt; the flag now fails without echoing it.
+- Removed the repository owner's baked-in Telegram user/chat IDs and permission
+  approvers. Startup now refuses a missing or empty owner allowlist. Before the
+  first restart after upgrading, set your own `allowed_user_ids` in the effective
+  `config.json` (for example `{"allowed_user_ids":[123456789]}`), or set
+  `TELEGRAM_ALLOWED_USER_IDS=123456789` in the channel environment. Env wins over
+  config; existing installs that relied on the old default must migrate explicitly.
+  Missing chat and permission-relay lists inherit the configured owner list;
+  explicitly configured lists remain unchanged. Doctor reports
+  “owner ID configured”. `TELEGRAM_OWNER_ID` is an installer input only.
+
+### Fixed
+- Linux installer: the rendered systemd unit quoted `WorkingDirectory=`, which
+  systemd does not unquote ("path is not absolute", fatal), so the unit never loaded.
+  The path is now unquoted (spaces are accepted); `systemd-analyze verify` is tested.
+- Installer: the generated wrapper no longer sources `channel.env` before starting the
+  tmux session (a tmux server copies its first client's environment into its global
+  environment, exposing the bot token to every session); the pane script still sources it.
+- Installer: a rerun with an existing `channel.env` no longer demands a token; a token
+  supplied anyway prints a warning that it was NOT applied and that rotation means
+  editing `channel.env`.
+- Installer: a user-exported `TELEGRAM_BOT_TOKEN` is dropped from the environment right
+  after it is read, so `claude --version` and `bun install` never receive it; only the
+  renderer call gets it. `update.sh` drops it too.
+- `update.sh`: no longer backs up `channel.env` (it never rewrites it); any backup of
+  `channel.env` is created mode 600. Plugin tests run with every `TELEGRAM_*` variable
+  cleared, so they cannot touch the real state dir or webhook.
+- `update.sh`: the clean-tree guard (no tracked edits, no untracked files) and the
+  `git reset --hard` rollback scope (tracked files only; ignored/untracked files are not
+  deleted) are now documented in `--help` and covered by real-git tests.
+- systemd unit: `WorkingDirectory=` escapes only `%` (as `%%`); backslashes stay literal
+  because systemd does not process backslash escapes in that directive.
+
+### Added
+- English and Russian guides for agent-assisted server installation.
+- Root `install.sh` for Linux/systemd and macOS/launchd: prerequisite checks,
+  interactive or non-interactive owner setup, hidden token input, private env file,
+  timestamped backups, standard plugin hooks, service rendering and doctor summary.
+  `--dry-run` previews actions; starting is opt-in with `--start`. Linux prints
+  exact `sudo` installation/enable commands; macOS registers launchd only on start.
+- Root `update.sh`: clean-checkout check, config/settings backups, fast-forward
+  pull, dependency install and plugin tests, rollback to the recorded commit on
+  test failure, hook refresh and doctor `--check-latest`. Restart commands are
+  printed; `--restart` is refused inside the channel's own tmux session.
+- Installation/update shell regressions run with plugin tests via
+  `cd plugin && bun test`; doctor tests run separately from the repository root
+  with `bun test skills/doctor-dashi-plugin/scripts/doctor.test.ts`; quick-install sections retain the manual Linux/macOS path.
+
 ### Changed
 - Installation templates, Linux/macOS guides and English/Russian launch examples
   use the autonomous `--permission-mode bypassPermissions` profile by default;

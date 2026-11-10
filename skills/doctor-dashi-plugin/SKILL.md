@@ -105,10 +105,20 @@ The doctor follows `plugin/src/config.ts` for fields used by its checks:
 otherwise `~/.claude/channels/dashi-telegram-canary/config.json`. File values
 merge over runtime defaults; applicable env overrides win. The report names
 the selected path/source and override **keys**, never their credential values.
-An absent config file uses defaults, as runtime does. An unreadable/invalid
+An absent config file uses defaults, as runtime does, but owner access has no default.
+The `owner-id-configured` check fails when the effective `allowed_user_ids` is absent
+or empty. Set it in the selected config.json or use `TELEGRAM_ALLOWED_USER_IDS`
+(CSV positive user IDs) before restarting. Missing chat and permission-relay lists
+inherit those explicitly configured owner IDs; explicit lists are preserved. An unreadable/invalid
 file, unknown env source or duplicate env assignments produces incomplete
 coverage, not PASS. Shell/systemd and the server .env loader resolve duplicates
 differently; verify the actual effective environment before trusting a value.
+For a known shell-loaded service env (including files rendered by `install.sh`),
+pass `--env-loader shell`. This permits literal single-quoted paths with spaces
+and other literal characters without executing the file. Only literal assignments
+are accepted; expansions, command substitution and duplicate assignments still
+produce incomplete coverage. Leave the default `--env-loader unknown` when the
+loader is not established; quoted assignments then remain unverified.
 
 This standalone diagnostic projects only fields it checks; it does not run
 full runtime schema validation or inspect the live process environment. Pass
@@ -187,6 +197,7 @@ unused, not healthy.
 | `gate-policy-path`, `permission-policy*` | Have the operator check the policy path, syntax and default tier. Review risky `confirm_overrides` deliberately: ordinary sudo/rm rules can be lifted; catastrophic forms retain separate hard denies. |
 | `webhook-bind`, `permission-endpoint` | Ask the operator to restore the loopback listener and verify GET `/health`; never POST a permission request as a probe. |
 | `env-file-mode` | Have the operator restrict env-file permissions to the service account (normally mode 600). |
+| `owner-id-configured` | Set `allowed_user_ids` in the selected config.json or `TELEGRAM_ALLOWED_USER_IDS` to the actual owner ID. Default-only installations must configure it before their next restart. |
 | `allowlist-*` | Have the operator allow the intended user AND chat in effective config/env. For DM both IDs are equal; re-run with `--user`. Group policy needs separate inspection. |
 | `mirror-terminal`, `progress-surfaces` | Follow Mirror above; verify the private target and keep one intended progress surface to avoid duplicate messages. |
 | `multichat-dm-mirror`, `multichat-dirs`, `spawn-chat-shell-tmux-pane` | Have the operator reconcile actual policy/chat folders, keep terminal output private, and use the current spawn helper with TMUX_PANE forwarding. |
@@ -198,32 +209,32 @@ unused, not healthy.
 
 ## Update
 
-There is no dedicated student updater script. Clone/development-channel manual
-updates are documented in [Linux Update](../../docs/03-installation-linux.md#update-плагина)
+For clone installations, run the repository's [update.sh](../../update.sh) from
+the actual installation root in an external terminal:
+
+```bash
+./update.sh
+```
+
+The updater records the current commit, refuses local changes, backs up config
+and settings, pulls with `--ff-only`, installs dependencies, runs plugin tests,
+re-registers standard hooks, and ends with doctor `--check-latest`. A test failure
+returns the checkout to the recorded commit and exits non-zero. Preserve any
+local work before retrying and inspect [CHANGELOG](../../CHANGELOG.md), especially
+the explicit owner-ID migration, before the next channel restart.
+
+By default it prints the exact service restart command. `./update.sh --restart`
+requests restart only outside the channel's own tmux session; never restart your
+own communication channel mid-session. After an external restart verify a real
+DM reply, mirror and pinned tasks. Updated files are not proof of what a running
+session loaded. Manual procedures remain in [Linux Update](../../docs/03-installation-linux.md#update-плагина)
 and [macOS Update](../../docs/03-installation-macos.md#update-плагина).
-Use the actual installation, not the diagnostic checkout. The external operator:
-
-1. Records the installed commit, running revision if known, and local changes;
-   backs up config and persistent state using the OS guide's backup procedure.
-2. Checks the target version and [CHANGELOG](../../CHANGELOG.md), and preserves
-   local changes before updating. Do not apply a blind pull or overwrite them.
-3. Stops the channel from an external terminal as documented for its OS,
-   follows the guide's checkout update (`git pull`), installs dependencies with
-   `bun install` from `plugin/`, then runs `bun test`
-   and `bun run typecheck`; only then starts the channel again. This diagnostic
-   never performs those operations.
-4. Re-runs this doctor and verifies a real DM reply, mirror and pinned tasks.
-   Updated files are not proof that a still-running session loaded them.
-
-The OS guides contain `git reset --hard HEAD~1`; do not use that as generic
-rollback. Restore the recorded known revision and backups with the operator's
-approval, preserving state and local changes.
 
 For marketplace installs, [RELEASING](../../docs/RELEASING.md) explains
 `/plugin update` and the manifest version requirement: source commits alone
 do not trigger an update. The repository does not provide a complete student
 marketplace runbook; use its supported management mechanism, not clone commands
-inside an assumed cache. Do not invent an updater command.
+inside an assumed cache. Use `update.sh` only for a clone installation, not a managed cache.
 
 ## Boundaries and further references
 

@@ -1434,7 +1434,7 @@ describe('resolveDoctorConfig — runtime precedence', () => {
   test('default state root and absent file apply runtime defaults', () => {
     const result = resolveDoctorConfig('', home, missing)
     expect(result.configPath).toBe('/home/student/.claude/channels/dashi-telegram-canary/config.json')
-    expect(result.config?.allowed_user_ids).toEqual([164795011])
+    expect(result.config?.allowed_user_ids).toEqual([])
     expect(result.config?.task_mirror).toMatchObject({ enabled: true })
     expect(result.config?.tmux_mirror).toMatchObject({ enabled: false })
     expect(result.check.detail).toContain('defaults')
@@ -1867,6 +1867,66 @@ describe('macOS discovery CLI integration', () => {
           }
         }
         expect(report.checks.some((c) => c.id === 'permission-endpoint')).toBe(false)
+      } finally { rmSync(fixture, { recursive: true, force: true }) }
+    })
+  }
+})
+
+
+describe('owner ID configured CLI check', () => {
+  for (const { config, env, status } of [
+    { config: {}, env: '', status: 'fail' },
+    { config: { allowed_user_ids: [] }, env: '', status: 'fail' },
+    { config: { allowed_user_ids: [42] }, env: '', status: 'pass' },
+    { config: { allowed_user_ids: [7] }, env: 'TELEGRAM_ALLOWED_USER_IDS=42', status: 'pass' },
+    { config: { allowed_user_ids: [42] }, env: 'TELEGRAM_ALLOWED_USER_IDS=', status: 'fail' },
+  ]) {
+    test(`effective owner check ${JSON.stringify(config)} ${env} => ${status}`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), 'doctor-owner-'))
+      try {
+        writeFileSync(join(fixture, 'config.json'), JSON.stringify(config))
+        writeFileSync(join(fixture, 'channel.env'), `TELEGRAM_CONFIG_FILE=config.json\n${env}`)
+        writeFileSync(join(fixture, 'settings.json'), '{}')
+        const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'),
+          '--json', '--no-autodetect', '--plugin-dir', fixture,
+          '--env', join(fixture, 'channel.env'), '--settings', join(fixture, 'settings.json'),
+        ], { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+        const report = JSON.parse(result.stdout) as { checks: Check[] }
+        expect(report.checks.find((c) => c.id === 'owner-id-configured')?.status).toBe(status)
+      } finally { rmSync(fixture, { recursive: true, force: true }) }
+    })
+  }
+})
+
+describe('explicit shell env-loader provenance', () => {
+  for (const { loader, extra, expected } of [
+    { loader: true, extra: '', expected: 'pass' },
+    { loader: false, extra: '', expected: 'warn' },
+    { loader: true, extra: '\nTELEGRAM_WORKSPACE_ROOT=$HOME/workspace', expected: 'warn' },
+    { loader: true, extra: '\nTELEGRAM_WORKSPACE_ROOT="$(touch sentinel)"', expected: 'warn' },
+    { loader: true, extra: '\nTELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_USER_IDS=7', expected: 'warn' },
+  ]) {
+    test(`quoted renderer paths, shell=${loader}, extra=${extra} => ${expected}`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), 'doctor-shell-env-'))
+      try {
+        const state = join(fixture, 'state $literal `literal` # literal')
+        mkdirSync(state)
+        const config = join(state, 'config.json')
+        writeFileSync(config, JSON.stringify({ allowed_user_ids: [42] }))
+        writeFileSync(join(fixture, 'channel.env'), [
+          `TELEGRAM_STATE_DIR='${state}'`, `TELEGRAM_CONFIG_FILE='${config}'`,
+          `TELEGRAM_WORKSPACE_ROOT='${fixture}'`,
+        ].join('\n') + extra)
+        writeFileSync(join(fixture, 'settings.json'), '{}')
+        const args = [join(import.meta.dir, 'doctor.ts'), '--json', '--no-autodetect',
+          '--plugin-dir', fixture, '--env', join(fixture, 'channel.env'), '--settings', join(fixture, 'settings.json')]
+        if (loader) args.push('--env-loader', 'shell')
+        const result = spawnSync(process.execPath, args, { cwd: fixture, encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+        expect(result.status).not.toBe(2)
+        const report = JSON.parse(result.stdout) as { checks: Check[] }
+        expect(report.checks.find(c => c.id === 'owner-id-configured')?.status).toBe(expected)
+        expect(report.checks.find(c => c.id === 'config-source')?.status).toBe(expected)
+        expect(existsSync(join(fixture, 'sentinel'))).toBe(false)
       } finally { rmSync(fixture, { recursive: true, force: true }) }
     })
   }

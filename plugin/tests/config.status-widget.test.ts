@@ -20,12 +20,12 @@ afterEach(() => {
 function load(block: unknown): ReturnType<typeof loadConfig> {
   const file = join(stateDir, 'config.json')
   writeFileSync(file, JSON.stringify({ status_widget: block }))
-  return loadConfig({ TELEGRAM_BOT_TOKEN: FAKE_TOKEN, TELEGRAM_STATE_DIR: stateDir, TELEGRAM_CONFIG_FILE: file })
+  return loadConfig({ TELEGRAM_BOT_TOKEN: FAKE_TOKEN, TELEGRAM_ALLOWED_USER_IDS: '164795011', TELEGRAM_STATE_DIR: stateDir, TELEGRAM_CONFIG_FILE: file })
 }
 
 describe('status_widget config', () => {
   test('absent block: the feature is off', () => {
-    const cfg = loadConfig({ TELEGRAM_BOT_TOKEN: FAKE_TOKEN, TELEGRAM_STATE_DIR: stateDir })
+    const cfg = loadConfig({ TELEGRAM_BOT_TOKEN: FAKE_TOKEN, TELEGRAM_ALLOWED_USER_IDS: '164795011', TELEGRAM_STATE_DIR: stateDir })
     expect(cfg.status_widget?.enabled ?? false).toBe(false)
   })
 

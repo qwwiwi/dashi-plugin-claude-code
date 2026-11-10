@@ -2,6 +2,63 @@
 
 > **Read in your language:** English (this page) · [**Русская версия →**](README.ru.md)
 
+> **Want help installing?** Give [this guide](INSTALL-WITH-AGENT.md) to Claude or Codex.
+
+## Quick installation
+
+Run this from a terminal on the host, as the user who will run the agent. Install
+`claude`, Bun, `tmux` and Git first; the installer checks versions and prints
+missing prerequisite commands. Log in to Claude Code with `claude` once.
+
+```bash
+mkdir -p ~/.claude-lab/myagent/.claude
+cd ~/.claude-lab/myagent/.claude
+git clone https://github.com/qwwiwi/dashi-plugin-claude-code.git
+cd dashi-plugin-claude-code
+./install.sh
+# Later, from this repository:
+./update.sh
+```
+
+The installer asks for the agent name, workspace path, bot token (hidden input)
+and your positive numeric Telegram user ID. It writes the token only to a private
+`channel.env` (mode `600`), installs standard plugin hooks and renders an autonomous
+service. Existing config/env are preserved; replaced files receive timestamped backups. Nothing starts unless you
+pass `--start`; on Linux it prints the exact `sudo` commands to install and enable
+the staged unit. On macOS `--start` registers the LaunchAgent, which runs at login.
+Both services restart after a crash. See the [Linux](docs/03-installation-linux.md)
+and [macOS](docs/03-installation-macos.md) guides for the manual path below.
+
+For automation use `--agent NAME --workspace PATH --owner-id ID --non-interactive`
+and supply `TELEGRAM_BOT_TOKEN` in the environment (`TELEGRAM_OWNER_ID` is also an
+installer input). There is no `--bot-token` flag: a token in argv is visible in
+`ps` and `/proc/<pid>/cmdline` and stays in shell history, so the installer rejects it.
+Use the environment or the hidden prompt. `--state-dir PATH` and `--settings PATH` select custom
+locations; `--dry-run` previews actions without writing or starting anything.
+
+`./update.sh` refuses a dirty checkout, backs up config/settings, pulls with
+`--ff-only`, installs dependencies, runs tests and refreshes plugin hooks. It prints
+a restart command and never restarts automatically. `--restart` is allowed only
+outside the channel's own tmux session; always update/restart from a separate
+terminal, never from the Telegram channel being updated. Update also supports
+`--dry-run`, `--state-dir PATH` and `--settings PATH`. Plugin and installer tests: `cd plugin && bun test`. From the repository root,
+run doctor tests with `bun test skills/doctor-dashi-plugin/scripts/doctor.test.ts`.
+
+Update needs `install.json` from the installer/renderer. For an older manual
+installation, first place its private env/config in the chosen state directory,
+then rerun `./install.sh --state-dir PATH` with the same agent/workspace/owner.
+Config/env are preserved; review doctor before starting. With multiple agents
+(or a custom state path), use `./update.sh --state-dir PATH`.
+
+**Upgrading an existing installation:** the built-in owner's ID has been removed.
+Before restarting, set your own `allowed_user_ids` in the effective `config.json`
+(e.g. `{"allowed_user_ids":[123456789]}`), or set
+`TELEGRAM_ALLOWED_USER_IDS=123456789` in the channel environment. Env overrides
+config. Missing chat and permission-relay lists inherit that owner list; explicit
+lists are preserved. A config that relied on the old default now fails startup
+with instructions instead of granting access to a foreign account. The doctor
+checks “owner ID configured”.
+
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Runtime: Bun](https://img.shields.io/badge/runtime-Bun_1.3+-f9f1e1.svg)](https://bun.sh)
 [![Language: TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)](https://www.typescriptlang.org/)
@@ -591,6 +648,11 @@ The old gateway architecture (a Python daemon spawning `claude -p` on every Tele
 ---
 
 ## 14. Multi-agent — a fleet of agents under one subscription
+
+The fleet examples below describe existing deployments. New installations use
+the foreground wrapper and `Type=simple` from the current
+[Linux guide](docs/03-installation-linux.md); this lets systemd observe a lost
+Claude/tmux session and restart it. Use that service layout for new agents.
 
 ### What it is
 
