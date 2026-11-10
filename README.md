@@ -31,8 +31,9 @@ and [macOS](docs/03-installation-macos.md) guides for the manual path below.
 
 For automation use `--agent NAME --workspace PATH --owner-id ID --non-interactive`
 and supply `TELEGRAM_BOT_TOKEN` in the environment (`TELEGRAM_OWNER_ID` is also an
-installer input). `--bot-token TOKEN` is supported; prefer the environment to keep
-secrets out of shell history. `--state-dir PATH` and `--settings PATH` select custom
+installer input). There is no `--bot-token` flag: a token in argv is visible in
+`ps` and `/proc/<pid>/cmdline` and stays in shell history, so the installer rejects it.
+Use the environment or the hidden prompt. `--state-dir PATH` and `--settings PATH` select custom
 locations; `--dry-run` previews actions without writing or starting anything.
 
 `./update.sh` refuses a dirty checkout, backs up config/settings, pulls with

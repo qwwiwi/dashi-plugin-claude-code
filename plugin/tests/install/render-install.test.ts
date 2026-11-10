@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -190,4 +190,30 @@ test('paths with literal shell metacharacters survive rendering, doctor, and a s
   const again = f.run()
   expect(again.exitCode).toBe(0)
   expect(again.stdout.toString() + again.stderr.toString()).not.toContain(token)
+})
+
+// H1: systemd does not unquote WorkingDirectory=; a quoted value is "not absolute" and fatal.
+const hasAnalyze = Bun.spawnSync(['sh', '-c', 'command -v systemd-analyze']).exitCode === 0
+function verifyUnit(unitPath: string) {
+  const p = Bun.spawnSync(['systemd-analyze', 'verify', unitPath], { env: { ...process.env, SYSTEMD_LOG_LEVEL: 'info' } })
+  return { code: p.exitCode, out: p.stdout.toString() + p.stderr.toString() }
+}
+test.skipIf(!hasAnalyze)('rendered Linux unit passes systemd-analyze verify, including a plugin dir with spaces and % \\', () => {
+  for (const dirName of ['plain-repo', 'repo with spaces', 'repo%100\\x']) {
+    const f = fixture()
+    const fakeRepo = join(f.root, dirName)
+    mkdirSync(join(fakeRepo, 'plugin'), { recursive: true })
+    cpSync(join(repo, 'examples'), join(fakeRepo, 'examples'), { recursive: true })
+    f.env.INSTALL_REPO = fakeRepo
+    const result = f.run()
+    expect(result.stderr.toString()).toBe('')
+    expect(result.exitCode).toBe(0)
+    const unitPath = join(f.state, 'channel-student.service')
+    const unit = readFileSync(unitPath, 'utf8')
+    const verdict = verifyUnit(unitPath)
+    expect(verdict.out).not.toContain('not absolute')
+    expect(verdict.out).not.toContain('fatal error')
+    expect(verdict.code).toBe(0)
+    expect(unit).not.toMatch(/^WorkingDirectory="/m)
+  }
 })

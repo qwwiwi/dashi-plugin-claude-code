@@ -16,6 +16,9 @@ retroactively marks the state of `main` on 2026-06-14.
 ## [Unreleased]
 
 ### Breaking
+- `install.sh` no longer accepts `--bot-token TOKEN`: a secret in argv is readable
+  in `ps` and `/proc/<pid>/cmdline` and stays in shell history. Supply the token via
+  `TELEGRAM_BOT_TOKEN` or the hidden prompt; the flag now fails without echoing it.
 - Removed the repository owner's baked-in Telegram user/chat IDs and permission
   approvers. Startup now refuses a missing or empty owner allowlist. Before the
   first restart after upgrading, set your own `allowed_user_ids` in the effective
@@ -25,6 +28,11 @@ retroactively marks the state of `main` on 2026-06-14.
   Missing chat and permission-relay lists inherit the configured owner list;
   explicitly configured lists remain unchanged. Doctor reports
   “owner ID configured”. `TELEGRAM_OWNER_ID` is an installer input only.
+
+### Fixed
+- Linux installer: the rendered systemd unit quoted `WorkingDirectory=`, which
+  systemd does not unquote ("path is not absolute", fatal), so the unit never loaded.
+  The path is now unquoted (spaces are accepted); `systemd-analyze verify` is tested.
 
 ### Added
 - English and Russian guides for agent-assisted server installation.

@@ -38,7 +38,7 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.dashi-plugin.
 
 Для автоматизации: `--agent NAME --workspace PATH --owner-id ID --non-interactive`;
 токен передайте через `TELEGRAM_BOT_TOKEN`, ID можно через `TELEGRAM_OWNER_ID`.
-Флаг `--bot-token TOKEN` тоже есть, но env не оставляет токен в истории команд.
+Флага `--bot-token` нет: токен в argv виден в `ps` и остаётся в истории команд, установщик его отклоняет.
 Доступны `--state-dir PATH`, `--settings PATH`, `--start`, `--dry-run`.
 `./update.sh` сохраняет config/settings, отказывается от грязного checkout,
 обновляет код через `--ff-only`, запускает тесты и обновляет hooks. Рестарт только

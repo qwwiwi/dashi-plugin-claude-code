@@ -32,8 +32,9 @@ cd dashi-plugin-claude-code
 
 Для автоматизации: `--agent NAME --workspace PATH --owner-id ID --non-interactive`,
 токен передайте через `TELEGRAM_BOT_TOKEN` (ID можно через `TELEGRAM_OWNER_ID`).
-Есть `--bot-token TOKEN`, но переменная окружения не оставляет токен в истории
-команд. `--state-dir PATH` и `--settings PATH` задают свои пути;
+Флага `--bot-token` нет: токен в argv виден в `ps` и `/proc/<pid>/cmdline` и остаётся
+в истории команд, поэтому установщик его отклоняет. Используйте переменную окружения
+или скрытый ввод. `--state-dir PATH` и `--settings PATH` задают свои пути;
 `--dry-run` показывает действия без записи и запуска.
 
 `./update.sh` отказывается работать с изменённым checkout, сохраняет config/settings,

@@ -9,11 +9,12 @@ STATE_DIR="${TELEGRAM_STATE_DIR:-}"; SETTINGS=''; OWNER_ID="${TELEGRAM_OWNER_ID:
 TOKEN="${TELEGRAM_BOT_TOKEN:-}"; DRY_RUN=0; START=0; NONINTERACTIVE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --agent|--workspace|--state-dir|--settings|--owner-id|--bot-token)
+    --agent|--workspace|--state-dir|--settings|--owner-id)
       [[ $# -ge 2 && -n "$2" ]] || fail 'Option requires a value'
-      case "$1" in --agent) AGENT="$2";; --workspace) WORKSPACE="$2";; --state-dir) STATE_DIR="$2";; --settings) SETTINGS="$2";; --owner-id) OWNER_ID="$2";; --bot-token) TOKEN="$2";; esac; shift 2;;
+      case "$1" in --agent) AGENT="$2";; --workspace) WORKSPACE="$2";; --state-dir) STATE_DIR="$2";; --settings) SETTINGS="$2";; --owner-id) OWNER_ID="$2";; esac; shift 2;;
     --dry-run) DRY_RUN=1; shift;; --start) START=1; shift;; --non-interactive) NONINTERACTIVE=1; shift;;
-    -h|--help) echo 'Usage: ./install.sh [--agent NAME --workspace PATH --owner-id ID --state-dir PATH --settings PATH] [--bot-token TOKEN] [--non-interactive] [--dry-run] [--start]'; echo 'Prefer TELEGRAM_BOT_TOKEN env or the hidden prompt; TELEGRAM_OWNER_ID supplies the installer owner ID.'; exit 0;;
+    -h|--help) echo 'Usage: ./install.sh [--agent NAME --workspace PATH --owner-id ID --state-dir PATH --settings PATH] [--non-interactive] [--dry-run] [--start]'; echo 'The bot token is never an argument (visible in ps and shell history): use the TELEGRAM_BOT_TOKEN env or the hidden prompt; TELEGRAM_OWNER_ID supplies the installer owner ID.'; exit 0;;
+    --bot-token|--bot-token=*) fail 'The bot token is not accepted as an argument (visible in ps and shell history): set TELEGRAM_BOT_TOKEN or use the hidden prompt';;
     *) fail 'Unknown option (use --help)';;
   esac
 done

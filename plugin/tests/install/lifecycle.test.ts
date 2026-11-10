@@ -55,6 +55,18 @@ describe('clone lifecycle scripts (no network or real services)', () => {
       expect(r.code).not.toBe(0); expect(r.out).toContain('owner'); expect(existsSync(f.state)).toBe(false)
     }
   })
+  test('install never accepts the bot token as an argv value (--bot-token removed)', () => {
+    const f = fixture(); const secret = '555555:ARGV_secret_TEST'
+    for (const args of [[...f.installArgs, '--bot-token', secret], [...f.installArgs, `--bot-token=${secret}`]]) {
+      const r = f.run('install.sh', args, { TELEGRAM_BOT_TOKEN: '' })
+      expect(r.code).not.toBe(0); expect(r.out).not.toContain(secret); expect(existsSync(f.state)).toBe(false)
+    }
+    const help = f.run('install.sh', ['--help'])
+    expect(help.code).toBe(0); expect(help.out).not.toContain('--bot-token')
+    // The same argv token must not be consumed even when --dry-run would otherwise succeed.
+    const dry = f.run('install.sh', [...f.installArgs, '--dry-run', '--bot-token', secret], { TELEGRAM_BOT_TOKEN: '' })
+    expect(dry.code).not.toBe(0)
+  })
   test('dry run writes nothing, logs every phase and never prints token', () => {
     const f = fixture(); const r = f.run('install.sh', [...f.installArgs, '--dry-run'])
     expect(r.code).toBe(0); expect(existsSync(f.state)).toBe(false)

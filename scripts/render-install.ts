@@ -106,7 +106,9 @@ try {
   const wrapperText = render(template('launchd-wrapper.sh.example'), { 'env-file-shell': shell(envFile), 'session-shell': shell(session), 'tmux-shell': shell(tmux), 'workspace-shell': shell(workspace), 'claude-command-shell': shell(command) })
   const values = { agent, 'service-user': userInfo().username, 'plugin-dir': pluginDir, home, path, wrapper, 'state-dir': stateDir }
   const escaped = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, platform === 'Linux' ? systemd(value) : xml(value)]))
-  if (platform === 'Linux') { escaped.wrapper = `"${escaped.wrapper!.replaceAll('$', () => '$$')}"`; escaped['plugin-dir'] = `"${escaped['plugin-dir']}"` }
+  // ExecStart= parses quoted words; WorkingDirectory= does not unquote at all (quotes make the path
+  // "not absolute", a fatal unit error) and accepts spaces, so plugin-dir stays unquoted.
+  if (platform === 'Linux') escaped.wrapper = `"${escaped.wrapper!.replaceAll('$', () => '$$')}"`
   const serviceText = render(template(platform === 'Linux' ? 'systemd-unit.service.example' : 'launchd-plist.example.plist'), escaped)
   const stamp = `${new Date().toISOString().replaceAll(':', '-')}-${process.pid}`
   function write(file: string, content: string, mode = 0o600): void {
