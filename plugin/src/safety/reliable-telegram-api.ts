@@ -74,6 +74,7 @@ import type {
   SendMessageOpts,
   SendRichMessageOpts,
   SendRichMessageResult,
+  SendWidgetParams,
   TelegramApi,
 } from '../channel/tools.js'
 
@@ -92,7 +93,7 @@ export type OutboundErrorClass = 'pre_send' | 'ambiguous' | 'rate_limited'
 
 // Pull an HTTP-ish status code from the many shapes an error can take (grammY
 // GrammyError.error_code, a fetch Response-ish .status/.statusCode).
-function extractStatusCode(err: unknown): number | undefined {
+export function extractStatusCode(err: unknown): number | undefined {
   if (typeof err !== 'object' || err === null) return undefined
   const e = err as Record<string, unknown>
   if (typeof e.error_code === 'number') return e.error_code
@@ -388,6 +389,36 @@ export function createReliableTelegramApi(
     }
   }
 
+  // Per-widget serialization (N1). A widget edit is a full-state overwrite, so
+  // the COMPLETE operation of an edit — every attempt and every backoff — runs
+  // before the next edit of the same widget (chat + message) starts. Without
+  // it the inner FIFO is released during backoff and an older edit can retry
+  // after a newer one already landed (old -> new -> old). Keyed per widget, so
+  // different widgets never wait for each other; no global lock. A failed
+  // edit only passes its turn on: the next edit starts after it settles.
+  const widgetTails = new Map<string, Promise<void>>()
+
+  async function serializeWidget<T>(
+    chatId: string,
+    messageId: number,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const key = `${chatId}:${messageId}`
+    const prev = widgetTails.get(key) ?? Promise.resolve()
+    const result = prev.then(run)
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    widgetTails.set(key, tail)
+    try {
+      return await result
+    } finally {
+      // Drop the entry once nobody queued behind us (no unbounded growth).
+      if (widgetTails.get(key) === tail) widgetTails.delete(key)
+    }
+  }
+
   return {
     async sendMessage(chatId, text, sendOpts: SendMessageOpts): Promise<{ message_id: number }> {
       // Strip the wrapper-only flag so it never travels downstream (the safe
@@ -425,6 +456,36 @@ export function createReliableTelegramApi(
       const res = await raw.sendRichMessage(chatId, rawMarkdown, richOpts)
       if ('message_id' in res) stampOutbound(chatId)
       return res
+    },
+
+    async sendWidget(chatId, params: SendWidgetParams): Promise<{ message_id: number }> {
+      // NOT retried: a widget send is non-idempotent and its transient errors
+      // are ambiguous (the card may have landed) — a retry could show the owner
+      // two widgets. A failure surfaces to the agent as an honest tool error.
+      const { skipOutboundStamp, ...rest } = params
+      const res = await raw.sendWidget(chatId, rest)
+      if (skipOutboundStamp !== true) stampOutbound(chatId)
+      return res
+    },
+
+    async editWidgetData(chatId, messageId, chatData): Promise<void> {
+      // IDEMPOTENT, like editMessageText: setting the same state twice is
+      // harmless, so pre_send AND ambiguous errors retry, and «message is not
+      // modified» (a retry after a delivered-but-unanswered first attempt, or
+      // the same state again) IS success. Not stamped as outbound: a state
+      // edit does not ping.
+      try {
+        await serializeWidget(chatId, messageId, () =>
+          withRetry(
+            true,
+            () => raw.editWidgetData(chatId, messageId, chatData),
+            () => ({ method: 'editWidgetData', chatId, body: chatData }),
+          ),
+        )
+      } catch (err) {
+        if (isNotModifiedError(err)) return
+        throw err
+      }
     },
 
     async editMessageText(chatId, messageId, text, editOpts: EditOpts): Promise<void> {

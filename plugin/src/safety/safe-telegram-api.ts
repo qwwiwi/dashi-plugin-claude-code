@@ -27,6 +27,7 @@ import type {
   InlineKeyboardLike,
   SendDocumentOpts,
   SendMessageOpts,
+  SendWidgetParams,
   SendRichMessageOpts,
   SendRichMessageResult,
   EditRichMessageResult,
@@ -36,6 +37,7 @@ import { redactSecrets } from './redact.js'
 import { validateTelegramHtml } from './html-validator.js'
 import { richErrorClass, isNotModifiedError } from '../format/rich.js'
 import type { RichLatch } from './rich-latch.js'
+import { WidgetPreSendError } from './pre-send-error.js'
 
 /**
  * Walk an inline keyboard and redact every button's `text` and `url`
@@ -138,6 +140,20 @@ export function createSafeTelegramApi(
       return { text: validated.text, parseMode: undefined }
     }
     return { text: validated.text, parseMode }
+  }
+
+  // Fail-closed guard for widget code/state (see sendWidget). The message names
+  // the field and the offset of the first change; the matched value is never
+  // echoed (it is, by definition, secret-looking).
+  const assertUnchangedByRedaction = (field: 'html' | 'chat_data', text: string): void => {
+    const redacted = redactSecrets(text, extraSecrets)
+    if (redacted === text) return
+    let offset = 0
+    const limit = Math.min(text.length, redacted.length)
+    while (offset < limit && text[offset] === redacted[offset]) offset += 1
+    throw new WidgetPreSendError(
+      `${field} looks like it contains a secret at offset ${offset}; redaction would silently change the widget ${field === 'html' ? 'code' : 'state'}, so nothing was sent — remove or split the secret-looking value`,
+    )
   }
 
   return {
@@ -269,6 +285,28 @@ export function createSafeTelegramApi(
         safeOpts.reply_markup = redactReplyMarkup(opts.reply_markup, extraSecrets)
       }
       return raw.editMessageText(chatId, messageId, safeText, safeOpts)
+    },
+
+    // Widget html and chat_data are CODE and STATE, not prose: redaction must
+    // never silently rewrite them (a masked identifier in a <script> is broken
+    // JavaScript the caller would be told was sent fine). If the redactor would
+    // change either, the call FAILS closed with the offset — never the value —
+    // and nothing is sent. The caption is plain fallback text: it is redacted
+    // like any normal message. The final size limits are enforced again at the
+    // last layer (createTelegramApi), after every transformation.
+    async sendWidget(chatId: string, params: SendWidgetParams): Promise<{ message_id: number }> {
+      assertUnchangedByRedaction('html', params.html)
+      if (params.chat_data !== undefined) assertUnchangedByRedaction('chat_data', params.chat_data)
+      const safe: SendWidgetParams = {
+        ...params,
+        caption: redactSecrets(params.caption, extraSecrets),
+      }
+      return raw.sendWidget(chatId, safe)
+    },
+
+    async editWidgetData(chatId: string, messageId: number, chatData: string): Promise<void> {
+      assertUnchangedByRedaction('chat_data', chatData)
+      return raw.editWidgetData(chatId, messageId, chatData)
     },
 
     // ─── Pass-through methods ────────────────────────────────────────

@@ -1,0 +1,139 @@
+<!doctype html>
+<!--
+State: ONE compact JSON string in TelegramWidget.chatData, UTF-8 <=1024 bytes.
+{m:[[title,[[label,percent],...]],...],j:[[name,percent,state,details?],...],l?:footer}
+m contains ACTIVE groups supplied by the producer; no status field is inferred.
+state: r=run,q=queue,d=done,f=fail,b=block. details?: {m?:model,t?:minutes,
+s?:currentStep,r?:lastResult}. Existing three-item jobs remain valid.
+All labels/text are strings; percents and minutes are finite numbers. Percent
+is rounded/clamped to 0..100; malformed percent becomes 0. Missing data is safe.
+Exact compact UTF-8 budgets (no footer): 3 titles, every title/row/job label
+11 Cyrillic letters, percent=50, state=r, 5 jobs. Each details object has
+model="local", minutes=12, step/result each 11 Cyrillic letters:
+18 rows (8+5+5), no details: 810 bytes; two detailed jobs: 968 bytes.
+11 rows (4+4+3), all five detailed: 995 bytes; 12 rows: 1025 (too large).
+Optional footer adds 7 + UTF-8 text bytes; escaping/longer text costs extra.
+Producer must measure the final serialized string, not character count.
+Display budget: 3 x 8 rows, 5 jobs. Extra rows show +N in their group title;
+extra groups/jobs share footer +N. CSS height arithmetic: <=587px including
+footer and running-step fallback (18 rows: 515px); expanded <=453px.
+These are layout budgets, not browser measurements. Titles/details are single
+line ellipsized. Expansion collapses groups to titles + mean rounded percent.
+First running job's step stays visible even without delivered click events.
+-->
+
+<style>
+*{box-sizing:border-box}
+:root{color-scheme:light;background:#fff;color:#242321;font-family:system-ui}
+body{margin:0;padding:8px;background:#fff;font:13px/16px system-ui}
+.card{padding:6px 8px;margin-bottom:6px;border:1px solid #dedcd9;background:#fff;border-radius:0;min-width:0}
+h2{margin:0 0 4px;font-size:11px;line-height:14px;font-weight:500;letter-spacing:.04em;color:#777571}
+.cut{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row,.top{display:flex;align-items:center;gap:6px;min-width:0}
+.row{height:12px;font-size:11px;line-height:12px}
+.name{flex:1;min-width:0}
+.pct{flex:none;width:32px;text-align:right;font-size:11px;font-weight:500}
+.cells{width:58px;height:4px;flex:none;background:#dedcd9}
+.job{min-height:20px;cursor:pointer}
+.step,.detail{font-size:10px;line-height:12px;color:#777571}
+.detail{padding:2px 0 4px}
+.detail .cut{height:12px}
+.state{flex:none;color:#777571;font-size:10px}
+.bar{height:3px;background:#dedcd9;margin-top:1px}
+.bar i{display:block;height:100%;background:#f4511e}
+.s-d .bar i{background:#2f7a4f}
+.s-f .bar i{background:#c8361b}
+.s-q .bar i{background:#777571}
+.s-b .bar i{background:#242321}
+.empty{padding:8px;background:#f7f6f5;color:#777571;border:1px solid #dedcd9}
+.foot{padding-top:4px;border-top:1px solid #dedcd9;color:#777571;font-size:10px;line-height:14px}
+</style>
+<div id="a"></div>
+<script>
+const root = document.getElementById('a')
+const states = {r:'run',q:'queue',d:'done',f:'fail',b:'block'}
+const demo = {m:[['Подготовка',[['План',100],['Материалы',60]]],['Выполнение',[['Обработка',42]]],['Проверка',[['Результат',0]]]],j:[['Обработка данных',42,'r',{m:'local',t:12,s:'Проверка входных данных',r:'Данные загружены'}],['Проверка результата',0,'q'],['Подготовка',100,'d']],l:'Лимиты: 2 / 8'}
+let opened = -1
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag)
+  if (cls) e.className = cls
+  if (text !== undefined) e.append(text)
+  return e
+}
+const list = v => Array.isArray(v) ? v : []
+const label = (v, fallback) => typeof v === 'string' && v.trim() ? v : fallback
+const pct = v => typeof v === 'number' && Number.isFinite(v) ? Math.max(0,Math.min(100,Math.round(v))) : 0
+const section = title => {
+  const e = el('div','card')
+  e.append(el('h2','cut','[ '+title+' ]'))
+  root.append(e)
+  return e
+}
+const render = (local = false) => {
+  if (local !== true) opened = -1
+  let d = {}
+  if (typeof TelegramWidget === 'undefined') d = demo
+  else {
+    try { d = JSON.parse(TelegramWidget.chatData) } catch (e) {}
+  }
+  if (!d || typeof d !== 'object' || Array.isArray(d)) d = {}
+  while (root.firstChild) root.removeChild(root.firstChild)
+  let rows = 0, hidden = 0
+  const jobs = list(d.j).filter(Array.isArray)
+  const active = jobs.slice(0,5).findIndex(j => j[2] === 'r')
+  const expanded = opened >= 0 && opened < Math.min(5,jobs.length)
+  const groups = list(d.m).filter(Array.isArray)
+  hidden += Math.max(0,groups.length-3)
+  for (const g of groups.slice(0,3)) {
+    const items = list(g[1]).filter(Array.isArray)
+    const overall = items.length ? Math.round(items.reduce((sum,r) => sum+pct(r[1]),0)/items.length) : 0
+    const card = section(label(g[0],'Этапы')+(expanded ? ' · '+overall+'%' : ''))
+    if (expanded) continue
+    for (const r of items.slice(0,8)) {
+      const p = pct(r[1]), line = el('div','row'), bar = el('div','cells')
+      const stop = Math.max(0,Math.round(p/20)*12-2)
+      bar.style.backgroundImage = 'repeating-linear-gradient(to right,transparent 0 10px,#fff 10px 12px),linear-gradient(to right,#f4511e '+stop+'px,#dedcd9 '+stop+'px)'
+      line.append(el('span','name cut',label(r[0],'Без названия')),bar,el('b','pct',p+'%'))
+      card.append(line)
+      rows++
+    }
+    if (items.length > 8) card.firstChild.append(' +'+(items.length-8))
+    if (!items.length) card.append(el('div','cut','нет данных'))
+  }
+  hidden += Math.max(0,jobs.length-5)
+  if (jobs.length) {
+    const card = section('Задачи')
+    for (const [index,j] of jobs.slice(0,5).entries()) {
+      const s = typeof j[2] === 'string' && /^[rqdfb]$/.test(j[2]) ? j[2] : 'q'
+      const p = pct(j[1]), job = el('div','job s-'+s), top = el('div','top')
+      top.append(el('span','name cut',label(j[0],'Без названия')),el('span','state',states[s]),el('b','pct',p+'%'))
+      const bar = el('div','bar'), fill = el('i')
+      fill.style.width = p+'%'
+      bar.append(fill)
+      job.append(top,bar)
+      const detail = j[3] && typeof j[3] === 'object' && !Array.isArray(j[3]) ? j[3] : {}
+      if (index === active && index !== opened && label(detail.s,'')) job.append(el('div','step cut',detail.s))
+      if (expanded && index === opened) {
+        const box = el('div','detail')
+        const fields = []
+        if (label(detail.m,'')) fields.push('Модель: '+detail.m)
+        if (typeof detail.t === 'number' && Number.isFinite(detail.t) && detail.t >= 0) fields.push('Минут: '+Math.floor(detail.t))
+        if (label(detail.s,'')) fields.push('Шаг: '+detail.s)
+        if (label(detail.r,'')) fields.push('Итог: '+detail.r)
+        for (const text of fields.length ? fields : ['нет данных']) box.append(el('div','cut',text))
+        job.append(box)
+      }
+      job.addEventListener('click',() => { opened = opened === index ? -1 : index; render(true) })
+      card.append(job)
+      rows++
+    }
+  }
+  if (!rows && !groups.length) root.append(el('div','empty','нет данных'))
+  const footer = label(d.l,'')
+  if (footer || hidden) root.append(el('div','foot cut',(hidden ? '+'+hidden+(footer ? ' · ' : '') : '')+footer))
+}
+render()
+if (typeof TelegramWidget !== 'undefined' && TelegramWidget && typeof TelegramWidget.onEvent === 'function') {
+  TelegramWidget.onEvent('chatDataChanged',render)
+}
+</script>

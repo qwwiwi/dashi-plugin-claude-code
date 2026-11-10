@@ -64,6 +64,8 @@ function makeRecordingApi(sent: SentRecord[]): TelegramApi {
       size: 0,
     }),
     deleteMessage: async (_c: string, _m: number) => {},
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     answerGuestQuery: async (_id: string, _t: string, _o: AnswerGuestQueryOpts) => {},
   }
 }

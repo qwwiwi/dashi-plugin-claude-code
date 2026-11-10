@@ -167,6 +167,9 @@ export interface HandlerDeps {
   // when tmux_mirror.enabled=false at startup the mirror instance is
   // never created and the OOB handler replies «disabled in config».
   tmuxMirror?: TmuxMirrorControl
+  // /card — the model-free status card service (undefined when the feature is
+  // off). Structural, so handlers stay decoupled from the service module.
+  statusWidget?: OobContext['statusWidget']
   // Context HUD / status pin (2026-07-04): bump() re-anchors the pinned
   // status card at the bottom of the chat on every inbound owner message —
   // sequenced BEFORE tmuxMirror.bump so the card lands ABOVE the mirror.
@@ -1347,6 +1350,7 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
           : {}),
         ...(deps.tmuxMirror ? { tmuxMirror: deps.tmuxMirror } : {}),
         ...(deps.tmuxKeys ? { tmuxKeys: deps.tmuxKeys } : {}),
+        ...(deps.statusWidget ? { statusWidget: deps.statusWidget } : {}),
       }
       const result = await handleOobCommand(parsed, oobCtx)
       await executeOobResult(result, oobCtx, deps.server)

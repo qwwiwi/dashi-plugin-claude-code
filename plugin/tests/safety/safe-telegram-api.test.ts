@@ -49,6 +49,8 @@ function makeStubApi(): { api: TelegramApi; calls: SentCall[] } {
       return { path: '/tmp/fake' }
     },
     async deleteMessage(_chatId, _messageId) {},
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     async answerGuestQuery(guestQueryId, text, opts) {
       calls.push({ method: 'answerGuestQuery', chatId: guestQueryId, text, opts })
     },

@@ -431,6 +431,10 @@ Without `GROQ_API_KEY` → `transcription_status="missing_key"` (no error — Cl
 
 ---
 
+### Widgets
+
+The agent can send an interactive HTML widget to a **private** chat with the `send_widget(chat_id, html, caption, chat_data?, width?, height?)` tool (Bot API `sendWidget`) and later change its state with `edit_widget_data(chat_id, message_id, chat_data)` (`editMessageWidgetData`). Limits, checked before the call: `html` at most 32768 bytes UTF-8 and at most 4096 bytes after zlib level 9, no NUL; `chat_data` at most 1024 bytes (an empty string on edit removes it); `caption` is required, at most 1024 characters (clients without widget support show it); group chats are refused. The limits are re-checked on the final payload before the HTTP call. A secret-looking string in `html` or `chat_data` fails the call instead of being masked (masking would break the widget code). Same allowlist gate as `reply`. Send and state update only: `allow_queries` is off, taps never reach the bot. A ready dark status card is `plugin/templates/status.html`. Details, errors and the compact `chat_data` shape: [plugin/docs/widgets.md](plugin/docs/widgets.md).
+
 ## 8. Session auto-restart — so the link never drops
 
 The link holds at three levels, from the smallest glitch to a process crash:

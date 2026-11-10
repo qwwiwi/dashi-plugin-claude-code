@@ -71,6 +71,8 @@ function makeStubApi(): {
       const err = editErrors.shift()
       if (err) throw err
     },
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     async answerGuestQuery() {},
     async deleteMessage() {
       ops.push({ method: 'deleteMessage' })

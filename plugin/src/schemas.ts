@@ -121,6 +121,35 @@ export const EditMessageArgsSchema = z.object({
 })
 export type EditMessageArgs = z.infer<typeof EditMessageArgsSchema>
 
+// Tool args - send_widget (Bot API sendWidget, #151 slice 1: send only, no
+// allow_queries). Byte-size / NUL / zlib limits are NOT checked here: they
+// need Buffer + zlib and live in channel/widget.ts so the refusal text can
+// name the measured size. caption is required on purpose: it is the only text
+// clients without widget support show.
+export const SendWidgetArgsSchema = z.object({
+  chat_id: z.string().min(1),
+  html: z.string().min(1),
+  caption: z
+    .string({
+      required_error:
+        'caption is required — it is the fallback text clients without widget support show',
+    })
+    .min(1, 'caption must not be empty — it is the fallback text clients without widget support show'),
+  chat_data: z.string().optional(),
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+})
+export type SendWidgetArgs = z.infer<typeof SendWidgetArgsSchema>
+
+// Tool args - edit_widget_data (Bot API editMessageWidgetData). message_id is
+// a string like edit_message; the handler converts it to a number.
+export const EditWidgetDataArgsSchema = z.object({
+  chat_id: z.string().min(1),
+  message_id: z.string().regex(/^\d+$/, 'message_id must be a positive integer'),
+  chat_data: z.string(),
+})
+export type EditWidgetDataArgs = z.infer<typeof EditWidgetDataArgsSchema>
+
 // Tool args - status (T11 wires this).
 //   state: which status label to render next.
 //   tool_name: required when state='tool', renders as `🔧 <name>`.

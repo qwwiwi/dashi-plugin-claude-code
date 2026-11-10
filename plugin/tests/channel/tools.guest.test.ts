@@ -124,6 +124,8 @@ function makeStubApi(opts: { failures?: Error[] } = {}): {
     sendPhoto: noop as unknown as TelegramApi['sendPhoto'],
     downloadFile: noop as unknown as TelegramApi['downloadFile'],
     deleteMessage: noop as unknown as TelegramApi['deleteMessage'],
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     answerGuestQuery: async (guestQueryId, text, guestOpts) => {
       const failure = failures.shift()
       if (failure) throw failure
@@ -210,6 +212,8 @@ function makeDownloadApi(): { api: TelegramApi; downloadCalls: string[] } {
       return { path: `/inbox/${fileId}.bin`, size: 10 }
     },
     deleteMessage: noop as unknown as TelegramApi['deleteMessage'],
+    async sendWidget() { return { message_id: 0 } },
+    async editWidgetData() {},
     answerGuestQuery: noop as unknown as TelegramApi['answerGuestQuery'],
   }
   return { api, downloadCalls }

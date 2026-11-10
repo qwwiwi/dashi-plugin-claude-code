@@ -37,7 +37,14 @@ import {
   type StatePaths,
 } from './config.js'
 import { createLogger } from './log.js'
-import { ensureStateDirs, migrateLegacyAllowlist, writeDeadLetter } from './state/store.js'
+import {
+  clearStatusWidgetRecord,
+  ensureStateDirs,
+  migrateLegacyAllowlist,
+  readStatusWidgetRecord,
+  writeDeadLetter,
+  writeStatusWidgetRecord,
+} from './state/store.js'
 import {
   callTool,
   createTelegramApi,
@@ -56,6 +63,9 @@ import { StatusManager } from './status/status-manager.js'
 import { ProgressReporter } from './status/progress-reporter.js'
 import { TaskMirror } from './status/task-mirror.js'
 import { TmuxMirror } from './status/tmux-mirror.js'
+import { createStatusWidgetService, isStatusWidgetChatAllowed, type StatusWidgetService } from './status/status-widget.js'
+import { runStatusCommand } from './status/status-widget-runner.js'
+import { runShutdownSequence } from './shutdown-sequence.js'
 import { defaultTmuxExec } from './status/pane-capture.js'
 import { TaskRealityMirror } from './status/task-reality-mirror.js'
 import { SessionInfoStore } from './status/session-info.js'
@@ -1326,6 +1336,39 @@ if (tmuxKeysTarget === undefined) {
   })
 }
 
+// Model-free status card (default OFF): the plugin runs the configured command
+// itself and keeps one private-chat widget up to date. Nothing from it is ever
+// injected into the model session. The /card command talks to the same service.
+let statusWidget: StatusWidgetService | undefined
+if (config.status_widget?.enabled === true && config.status_widget.chat_id !== undefined) {
+  const sw = config.status_widget
+  const swChatId = sw.chat_id as string
+  if (!isStatusWidgetChatAllowed(config, swChatId)) {
+    log.error('status widget disabled: status_widget.chat_id is not in allowed_chat_ids')
+  } else {
+    try {
+      const html = readFileSync(new URL('../templates/status.html', import.meta.url), 'utf8')
+      statusWidget = createStatusWidgetService({
+        config: { chat_id: swChatId, command: sw.command, interval_sec: sw.interval_sec, timeout_ms: sw.timeout_ms },
+        api: telegramApi,
+        runner: runStatusCommand,
+        store: {
+          load: () => readStatusWidgetRecord(statePaths),
+          save: (record) => writeStatusWidgetRecord(statePaths, record),
+          clear: () => clearStatusWidgetRecord(statePaths),
+        },
+        html,
+        redact: (text) => redactSecrets(text, apiSecrets),
+        log,
+      })
+      statusWidget.start()
+    } catch (err) {
+      statusWidget = undefined
+      log.error('status widget failed to start', { error: err instanceof Error ? err.message : String(err) })
+    }
+  }
+}
+
 const handlerDeps: HandlerDeps = {
   server: mcp,
   config,
@@ -1344,6 +1387,7 @@ const handlerDeps: HandlerDeps = {
   watcher: inboundWatcher,
   // Optional /mirror control surface — undefined when tmux_mirror.enabled=false.
   ...(tmuxMirror !== null ? { tmuxMirror } : {}),
+  ...(statusWidget !== undefined ? { statusWidget } : {}),
   // Status pin (2026-07-04): re-anchor the pinned card on every inbound owner
   // message, sequenced before the tmux-mirror bump inside handlers.ts.
   contextHud,
@@ -1420,6 +1464,9 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   log.info('shutting down')
+  // Terminal: aborts the producer, settles queued work and drains a send that
+  // is already in flight (at most 1.5 s); awaited below with the other steps.
+  const stopWidget: Promise<unknown> = statusWidget?.stop() ?? Promise.resolve()
 
   // Best-effort: clean up any pulsing status messages so the chat doesn't
   // show a stale "Печатает..." after the bot dies. Errors are swallowed
@@ -1474,9 +1521,11 @@ function shutdown(): void {
   setTimeout(() => process.exit(0), 2000)
   const stopPoller = poller ? poller.stop() : Promise.resolve()
   const stopWebhook = webhookHandle ? webhookHandle.close() : Promise.resolve()
-  void Promise.all([stopPoller, stopWebhook])
-    .then(() => Promise.resolve(bot.stop()))
-    .finally(() => process.exit(0))
+  void runShutdownSequence({
+    steps: [stopPoller, stopWebhook, stopWidget],
+    stopBot: () => bot.stop(),
+    exit: () => process.exit(0),
+  })
 }
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)

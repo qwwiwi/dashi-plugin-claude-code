@@ -421,6 +421,10 @@ Runtime-управление: `/mirror on|off|status` без рестарта п
 
 ---
 
+### Виджеты
+
+Агент может отправить интерактивный HTML-виджет в **личный** чат с ботом тулом `send_widget(chat_id, html, caption, chat_data?, width?, height?)` (Bot API `sendWidget`) и потом менять его состояние через `edit_widget_data(chat_id, message_id, chat_data)` (`editMessageWidgetData`). Лимиты, проверяются до вызова: `html` не больше 32768 байт UTF-8 и не больше 4096 байт после zlib level 9, без NUL; `chat_data` не больше 1024 байт; `caption` обязателен (его показывают клиенты без поддержки виджетов); групповые чаты отклоняются. Тот же allowlist-гейт, что у `reply`. Только отправка и обновление состояния: `allow_queries` выключен, нажатия до бота не доходят. Готовая тёмная карточка статуса — `plugin/templates/status.html`. Подробности, ошибки и компактная форма `chat_data`: [plugin/docs/widgets.md](plugin/docs/widgets.md).
+
 ## 8. Авторестарт сессии — чтобы связь не прерывалась
 
 Связь держится на трёх уровнях, от самого мелкого сбоя к падению процесса:
