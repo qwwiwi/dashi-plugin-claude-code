@@ -1,7 +1,15 @@
 import { describe, expect, test } from 'bun:test'
-import { dirname, join } from 'path'
+import { dirname, join, resolve } from 'path'
+import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { spawnSync } from 'child_process'
+import { applyPatch } from '../../../plugin/scripts/patch-claude-settings.ts'
 import {
+  checkMirror,
+  resolveDoctorConfig,
   checkAllowlist,
+  pluginVersionReport,
+  versionCheck,
   checkProgressSurfaces,
   findEnclosingClaudeMd,
   checkFleet,
@@ -153,9 +161,9 @@ describe('checkSettingsHooks', () => {
   const good = {
     hooks: {
       SessionStart: [hookEntry('dashi-channel-hook')],
-      UserPromptSubmit: [hookEntry('dashi-channel-hook')],
-      PreToolUse: [{ ...hookEntry('dashi-channel-hook'), matcher: '.*' }],
-      PostToolUse: [{ ...hookEntry('dashi-channel-hook'), matcher: '.*' }],
+      UserPromptSubmit: [hookEntry('dashi-channel-hook'), { ...hookEntry('dashi-channel-reminder-hook'), hooks: [{ command: 'bun channel-reminder.ts' }] }],
+      SessionEnd: [hookEntry('dashi-channel-hook')],
+      PostToolUse: [{ ...hookEntry('dashi-channel-hook'), matcher: 'TaskCreate|TaskUpdate|TodoWrite' }],
       Stop: [hookEntry('dashi-channel-hook'), hookEntry('dashi-channel-fallback-reply')],
     },
   }
@@ -164,7 +172,7 @@ describe('checkSettingsHooks', () => {
     const checks = checkSettingsHooks(good)
     const byId = Object.fromEntries(checks.map((c) => [c.id, c.status]))
     expect(byId['settings-no-token']).toBe('pass')
-    for (const ev of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop']) {
+    for (const ev of ['SessionStart', 'UserPromptSubmit', 'SessionEnd', 'PostToolUse', 'Stop']) {
       expect(byId[`hook-${ev}`]).toBe('pass')
     }
     expect(byId['fallback-reply-hook']).toBe('pass')
@@ -348,16 +356,16 @@ describe('checkAllowlist (user AND chat)', () => {
     expect(user?.status).toBe('fail')
     expect(user?.detail).toContain('silently dropped')
   })
-  test('empty user allowlist → warn', () => {
-    expect(checkAllowlist('TELEGRAM_ALLOWED_USER_IDS=', '42')[0]?.status).toBe('warn')
+  test('empty user allowlist with known user → fail', () => {
+    expect(checkAllowlist('TELEGRAM_ALLOWED_USER_IDS=', '42')[0]?.status).toBe('fail')
   })
   test('chat list present and chat id missing → fail', () => {
     const c = checkAllowlist('TELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=-100123', '42', '-100999')
     expect(c.find((x) => x.id === 'allowlist-chat')?.status).toBe('fail')
   })
-  test('user-only DM setup → no chat check emitted', () => {
+  test('user-only DM setup still requires chat coverage', () => {
     const c = checkAllowlist('TELEGRAM_ALLOWED_USER_IDS=42', '42')
-    expect(c.find((x) => x.id === 'allowlist-chat')).toBeUndefined()
+    expect(c.find((x) => x.id === 'allowlist-chat')?.status).toBe('warn')
   })
 })
 
@@ -699,11 +707,11 @@ describe('checkSettingsHooks — profile aware', () => {
   const stopOnly = {
     hooks: { Stop: [hookEntry('dashi-channel-hook')] },
   }
-  test('mirror profile: Stop-only settings produce ZERO feeder warns', () => {
+  test('mirror profile: Stop-only settings still warn about missing lifecycle/task hooks', () => {
     const checks = checkSettingsHooks(stopOnly, 'mirror')
     const feederWarns = checks.filter((c) => c.id.startsWith('hook-') && c.status === 'warn' && c.id !== 'hook-Stop')
-    expect(feederWarns).toHaveLength(0)
-    expect(checks.find((c) => c.id === 'hook-profile')?.status).toBe('pass')
+    expect(feederWarns).toHaveLength(4)
+    expect(checks.find((c) => c.id === 'hook-SessionEnd')?.status).toBe('warn')
     expect(checks.find((c) => c.id === 'hook-Stop')?.status).toBe('pass')
   })
   test('mirror profile: missing Stop hook still warns', () => {
@@ -1241,6 +1249,14 @@ describe('checkPermissionEndpoint — SAFE liveness probe (never POSTs the real 
 })
 
 describe('fleet — Arthas-style bypass unit is detected as bypassPermissions:true', () => {
+  for (const flag of ['--dangerously-skip-permissions', '--permission-mode=bypassPermissions', '--permission-mode bypassPermissions']) {
+    test(`missing gate fails for launch flag ${flag}`, () => {
+      const unit = parseUnitFile(`ExecStart=/usr/bin/tmux new-session -d 'claude ${flag}'`)
+      const checks = checkPermissionGate({}, existsSync0, unit.bypassPermissions, false)
+      expect(checks.find((c) => c.id === 'permission-gate')?.status).toBe('fail')
+    })
+  }
+
   test('an Arthas-style ExecStart yields bypassPermissions:true', () => {
     const unit = [
       '[Service]',
@@ -1314,5 +1330,300 @@ describe('checkFleet — every bypass agent has the gate enabled + hook register
     const missing = { ...base('kaelthas'), gateHookRegistered: false }
     const checks = checkFleet([base('thrall'), unknown, missing], null)
     expect(checks.find((c) => c.id === 'fleet-gate')?.status).toBe('fail')
+  })
+})
+
+
+describe('plugin version provenance', () => {
+  const files = (manifest: string | null = '1.4.2', pkg: string | null = manifest) =>
+    (p: string): string | null => {
+      const v = p === '/installed/.claude-plugin/plugin.json' ? manifest : p === '/installed/plugin/package.json' ? pkg : null
+      return v === null ? null : JSON.stringify({ version: v })
+    }
+  test('uses the selected installed root, and never contacts upstream without opt-in', async () => {
+    const r = await pluginVersionReport('/installed/plugin', false, files(), async () => { throw new Error('must not fetch') })
+    expect(r.installed).toBe('1.4.2')
+    expect(r.latest).toBe('UNKNOWN')
+    expect(r.verdict).toBe('unknown')
+    expect(versionCheck(r).detail).toContain('INSTALLED: 1.4.2')
+    expect(versionCheck(r).fix).toContain('github.com/qwwiwi')
+  })
+  test('semantic comparison reports outdated and up to date with source and time', async () => {
+    const r = await pluginVersionReport('/installed/plugin', true, files('1.9.0'), async () => ({ version: '1.10.0' }))
+    expect(r.verdict).toBe('outdated')
+    expect(r.source).toContain('raw.githubusercontent.com')
+    expect(r.checkedAt).toMatch(/^\d{4}-/)
+    expect((await pluginVersionReport('/installed/plugin', true, files(), async () => ({ version: '1.4.2' }))).verdict).toBe('up to date')
+  })
+  test('mismatch, missing manifest, malformed latest, failure and newer local version never claim current', async () => {
+    const mismatch = await pluginVersionReport('/installed/plugin', true, files('1.4.2', '1.4.1'), async () => ({ version: '1.4.2' }))
+    expect(versionCheck(mismatch).status).toBe('warn')
+    expect(mismatch.verdict).toBe('unknown')
+    expect((await pluginVersionReport(null, true, files(), async () => ({ version: '1.4.2' }))).installed).toBe('UNKNOWN')
+    expect((await pluginVersionReport('/installed/plugin', true, files(null), async () => ({ version: '1.4.2' }))).verdict).toBe('unknown')
+    for (const fetcher of [async () => ({ version: 'not a version' }), async () => { throw new Error('network unavailable') }]) {
+      const r = await pluginVersionReport('/installed/plugin', true, files(), fetcher)
+      expect(r.latest).toBe('UNKNOWN')
+      expect(r.verdict).toBe('unknown')
+    }
+    expect((await pluginVersionReport('/installed/plugin', true, files('2.0.0'), async () => ({ version: '1.4.2' }))).verdict).toBe('unknown')
+  })
+})
+
+// Settings-only bypass must never skip a missing security gate.
+describe('checkPermissionGate — settings bypass regression', () => {
+  test('missing gate fails when bypass is declared only in settings', () => {
+    const checks = checkPermissionGate({ permissions: { defaultMode: 'bypassPermissions' } }, existsSync0, null, false)
+    expect(checks.find((c) => c.id === 'permission-gate')?.status).toBe('fail')
+  })
+  test('launch bypass remains effective with another settings default', () => {
+    const settings = { permissions: { defaultMode: 'default' }, hooks: { PreToolUse: [
+      { marker: 'dashi-permission-gate-hook', hooks: [{ command: 'bun permission-gate-hook.ts' }] },
+    ] } }
+    expect(checkPermissionGate(settings, existsSync0, true, true).find((c) => c.id === 'permission-gate-mode')?.status).toBe('pass')
+  })
+})
+
+describe('resolveDoctorConfig — runtime precedence', () => {
+  const home = '/home/student'
+  const missing = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }) }
+  for (const env of [
+    'TELEGRAM_ASK_USER_QUESTION_ENABLED="on"',
+    "TELEGRAM_ASK_USER_QUESTION_ENABLED='on'",
+    'TELEGRAM_ALLOWED_CHAT_IDS=42 # private',
+    'export TELEGRAM_ALLOWED_USER_IDS=42',
+    ' TELEGRAM_ALLOWED_USER_IDS=42',
+    'TELEGRAM_ALLOWED_USER_IDS=42 ',
+    'TELEGRAM_CONFIG_FILE="/custom.json"',
+    'TELEGRAM_STATE_DIR="/state"',
+  ]) {
+    test(`env loader syntax difference has incomplete coverage: ${env}`, () => {
+      const result = resolveDoctorConfig(env, home, () => '{}')
+      expect(result.check.status).toBe('warn')
+      expect(result.config).toBeNull()
+      expect(result.check.detail).toContain('incomplete coverage')
+      expect(result.check.detail).toContain('env syntax')
+    })
+  }
+  test('ordinary env assignments and standalone comments retain coverage', () => {
+    const result = resolveDoctorConfig('# comment\n\nTELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=42\n', home, missing)
+    expect(result.check.status).toBe('pass')
+    expect(result.config?.allowed_chat_ids).toEqual([42])
+  })
+  test('explicit config wins over state-dir and env overrides file', () => {
+    const result = resolveDoctorConfig('TELEGRAM_CONFIG_FILE=/custom.json\nTELEGRAM_STATE_DIR=/state\nTELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_WEBHOOK_PORT=9999\nTELEGRAM_ASK_USER_QUESTION_ENABLED=on', home,
+      (path) => path === '/custom.json' ? JSON.stringify({ allowed_user_ids: [7], webhook: { enabled: true, port: 88 } }) : missing())
+    expect(result.configPath).toBe('/custom.json')
+    expect(result.config?.allowed_user_ids).toEqual([42])
+    expect(result.config?.webhook).toMatchObject({ enabled: true, host: '127.0.0.1', port: 9999 })
+    expect(result.config?.ask_user_question).toMatchObject({ enabled: true })
+    expect(result.check.detail).toContain('TELEGRAM_CONFIG_FILE')
+    expect(result.check.detail).toContain('TELEGRAM_WEBHOOK_PORT')
+  })
+  test('default state root and absent file apply runtime defaults', () => {
+    const result = resolveDoctorConfig('', home, missing)
+    expect(result.configPath).toBe('/home/student/.claude/channels/dashi-telegram-canary/config.json')
+    expect(result.config?.allowed_user_ids).toEqual([164795011])
+    expect(result.config?.task_mirror).toMatchObject({ enabled: true })
+    expect(result.config?.tmux_mirror).toMatchObject({ enabled: false })
+    expect(result.check.detail).toContain('defaults')
+  })
+  test('state-dir config is used when explicit config is absent', () => {
+    const result = resolveDoctorConfig('TELEGRAM_STATE_DIR=/state', home, (path) => {
+      expect(path).toBe('/state/config.json')
+      return '{"permission_gate":{"enabled":true}}'
+    })
+    expect(result.config?.permission_gate).toMatchObject({ enabled: true })
+  })
+  for (const raw of ['[]', 'null', '{', '{"permission_gate":{"enabled":"false"}}']) {
+    test(`invalid config has incomplete coverage: ${raw}`, () => {
+      const result = resolveDoctorConfig('', home, () => raw)
+      expect(result.config).toBeNull()
+      expect(result.check.status).toBe('warn')
+      expect(result.check.detail).toContain('incomplete coverage')
+    })
+  }
+  test('unreadable file must not pass or reveal exception text', () => {
+    const result = resolveDoctorConfig('', home, () => { throw new Error('private content') })
+    expect(result.config).toBeNull()
+    expect(result.check.status).toBe('warn')
+    expect(result.check.detail).not.toContain('private content')
+  })
+  test('unknown env source does not claim defaults are effective', () => {
+    expect(resolveDoctorConfig(null, home, missing).check.status).toBe('warn')
+    expect(resolveDoctorConfig(null, home, missing).config).toBeNull()
+  })
+  test('empty env allowlist overrides file rather than falling back', () => {
+    const result = resolveDoctorConfig('TELEGRAM_ALLOWED_CHAT_IDS=', home, () => '{"allowed_chat_ids":[42]}')
+    expect(result.config?.allowed_chat_ids).toEqual([])
+  })
+  test('invalid env port or user list cannot give effective config PASS', () => {
+    for (const env of ['TELEGRAM_WEBHOOK_PORT=bad', 'TELEGRAM_ALLOWED_USER_IDS=-42']) {
+      expect(resolveDoctorConfig(env, home, missing).check.status).toBe('warn')
+    }
+  })
+})
+
+describe('current installer hook contract', () => {
+  const installed = applyPatch({ hooks: { Stop: [{ marker: 'dashi-channel-fallback-reply', hooks: [{ type: 'command', command: 'bun fallback-reply.ts' }] }] } }, { settingsPath: '/settings.json', chatId: '42', webhookUrl: 'http://127.0.0.1:8089/hooks/agent', helperPath: '/post-hook.ts', reminderHelperPath: '/channel-reminder.ts' })
+  test('canonical current install passes without removed PreToolUse feeder', () => {
+    const checks = checkSettingsHooks(installed, 'mirror')
+    expect(checks.filter((c) => c.status === 'warn' || c.status === 'fail')).toEqual([])
+    expect(checks.some((c) => c.id === 'hook-PreToolUse')).toBe(false)
+  })
+  test('missing SessionEnd is detected even in mirror profile', () => {
+    expect(checkSettingsHooks({ ...installed, hooks: { ...installed.hooks, SessionEnd: [] } }, 'mirror').find((c) => c.id === 'hook-SessionEnd')?.status).toBe('warn')
+  })
+  test('unscoped task feeder warns', () => {
+    const broad = { hooks: { ...installed.hooks, PostToolUse: [{ ...hookEntry('dashi-channel-hook'), matcher: '.*' }] } }
+    expect(checkSettingsHooks(broad).find((c) => c.id === 'hook-PostToolUse')?.status).toBe('warn')
+  })
+  test('reminder needs its own marker and helper command', () => {
+    for (const entry of [hookEntry('dashi-channel-hook'), hookEntry('dashi-channel-reminder-hook')]) {
+      const broken = { hooks: { ...installed.hooks, UserPromptSubmit: [entry] } }
+      expect(checkSettingsHooks(broken).find((c) => c.id === 'channel-reminder-hook')?.status).toBe('warn')
+    }
+  })
+})
+
+describe('Mirror diagnostics', () => {
+  const installed = applyPatch({}, { settingsPath: '/s', chatId: '42', webhookUrl: 'http://127.0.0.1:8089/hooks/agent', helperPath: '/post-hook.ts', reminderHelperPath: '/channel-reminder.ts' })
+  const config = { allowed_chat_ids: [42], tmux_mirror: { enabled: true }, task_mirror: { enabled: true }, hud: { enabled: true }, multichat: { enabled: false } }
+  test('configured target DM and complete hooks describe expected Telegram view', () => {
+    const checks = checkMirror(config, installed, '42')
+    expect(checks.find((c) => c.id === 'mirror-hooks')?.detail).toContain('yes')
+    const terminal = checks.find((c) => c.id === 'mirror-terminal')
+    expect(terminal?.status).toBe('pass')
+    expect(terminal?.detail).toContain('tmux_mirror.enabled=true')
+    expect(terminal?.detail).toContain('/mirror on')
+    const text = renderReport(checks)
+    expect(text).toContain('Mirror')
+    expect(text).toContain('pinned')
+    expect(text).toContain('delivery unverified')
+  })
+  test('mirror off gives config prerequisite, not just on command', () => {
+    const check = checkMirror({ ...config, tmux_mirror: { enabled: false } }, installed, '42').find((c) => c.id === 'mirror-terminal')
+    expect(check?.status).toBe('warn')
+    expect(check?.fix).toContain('tmux_mirror.enabled=true')
+    expect(check?.fix).toContain('external operator')
+  })
+  test('another allowed DM is not the runtime mirror target', () => {
+    const check = checkMirror({ ...config, allowed_chat_ids: [7, 42] }, installed, '42').find((c) => c.id === 'mirror-terminal')
+    expect(check?.status).toBe('warn')
+    expect(check?.detail).toContain('allowed_chat_ids[0]')
+  })
+  test('group mirror is not reported enabled for a private chat', () => {
+    expect(checkMirror({ ...config, allowed_chat_ids: [-100] }, installed, '-100').find((c) => c.id === 'mirror-terminal')?.status).toBe('warn')
+  })
+  test('multichat policy unverified must not claim enabled for DM', () => {
+    expect(checkMirror({ ...config, multichat: { enabled: true } }, installed, '42').find((c) => c.id === 'mirror-terminal')?.status).toBe('warn')
+  })
+  test('missing config and hooks are visibly incomplete', () => {
+    const checks = checkMirror(null, null, '42')
+    expect(checks.find((c) => c.id === 'mirror-hooks')?.status).toBe('warn')
+    expect(checks.find((c) => c.id === 'mirror-terminal')?.status).toBe('warn')
+  })
+})
+
+describe('DM allowlist inference', () => {
+  test('user without --chat must be in chat allowlist too', () => {
+    const checks = checkAllowlist('TELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=7', '42')
+    expect(checks.find((c) => c.id === 'allowlist-chat')?.status).toBe('fail')
+  })
+  test('matching DM passes', () => {
+    expect(checkAllowlist('TELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=42', '42').every((c) => c.status === 'pass')).toBe(true)
+  })
+  test('explicit group chat overrides inferred DM id', () => {
+    expect(checkAllowlist('TELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=-100', '42', '-100').every((c) => c.status === 'pass')).toBe(true)
+  })
+})
+
+describe('documented diagnostic invocation', () => {
+  const skillDir = resolve(import.meta.dir, '..')
+  const repoDir = resolve(skillDir, '../..')
+  test('skill resolves doctor from its own absolute directory and works outside checkout', () => {
+    const skill = readFileSync(join(skillDir, 'SKILL.md'), 'utf8')
+    expect(skill).toContain('doctor_skill_dir="/absolute/path/to/skills/doctor-dashi-plugin"')
+    const command = skill.match(/bun "\$doctor_skill_dir\/scripts\/doctor.ts"/)
+    expect(command).not.toBeNull()
+    const result = spawnSync(process.execPath, [join(skillDir, 'scripts/doctor.ts'), '--help'], { cwd: '/tmp', encoding: 'utf8' })
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('--check-latest')
+  })
+  test('README doctor command resolves after cd plugin', () => {
+    const readme = readFileSync(join(repoDir, 'README.ru.md'), 'utf8')
+    const script = readme.match(/bun ([^\s]+doctor\.ts) --plugin-dir "\$PWD"/)?.[1]
+    expect(script).toBeDefined()
+    expect(existsSync(resolve(repoDir, 'plugin', script ?? 'missing'))).toBe(true)
+  })
+})
+
+describe('config paths belong to runtime CWD', () => {
+  test('relative explicit file resolves from plugin runtime, not diagnostic CWD', () => {
+    const result = resolveDoctorConfig('TELEGRAM_CONFIG_FILE=state/custom.json', '/home/student', (path) => {
+      expect(path).toBe('/runtime/plugin/state/custom.json')
+      return '{}'
+    }, '/runtime/plugin')
+    expect(result.configPath).toBe('/runtime/plugin/state/custom.json')
+    expect(result.check.status).toBe('pass')
+  })
+  test('relative state root resolves from plugin runtime', () => {
+    const result = resolveDoctorConfig('TELEGRAM_STATE_DIR=../state', '/home/student', (path) => {
+      expect(path).toBe('/runtime/state/config.json')
+      return '{}'
+    }, '/runtime/plugin')
+    expect(result.stateDir).toBe('/runtime/state')
+    expect(result.check.status).toBe('pass')
+  })
+  test('valid env flag overrides invalid file flag before validation, like runtime', () => {
+    const result = resolveDoctorConfig('TELEGRAM_ASK_USER_QUESTION_ENABLED=off', '/home/student', () => '{"ask_user_question":{"enabled":"wrong"}}')
+    expect(result.config?.ask_user_question).toMatchObject({ enabled: false })
+    expect(result.check.status).toBe('pass')
+  })
+})
+
+describe('effective config access edge cases', () => {
+  for (const { chats, status } of [
+    { chats: ['42,43'], status: 'fail' },
+    { chats: [' 42 '], status: 'fail' },
+    { chats: [42], status: 'pass' },
+    { chats: ['42'], status: 'pass' },
+    { chats: [], status: 'fail' },
+  ]) {
+    test(`CLI compares original chat elements for DM: ${JSON.stringify(chats)}`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), 'doctor-allowlist-'))
+      try {
+        writeFileSync(join(fixture, 'config.json'), JSON.stringify({ allowed_user_ids: [42], allowed_chat_ids: chats }))
+        writeFileSync(join(fixture, 'channel.env'), 'TELEGRAM_CONFIG_FILE=config.json')
+        writeFileSync(join(fixture, 'settings.json'), '{}')
+        const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'),
+          '--json', '--no-autodetect', '--plugin-dir', fixture,
+          '--env', join(fixture, 'channel.env'), '--settings', join(fixture, 'settings.json'), '--user', '42',
+        ], { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+        const report = JSON.parse(result.stdout) as { checks: Check[] }
+        expect(report.checks.find((c) => c.id === 'config-source')?.status).toBe('pass')
+        expect(report.checks.find((c) => c.id === 'allowlist-user')?.status).toBe('pass')
+        expect(report.checks.find((c) => c.id === 'allowlist-chat')?.status).toBe(status)
+      } finally {
+        rmSync(fixture, { recursive: true, force: true })
+      }
+    })
+  }
+
+  test('explicit empty chat allowlist blocks known DM rather than using defaults', () => {
+    const check = checkAllowlist('TELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=', '42').find((c) => c.id === 'allowlist-chat')
+    expect(check?.status).toBe('fail')
+    expect(check?.detail).not.toContain('default applies')
+  })
+  test('duplicate assignments are ambiguous without knowing the env loader', () => {
+    const result = resolveDoctorConfig('TELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=7', '/home/student', () => '{}')
+    expect(result.check.status).toBe('warn')
+    expect(result.config).toBeNull()
+    expect(result.check.detail).toContain('duplicate env assignments')
+  })
+  test('duplicate explicit config paths cannot silently select the wrong security config', () => {
+    const result = resolveDoctorConfig('TELEGRAM_CONFIG_FILE=/a\nTELEGRAM_CONFIG_FILE=/b', '/home/student', () => '{}')
+    expect(result.config).toBeNull()
+    expect(result.check.detail).toContain('duplicate env assignments')
   })
 })
