@@ -317,6 +317,17 @@ describe('status widget service: invalid or oversized state is never sent', () =
     })
   }
 
+  test('the 1024-byte limit counts the JSON without the trailing newline', async () => {
+    const accepted = makeRig()
+    accepted.results.push(ok(exact(1024) + '\n'))
+    await accepted.svc.tick()
+    expect(accepted.sends).toHaveLength(1)
+    const refused = makeRig()
+    refused.results.push(ok(exact(1025) + '\n'))
+    await refused.svc.tick()
+    expect(refused.sends).toHaveLength(0)
+  })
+
   test('exactly 1024 bytes is accepted', async () => {
     const rig = makeRig()
     rig.results.push(ok(exact(1024)))

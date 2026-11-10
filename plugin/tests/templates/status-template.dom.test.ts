@@ -209,6 +209,8 @@ describe('status.html against a fake DOM: an opened job', () => {
     h.fire()
     expect(h.text()).toContain('Сборка')
     expect(h.text()).not.toContain('Модель:')
+    // The step text must not vanish or double after the data event either.
+    expect(h.count('Шаг проверки')).toBe(1)
   })
 
   test('a job without details shows the empty detail text instead of throwing', () => {

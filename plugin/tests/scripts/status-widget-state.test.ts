@@ -324,6 +324,36 @@ describe('CLI', () => {
     expect(out.l).toBe('подвал')
   })
 
+  test('the 1024-byte limit applies to the JSON itself: stdout carries exactly the JSON, no extra byte', () => {
+    // Find (bounded search) a card whose JSON is EXACTLY 1024 bytes: many short
+    // phase rows plus an ASCII footer of 1..20 letters tune the size to the byte.
+    const phases = (n: number): Array<{ label: string; pct: number }> =>
+      Array.from({ length: n }, (_, i) => ({ label: `w${String(i).padStart(3, '0')}`, pct: 50 }))
+    const card = (n: number, footer: string): { works: unknown[]; json: string } => {
+      const works = [{ title: 'Работа', active: true, phases: phases(n) }]
+      return { works, json: buildCardState({ milestones: { works }, jobs: [], footer, nowMs: NOW }).json }
+    }
+    let hit: { n: number; footer: string; works: unknown[] } | undefined
+    for (let n = 1; n <= 200 && hit === undefined; n++) {
+      if (bytes(card(n, '').json) > 1024) break
+      for (let f = 1; f <= 20; f++) {
+        const footer = 'x'.repeat(f)
+        const c = card(n, footer)
+        if (bytes(c.json) === 1024) {
+          hit = { n, footer, works: c.works }
+          break
+        }
+      }
+    }
+    expect(hit).toBeDefined()
+    const file = join(dir, 'm.json')
+    writeFileSync(file, JSON.stringify({ works: hit!.works }))
+    const r = run(['--milestones', file, '--footer', hit!.footer, '--now', '2026-11-09T12:00:00Z'])
+    expect(r.code).toBe(0)
+    expect(bytes(r.stdout)).toBe(1024)
+    expect(JSON.parse(r.stdout)).toEqual(JSON.parse(card(hit!.n, hit!.footer).json))
+  })
+
   test('an unreadable milestones file: non-zero exit, a message on stderr, nothing on stdout', () => {
     const r = run(['--milestones', join(dir, 'missing.json')])
     expect(r.code).not.toBe(0)
