@@ -362,6 +362,11 @@ export function resolveDoctorConfig(
   for (const line of envText.split('\n')) {
     const key = line.match(/^\s*(?:export\s+)?(TELEGRAM_[A-Z0-9_]+)=/)?.[1]
     if (key === undefined) continue
+    // server.ts loads raw KEY=value; shell normalization can change its meaning.
+    const runtime = line.match(/^(\w+)=(.*)$/)
+    if (runtime?.[1] !== key || runtime[2] !== envValue(line, key, true)) {
+      return incomplete('env syntax differs between service and runtime .env loaders; verify the effective service environment')
+    }
     if (seen.has(key)) return incomplete('duplicate env assignments; verify the effective service environment')
     seen.add(key)
   }
@@ -1634,7 +1639,7 @@ export interface ParsedUnit {
   workingDirectory: string | null
   /** tmux session name from `new-session … -s <name>` (ExecStart). */
   sessionName: string | null
-  /** True when any ExecStart payload carries --permission-mode bypassPermissions. */
+  /** True when any ExecStart payload carries a permission-bypass launch flag. */
   bypassPermissions: boolean
 }
 
@@ -1650,7 +1655,7 @@ export function parseUnitFile(text: string): ParsedUnit {
     if (env?.[1]) envPath = env[1]
     const wd = line.match(/^\s*WorkingDirectory=(\S+)/)
     if (wd?.[1]) workingDirectory = wd[1]
-    if (/^\s*ExecStart=/.test(line) && /--permission-mode\s+bypassPermissions/.test(line)) {
+    if (/^\s*ExecStart=/.test(line) && /(?:^|[\s'"])--(?:dangerously-skip-permissions|permission-mode(?:=|\s+)bypassPermissions)(?=$|[\s'"])/.test(line)) {
       bypassPermissions = true
     }
     if (/^\s*Exec(Start|StartPost|Stop|StopPost)=.*tmux/.test(line)) {
@@ -2354,8 +2359,9 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
 
   // Effective allowlists include file values, runtime defaults and env overrides.
   if (stateConfig !== null) {
-    const list = (key: string): string => Array.isArray(stateConfig[key]) ? stateConfig[key].map(String).join(',') : ''
-    checks.push(...checkAllowlist(`TELEGRAM_ALLOWED_USER_IDS=${list('allowed_user_ids')}\nTELEGRAM_ALLOWED_CHAT_IDS=${list('allowed_chat_ids')}`, opts.userId, opts.chatId))
+    const list = (key: string): string[] | null => Array.isArray(stateConfig[key]) ? stateConfig[key].map(String) : null
+    checks.push(allowlistCheck('allowlist-user', 'Telegram user allowlist', 'TELEGRAM_ALLOWED_USER_IDS', list('allowed_user_ids'), opts.userId))
+    checks.push(allowlistCheck('allowlist-chat', 'Telegram chat allowlist', 'TELEGRAM_ALLOWED_CHAT_IDS', list('allowed_chat_ids'), opts.chatId ?? opts.userId))
   } else {
     checks.push({ id: 'allowlist-user', title: 'Telegram access coverage', status: 'warn', detail: 'effective config unavailable — user and chat membership unverified', fix: 'resolve config-source first, then re-run with --user (and --chat for a group)' })
   }

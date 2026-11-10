@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { dirname, join, resolve } from 'path'
-import { readFileSync, existsSync } from 'fs'
+import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
 import { spawnSync } from 'child_process'
 import { applyPatch } from '../../../plugin/scripts/patch-claude-settings.ts'
 import {
@@ -1248,6 +1249,14 @@ describe('checkPermissionEndpoint — SAFE liveness probe (never POSTs the real 
 })
 
 describe('fleet — Arthas-style bypass unit is detected as bypassPermissions:true', () => {
+  for (const flag of ['--dangerously-skip-permissions', '--permission-mode=bypassPermissions', '--permission-mode bypassPermissions']) {
+    test(`missing gate fails for launch flag ${flag}`, () => {
+      const unit = parseUnitFile(`ExecStart=/usr/bin/tmux new-session -d 'claude ${flag}'`)
+      const checks = checkPermissionGate({}, existsSync0, unit.bypassPermissions, false)
+      expect(checks.find((c) => c.id === 'permission-gate')?.status).toBe('fail')
+    })
+  }
+
   test('an Arthas-style ExecStart yields bypassPermissions:true', () => {
     const unit = [
       '[Service]',
@@ -1378,6 +1387,29 @@ describe('checkPermissionGate — settings bypass regression', () => {
 describe('resolveDoctorConfig — runtime precedence', () => {
   const home = '/home/student'
   const missing = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }) }
+  for (const env of [
+    'TELEGRAM_ASK_USER_QUESTION_ENABLED="on"',
+    "TELEGRAM_ASK_USER_QUESTION_ENABLED='on'",
+    'TELEGRAM_ALLOWED_CHAT_IDS=42 # private',
+    'export TELEGRAM_ALLOWED_USER_IDS=42',
+    ' TELEGRAM_ALLOWED_USER_IDS=42',
+    'TELEGRAM_ALLOWED_USER_IDS=42 ',
+    'TELEGRAM_CONFIG_FILE="/custom.json"',
+    'TELEGRAM_STATE_DIR="/state"',
+  ]) {
+    test(`env loader syntax difference has incomplete coverage: ${env}`, () => {
+      const result = resolveDoctorConfig(env, home, () => '{}')
+      expect(result.check.status).toBe('warn')
+      expect(result.config).toBeNull()
+      expect(result.check.detail).toContain('incomplete coverage')
+      expect(result.check.detail).toContain('env syntax')
+    })
+  }
+  test('ordinary env assignments and standalone comments retain coverage', () => {
+    const result = resolveDoctorConfig('# comment\n\nTELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=42\n', home, missing)
+    expect(result.check.status).toBe('pass')
+    expect(result.config?.allowed_chat_ids).toEqual([42])
+  })
   test('explicit config wins over state-dir and env overrides file', () => {
     const result = resolveDoctorConfig('TELEGRAM_CONFIG_FILE=/custom.json\nTELEGRAM_STATE_DIR=/state\nTELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_WEBHOOK_PORT=9999\nTELEGRAM_ASK_USER_QUESTION_ENABLED=on', home,
       (path) => path === '/custom.json' ? JSON.stringify({ allowed_user_ids: [7], webhook: { enabled: true, port: 88 } }) : missing())
@@ -1551,6 +1583,33 @@ describe('config paths belong to runtime CWD', () => {
 })
 
 describe('effective config access edge cases', () => {
+  for (const { chats, status } of [
+    { chats: ['42,43'], status: 'fail' },
+    { chats: [' 42 '], status: 'fail' },
+    { chats: [42], status: 'pass' },
+    { chats: ['42'], status: 'pass' },
+    { chats: [], status: 'fail' },
+  ]) {
+    test(`CLI compares original chat elements for DM: ${JSON.stringify(chats)}`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), 'doctor-allowlist-'))
+      try {
+        writeFileSync(join(fixture, 'config.json'), JSON.stringify({ allowed_user_ids: [42], allowed_chat_ids: chats }))
+        writeFileSync(join(fixture, 'channel.env'), 'TELEGRAM_CONFIG_FILE=config.json')
+        writeFileSync(join(fixture, 'settings.json'), '{}')
+        const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'),
+          '--json', '--no-autodetect', '--plugin-dir', fixture,
+          '--env', join(fixture, 'channel.env'), '--settings', join(fixture, 'settings.json'), '--user', '42',
+        ], { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+        const report = JSON.parse(result.stdout) as { checks: Check[] }
+        expect(report.checks.find((c) => c.id === 'config-source')?.status).toBe('pass')
+        expect(report.checks.find((c) => c.id === 'allowlist-user')?.status).toBe('pass')
+        expect(report.checks.find((c) => c.id === 'allowlist-chat')?.status).toBe(status)
+      } finally {
+        rmSync(fixture, { recursive: true, force: true })
+      }
+    })
+  }
+
   test('explicit empty chat allowlist blocks known DM rather than using defaults', () => {
     const check = checkAllowlist('TELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=', '42').find((c) => c.id === 'allowlist-chat')
     expect(check?.status).toBe('fail')
