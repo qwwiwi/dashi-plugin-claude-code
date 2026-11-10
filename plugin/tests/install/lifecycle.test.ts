@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -16,15 +16,15 @@ function fixture() {
   for (const name of ['install.sh', 'update.sh']) if (existsSync(join(root, name))) cpSync(join(root, name), join(repo, name))
   mkdirSync(join(repo, 'plugin/node_modules'), { recursive: true })
   const bin = join(dir, 'bin'); mkdirSync(bin)
-  const log = join(dir, 'calls'); const head = join(dir, 'head'); writeFileSync(head, 'old-commit\n')
+  const log = join(dir, 'calls'); const envlog = join(dir, 'envlog'); const head = join(dir, 'head'); writeFileSync(head, 'old-commit\n')
   function command(name: string, body: string) { writeFileSync(join(bin, name), `#!/bin/bash\nset -euo pipefail\n${body}\n`, { mode: 0o755 }) }
-  command('claude', 'echo "2.1.80 (Claude Code)"')
+  command('claude', 'echo "claude token=${TELEGRAM_BOT_TOKEN:+SET}" >> "$TEST_ENVLOG"; echo "2.1.80 (Claude Code)"')
   command('tmux', 'if [[ "${1:-}" == "-V" ]]; then echo "tmux 3.4"; elif [[ "${1:-}" == "display-message" ]]; then echo "${TEST_SESSION:-other}"; fi')
   command('uname', 'echo "${TEST_PLATFORM:-Linux}"')
   command('launchctl', 'echo "launchctl $*" >> "$TEST_LOG"')
   command('bun', `if [[ "\${1:-}" == "--version" ]]; then echo 1.3.14
-elif [[ "\${1:-}" == "install" ]]; then echo 'bun install' >> "$TEST_LOG"
-elif [[ "\${1:-}" == "test" ]]; then echo 'bun test' >> "$TEST_LOG"; exit "\${TEST_FAIL_TESTS:-0}"
+elif [[ "\${1:-}" == "install" ]]; then echo 'bun install' >> "$TEST_LOG"; echo "bun-install token=\${TELEGRAM_BOT_TOKEN:+SET}" >> "$TEST_ENVLOG"
+elif [[ "\${1:-}" == "test" ]]; then echo 'bun test' >> "$TEST_LOG"; { echo 'bun-test begin'; env | grep '^TELEGRAM_' | cut -d= -f1 || true; echo 'bun-test end'; } >> "$TEST_ENVLOG"; exit "\${TEST_FAIL_TESTS:-0}"
 elif [[ "\${1:-}" == *doctor.ts ]]; then echo 'doctor summary (stub)'; echo "doctor $*" >> "$TEST_LOG"
 else exec '${realBun.replace(/'/g, "'\\''")}' "$@"; fi`)
   command('git', `echo "git $*" >> "$TEST_LOG"
@@ -37,7 +37,7 @@ reset) echo old-commit > "$TEST_HEAD";;
 esac`)
   const state = join(dir, 'state'); const workspace = join(dir, 'workspace'); mkdirSync(workspace)
   const home = join(dir, 'home'); mkdirSync(home)
-  const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, TEST_LOG: log, TEST_HEAD: head,
+  const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, TEST_LOG: log, TEST_ENVLOG: envlog, TEST_HEAD: head,
     TELEGRAM_BOT_TOKEN: '123456:private_TEST_secret', TELEGRAM_OWNER_ID: '987654321',
     INSTALL_AGENT: 'student', TELEGRAM_STATE_DIR: state }
   function run(script: string, args: string[] = [], overrides: Record<string, string> = {}) {
@@ -45,7 +45,7 @@ esac`)
     return { code: p.exitCode, out: p.stdout.toString() + p.stderr.toString() }
   }
   const installArgs = ['--non-interactive', '--agent', 'student', '--workspace', workspace, '--state-dir', state]
-  return { dir, repo, state, home, log, head, env, run, installArgs }
+  return { dir, repo, bin, state, home, log, envlog, head, env, run, installArgs }
 }
 describe('clone lifecycle scripts (no network or real services)', () => {
   test('install rejects missing and malformed owner IDs before writing', () => {
@@ -140,5 +140,122 @@ describe('clone lifecycle scripts (no network or real services)', () => {
     expect(own.code).not.toBe(0); expect(own.out).toContain('channel-student'); expect(readFileSync(f.log, 'utf8')).not.toContain('launchctl kickstart')
     const external = f.run('update.sh', ['--restart', '--state-dir', f.state], { TEST_PLATFORM: 'Darwin', TMUX: '' })
     expect(external.code).toBe(0); expect(readFileSync(f.log, 'utf8')).toContain('launchctl kickstart -k'); expect(external.out).toContain('doctor summary')
+  })
+})
+
+const envLines = (path: string) => (existsSync(path) ? readFileSync(path, 'utf8') : '').split('\n').filter(Boolean)
+describe('token handling (N3, N8)', () => {
+  test('N8: a user-exported bot token never reaches claude or bun install, only the renderer', () => {
+    const f = fixture(); const r = f.run('install.sh', f.installArgs)
+    expect(r.code).toBe(0)
+    const lines = envLines(f.envlog)
+    expect(lines).toContain('claude token='); expect(lines).toContain('bun-install token=')
+    expect(lines.filter(l => l.includes('token=SET'))).toEqual([])
+    // The renderer still received it (via its own call env): it is in the private file.
+    expect(readFileSync(join(f.state, 'channel.env'), 'utf8')).toContain(f.env.TELEGRAM_BOT_TOKEN)
+  })
+  test('N8: the same holds on update (token in the environment is dropped before any tool runs)', () => {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0); writeFileSync(f.envlog, '')
+    expect(f.run('update.sh', ['--state-dir', f.state]).code).toBe(0)
+    const lines = envLines(f.envlog)
+    expect(lines).toContain('claude token=')
+    expect(lines.filter(l => l.includes('token=SET'))).toEqual([])
+  })
+  test('N3: a rerun with an existing channel.env needs no token', () => {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0)
+    const before = readFileSync(join(f.state, 'channel.env'), 'utf8')
+    const r = f.run('install.sh', f.installArgs, { TELEGRAM_BOT_TOKEN: '' })
+    expect(r.code).toBe(0); expect(r.out).not.toContain('Bot token required')
+    expect(r.out).not.toContain('NOT applied')
+    expect(readFileSync(join(f.state, 'channel.env'), 'utf8')).toBe(before)
+  })
+  test('N3: a token supplied on a rerun is warned about as NOT applied, with the rotation path', () => {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0)
+    const before = readFileSync(join(f.state, 'channel.env'), 'utf8'); const fresh = '777777:FRESH_secret_TEST'
+    const r = f.run('install.sh', f.installArgs, { TELEGRAM_BOT_TOKEN: fresh })
+    expect(r.code).toBe(0); expect(r.out).toContain('NOT applied'); expect(r.out).toContain(join(f.state, 'channel.env'))
+    expect(r.out).not.toContain(fresh); expect(r.out).not.toContain(f.env.TELEGRAM_BOT_TOKEN)
+    expect(readFileSync(join(f.state, 'channel.env'), 'utf8')).toBe(before)
+  })
+  test('N3: a first install still requires a valid token', () => {
+    const f = fixture(); const r = f.run('install.sh', f.installArgs, { TELEGRAM_BOT_TOKEN: '' })
+    expect(r.code).not.toBe(0); expect(r.out).toContain('Bot token required'); expect(existsSync(f.state)).toBe(false)
+  })
+})
+
+describe('update hygiene (N5, U1)', () => {
+  test('N5: update backs up only files it can change, never channel.env', () => {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0)
+    expect(f.run('update.sh', ['--state-dir', f.state]).code).toBe(0)
+    const names = readdirSync(f.state)
+    expect(names.filter(n => n.startsWith('channel.env.bak'))).toEqual([])
+    expect(names.some(n => n.startsWith('channel-student.service.bak.'))).toBe(true)
+    for (const n of names) if (n.includes('.bak.')) expect(readFileSync(join(f.state, n), 'utf8')).not.toContain(f.env.TELEGRAM_BOT_TOKEN)
+  })
+  test('N5: any backup of channel.env is created mode 600 even if the source was looser', () => {
+    const f = fixture(); const dir = join(f.dir, 'b'); mkdirSync(dir)
+    const target = join(dir, 'channel.env'); writeFileSync(target, 'TELEGRAM_BOT_TOKEN=1:x\n', { mode: 0o644 })
+    const p = Bun.spawnSync(['bash', '-c', 'source "$1"; backup "$2"', 'x', join(f.repo, 'scripts/lifecycle-common.sh'), target], { stdout: 'pipe', stderr: 'pipe' })
+    expect(p.exitCode).toBe(0)
+    const backups = readdirSync(dir).filter(n => n.startsWith('channel.env.bak.')); expect(backups).toHaveLength(1)
+    expect(statSync(join(dir, backups[0]!)).mode & 0o777).toBe(0o600)
+  })
+  test('U1: bun test runs with every TELEGRAM_* variable cleared', () => {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0); writeFileSync(f.envlog, '')
+    const r = f.run('update.sh', ['--state-dir', f.state], { TELEGRAM_WEBHOOK_URL: 'https://example.invalid/hook', TELEGRAM_EXTRA_PROBE: '1' })
+    expect(r.code).toBe(0)
+    const lines = envLines(f.envlog); const begin = lines.indexOf('bun-test begin'); const end = lines.indexOf('bun-test end')
+    expect(begin).toBeGreaterThanOrEqual(0); expect(lines.slice(begin + 1, end)).toEqual([])
+  })
+})
+
+describe('update refuses a dirty checkout and rollback never touches user files (U2, real git)', () => {
+  const identity = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.invalid', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }
+  function gitIn(cwd: string, ...args: string[]): string {
+    const p = Bun.spawnSync(['git', ...args], { cwd, env: { ...process.env, ...identity }, stdout: 'pipe', stderr: 'pipe' })
+    if (p.exitCode !== 0) throw new Error(`git ${args.join(' ')}: ${p.stderr.toString()}`)
+    return p.stdout.toString().trim()
+  }
+  function realGit() {
+    const f = fixture(); rmSync(join(f.bin, 'git'))
+    writeFileSync(join(f.repo, '.gitignore'), 'plugin/node_modules\nlocal-ignored.txt\n')
+    gitIn(f.repo, 'init', '-q', '-b', 'main'); gitIn(f.repo, 'add', '-A'); gitIn(f.repo, 'commit', '-q', '-m', 'base')
+    const origin = join(f.dir, 'origin.git'); gitIn(f.dir, 'init', '-q', '--bare', '-b', 'main', origin)
+    gitIn(f.repo, 'remote', 'add', 'origin', origin); gitIn(f.repo, 'push', '-q', '-u', 'origin', 'main')
+    const base = gitIn(f.repo, 'rev-parse', 'HEAD')
+    const run = (script: string, args: string[], over: Record<string, string> = {}) => f.run(script, args, { ...identity, ...over })
+    expect(run('install.sh', f.installArgs).code).toBe(0)
+    return { ...f, run, base, origin }
+  }
+  function publishUpstream(f: ReturnType<typeof realGit>): string {
+    const other = join(f.dir, 'other'); gitIn(f.dir, 'clone', '-q', f.origin, other)
+    writeFileSync(join(other, 'upstream.txt'), 'new\n'); gitIn(other, 'add', '-A'); gitIn(other, 'commit', '-q', '-m', 'upstream'); gitIn(other, 'push', '-q', 'origin', 'main')
+    return gitIn(other, 'rev-parse', 'HEAD')
+  }
+  test('tracked edits and untracked files both stop the update before any pull; nothing is touched', () => {
+    const f = realGit(); publishUpstream(f)
+    const tracked = join(f.repo, 'examples/config.example.json'); const edited = readFileSync(tracked, 'utf8') + '\n'
+    writeFileSync(tracked, edited)
+    const a = f.run('update.sh', ['--state-dir', f.state])
+    expect(a.code).not.toBe(0); expect(a.out).toContain('examples/config.example.json')
+    expect(readFileSync(tracked, 'utf8')).toBe(edited); expect(gitIn(f.repo, 'rev-parse', 'HEAD')).toBe(f.base)
+    gitIn(f.repo, 'checkout', '-q', '--', 'examples/config.example.json')
+    const mine = join(f.repo, 'my-notes.txt'); writeFileSync(mine, 'keep me\n')
+    const b = f.run('update.sh', ['--state-dir', f.state])
+    expect(b.code).not.toBe(0); expect(b.out).toContain('my-notes.txt')
+    expect(readFileSync(mine, 'utf8')).toBe('keep me\n'); expect(gitIn(f.repo, 'rev-parse', 'HEAD')).toBe(f.base)
+  })
+  test('failed validation resets tracked files to the recorded commit and leaves ignored user files alone', () => {
+    const f = realGit(); const upstream = publishUpstream(f)
+    const ignored = join(f.repo, 'local-ignored.txt'); writeFileSync(ignored, 'private\n')
+    const r = f.run('update.sh', ['--state-dir', f.state], { TEST_FAIL_TESTS: '1' })
+    expect(r.code).not.toBe(0); expect(r.out).toContain('Restoring recorded commit')
+    expect(gitIn(f.repo, 'rev-parse', 'HEAD')).toBe(f.base); expect(gitIn(f.repo, 'rev-parse', 'HEAD')).not.toBe(upstream)
+    expect(existsSync(join(f.repo, 'upstream.txt'))).toBe(false)
+    expect(readFileSync(ignored, 'utf8')).toBe('private\n')
+  })
+  test('help documents the clean-tree guard and what rollback touches', () => {
+    const f = fixture(); const r = f.run('update.sh', ['--help'])
+    expect(r.code).toBe(0); expect(r.out).toContain('untracked'); expect(r.out).toContain('git reset --hard')
   })
 })

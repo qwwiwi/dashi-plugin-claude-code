@@ -16,6 +16,8 @@ function absolute(key: string): string {
 }
 function shell(value: string): string { return `'${value.replaceAll("'", "'\\''")}'` }
 function xml(value: string): string { return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;') }
+// WorkingDirectory= is neither unquoted nor backslash-unescaped by systemd; only % is a specifier there.
+function systemdPlain(value: string): string { return value.replaceAll('%', '%%') }
 function systemd(value: string): string { return value.replaceAll('%', '%%').replaceAll('\\', '\\\\').replaceAll('"', '\\"') }
 function envLiteral(value: string): string {
   // A literal valid both when sourced by Bash and read by doctor's dotenv parser.
@@ -105,7 +107,7 @@ try {
   const command = ['/bin/bash', '-c', paneScript].map(shell).join(' ')
   const wrapperText = render(template('launchd-wrapper.sh.example'), { 'env-file-shell': shell(envFile), 'session-shell': shell(session), 'tmux-shell': shell(tmux), 'workspace-shell': shell(workspace), 'claude-command-shell': shell(command) })
   const values = { agent, 'service-user': userInfo().username, 'plugin-dir': pluginDir, home, path, wrapper, 'state-dir': stateDir }
-  const escaped = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, platform === 'Linux' ? systemd(value) : xml(value)]))
+  const escaped = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, platform === 'Linux' ? (key === 'plugin-dir' ? systemdPlain(value) : systemd(value)) : xml(value)]))
   // ExecStart= parses quoted words; WorkingDirectory= does not unquote at all (quotes make the path
   // "not absolute", a fatal unit error) and accepts spaces, so plugin-dir stays unquoted.
   if (platform === 'Linux') escaped.wrapper = `"${escaped.wrapper!.replaceAll('$', () => '$$')}"`

@@ -5,11 +5,13 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 [[ -f "$REPO/scripts/lifecycle-common.sh" ]] || { echo 'Missing lifecycle helper' >&2; exit 1; }
 source "$REPO/scripts/lifecycle-common.sh"
 STATE_DIR="${TELEGRAM_STATE_DIR:-}"; SETTINGS=''; RESTART=0; DRY_RUN=0
+# Update never needs the bot token: keep a user-exported one out of every child (claude, bun).
+unset TELEGRAM_BOT_TOKEN
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --state-dir|--settings) [[ $# -ge 2 && -n "$2" ]] || fail 'Option requires a value'; if [[ "$1" == --state-dir ]]; then STATE_DIR="$2"; else SETTINGS="$2"; fi; shift 2;;
     --restart) RESTART=1; shift;; --dry-run) DRY_RUN=1; shift;;
-    -h|--help) echo 'Usage: ./update.sh [--state-dir PATH --settings PATH] [--dry-run] [--restart]'; exit 0;;
+    -h|--help) echo 'Usage: ./update.sh [--state-dir PATH --settings PATH] [--dry-run] [--restart]'; echo 'Refuses to start if the checkout has any uncommitted change (tracked edits or untracked files). If dependency install or tests fail after the pull, it runs git reset --hard to the recorded commit: tracked files only; untracked and ignored files are never deleted.'; exit 0;;
     *) fail 'Unknown option (use --help)';;
   esac
 done
@@ -28,13 +30,14 @@ if [[ -n "$CHANGES" ]]; then echo 'Refusing update: local changes:' >&2; echo "$
 read_context
 if [[ "$RESTART" == 1 ]] && inside_channel; then restart_hint; fail "Refusing --restart inside tmux session $SESSION; run from an external terminal"; fi
 if [[ "$DRY_RUN" == 1 ]]; then
-  echo "DRY RUN: record current commit $CURRENT; timestamp backup config/env/settings/metadata/service"
-  echo 'DRY RUN: git pull --ff-only; (cd plugin && bun install && bun test); rollback to recorded commit if dependencies/tests fail'
+  echo "DRY RUN: record current commit $CURRENT; timestamp backup settings/metadata/service/wrapper/mcp (never channel.env)"
+  echo 'DRY RUN: git pull --ff-only; (cd plugin && bun install && bun test with TELEGRAM_* cleared); rollback to recorded commit if dependencies/tests fail'
   echo 'DRY RUN: re-register standard plugin/scripts/install-hooks.sh; doctor --check-latest summary'
   restart_hint
   exit 0
 fi
-for file in "$CONFIG_FILE" "$ENV_FILE" "$SETTINGS" "$STATE_DIR/install.json" "$SERVICE" "$STATE_DIR/channel-wrapper.sh" "$STATE_DIR/channel.mcp.json"; do backup "$file"; done
+# channel.env and config.json are never rewritten by update: no backup (the env file holds the plaintext token).
+for file in "$SETTINGS" "$STATE_DIR/install.json" "$SERVICE" "$STATE_DIR/channel-wrapper.sh" "$STATE_DIR/channel.mcp.json"; do backup "$file"; done
 echo "Recorded commit: $CURRENT"
 echo 'Updating checkout: git pull --ff-only'
 git pull --ff-only
@@ -46,7 +49,9 @@ rollback() {
   exit 1
 }
 echo 'Installing and testing plugin dependencies'
-(cd "$REPO/plugin" && bun install && bun test) || rollback
+# Tests must never see live TELEGRAM_* settings (real state dir, webhook): run them with all of those cleared.
+CLEAR_TELEGRAM=(); while IFS= read -r name; do CLEAR_TELEGRAM+=(-u "$name"); done < <(compgen -e | grep '^TELEGRAM_' || true)
+(cd "$REPO/plugin" && bun install && env ${CLEAR_TELEGRAM[@]+"${CLEAR_TELEGRAM[@]}"} bun test) || rollback
 require_file "$REPO/plugin/scripts/install-hooks.sh"
 echo 'Re-registering standard plugin hooks'
 TELEGRAM_STATE_DIR="$STATE_DIR" bash "$REPO/plugin/scripts/install-hooks.sh" --settings "$SETTINGS" --chat-id "$CHAT_ID" --webhook-url "$WEBHOOK_URL" --agent-id "$AGENT"

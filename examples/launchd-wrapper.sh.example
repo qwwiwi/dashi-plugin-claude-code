@@ -8,14 +8,13 @@ TMUX_BIN='<tmux-shell>'
 WORKSPACE='<workspace-shell>'
 CLAUDE_CMD='<claude-command-shell>'
 
+# Existence check only. Do not source the file here: a tmux server copies its
+# first client's environment into its global environment, which would expose the
+# bot token to every session. The pane script sources the file itself.
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing private channel environment: $ENV_FILE" >&2
   exit 78
 fi
-set -a
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-set +a
 if "$TMUX_BIN" has-session -t "$TMUX_SESSION" 2>/dev/null; then
   echo "Session $TMUX_SESSION already exists; stop it externally before starting the service." >&2
   exit 1

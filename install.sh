@@ -6,7 +6,10 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 source "$REPO/scripts/lifecycle-common.sh"
 AGENT="${INSTALL_AGENT:-${AGENT_ID:-}}"; WORKSPACE="${TELEGRAM_WORKSPACE_ROOT:-}"
 STATE_DIR="${TELEGRAM_STATE_DIR:-}"; SETTINGS=''; OWNER_ID="${TELEGRAM_OWNER_ID:-${TELEGRAM_ALLOWED_USER_IDS:-}}"
-TOKEN="${TELEGRAM_BOT_TOKEN:-}"; DRY_RUN=0; START=0; NONINTERACTIVE=0
+TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+# Keep the secret out of the environment of every child (claude, bun install); only the renderer call gets it.
+unset TELEGRAM_BOT_TOKEN
+DRY_RUN=0; START=0; NONINTERACTIVE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --agent|--workspace|--state-dir|--settings|--owner-id)
@@ -22,17 +25,26 @@ if [[ "$NONINTERACTIVE" == 0 && -t 0 ]]; then
   [[ -n "$AGENT" ]] || read -r -p 'Agent name: ' AGENT
   [[ -n "$WORKSPACE" ]] || read -r -p 'Workspace (absolute path): ' WORKSPACE
   [[ -n "$OWNER_ID" ]] || read -r -p 'Telegram owner ID (numeric): ' OWNER_ID
-  if [[ -z "$TOKEN" ]]; then read -r -s -p 'Telegram bot token (hidden): ' TOKEN; echo; fi
 fi
 [[ "$OWNER_ID" =~ ^[1-9][0-9]*$ && ${#OWNER_ID} -le 16 ]] || fail 'Telegram owner ID is required: --owner-id ID or TELEGRAM_OWNER_ID (positive numeric ID)'
 [[ ${#OWNER_ID} -lt 16 || "$OWNER_ID" < 9007199254740992 ]] || fail 'Telegram owner ID exceeds the safe integer range'
 [[ "$AGENT" =~ ^[a-z][a-z0-9_-]*$ ]] || fail 'Agent name must start with a lowercase letter and contain only a-z, 0-9, _ or -'
 [[ -n "$WORKSPACE" ]] || fail 'Workspace path required: --workspace PATH'
 absolute "$WORKSPACE"
-# Token syntax prevents multiline/env injection; never include the rejected value in errors.
-[[ "$TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || fail 'Bot token required: hidden prompt or TELEGRAM_BOT_TOKEN'
 STATE_DIR="${STATE_DIR:-$HOME/.claude/channels/$AGENT}"; SETTINGS="${SETTINGS:-$WORKSPACE/.claude/settings.json}"
 absolute "$STATE_DIR"; absolute "$SETTINGS"
+if [[ -f "$STATE_DIR/channel.env" ]]; then
+  # Rerun: the renderer keeps the existing private file, so a token is neither needed nor applied.
+  if [[ -n "$TOKEN" ]]; then
+    echo "Warning: a bot token was supplied but NOT applied: $STATE_DIR/channel.env already exists and is preserved." >&2
+    echo "To rotate the token, edit TELEGRAM_BOT_TOKEN in $STATE_DIR/channel.env (keep mode 600), then restart the channel." >&2
+  fi
+  TOKEN=''
+else
+  if [[ -z "$TOKEN" && "$NONINTERACTIVE" == 0 && -t 0 ]]; then read -r -s -p 'Telegram bot token (hidden): ' TOKEN; echo; fi
+  # Token syntax prevents multiline/env injection; never include the rejected value in errors.
+  [[ "$TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || fail 'Bot token required: hidden prompt or TELEGRAM_BOT_TOKEN'
+fi
 platform; prerequisites
 for file in scripts/render-install.ts plugin/scripts/install-hooks.sh examples/config.example.json examples/channel.env.example skills/doctor-dashi-plugin/scripts/doctor.ts; do require_file "$REPO/$file"; done
 ENV_FILE="$STATE_DIR/channel.env"; SESSION="channel-$AGENT"

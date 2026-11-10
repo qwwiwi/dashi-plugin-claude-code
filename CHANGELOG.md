@@ -33,6 +33,23 @@ retroactively marks the state of `main` on 2026-06-14.
 - Linux installer: the rendered systemd unit quoted `WorkingDirectory=`, which
   systemd does not unquote ("path is not absolute", fatal), so the unit never loaded.
   The path is now unquoted (spaces are accepted); `systemd-analyze verify` is tested.
+- Installer: the generated wrapper no longer sources `channel.env` before starting the
+  tmux session (a tmux server copies its first client's environment into its global
+  environment, exposing the bot token to every session); the pane script still sources it.
+- Installer: a rerun with an existing `channel.env` no longer demands a token; a token
+  supplied anyway prints a warning that it was NOT applied and that rotation means
+  editing `channel.env`.
+- Installer: a user-exported `TELEGRAM_BOT_TOKEN` is dropped from the environment right
+  after it is read, so `claude --version` and `bun install` never receive it; only the
+  renderer call gets it. `update.sh` drops it too.
+- `update.sh`: no longer backs up `channel.env` (it never rewrites it); any backup of
+  `channel.env` is created mode 600. Plugin tests run with every `TELEGRAM_*` variable
+  cleared, so they cannot touch the real state dir or webhook.
+- `update.sh`: the clean-tree guard (no tracked edits, no untracked files) and the
+  `git reset --hard` rollback scope (tracked files only; ignored/untracked files are not
+  deleted) are now documented in `--help` and covered by real-git tests.
+- systemd unit: `WorkingDirectory=` escapes only `%` (as `%%`); backslashes stay literal
+  because systemd does not process backslash escapes in that directive.
 
 ### Added
 - English and Russian guides for agent-assisted server installation.

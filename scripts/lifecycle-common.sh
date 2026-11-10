@@ -10,6 +10,8 @@ backup() {
     while [[ -e "$dest" ]]; do serial=$((serial + 1)); dest="${dest}.${serial}"; done
     echo "Backup: $target -> $dest"
     cp -p "$target" "$dest"
+    # A copy of the private env holds the plaintext bot token: never leave it readable by others.
+    if [[ "$(basename "$target")" == channel.env ]]; then chmod 600 "$dest"; fi
   fi
 }
 require_file() { [[ -f "$1" ]] || fail "Missing required file: $1"; }

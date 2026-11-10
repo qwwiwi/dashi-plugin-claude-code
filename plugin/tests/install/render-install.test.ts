@@ -217,3 +217,48 @@ test.skipIf(!hasAnalyze)('rendered Linux unit passes systemd-analyze verify, inc
     expect(unit).not.toMatch(/^WorkingDirectory="/m)
   }
 })
+
+// N1: the wrapper must not source the env file itself. A real multiplexer server copies the client's
+// environment into its global environment on first start, which would publish the bot token to every
+// later session. The recording stub stands in for that server: whatever it sees at new-session is
+// what the real one would store (a real-server check needs a host multiplexer, which jobs cannot start).
+test('wrapper hands the multiplexer a token-free environment at new-session', async () => {
+  const f = fixture()
+  const seen = join(f.root, 'seen-token')
+  const alive = join(f.root, 'alive')
+  const fakeTmux = join(f.root, 'tmux')
+  writeFileSync(fakeTmux, `#!/bin/bash\ncase "$1" in\n has-session) test -f '${alive}' ;;\n new-session) printf '%s|%s' "\${TELEGRAM_BOT_TOKEN:-absent}" "\${TELEGRAM_ALLOWED_USER_IDS:-absent}" > '${seen}'; touch '${alive}' ;;\n kill-session) rm -f '${alive}' ;;\n send-keys) : ;;\nesac\n`, { mode: 0o700 })
+  f.env.INSTALL_TMUX = fakeTmux
+  expect(f.run().exitCode).toBe(0)
+  const clean = { ...process.env }; delete clean.TELEGRAM_BOT_TOKEN; delete clean.TELEGRAM_ALLOWED_USER_IDS
+  const child = Bun.spawn(['/bin/bash', join(f.state, 'channel-wrapper.sh')], { stdout: 'ignore', stderr: 'ignore', env: clean })
+  try {
+    await waitFor(() => existsSync(seen))
+    expect(readFileSync(seen, 'utf8')).toBe('absent|absent')
+  } finally {
+    child.kill('SIGTERM')
+    await child.exited
+  }
+})
+
+test('wrapper still refuses to start when the private env file is missing', () => {
+  const f = fixture()
+  expect(f.run().exitCode).toBe(0)
+  rmSync(join(f.state, 'channel.env'))
+  const p = Bun.spawnSync(['/bin/bash', join(f.state, 'channel-wrapper.sh')], { stdout: 'pipe', stderr: 'pipe' })
+  expect(p.exitCode).toBe(78)
+  expect(p.stderr.toString()).toContain('Missing private channel environment')
+})
+
+// U3: WorkingDirectory= is not unquoted and has no backslash escapes; only % is a specifier there.
+test('WorkingDirectory= escapes only % and keeps backslashes literal', () => {
+  const f = fixture()
+  const fakeRepo = join(f.root, 'repo%1\\x y')
+  mkdirSync(join(fakeRepo, 'plugin'), { recursive: true })
+  cpSync(join(repo, 'examples'), join(fakeRepo, 'examples'), { recursive: true })
+  f.env.INSTALL_REPO = fakeRepo
+  expect(f.run().exitCode).toBe(0)
+  const unit = readFileSync(join(f.state, 'channel-student.service'), 'utf8')
+  const line = unit.split('\n').find(l => l.startsWith('WorkingDirectory='))
+  expect(line).toBe(`WorkingDirectory=${join(fakeRepo, 'plugin').replaceAll('%', '%%')}`)
+})
