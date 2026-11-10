@@ -19,6 +19,7 @@
 //   TELEGRAM_WEBHOOK_TOKEN   bearer token configured on the plugin
 //   TELEGRAM_HOOK_CHAT_ID    target Telegram chat id (string or numeric)
 //   TELEGRAM_HOOK_AGENT_ID   optional agent id (defaults to no agentId)
+//   TELEGRAM_HOOK_TIMEOUT_MS optional positive HTTP deadline (default 3000 ms)
 
 export interface HookRequest {
   readonly url: string
@@ -150,11 +151,16 @@ async function main(): Promise<void> {
 
   // Narrow to HookRequest after the discriminator check.
   const request = req as HookRequest
+  const configuredTimeout = Number(process.env.TELEGRAM_HOOK_TIMEOUT_MS)
+  const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? configuredTimeout
+    : 3000
   try {
     const response = await fetch(request.url, {
       method: 'POST',
       headers: { ...request.headers },
       body: request.body,
+      signal: AbortSignal.timeout(timeoutMs),
     })
     if (!response.ok) {
       // Don't log response body — could contain server-emitted Zod issues

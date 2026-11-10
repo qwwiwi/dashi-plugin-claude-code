@@ -21,10 +21,15 @@ Environment=HOME=/home/<service-user>
 Environment=PATH=/home/<service-user>/.bun/bin:/home/<service-user>/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=LANG=en_US.UTF-8
 
+# Autonomous launch: bypassPermissions disables Claude Code action confirmations.
+# For confirmations, remove --permission-mode bypassPermissions; optionally add
+# --permission-gate to scripts/install-hooks.sh with your installation arguments
+# and set permission_gate.enabled=true in the plugin configuration.
+
 # Claude Code требует TTY → tmux session
 Type=forking
 ExecStart=/usr/bin/tmux new-session -d -s channel-<agent> \
-  claude --dangerously-load-development-channels server:dashi-channel
+  claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel
 
 # Первый Enter автоматически проходит welcome-промт "Allow external imports".
 # Второй (если есть) — нужно вручную через tmux attach + Enter, или поднять persistent fix

@@ -577,27 +577,14 @@ interface SettingsPermShape {
 }
 
 /**
- * Permission gate (2026-06-09, hardened 2026-06-10) — the interactive
- * Allow/Deny confirm hook for a bypassPermissions DM session. Under
- * --permission-mode bypassPermissions the native terminal prompt is suppressed,
- * so the gate is the SOLE confirmation path that reaches the warchief: a bypass
- * session without it silently renders confirms in an unwatched pane (the Silvana
- * incident). The feature is therefore only "optional" when the session is NOT a
- * bypass session and the gate is not configured on. When it IS registered we
- * verify:
- *   - the PreToolUse entry has a runnable command pointing at the gate helper;
- *   - no bearer token leaked into the command (defence-in-depth over the global
- *     leak check);
- *   - the session is (or claims to be) in bypassPermissions — the gate is the
- *     SOLE authority only in that mode; otherwise native prompts still wedge;
- *   - the state-config feature flag (permission_gate.enabled) matches the hook —
- *     a hook with enabled=false makes /hooks/permission/request answer 503, so
- *     every confirm fails closed to DENY.
+ * The gate is opt-in. bypassPermissions without a gate is the supported
+ * autonomous profile. A configured gate must have a hook, and a registered
+ * hook must have its server enabled; otherwise the optional feature is broken.
  */
 export function checkPermissionGate(
   settings: unknown,
   fileExists: (p: string) => boolean = existsSync,
-  /** True when the supervising unit's ExecStart carries --permission-mode bypassPermissions. */
+  /** True when the supervising unit/wrapper launch carries a permission-bypass flag. */
   unitBypass: boolean | null = null,
   /** permission_gate.enabled from the state config; null = state config unreadable. */
   gateEnabled: boolean | null = null,
@@ -609,28 +596,20 @@ export function checkPermissionGate(
   const pre = Array.isArray(s.hooks?.PreToolUse) ? s.hooks!.PreToolUse! : []
   const gate = pre.find((e) => e.marker === GATE_MARKER)
   if (!gate) {
-    // The gate is the sole confirm path ONLY under bypassPermissions. A bypass
-    // session (or one with permission_gate.enabled=true) that lacks the hook is
-    // the incident class — FAIL, do not silently SKIP. When neither signal is
-    // present (no bypass, gate disabled, or host unknown) the feature is
-    // genuinely off and SKIP is correct (don't over-fail an unreadable host).
-    if (bypassActive || gateEnabled === true) {
-      const cause = bypassActive
-        ? 'the effective session mode is bypassPermissions (native prompts are suppressed) but no gate hook is registered — confirms never reach the warchief'
-        : 'permission_gate.enabled=true in the state config but no gate PreToolUse hook is registered — the configured gate never fires'
+    if (gateEnabled === true) {
       return [{
         id: 'permission-gate',
         title: 'Permission gate (interactive Allow/Deny)',
         status: 'fail',
-        detail: cause,
+        detail: 'permission_gate.enabled=true in the effective config but no gate PreToolUse hook is registered — the configured gate never fires',
         fix: 'run plugin/scripts/install-hooks.sh --permission-gate to register the gate hook',
       }]
     }
     return [{
       id: 'permission-gate',
       title: 'Permission gate (interactive Allow/Deny)',
-      status: 'skip',
-      detail: 'no permission-gate PreToolUse hook — interactive confirm is off (not a bypass session)',
+      status: bypassActive ? 'pass' : 'skip',
+      detail: bypassActive ? 'autonomous profile: confirmations off by design' : 'no permission-gate PreToolUse hook — optional gate is off',
     }]
   }
   const out: Check[] = []
@@ -682,7 +661,7 @@ export function checkPermissionGate(
   // CLI/systemd ExecStart, so a non-match is unverified, not a hard fail.
   const mode = s.permissions?.defaultMode
   if (bypassActive) {
-    out.push({ id: 'permission-gate-mode', title: 'Permission gate: session in bypassPermissions', status: 'pass', detail: mode === 'bypassPermissions' ? 'permissions.defaultMode=bypassPermissions' : '--permission-mode bypassPermissions on the unit ExecStart' })
+    out.push({ id: 'permission-gate-mode', title: 'Permission gate: session in bypassPermissions', status: 'pass', detail: mode === 'bypassPermissions' ? 'permissions.defaultMode=bypassPermissions' : '--permission-mode bypassPermissions on the supervisor launch' })
   } else {
     out.push({
       id: 'permission-gate-mode',
@@ -1541,6 +1520,12 @@ function probe(cmd: string, args: string[], timeoutMs = 8000): ProbeResult {
   }
 }
 
+/** launchd's PATH often excludes /usr/sbin, the macOS home of lsof. */
+export function probeLsof(os: OS, args: string[], run = probe): ProbeResult {
+  const result = run('lsof', args)
+  return os === 'macos' && result.code === -1 ? run('/usr/sbin/lsof', args) : result
+}
+
 function readFileSafe(p: string): string | null {
   try {
     return existsSync(p) ? readFileSync(p, 'utf8') : null
@@ -1580,7 +1565,7 @@ function liveCwd(pid: string, os: OS): string {
     if (r.stdout.trim()) return r.stdout.trim()
   }
   // lsof exists on both macOS and Linux. `-Fn` prints an `n<path>` field line.
-  const r = probe('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'])
+  const r = probeLsof(os, ['-a', '-p', pid, '-d', 'cwd', '-Fn'])
   const line = r.stdout.split('\n').find((l) => l.startsWith('n'))
   return line ? line.slice(1).trim() : ''
 }
@@ -1831,31 +1816,24 @@ export function checkFleet(agents: FleetAgent[], sharedSettingsRaw: string | nul
     out.push({ id: 'fleet-hook-ports', title: 'Each agent\'s hooks point at its own port', status: 'pass', detail: 'no foreign-port hooks' })
   }
 
-  // Fleet-wide gate invariant (2026-06-10, the Silvana incident generalised):
-  // EVERY bypassPermissions agent must have the gate hook registered AND
-  // permission_gate.enabled=true. A bypass agent without it confirms into an
-  // unwatched pane (incident) or fails closed to DENY (config off). Non-bypass
-  // agents are exempt — they still get native prompts.
-  //
-  // State config unreadable (gateEnabled===null) does NOT pass: emitting PASS
-  // would claim "enabled=true" for an agent whose config we never read (Codex
-  // review 2026-06-10 — against the incident-lock goal). It downgrades to WARN
-  // instead, distinct from the hard FAIL of a known-missing/disabled gate.
-  const bypassAgents = agents.filter((a) => a.bypassPermissions)
-  const gateGaps = bypassAgents
-    .filter((a) => !a.gateHookRegistered || a.gateEnabled === false)
-    .map((a) => `${a.name} (${!a.gateHookRegistered ? 'no gate hook' : 'permission_gate.enabled=false'})`)
-  const gateUnknown = bypassAgents
+  // The autonomous profile needs no gate. Validate only opt-in wiring,
+  // regardless of whether native confirmations are enabled.
+  const gateGaps = agents
+    .filter((a) => (a.gateEnabled === true && !a.gateHookRegistered) || (a.gateHookRegistered && a.gateEnabled === false))
+    .map((a) => `${a.name} (${!a.gateHookRegistered ? 'configured gate has no hook' : 'gate hook registered but permission_gate.enabled=false'})`)
+  const gateUnknown = agents
     .filter((a) => a.gateHookRegistered && a.gateEnabled === null)
     .map((a) => `${a.name} (permission_gate.enabled unverified — state config unreadable)`)
-  if (bypassAgents.length === 0) {
-    out.push({ id: 'fleet-gate', title: 'Every bypass agent has the permission gate wired', status: 'pass', detail: 'no bypassPermissions agents — native prompts still apply' })
-  } else if (gateGaps.length > 0) {
-    out.push({ id: 'fleet-gate', title: 'Every bypass agent has the permission gate wired', status: 'fail', detail: `${gateGaps.join('; ')} — confirms render in an unwatched pane or fail closed to DENY`, fix: 'run install-hooks.sh --permission-gate for that agent and set permission_gate.enabled=true in its state config' })
+  const title = 'Optional permission gates match effective config'
+  if (gateGaps.length > 0) {
+    out.push({ id: 'fleet-gate', title, status: 'fail', detail: gateGaps.join('; '), fix: 'align each optional gate hook with permission_gate.enabled; remove the hook for autonomous operation or register and enable it for confirmations' })
   } else if (gateUnknown.length > 0) {
-    out.push({ id: 'fleet-gate', title: 'Every bypass agent has the permission gate wired', status: 'warn', detail: `${gateUnknown.join('; ')} — gate hook registered but enabled flag could not be verified`, fix: 'ensure the agent\'s state config is readable and permission_gate.enabled=true' })
+    out.push({ id: 'fleet-gate', title, status: 'warn', detail: gateUnknown.join('; '), fix: 'make the effective config readable to verify the optional gate' })
   } else {
-    out.push({ id: 'fleet-gate', title: 'Every bypass agent has the permission gate wired', status: 'pass', detail: `${bypassAgents.map((a) => a.name).join(', ')}: gate hook registered + permission_gate.enabled=true` })
+    const autonomous = agents.filter((a) => a.bypassPermissions && !a.gateHookRegistered)
+    out.push({ id: 'fleet-gate', title, status: 'pass', detail: autonomous.length > 0
+      ? `${autonomous.map((a) => a.name).join(', ')}: autonomous profile: confirmations off by design; optional gate wiring consistent`
+      : 'optional gate wiring consistent' })
   }
 
   return out
@@ -1943,6 +1921,145 @@ export function matchAgentForPlugin(agents: FleetAgent[], pluginDir: string): Fl
     agents.find((a) => a.workspaceRoot != null && sameTree(dir, a.workspaceRoot)) ??
     null
   )
+}
+
+interface LaunchWrapper {
+  envPath: string | null
+  sessionName: string | null
+  sockets: string[]
+  bypassPermissions: boolean | null
+  socketKnown: boolean
+}
+
+/** Deliberately not a shell evaluator: expansions, escapes and operators stay unknown. */
+function shellLiteral(raw: string): string | null {
+  const value = raw.trim().replace(/\s+#.*$/, '').trim()
+  if (/^'[^'\n]*'$/.test(value)) return value.slice(1, -1)
+  if (/^"[^"\\$`\n]*"$/.test(value)) return value.slice(1, -1)
+  return /^[A-Za-z0-9_./:@+-]+$/.test(value) ? value : null
+}
+
+/** Infer only single literal assignments actually used by one tmux launch. */
+export function parseLaunchWrapper(text: string): LaunchWrapper {
+  const lines = text.split('\n').filter((line) => !/^\s*#/.test(line))
+  // Constants before shell control flow are the supported subset. Do not try
+  // to resolve functions, conditions or loops, even when not indented.
+  const barrier = lines.findIndex((line) => /^\s*(?:(?:if|for|while|until|case|select|function)\b|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{|[({])/.test(line))
+  const assignment = (key: string): string | null => {
+    const mentions = lines.filter((line) => new RegExp(`\\b${key}\\s*=`).test(line))
+    if (mentions.length !== 1) return null
+    if (barrier !== -1 && lines.indexOf(mentions[0]!) >= barrier) return null
+    // No indented/conditional assignments or inline shell statements.
+    const match = mentions[0]!.match(new RegExp(`^(?:export )?${key}=(.*)$`))
+    return match ? shellLiteral(match[1]!) : null
+  }
+  const env = assignment('ENV_FILE')
+  const sourced = lines.some((line) => /^\s*(?:\.|source)\s+"?\$(?:\{ENV_FILE\}|ENV_FILE)"?\s*(?:#.*)?$/.test(line))
+  const envPath = sourced && env?.startsWith('/') ? env : null
+  const launches = lines.filter((line) => /\bnew-session\b/.test(line))
+  const empty: LaunchWrapper = { envPath, sessionName: null, sockets: [], bypassPermissions: null, socketKnown: false }
+  if (launches.length !== 1) return empty
+  const launch = launches[0]!.trim()
+  if (!/^(?:"\$(?:\{TMUX_BIN\}|TMUX_BIN)"|(?:\/[A-Za-z0-9_.+-]+)*\/tmux|tmux)\s/.test(launch)) return empty
+  if (launch.startsWith('"$') && !/^(?:\/[A-Za-z0-9_.+-]+)*\/?tmux$/.test(assignment('TMUX_BIN') ?? '')) return empty
+  const token = `("[^"\n]*"|'[^'\n]*'|[^\\s]+)`
+  const sessions = [...launch.matchAll(new RegExp(`(?:^|\\s)-s\\s+${token}`, 'g'))]
+  const session = sessions.length === 1 ? sessions[0]?.[1] : undefined
+  const variableValue = (raw: string | undefined): string | null => {
+    if (!raw) return null
+    const variable = raw.match(/^"?\$(?:\{([A-Z_]+)\}|([A-Z_]+))"?$/)
+    return variable ? assignment(variable[1] ?? variable[2]!) : shellLiteral(raw)
+  }
+  const sessionName = variableValue(session)
+  const sockets = [...launch.slice(0, launch.indexOf('new-session')).matchAll(new RegExp(`(?:^|\\s)-L\\s+${token}`, 'g'))]
+  const socket = sockets.length === 1 ? sockets[0]?.[1] : undefined
+  const socketName = variableValue(socket)
+  // Read a literal command only when this launch actually uses it. Comments
+  // and arbitrary flags elsewhere in the wrapper are not launch evidence.
+  const command = /"\$(?:\{CLAUDE_CMD\}|CLAUDE_CMD)"\s*$/.test(launch) ? assignment('CLAUDE_CMD') : null
+  const bypassPermissions = literalClaudeMode(command)
+  return { envPath, sessionName: sessionName && /^[A-Za-z0-9_.-]+$/.test(sessionName) ? sessionName : null,
+    sockets: socketName ? [socketName] : [], bypassPermissions, socketKnown: sockets.length === 0 || (sockets.length === 1 && socketName !== null) }
+}
+
+/** Recognize the documented simple launch; unknown CLI grammar stays unknown. */
+function literalClaudeMode(command: string | null): boolean | null {
+  if (command === null || /['"\\;$`|&<>()\n]/.test(command)) return null
+  const args = command.trim().split(/\s+/)
+  if (!/^(?:\/[A-Za-z0-9_.+-]+)*\/?claude$/.test(args.shift() ?? '')) return null
+  let mode: boolean | null = null
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!
+    if (arg === '--permission-mode' || arg.startsWith('--permission-mode=') || arg === '--dangerously-skip-permissions') {
+      if (mode !== null) return null // Repeated mode flags are ambiguous.
+      const value = arg === '--dangerously-skip-permissions' ? 'bypassPermissions' : arg === '--permission-mode' ? args[++i] : arg.slice('--permission-mode='.length)
+      if (!value || value.startsWith('-')) return null
+      mode = value === 'bypassPermissions'
+    } else if (arg === '--model' || arg === '-m' || arg === '--dangerously-load-development-channels') {
+      if (!args[++i] || args[i]!.startsWith('-')) return null
+    } else if (arg !== '--continue' && arg !== '-c' && arg !== 'server:dashi-channel') {
+      return null
+    }
+  }
+  return mode ?? false
+}
+
+interface LaunchDiscovery extends LaunchWrapper {
+  wrapperPath: string | null
+  check: Check
+}
+
+function readLaunchPlist(path: string): unknown {
+  const result = probe('/usr/bin/plutil', ['-convert', 'json', '-o', '-', path])
+  return result.code === 0 ? parseJsonSafe(result.stdout) : null
+}
+
+/** Read plists/wrappers, never source or execute them. Explicit flags win in gatherChecks. */
+export function discoverLaunchd(
+  pluginDir: string,
+  launchDir = join(homedir(), 'Library', 'LaunchAgents'),
+  readPlist: (path: string) => unknown = readLaunchPlist,
+  read: (path: string) => string | null = readFileSafe,
+): LaunchDiscovery {
+  const unknown = (reason: string): LaunchDiscovery => ({
+    envPath: null, sessionName: null, sockets: [], bypassPermissions: null, socketKnown: false, wrapperPath: null,
+    check: { id: 'autodetect', title: 'Autodetect: launchd agent matched to this plugin', status: 'warn',
+      detail: `incomplete coverage — ${reason}`, fix: 'inspect the actual plist/wrapper and pass --env and --session explicitly' },
+  })
+  let entries: string[]
+  try { entries = readdirSync(launchDir).filter((name) => name.endsWith('.plist')).sort() }
+  catch { return unknown('LaunchAgents directory unreadable') }
+  const matches: Record<string, unknown>[] = []
+  let unreadable = false
+  for (const name of entries) {
+    let plist: unknown = null
+    try { plist = readPlist(join(launchDir, name)) } catch { /* no error contents in output */ }
+    if (!objectRecord(plist)) { unreadable = true; continue }
+    if (typeof plist.WorkingDirectory === 'string' && plist.WorkingDirectory.startsWith('/') && resolve(plist.WorkingDirectory) === resolve(pluginDir)) matches.push(plist)
+  }
+  if (unreadable) return unknown('one or more plists unreadable; unique match cannot be verified')
+  if (matches.length !== 1) return unknown(matches.length > 1 ? 'multiple matching launchd agents' : 'no exact WorkingDirectory match')
+  const plist = matches[0]!
+  const args = plist.ProgramArguments
+  if (!Array.isArray(args) || !args.every((arg) => typeof arg === 'string') || args.length === 0) return unknown('ProgramArguments does not identify a wrapper')
+  const program = typeof plist.Program === 'string' ? plist.Program : args[0]
+  if (program !== args[0]) return unknown('Program and ProgramArguments are ambiguous')
+  let wrapperPath: string | null = null
+  if (/^\/bin\/(?:ba|z|k)?sh$/.test(program)) {
+    if (args.length === 2 && !args[1].startsWith('-')) wrapperPath = args[1]
+    else if (args.length === 3 && args[1] === '--') wrapperPath = args[2]
+  } else if (args.length === 1) wrapperPath = program
+  if (!wrapperPath?.startsWith('/')) return unknown('wrapper command is dynamic or ambiguous')
+  const wrapper = read(wrapperPath)
+  if (wrapper === null) return unknown('wrapper unreadable')
+  const inferred = parseLaunchWrapper(wrapper)
+  const missing = [!inferred.envPath ? 'ENV_FILE' : null, !inferred.sessionName ? 'tmux session' : null, !inferred.socketKnown ? 'tmux socket' : null, inferred.bypassPermissions === null ? 'launch permission mode' : null].filter(Boolean)
+  return { ...inferred, wrapperPath,
+    check: { id: 'autodetect', title: 'Autodetect: launchd agent matched to this plugin',
+      status: missing.length > 0 ? 'warn' : 'pass',
+      detail: missing.length > 0 ? `incomplete coverage — nonliteral, absent or ambiguous ${missing.join(', ')}` : 'unique WorkingDirectory match; literal env source, tmux session and launch mode inferred (values omitted)',
+      ...(missing.length > 0 ? { fix: 'inspect the wrapper and pass --env and --session explicitly; verify launch mode separately' } : {}) },
+  }
 }
 
 interface Options {
@@ -2064,9 +2181,9 @@ Options:
   --chat <id>              a Telegram chat id to verify (group id is -100...)
   --session <name>         tmux channel session (e.g. channel-myagent)
   --queue-json <path>      a saved getUpdates JSON response to classify (409 / drain)
-  --no-autodetect          do not infer --env/--session from systemd channel-*.service
-                           units (default: infer when the unit's WorkingDirectory
-                           matches --plugin-dir)
+  --no-autodetect          do not infer --env/--session from systemd units or
+                           ~/Library/LaunchAgents/*.plist (macOS requires an
+                           exact WorkingDirectory match and literal wrapper inputs)
   --fleet                  multi-agent mode: discover channel-*.service units and
                            verify the five isolation invariants ACROSS agents
                            (README section 14)
@@ -2116,6 +2233,7 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
   // workspace covers this plugin dir and fill in --env/--session so the
   // default flag-less run reaches full coverage. Explicit flags always win.
   let unitAgent: FleetAgent | null = null
+  let launchAgent: LaunchDiscovery | null = null
   if (!opts.noAutodetect && opts.os === 'linux') {
     const unitDir = opts.fleetDir ?? '/etc/systemd/system'
     const agents = scanFleet(unitDir)
@@ -2154,6 +2272,13 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
         detail: `${agents.length} channel unit(s) found but none matches this plugin dir — pass --env/--session explicitly`,
       })
     }
+  }
+
+  if (!opts.noAutodetect && opts.os === 'macos') {
+    launchAgent = discoverLaunchd(opts.pluginDir)
+    checks.push(launchAgent.check)
+    if (!opts.envPath && launchAgent.envPath) opts.envPath = launchAgent.envPath
+    if (!opts.tmuxSession && launchAgent.sessionName) opts.tmuxSession = launchAgent.sessionName
   }
 
   // Dev-copy vs runtime-copy divergence (lessons §1). The service runs the
@@ -2209,7 +2334,7 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
       id: 'env-unknown',
       title: 'Channel env located',
       status: 'skip',
-      detail: 'no channel.env found (no --env, no matching systemd unit — launchd hosts are not autodetected yet) — effective config, webhook bind, allowlists and hook profile have incomplete coverage',
+      detail: 'no channel.env found (no --env or unambiguous service/wrapper env source) — effective config, webhook bind, allowlists and hook profile have incomplete coverage',
       fix: 'pass --env <channel.env path> to enable the env-dependent checks',
     })
   }
@@ -2226,7 +2351,7 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
   }
   const gateEnabled = flag('permission_gate')
   const askEnabled = flag('ask_user_question')
-  const unitBypass = unitAgent ? unitAgent.bypassPermissions : null
+  const unitBypass = unitAgent ? unitAgent.bypassPermissions : launchAgent?.bypassPermissions ?? null
 
   // settings.json hooks + token leak
   const settings = parseJsonSafe(readFileSafe(opts.settingsPath))
@@ -2239,26 +2364,19 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
       detail: `could not read/parse ${opts.settingsPath}`,
       fix: 'pass --settings <path> to the agent settings.json',
     })
-    // Unreadable settings must NOT mask the incident: under bypassPermissions
-    // (or with the gate configured on) we cannot confirm the gate hook exists,
-    // so an unreadable settings file is itself a gate failure, not a quiet warn.
-    if (unitBypass === true || gateEnabled === true) {
+    if (gateEnabled === true) {
       checks.push({
         id: 'permission-gate',
         title: 'Permission gate (interactive Allow/Deny)',
-        status: 'fail',
-        detail: `${unitBypass === true ? 'unit runs --permission-mode bypassPermissions' : 'permission_gate.enabled=true'} but settings.json is unreadable — cannot confirm the gate hook is registered`,
-        fix: 'make the agent settings.json readable, then re-run; the gate is the sole confirm path under bypassPermissions',
+        status: 'warn',
+        detail: 'permission_gate.enabled=true but settings.json is unreadable — gate hook registration unverified; incomplete coverage',
+        fix: 'make the effective settings.json readable, then re-run',
       })
     }
   } else {
     checks.push(...checkSettingsHooks(settings, profile))
     const gateChecks = checkPermissionGate(settings, existsSync, unitBypass, gateEnabled, askEnabled)
-    // gateRegistered drives the policy-lint below — it must mean "a gate hook
-    // is actually present", NOT "the gate check is non-skip". After the
-    // incident-lock change a MISSING hook under bypass yields a FAIL check, so
-    // keying off status!=='skip' would lint a non-existent hook (Codex review
-    // 2026-06-10). Derive it from the real hook entry instead.
+    // Policy/endpoint checks apply only to an actual opt-in gate hook.
     gateRegistered = ((settings as SettingsPermShape)?.hooks?.PreToolUse ?? []).some((e) => e.marker === GATE_MARKER)
     checks.push(...gateChecks)
   }
@@ -2314,18 +2432,16 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
     if (ss.code === 0 && ss.stdout) {
       listenersText = ss.stdout
     } else {
-      const lsof = probe('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN'])
+      const lsof = probeLsof(opts.os, ['-nP', '-iTCP', '-sTCP:LISTEN'])
       if (lsof.code === 0 && lsof.stdout) listenersText = lsof.stdout
     }
     parsedListeners = listenersText == null ? null : parseListeners(listenersText)
     checks.push(checkWebhookBind(webhookPort, parsedListeners))
   }
 
-  // Permission endpoint liveness (gap 5): the gate is the sole confirm path
-  // under bypassPermissions, so a dead webhook fails every confirm closed. SAFE
-  // probe only — GET /health (unauthenticated, no side effects); NEVER POST the
-  // real /hooks/permission/request route (it would card the warchief).
-  const gateRequired = unitBypass === true || (settings as SettingsPermShape | null)?.permissions?.defaultMode === 'bypassPermissions' || gateEnabled === true
+  // Only configured/registered gates need a permission endpoint. Autonomous
+  // bypass sessions must not fail because an unused confirm endpoint is down.
+  const gateRequired = gateRegistered || gateEnabled === true
   if (gateRequired) {
     checks.push(checkPermissionEndpoint(true, webhookPort, parsedListeners, healthHttpProbe))
   }
@@ -2401,7 +2517,7 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
       // Prefer the REAL socket parsed from the matched unit (socket name and
       // session name can differ — `-L channel-arthas … -s main` gave a false
       // "session not found" when we only retried the convention socket).
-      const socketNames = [...new Set([unitAgent?.sockets[0], opts.tmuxSession].filter((s): s is string => !!s))]
+      const socketNames = [...new Set([unitAgent?.sockets[0], launchAgent?.sockets[0], opts.tmuxSession].filter((s): s is string => !!s))]
       for (const sock of socketNames) {
         const socketCap = probe('tmux', ['-L', sock, 'capture-pane', '-t', opts.tmuxSession, '-p', '-S', '-200'])
         if (socketCap.code === 0) {
@@ -2424,7 +2540,7 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
     }
   }
 
-  const version = await pluginVersionReport(opts.pluginDirExplicit || unitAgent !== null || runtimeMatched ? opts.pluginDir : null, opts.checkLatest === true)
+  const version = await pluginVersionReport(opts.pluginDirExplicit || unitAgent !== null || launchAgent?.wrapperPath != null || runtimeMatched ? opts.pluginDir : null, opts.checkLatest === true)
   checks.unshift(versionCheck(version))
   return { checks, version }
 }

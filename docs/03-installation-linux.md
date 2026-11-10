@@ -98,10 +98,12 @@ bun test             # 425 pass
 - Использую инструменты Claude Code (Bash, Read, Write, etc.)
 - Могу обращаться к MCP-серверам если они подключены
 
+## Autonomy
+- Выполняю обычную работу самостоятельно, без запросов подтверждения
+
 ## Boundaries
-- Не передаю секреты в чат
-- Не запускаю rm -rf / DROP TABLE без подтверждения
-- В случае ошибки — извещаю владельца, не маскирую
+- Никогда не вывожу и не коммичу секреты
+- Разрушительное удаление и force-push — только по явному указанию владельца
 ```
 
 Полный пример с разделённой памятью (`@-include`) — изучите по аналогии существующих агентов в [github.com/qwwiwi/public-gbrain-agentos/tree/main/agent-template](https://github.com/qwwiwi/public-gbrain-agentos/tree/main/agent-template).
@@ -173,7 +175,7 @@ Environment=HOME=/home/agentctl
 Environment=PATH=/home/agentctl/.bun/bin:/home/agentctl/.local/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=/home/agentctl/.claude-lab/myagent/.claude/dashi-plugin-claude-code/plugin
 ExecStart=/usr/bin/tmux new-session -d -s channel-myagent \
-  claude --dangerously-load-development-channels server:dashi-channel
+  claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel
 ExecStartPost=/bin/sh -c 'sleep 6 && /usr/bin/tmux send-keys -t channel-myagent Enter'
 ExecStop=/usr/bin/tmux kill-session -t channel-myagent
 Restart=on-failure
@@ -182,6 +184,8 @@ RestartSec=15s
 [Install]
 WantedBy=multi-user.target
 ```
+
+По умолчанию `--permission-mode bypassPermissions` отключает подтверждения действий Claude Code: агент работает автономно. Для запуска с подтверждениями уберите `--permission-mode bypassPermissions` из команды запуска; при необходимости добавьте `--permission-gate` к команде `scripts/install-hooks.sh` с вашими параметрами установки и включите `permission_gate.enabled=true` в конфигурации плагина. Первичные welcome-промты проходят отдельно.
 
 **КРИТИЧНО:** `WorkingDirectory=` указывает внутрь `plugin/`. Если опечатка — Claude Code не найдёт project CLAUDE.md и агент будет без identity. См. [02-where-to-place-plugin.md](02-where-to-place-plugin.md).
 

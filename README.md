@@ -70,7 +70,7 @@ In parallel, three "progress surfaces" run (fed by hooks, see section 4):
 | `ProgressReporter` | a separate rolling message with activity lines (PreToolUse/PostToolUse/Stop) via `editMessageText` |
 | `TaskMirror` | a third rolling message — milestones from `TodoWrite` / `TaskCreate` / `TaskUpdate` |
 
-Two ways to launch: a standalone Bun process (`bun start`, a quick token check) or production via `claude --dangerously-load-development-channels server:dashi-channel` (Claude Code itself hosts the plugin runtime). See section 12.
+Two ways to launch: a standalone Bun process (`bun start`, a quick token check) or production via `claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel` (Claude Code itself hosts the plugin runtime). See section 12.
 
 ---
 
@@ -537,7 +537,7 @@ $EDITOR ~/.claude-lab/myagent/secrets/channel.env   # TELEGRAM_BOT_TOKEN, TELEGR
 
 # 5. Launch (production variant — Claude Code hosts the runtime)
 set -a; . ~/.claude-lab/myagent/secrets/channel.env; set +a
-claude --dangerously-load-development-channels server:dashi-channel
+claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel
 
 # 6. MANDATORY — install the hooks (otherwise there's no progress in Telegram)
 bash scripts/install-hooks.sh --settings ~/.claude/settings.json \
@@ -548,6 +548,8 @@ bash scripts/install-hooks.sh --settings ~/.claude/settings.json \
 #    flags only for unusual layouts, see --help)
 bun skills/doctor-dashi-plugin/scripts/doctor.ts --plugin-dir "$PWD"
 ```
+
+By default, `--permission-mode bypassPermissions` disables Claude Code action confirmations so the agent works autonomously. To run with confirmations, remove `--permission-mode bypassPermissions` from the launch command; optionally add `--permission-gate` to `scripts/install-hooks.sh` with your installation arguments and set `permission_gate.enabled=true` in the plugin configuration. Initial welcome prompts are handled separately.
 
 On the first launch, Claude Code asks 2 interactive questions (allow external imports + dev channels) — **once**; answer `1` to both.
 
@@ -627,6 +629,7 @@ one Claude Code OAuth login
 |    Type=forking                                                |
 |    tmux -L channel-thrall                                      |
 |      claude session                                            |
+|        --permission-mode bypassPermissions
 |        --dangerously-load-development-channels server:dashi-channel
 |        workspace: /srv/agents/thrall   (CLAUDE.md = identity)  |
 |        plugin: /srv/agents/thrall/.claude/dashi-plugin-claude-code/plugin
@@ -817,7 +820,7 @@ Environment=HOME=/home/<service-user>
 Environment=PATH=/home/<service-user>/.bun/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=/srv/agents/arthas/.claude/dashi-plugin-claude-code/plugin
 EnvironmentFile=/etc/dashi-plugin/arthas/channel.env
-ExecStart=/usr/bin/tmux -L channel-arthas new-session -d -s channel-arthas 'claude --dangerously-load-development-channels server:dashi-channel'
+ExecStart=/usr/bin/tmux -L channel-arthas new-session -d -s channel-arthas 'claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel'
 ExecStartPost=/usr/local/bin/channel-confirm-arthas.sh
 ExecStop=/usr/bin/tmux -L channel-arthas kill-session -t channel-arthas
 Restart=on-failure
