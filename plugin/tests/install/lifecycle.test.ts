@@ -16,14 +16,16 @@ function fixture() {
   for (const name of ['install.sh', 'update.sh']) if (existsSync(join(root, name))) cpSync(join(root, name), join(repo, name))
   mkdirSync(join(repo, 'plugin/node_modules'), { recursive: true })
   const bin = join(dir, 'bin'); mkdirSync(bin)
-  const log = join(dir, 'calls'); const envlog = join(dir, 'envlog'); const head = join(dir, 'head'); writeFileSync(head, 'old-commit\n')
+  const log = join(dir, 'calls'); const envlog = join(dir, 'envlog'); const leaklog = join(dir, 'leaklog'); writeFileSync(leaklog, ''); const head = join(dir, 'head'); writeFileSync(head, 'old-commit\n')
+  const leakProbe = 'env | grep -vE "^(TEST_SECRET)=" | grep -F -- "${TEST_SECRET:-__no_secret__}" | cut -d= -f1 | sed "s/^/$(basename "$0") leaks /" >> "$TEST_LEAKLOG" || true'
   function command(name: string, body: string) { writeFileSync(join(bin, name), `#!/bin/bash\nset -euo pipefail\n${body}\n`, { mode: 0o755 }) }
-  command('claude', 'echo "claude token=${TELEGRAM_BOT_TOKEN:+SET}" >> "$TEST_ENVLOG"; echo "2.1.80 (Claude Code)"')
+  writeFileSync(join(bin, 'dirname'), `#!/bin/bash\n${leakProbe}\nexec /usr/bin/dirname "$@"\n`, { mode: 0o755 })
+  command('claude', leakProbe + '\necho "claude token=${TELEGRAM_BOT_TOKEN:+SET}" >> "$TEST_ENVLOG"; echo "2.1.80 (Claude Code)"')
   command('tmux', 'if [[ "${1:-}" == "-V" ]]; then echo "tmux 3.4"; elif [[ "${1:-}" == "display-message" ]]; then echo "${TEST_SESSION:-other}"; fi')
   command('uname', 'echo "${TEST_PLATFORM:-Linux}"')
   command('launchctl', 'echo "launchctl $*" >> "$TEST_LOG"')
   command('bun', `if [[ "\${1:-}" == "--version" ]]; then echo 1.3.14
-elif [[ "\${1:-}" == "install" ]]; then echo 'bun install' >> "$TEST_LOG"; echo "bun-install token=\${TELEGRAM_BOT_TOKEN:+SET}" >> "$TEST_ENVLOG"
+elif [[ "\${1:-}" == "install" ]]; then ${leakProbe}; echo 'bun install' >> "$TEST_LOG"; echo "bun-install token=\${TELEGRAM_BOT_TOKEN:+SET}" >> "$TEST_ENVLOG"
 elif [[ "\${1:-}" == "test" ]]; then echo 'bun test' >> "$TEST_LOG"; { echo 'bun-test begin'; env | grep '^TELEGRAM_' | cut -d= -f1 || true; echo 'bun-test end'; } >> "$TEST_ENVLOG"; exit "\${TEST_FAIL_TESTS:-0}"
 elif [[ "\${1:-}" == *doctor.ts ]]; then echo 'doctor summary (stub)'; echo "doctor $*" >> "$TEST_LOG"
 else exec '${realBun.replace(/'/g, "'\\''")}' "$@"; fi`)
@@ -37,7 +39,7 @@ reset) echo old-commit > "$TEST_HEAD";;
 esac`)
   const state = join(dir, 'state'); const workspace = join(dir, 'workspace'); mkdirSync(workspace)
   const home = join(dir, 'home'); mkdirSync(home)
-  const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, TEST_LOG: log, TEST_ENVLOG: envlog, TEST_HEAD: head,
+  const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, TEST_LOG: log, TEST_ENVLOG: envlog, TEST_LEAKLOG: leaklog, TEST_SECRET: '123456:private_TEST_secret', TEST_HEAD: head,
     TELEGRAM_BOT_TOKEN: '123456:private_TEST_secret', TELEGRAM_OWNER_ID: '987654321',
     INSTALL_AGENT: 'student', TELEGRAM_STATE_DIR: state }
   function run(script: string, args: string[] = [], overrides: Record<string, string> = {}) {
@@ -45,7 +47,7 @@ esac`)
     return { code: p.exitCode, out: p.stdout.toString() + p.stderr.toString() }
   }
   const installArgs = ['--non-interactive', '--agent', 'student', '--workspace', workspace, '--state-dir', state]
-  return { dir, repo, bin, state, home, log, envlog, head, env, run, installArgs }
+  return { dir, repo, bin, state, home, log, envlog, leaklog, head, env, run, installArgs }
 }
 describe('clone lifecycle scripts (no network or real services)', () => {
   test('install rejects missing and malformed owner IDs before writing', () => {
@@ -257,5 +259,22 @@ describe('update refuses a dirty checkout and rollback never touches user files 
   test('help documents the clean-tree guard and what rollback touches', () => {
     const f = fixture(); const r = f.run('update.sh', ['--help'])
     expect(r.code).toBe(0); expect(r.out).toContain('untracked'); expect(r.out).toContain('git reset --hard')
+  })
+})
+
+describe('N8: the bot token never reaches a child process under any variable name', () => {
+  const leaks = (f: ReturnType<typeof fixture>) => readFileSync(f.leaklog, 'utf8').split('\n').filter(Boolean)
+  test('N8: an inherited exported TOKEN does not carry the bot token into claude or bun install', () => {
+    const f = fixture(); const r = f.run('install.sh', f.installArgs, { TOKEN: 'caller-exported-placeholder' })
+    expect(r.code).toBe(0); expect(leaks(f)).toEqual([])
+  })
+  test('N8: install runs no external command (dirname) with the token in its environment', () => {
+    const f = fixture(); expect(f.run('install.sh', ['--help']).code).toBe(0)
+    expect(leaks(f)).toEqual([])
+  })
+  test('N8: update runs no external command (dirname, claude, bun) with the token in its environment', () => {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0); writeFileSync(f.leaklog, '')
+    expect(f.run('update.sh', ['--state-dir', f.state], { TOKEN: 'caller-exported-placeholder' }).code).toBe(0)
+    expect(leaks(f)).toEqual([])
   })
 })

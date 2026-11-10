@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # One-command clone installation; never installs OS packages or escalates privileges.
 set -euo pipefail
+# First statements, before any external command: keep the secret out of the environment of every child
+# (dirname, claude, bun install); only the renderer call gets it. `export -n` drops an export attribute
+# that a caller-exported TOKEN would otherwise carry onto the copied secret.
+TOKEN="${TELEGRAM_BOT_TOKEN:-}"; export -n TOKEN
+unset TELEGRAM_BOT_TOKEN
 REPO="$(cd "$(dirname "$0")" && pwd)"
 [[ -f "$REPO/scripts/lifecycle-common.sh" ]] || { echo 'Missing lifecycle helper' >&2; exit 1; }
 source "$REPO/scripts/lifecycle-common.sh"
 AGENT="${INSTALL_AGENT:-${AGENT_ID:-}}"; WORKSPACE="${TELEGRAM_WORKSPACE_ROOT:-}"
 STATE_DIR="${TELEGRAM_STATE_DIR:-}"; SETTINGS=''; OWNER_ID="${TELEGRAM_OWNER_ID:-${TELEGRAM_ALLOWED_USER_IDS:-}}"
-TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-# Keep the secret out of the environment of every child (claude, bun install); only the renderer call gets it.
-unset TELEGRAM_BOT_TOKEN
 DRY_RUN=0; START=0; NONINTERACTIVE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in

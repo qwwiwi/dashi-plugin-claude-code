@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Update a clean clone; never kill the channel carrying the current conversation.
 set -euo pipefail
+# Update never needs the bot token: drop it before any external command (dirname, claude, bun).
+unset TELEGRAM_BOT_TOKEN
 REPO="$(cd "$(dirname "$0")" && pwd)"
 [[ -f "$REPO/scripts/lifecycle-common.sh" ]] || { echo 'Missing lifecycle helper' >&2; exit 1; }
 source "$REPO/scripts/lifecycle-common.sh"
 STATE_DIR="${TELEGRAM_STATE_DIR:-}"; SETTINGS=''; RESTART=0; DRY_RUN=0
-# Update never needs the bot token: keep a user-exported one out of every child (claude, bun).
-unset TELEGRAM_BOT_TOKEN
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --state-dir|--settings) [[ $# -ge 2 && -n "$2" ]] || fail 'Option requires a value'; if [[ "$1" == --state-dir ]]; then STATE_DIR="$2"; else SETTINGS="$2"; fi; shift 2;;
