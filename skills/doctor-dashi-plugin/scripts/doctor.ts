@@ -45,7 +45,7 @@ export const MIN_BUN = [1, 3, 9] as const
 export const REQUIRED_HOOK_EVENTS = [
   'SessionStart',
   'UserPromptSubmit',
-  'PreToolUse',
+  'SessionEnd',
   'PostToolUse',
   'Stop',
 ] as const
@@ -59,18 +59,11 @@ export const GATE_MARKER = 'dashi-permission-gate-hook'
 export const ASK_MARKER = 'dashi-ask-user-question-hook'
 export const LIVE_MARKER = 'Listening for channel messages from: server:dashi-channel'
 
-/**
- * Hook profile (2026-06-09). The 5-event feeder set is only REQUIRED when a
- * hook-driven progress surface (status / progress reporter) is enabled in the
- * state config. The modern minimal profile is "mirror": the tmux terminal
- * mirror carries progress, and only the Stop delivery hook (plus the optional
- * permission gate pair) is needed. Demanding all 5 events on a mirror-profile
- * host produced 3 false WARNs on every correctly configured agent.
- */
+/** Surface label only: lifecycle/task hooks remain required for HUD and task mirror. */
 export type HookProfile = 'hook-feeders' | 'mirror' | 'none' | 'unknown'
-
-/** Feeder events — required only in the hook-feeders profile. */
-export const FEEDER_HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse'] as const
+export const FEEDER_HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'SessionEnd', 'PostToolUse'] as const
+export const REMINDER_MARKER = 'dashi-channel-reminder-hook'
+export const TASK_MATCHER = 'TaskCreate|TaskUpdate|TodoWrite'
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested)
@@ -307,6 +300,7 @@ export function checkWorkspacePlacement(
 }
 
 interface SettingsHookEntry {
+  matcher?: string
   marker?: string
   hooks?: Array<{ command?: string }>
   command?: string
@@ -334,12 +328,124 @@ function hasWorkingHook(entries: SettingsHookEntry[], marker: string): boolean {
   return entries.some((e) => e.marker === marker && entryCommands(e).some((c) => c.length > 0))
 }
 
+/** Diagnostic subset of loadConfig: env > file > runtime defaults; never imports the server. */
+export interface DoctorConfigResolution {
+  stateDir: string
+  configPath: string
+  config: Record<string, unknown> | null
+  check: Check
+}
+
+function objectRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+export function resolveDoctorConfig(
+  envText: string | null,
+  home: string = homedir(),
+  read: (path: string) => string = (path) => readFileSync(path, 'utf8'),
+  runtimeDir: string = process.cwd(),
+): DoctorConfigResolution {
+  const value = (key: string): string | undefined => envText === null ? undefined : envValue(envText, key, true) ?? undefined
+  const stateDir = resolve(runtimeDir, value('TELEGRAM_STATE_DIR') ?? join(home, '.claude', 'channels', 'dashi-telegram-canary'))
+  const configPath = resolve(runtimeDir, value('TELEGRAM_CONFIG_FILE') ?? join(stateDir, 'config.json'))
+  const source = value('TELEGRAM_CONFIG_FILE') !== undefined ? 'TELEGRAM_CONFIG_FILE' : value('TELEGRAM_STATE_DIR') !== undefined ? 'TELEGRAM_STATE_DIR/config.json' : 'default state directory'
+  const incomplete = (reason = 'env/config unavailable or invalid'): DoctorConfigResolution => ({ stateDir, configPath, config: null, check: {
+    id: 'config-source', title: 'Effective runtime configuration', status: 'warn',
+    detail: `${source}: ${configPath}; incomplete coverage — ${reason}`,
+    fix: 'pass --env for this service and make its selected config readable valid JSON; do not treat dependent checks as verified',
+  } })
+  if (envText === null) return incomplete()
+  // Shell/systemd takes the last assignment; server.ts's .env loader takes the
+  // first. Without launch provenance, duplicate keys cannot be resolved safely.
+  const seen = new Set<string>()
+  for (const line of envText.split('\n')) {
+    const key = line.match(/^\s*(?:export\s+)?(TELEGRAM_[A-Z0-9_]+)=/)?.[1]
+    if (key === undefined) continue
+    if (seen.has(key)) return incomplete('duplicate env assignments; verify the effective service environment')
+    seen.add(key)
+  }
+  let file: Record<string, unknown> = {}
+  let fileSource = 'file'
+  try {
+    const parsed: unknown = JSON.parse(read(configPath))
+    if (!objectRecord(parsed)) return incomplete()
+    file = parsed
+  } catch (error: unknown) {
+    if (objectRecord(error) && error['code'] === 'ENOENT') fileSource = 'file absent; schema defaults'
+    else return incomplete()
+  }
+  // Only fields consumed by doctor checks are projected. This is not full Zod validation.
+  const config: Record<string, unknown> = {
+    allowed_user_ids: [164795011], allowed_chat_ids: [164795011], ...file,
+  }
+  const defaults: Record<string, Record<string, unknown>> = {
+    status: { enabled: false }, progress: { enabled: false },
+    tmux_mirror: { enabled: false }, task_mirror: { enabled: true }, hud: { enabled: true },
+    permission_gate: { enabled: false }, ask_user_question: { enabled: false },
+    webhook: { enabled: false, host: '127.0.0.1', port: 0 }, multichat: { enabled: false },
+  }
+  for (const [key, fallback] of Object.entries(defaults)) {
+    if (file[key] !== undefined && !objectRecord(file[key])) return incomplete()
+    const block = { ...fallback, ...(objectRecord(file[key]) ? file[key] : {}) }
+    config[key] = block
+  }
+  const overrides: string[] = []
+  const assign = (key: string, field: string, block?: string, parse: (v: string) => unknown = (v) => v): void => {
+    const raw = value(key)
+    if (raw === undefined) return
+    const target = block === undefined ? config : config[block]
+    if (!objectRecord(target)) throw new Error('invalid block')
+    target[field] = parse(raw)
+    overrides.push(key)
+  }
+  const integer = (raw: string): number => {
+    const n = Number(raw)
+    if (!Number.isInteger(n)) throw new Error('invalid number')
+    return n
+  }
+  const users = (raw: string): number[] => raw.split(',').map((v) => v.trim()).filter(Boolean).map((v) => {
+    const n = integer(v)
+    if (n <= 0) throw new Error('invalid user id')
+    return n
+  })
+  const chats = (raw: string): Array<number | string> => raw.split(',').map((v) => v.trim()).filter(Boolean).map((v) => {
+    if (v.startsWith('@')) return v
+    const n = integer(v)
+    if (n === 0) throw new Error('invalid chat id')
+    return n
+  })
+  const enabled = (v: string): boolean => /^(1|true|yes|on)$/i.test(v)
+  try {
+    assign('TELEGRAM_ALLOWED_USER_IDS', 'allowed_user_ids', undefined, users)
+    assign('TELEGRAM_ALLOWED_CHAT_IDS', 'allowed_chat_ids', undefined, chats)
+    assign('TELEGRAM_WORKSPACE_ROOT', 'workspace_root')
+    assign('TELEGRAM_WEBHOOK_HOST', 'host', 'webhook')
+    assign('TELEGRAM_WEBHOOK_PORT', 'port', 'webhook', integer)
+    assign('TELEGRAM_ASK_USER_QUESTION_ENABLED', 'enabled', 'ask_user_question', enabled)
+    assign('TELEGRAM_MULTICHAT_ENABLED', 'enabled', 'multichat', enabled)
+    for (const field of ['POLICY_PATH', 'STATE_DIR', 'WORKSPACE_DIR']) {
+      assign(`TELEGRAM_MULTICHAT_${field}`, field.toLowerCase(), 'multichat')
+    }
+    for (const key of Object.keys(defaults)) {
+      const block = config[key]
+      if (!objectRecord(block) || typeof block.enabled !== 'boolean') return incomplete()
+    }
+    if (!Array.isArray(config.allowed_user_ids) || config.allowed_user_ids.length === 0 || !config.allowed_user_ids.every((v: unknown) => typeof v === 'number' && Number.isInteger(v) && v > 0)) return incomplete()
+    if (!Array.isArray(config.allowed_chat_ids) || !config.allowed_chat_ids.every((v: unknown) => typeof v === 'string' || typeof v === 'number')) return incomplete()
+    const webhook = config.webhook
+    if (!objectRecord(webhook) || typeof webhook.host !== 'string' || typeof webhook.port !== 'number' || !Number.isInteger(webhook.port) || webhook.port < 0) return incomplete()
+  } catch { return incomplete() }
+  return { stateDir, configPath, config, check: {
+    id: 'config-source', title: 'Effective runtime configuration', status: 'pass',
+    detail: `${source}: ${configPath} (${fileSource}); defaults + env overrides: ${overrides.join(', ') || 'none'}. Coverage: doctor fields only; full runtime schema and live process env not validated.`,
+  } }
+}
+
 /**
  * Map the channel state config to the hook profile in force.
- *   - status/progress reporter enabled → 'hook-feeders' (all 5 events needed);
- *   - tmux_mirror enabled (and no hook reporter) → 'mirror' (Stop only);
- *   - config present, nothing enabled → 'none' (Stop only — final replies still ship);
- *   - config missing/unreadable → 'unknown' (conservative: demand all 5).
+ * Labels describe progress surfaces, not hook exemptions. Current lifecycle
+ * and task hooks are required in every profile (HUD/task mirror default on).
  */
 export function selectHookProfile(stateConfig: unknown): HookProfile {
   if (stateConfig === null || typeof stateConfig !== 'object') return 'unknown'
@@ -383,50 +489,28 @@ export function checkSettingsHooks(settings: unknown, profile: HookProfile = 'un
 
   const hooks = (settings as SettingsShape)?.hooks ?? {}
   const stopEntries = Array.isArray(hooks['Stop']) ? hooks['Stop'] : []
-  const feederRequired = profile === 'hook-feeders' || profile === 'unknown'
-
-  if (feederRequired) {
-    for (const ev of REQUIRED_HOOK_EVENTS) {
-      const entries = Array.isArray(hooks[ev]) ? hooks[ev] : []
-      const working = hasWorkingHook(entries, HOOK_MARKER)
-      const markerOnly = !working && JSON.stringify(entries).includes(HOOK_MARKER)
-      out.push(
-        working
-          ? { id: `hook-${ev}`, title: `Hook registered: ${ev}`, status: 'pass', detail: `marker ${HOOK_MARKER} with a runnable command` }
-          : {
-              id: `hook-${ev}`,
-              title: `Hook registered: ${ev}`,
-              status: 'warn',
-              detail: markerOnly ? `${ev} has a ${HOOK_MARKER} entry but no runnable command` : `no ${HOOK_MARKER} entry for ${ev}${profile === 'unknown' ? ' (profile unknown — pass --env so the doctor can read the state config)' : ''}`,
-              fix: 'run plugin/scripts/install-hooks.sh to register status + memory hooks',
-            },
-      )
-    }
-  } else {
-    // mirror / none profile: feeder hooks are NOT required — the tmux mirror
-    // (or nothing) carries progress. Only the Stop delivery hook matters.
-    // The fallback hook is a separate safety net and must NOT mask a missing
-    // primary Stop hook (it has its own check below).
-    const stopWorking = hasWorkingHook(stopEntries, HOOK_MARKER)
-    const fallbackOnly = !stopWorking && hasWorkingHook(stopEntries, FALLBACK_MARKER)
-    out.push({
-      id: 'hook-profile',
-      title: `Hook profile: ${profile} (feeder hooks not required)`,
-      status: 'pass',
-      detail: `state config enables no hook-driven progress surface — SessionStart/UserPromptSubmit/PostToolUse feeders are optional`,
-    })
-    out.push(
-      stopWorking
-        ? { id: 'hook-Stop', title: 'Hook registered: Stop (final-reply delivery)', status: 'pass', detail: 'a runnable Stop hook is registered' }
-        : {
-            id: 'hook-Stop',
-            title: 'Hook registered: Stop (final-reply delivery)',
-            status: 'warn',
-            detail: fallbackOnly ? 'only the fallback-reply Stop hook is registered — the primary Stop delivery (read receipt) hook is missing' : 'no Stop hook — read receipts and the silent-turn fallback never fire',
-            fix: 'run plugin/scripts/install-hooks.sh to register the Stop hook',
-          },
-    )
+  // Match the current installer for every profile: HUD and tasks also consume hooks.
+  for (const ev of REQUIRED_HOOK_EVENTS) {
+    const entries = Array.isArray(hooks[ev]) ? hooks[ev] : []
+    const registered = hasWorkingHook(entries, HOOK_MARKER)
+    const working = registered && (ev !== 'PostToolUse' || entries.some((e) =>
+      e.marker === HOOK_MARKER && e.matcher === TASK_MATCHER && entryCommands(e).some((c) => c.length > 0)))
+    const fallbackOnly = ev === 'Stop' && !registered && hasWorkingHook(entries, FALLBACK_MARKER)
+    out.push(working
+      ? { id: `hook-${ev}`, title: `Hook registered: ${ev}`, status: 'pass', detail: `marker ${HOOK_MARKER}, command registered${ev === 'PostToolUse' ? `; matcher ${TASK_MATCHER}` : ''}` }
+      : {
+          id: `hook-${ev}`, title: `Hook registered: ${ev}`, status: 'warn',
+          detail: fallbackOnly ? 'only fallback Stop registered; primary delivery hook has no runnable command'
+            : registered ? `${ev} must use task matcher ${TASK_MATCHER}`
+            : `${ev}: no runnable command registered for ${HOOK_MARKER}${profile === 'unknown' ? ' (profile unknown; config coverage incomplete)' : ''}`,
+          fix: 'ask the operator to run plugin/scripts/install-hooks.sh with this session settings and webhook URL; lifecycle/task hooks are needed for the pinned HUD and tasks too',
+        })
   }
+  const reminderEntries = Array.isArray(hooks['UserPromptSubmit']) ? hooks['UserPromptSubmit'] : []
+  const reminder = reminderEntries.some((e) => e.marker === REMINDER_MARKER && entryCommands(e).some((c) => c.includes('channel-reminder.ts')))
+  out.push(reminder
+    ? { id: 'channel-reminder-hook', title: 'Channel reminder', status: 'pass', detail: 'channel-reminder.ts command registered on UserPromptSubmit' }
+    : { id: 'channel-reminder-hook', title: 'Channel reminder', status: 'warn', detail: 'channel reminder missing or wrong helper; agent may forget to reply in Telegram', fix: 'ask the operator to reinstall hooks without --no-reminder for this session' })
 
   // DM fallback-reply (PR #47) — optional but recommended: guarantees the chief
   // gets an answer even when the agent forgets to call the reply tool.
@@ -441,6 +525,44 @@ export function checkSettingsHooks(settings: unknown, profile: HookProfile = 'un
           fix: 'register the fallback-reply Stop-hook so a silent turn still reaches the chief',
         },
   )
+  return out
+}
+
+/** Configuration readiness only; command state and Telegram delivery require an operator smoke. */
+export function checkMirror(config: unknown, settings: unknown, chatId?: string): Check[] {
+  const cfg = objectRecord(config) ? config : null
+  const hooks = checkSettingsHooks(settings).filter((c) => c.id.startsWith('hook-') || c.id === 'channel-reminder-hook')
+  const installed = settings != null && hooks.every((c) => c.status === 'pass')
+  const out: Check[] = [{
+    id: 'mirror-hooks', title: 'Mirror hooks installed', status: installed ? 'pass' : 'warn',
+    detail: `hooks installed: ${installed ? 'yes' : settings == null ? 'unknown' : 'no'} (lifecycle, task matcher and channel reminder; helper execution unverified)`,
+    ...(!installed ? { fix: 'ask the operator to install the current hooks for this session; see hook checks above' } : {}),
+  }]
+  const mirror = cfg?.tmux_mirror
+  const enabled = objectRecord(mirror) && mirror.enabled === true
+  const allowed = cfg?.allowed_chat_ids
+  const target = Array.isArray(allowed) && allowed.length > 0 ? String(allowed[0]) : null
+  const requested = chatId ?? target
+  const privateTarget = target !== null && /^[1-9]\d*$/.test(target)
+  const multichat = cfg?.multichat
+  const policyUnknown = objectRecord(multichat) && multichat.enabled === true
+  const ready = cfg !== null && enabled && privateTarget && requested === target && !policyUnknown
+  out.push({
+    id: 'mirror-terminal', title: 'Terminal mirror for the private chat', status: ready ? 'pass' : 'warn',
+    detail: `tmux_mirror.enabled=${cfg === null ? 'UNKNOWN' : String(enabled)}; runtime target allowed_chat_ids[0]=${target ?? 'UNKNOWN'}; requested chat=${requested ?? 'UNKNOWN'}. ${ready ? 'Enabled in config for this private chat' : 'Private-chat readiness unverified or disabled'}${policyUnknown ? '; multichat policy must allow private mode + tmux_mirror: true' : ''}. Runtime command: /mirror on; inspect with /mirror status. Running toggle and delivery unverified.`,
+    ...(!ready ? { fix: cfg === null ? 'resolve config-source first'
+      : !enabled ? 'have an external operator set tmux_mirror.enabled=true in the selected config, verify pane_target/socket_name and restart outside this channel; then send /mirror on in the bot DM'
+      : 'have an external operator verify allowed_chat_ids[0] is the intended private chat, pane_target/socket_name and multichat policy; then inspect /mirror status and send /mirror on' } : {}),
+  })
+  const active = (key: string, fallback: boolean): string => {
+    if (cfg === null) return 'UNKNOWN'
+    const block = cfg[key]
+    return String(objectRecord(block) && typeof block.enabled === 'boolean' ? block.enabled : fallback)
+  }
+  out.push({
+    id: 'mirror-view', title: 'What you will see in Telegram', status: 'skip',
+    detail: `When configured and working: one rolling terminal message shows recent work/progress; the pinned HUD shows context and current tasks. hud.enabled=${active('hud', true)}; task_mirror.enabled=${active('task_mirror', true)}. Task events update tasks; the current hook set does not send every tool call. Configuration does not prove display; delivery unverified — ask the operator to send a real DM and inspect the rolling message and pin.`,
+  })
   return out
 }
 
@@ -478,6 +600,7 @@ export function checkPermissionGate(
   askEnabled: boolean | null = null,
 ): Check[] {
   const s = (settings as SettingsPermShape) ?? {}
+  const bypassActive = unitBypass === true || s.permissions?.defaultMode === 'bypassPermissions'
   const pre = Array.isArray(s.hooks?.PreToolUse) ? s.hooks!.PreToolUse! : []
   const gate = pre.find((e) => e.marker === GATE_MARKER)
   if (!gate) {
@@ -486,9 +609,9 @@ export function checkPermissionGate(
     // the incident class — FAIL, do not silently SKIP. When neither signal is
     // present (no bypass, gate disabled, or host unknown) the feature is
     // genuinely off and SKIP is correct (don't over-fail an unreadable host).
-    if (unitBypass === true || gateEnabled === true) {
-      const cause = unitBypass === true
-        ? 'the unit runs --permission-mode bypassPermissions (native prompts are suppressed) but no gate hook is registered — confirms never reach the warchief'
+    if (bypassActive || gateEnabled === true) {
+      const cause = bypassActive
+        ? 'the effective session mode is bypassPermissions (native prompts are suppressed) but no gate hook is registered — confirms never reach the warchief'
         : 'permission_gate.enabled=true in the state config but no gate PreToolUse hook is registered — the configured gate never fires'
       return [{
         id: 'permission-gate',
@@ -553,13 +676,8 @@ export function checkPermissionGate(
   // explicit settings.permissions.defaultMode but the flag is usually on the
   // CLI/systemd ExecStart, so a non-match is unverified, not a hard fail.
   const mode = s.permissions?.defaultMode
-  if (mode === 'bypassPermissions') {
-    out.push({ id: 'permission-gate-mode', title: 'Permission gate: session in bypassPermissions', status: 'pass', detail: 'permissions.defaultMode=bypassPermissions' })
-  } else if (mode === undefined && unitBypass === true) {
-    // The flag usually rides on the unit's ExecStart, not in settings — when
-    // the supervising unit carries it, an unset defaultMode is the normal
-    // layout, not a gap.
-    out.push({ id: 'permission-gate-mode', title: 'Permission gate: session in bypassPermissions', status: 'pass', detail: '--permission-mode bypassPermissions on the unit ExecStart' })
+  if (bypassActive) {
+    out.push({ id: 'permission-gate-mode', title: 'Permission gate: session in bypassPermissions', status: 'pass', detail: mode === 'bypassPermissions' ? 'permissions.defaultMode=bypassPermissions' : '--permission-mode bypassPermissions on the unit ExecStart' })
   } else {
     out.push({
       id: 'permission-gate-mode',
@@ -594,7 +712,6 @@ export function checkPermissionGate(
   //     AskUserQuestion renders in the unwatched pane and hangs the session.
   // askEnabled===null (state unreadable) → no opinion; the warn above already
   // flags a missing relay.
-  const bypassActive = unitBypass === true || s.permissions?.defaultMode === 'bypassPermissions'
   if (askEnabled === false && askWorking) {
     out.push({
       id: 'permission-gate-ask-config-match',
@@ -782,8 +899,11 @@ export function parseEnvList(envText: string, key: string): string[] | null {
 }
 
 function allowlistCheck(id: string, title: string, key: string, ids: string[] | null, wanted?: string): Check {
-  if (ids === null || ids.length === 0) {
-    return { id, title, status: 'warn', detail: `${key} empty — the code default applies`, fix: `set ${key} to your numeric id (ask @userinfobot)` }
+  if (ids === null) {
+    return { id, title, status: 'warn', detail: `${key} unavailable — effective membership unverified`, fix: `verify the effective allowlist and supply the intended numeric id` }
+  }
+  if (ids.length === 0) {
+    return { id, title, status: wanted ? 'fail' : 'warn', detail: `${key} explicitly empty — no messages are allowed; defaults do not apply`, fix: `add the intended ${wanted ?? 'user/chat id'} to ${key}` }
   }
   if (!wanted) {
     return { id, title, status: 'pass', detail: `${key} set (${ids.length} id(s)); pass the id to verify membership` }
@@ -804,10 +924,9 @@ export function checkAllowlist(envText: string, userId?: string, chatId?: string
     allowlistCheck('allowlist-user', 'Telegram user allowlist', 'TELEGRAM_ALLOWED_USER_IDS', parseEnvList(envText, 'TELEGRAM_ALLOWED_USER_IDS'), userId),
   ]
   const chats = parseEnvList(envText, 'TELEGRAM_ALLOWED_CHAT_IDS')
-  // A DM uses chat.id == user.id; only flag the chat list when it exists or a
-  // chat id was provided to verify, to avoid noise on a user-only DM setup.
-  if (chats !== null || chatId) {
-    out.push(allowlistCheck('allowlist-chat', 'Telegram chat allowlist', 'TELEGRAM_ALLOWED_CHAT_IDS', chats, chatId))
+  const effectiveChatId = chatId ?? userId
+  if (chats !== null || effectiveChatId) {
+    out.push(allowlistCheck('allowlist-chat', 'Telegram chat allowlist', 'TELEGRAM_ALLOWED_CHAT_IDS', chats, effectiveChatId))
   }
   return out
 }
@@ -1379,7 +1498,12 @@ const ICON: Record<Status, string> = { pass: 'OK  ', warn: 'WARN', fail: 'FAIL',
 
 export function renderReport(checks: Check[]): string {
   const lines: string[] = []
+  let mirrorHeading = false
   for (const c of checks) {
+    if (c.id.startsWith('mirror-') && !mirrorHeading) {
+      lines.push('\nMirror')
+      mirrorHeading = true
+    }
     lines.push(`[${ICON[c.status]}] ${c.title}`)
     if (c.detail) lines.push(`        ${redact(c.detail)}`)
     if (c.fix && (c.status === 'warn' || c.status === 'fail')) {
@@ -1551,14 +1675,14 @@ export function parseUnitFile(text: string): ParsedUnit {
  * EnvironmentFile accepts `KEY="value"`, and the raw quotes broke the
  * webhook-port and state-dir lookups (false "nothing listens" / profile=unknown).
  */
-export function envValue(envText: string, key: string): string | null {
+export function envValue(envText: string, key: string, preserveEmpty = false): string | null {
   for (const line of envText.split('\n')) {
     const m = line.match(new RegExp(`^\\s*(?:export\\s+)?${key}=(.*)$`))
     if (m) {
       let v = (m[1] ?? '').trim()
       v = v.replace(/\s+#.*$/, '').trim()
       v = v.replace(/^["']|["']$/g, '')
-      return v || null
+      return preserveEmpty ? v : v || null
     }
   }
   return null
@@ -1753,15 +1877,13 @@ export function scanFleet(unitDir: string): FleetAgent[] {
     if (sockets.length === 0) continue
     const envText = envPath ? readFileSafe(envPath) : null
     const token = envText ? envValue(envText, 'TELEGRAM_BOT_TOKEN') : null
-    const stateDir = envText ? envValue(envText, 'TELEGRAM_STATE_DIR') : null
-    const workspaceRoot = envText ? envValue(envText, 'TELEGRAM_WORKSPACE_ROOT') : null
-    let webhookEnabled: boolean | null = null
-    let gateEnabled: boolean | null = null
-    if (stateDir) {
-      const stateConfig = parseJsonSafe(readFileSafe(join(stateDir, 'config.json'))) as { webhook?: { enabled?: boolean }; permission_gate?: { enabled?: boolean } } | null
-      webhookEnabled = stateConfig?.webhook?.enabled === true ? true : stateConfig ? false : null
-      gateEnabled = stateConfig?.permission_gate?.enabled === true ? true : stateConfig ? false : null
-    }
+    const effective = resolveDoctorConfig(envText, homedir(), undefined, workingDirectory ?? process.cwd())
+    const stateDir = effective.stateDir
+    const workspaceRoot = typeof effective.config?.workspace_root === 'string' ? effective.config.workspace_root : null
+    const webhook = effective.config?.webhook
+    const gateConfig = effective.config?.permission_gate
+    const webhookEnabled = objectRecord(webhook) ? webhook.enabled === true : null
+    const gateEnabled = objectRecord(gateConfig) ? gateConfig.enabled === true : null
     // Workspace settings: both layouts exist in the wild — the workspace root
     // IS the .claude dir (settings.json directly inside), or the root contains
     // a .claude/ subdir.
@@ -1788,7 +1910,7 @@ export function scanFleet(unitDir: string): FleetAgent[] {
       sockets,
       envPath,
       envReadable: envText != null,
-      port: envText ? envValue(envText, 'TELEGRAM_WEBHOOK_PORT') : null,
+      port: objectRecord(webhook) && typeof webhook.port === 'number' ? String(webhook.port) : null,
       tokenDigest: token ? createHash('sha256').update(token).digest('hex') : null,
       stateDir,
       workspaceRoot,
@@ -2082,25 +2204,23 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
       id: 'env-unknown',
       title: 'Channel env located',
       status: 'skip',
-      detail: 'no channel.env found (no --env, no matching systemd unit — launchd hosts are not autodetected yet) — webhook bind, env-file mode, allowlist and hook profile are NOT checked',
+      detail: 'no channel.env found (no --env, no matching systemd unit — launchd hosts are not autodetected yet) — effective config, webhook bind, allowlists and hook profile have incomplete coverage',
       fix: 'pass --env <channel.env path> to enable the env-dependent checks',
     })
   }
 
-  // Hook profile: read the state config (env → TELEGRAM_STATE_DIR → config.json)
-  // BEFORE judging hook registration, so a mirror-only setup is not punished
-  // for the feeder hooks it deliberately does not have.
+  // Resolve the same config path and diagnostic fields as runtime before checks.
   const envText = opts.envPath ? readFileSafe(opts.envPath) : null
-  const stateDir = envText ? envValue(envText, 'TELEGRAM_STATE_DIR') : null
-  const rawStateText = stateDir ? readFileSafe(join(stateDir, 'config.json')) : null
-  const stateConfig = rawStateText == null ? null : parseJsonSafe(rawStateText)
+  const effective = resolveDoctorConfig(envText, homedir(), undefined, opts.pluginDir)
+  checks.push(effective.check)
+  const stateConfig = effective.config
   const profile = selectHookProfile(stateConfig)
-  // Feature flags from the state config (gap 1/2). null = state config
-  // unreadable — keep the gate checks conservative, never over-fail a host we
-  // simply could not read.
-  const gateCfg = stateConfig as { permission_gate?: { enabled?: boolean }; ask_user_question?: { enabled?: boolean } } | null
-  const gateEnabled: boolean | null = stateConfig == null ? null : gateCfg?.permission_gate?.enabled === true
-  const askEnabled: boolean | null = stateConfig == null ? null : gateCfg?.ask_user_question?.enabled === true
+  const flag = (key: string): boolean | null => {
+    const block = stateConfig?.[key]
+    return objectRecord(block) && typeof block.enabled === 'boolean' ? block.enabled : null
+  }
+  const gateEnabled = flag('permission_gate')
+  const askEnabled = flag('ask_user_question')
   const unitBypass = unitAgent ? unitAgent.bypassPermissions : null
 
   // settings.json hooks + token leak
@@ -2137,6 +2257,8 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
     gateRegistered = ((settings as SettingsPermShape)?.hooks?.PreToolUse ?? []).some((e) => e.marker === GATE_MARKER)
     checks.push(...gateChecks)
   }
+
+  checks.push(...checkMirror(stateConfig, settings, opts.chatId ?? opts.userId))
 
   // Permission policy lint (P1): the file the gate actually reads — path from
   // the gate hook command, else the workspace convention.
@@ -2178,7 +2300,8 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
   }
 
   // Webhook bind (P0, security): the hook webhook must listen on loopback only.
-  const webhookPort = envText ? envValue(envText, 'TELEGRAM_WEBHOOK_PORT') : null
+  const webhookCfg = stateConfig?.webhook
+  const webhookPort = objectRecord(webhookCfg) && typeof webhookCfg.port === 'number' ? String(webhookCfg.port) : null
   let parsedListeners: Listener[] | null = null
   if (webhookPort) {
     let listenersText: string | null = null
@@ -2197,7 +2320,7 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
   // under bypassPermissions, so a dead webhook fails every confirm closed. SAFE
   // probe only — GET /health (unauthenticated, no side effects); NEVER POST the
   // real /hooks/permission/request route (it would card the warchief).
-  const gateRequired = unitBypass === true || gateEnabled === true
+  const gateRequired = unitBypass === true || (settings as SettingsPermShape | null)?.permissions?.defaultMode === 'bypassPermissions' || gateEnabled === true
   if (gateRequired) {
     checks.push(checkPermissionEndpoint(true, webhookPort, parsedListeners, healthHttpProbe))
   }
@@ -2229,20 +2352,14 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
     }
   }
 
-  // allowlists (user AND chat)
-  if (opts.envPath) {
-    const env = readFileSafe(opts.envPath)
-    if (env == null) {
-      checks.push({ id: 'allowlist-user', title: 'Telegram user allowlist', status: 'warn', detail: `could not read ${opts.envPath}` })
-    } else {
-      checks.push(...checkAllowlist(env, opts.userId, opts.chatId))
-    }
+  // Effective allowlists include file values, runtime defaults and env overrides.
+  if (stateConfig !== null) {
+    const list = (key: string): string => Array.isArray(stateConfig[key]) ? stateConfig[key].map(String).join(',') : ''
+    checks.push(...checkAllowlist(`TELEGRAM_ALLOWED_USER_IDS=${list('allowed_user_ids')}\nTELEGRAM_ALLOWED_CHAT_IDS=${list('allowed_chat_ids')}`, opts.userId, opts.chatId))
+  } else {
+    checks.push({ id: 'allowlist-user', title: 'Telegram access coverage', status: 'warn', detail: 'effective config unavailable — user and chat membership unverified', fix: 'resolve config-source first, then re-run with --user (and --chat for a group)' })
   }
-
-  // Exactly one progress surface (duplicate-windows guard, 2026-06-09)
-  if (stateDir) {
-    checks.push(checkProgressSurfaces(stateConfig))
-  }
+  checks.push(checkProgressSurfaces(stateConfig))
 
   // Telegram queue (409 / drain) from a saved getUpdates response
   if (opts.queueJsonPath) {
