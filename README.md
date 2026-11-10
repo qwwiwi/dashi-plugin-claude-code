@@ -2,6 +2,8 @@
 
 > **Read in your language:** English (this page) · [**Русская версия →**](README.ru.md)
 
+> **Want help installing?** Give [this guide](INSTALL-WITH-AGENT.md) to Claude or Codex.
+
 ## Quick installation
 
 Run this from a terminal on the host, as the user who will run the agent. Install

@@ -27,6 +27,7 @@ retroactively marks the state of `main` on 2026-06-14.
   “owner ID configured”. `TELEGRAM_OWNER_ID` is an installer input only.
 
 ### Added
+- English and Russian guides for agent-assisted server installation.
 - Root `install.sh` for Linux/systemd and macOS/launchd: prerequisite checks,
   interactive or non-interactive owner setup, hidden token input, private env file,
   timestamped backups, standard plugin hooks, service rendering and doctor summary.
