@@ -38,6 +38,7 @@ beforeEach(() => {
   delete process.env.TELEGRAM_WEBHOOK_TOKEN
   const env = {
     TELEGRAM_BOT_TOKEN: FAKE_TOKEN,
+    TELEGRAM_ALLOWED_USER_IDS: '164795011',
     TELEGRAM_STATE_DIR: stateDir,
     TELEGRAM_ALLOWED_CHAT_IDS: `${WARCHIEF_ID},${GROUP_ID}`,
   }

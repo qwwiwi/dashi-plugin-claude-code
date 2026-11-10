@@ -1,137 +1,26 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  dashi-plugin-claude-code · launchd agent example для macOS
-
-  Скопируйте в ~/Library/LaunchAgents/com.dashi-plugin.channel-<agent>.plist
-  Замените:
-    <you>      → ваш macOS username (echo $USER)
-    myagent    → имя вашего агента (lowercase, без пробелов)
-
-  ВАЖНО: этот plist запускает wrapper-скрипт (launchd-wrapper.sh), а НЕ
-  пытается inline-командой через `sh -c "exec tmux ...; sleep; send-keys"`.
-  Прежний inline-подход ломался: `exec` подменял shell, sleep/send-keys
-  никогда не запускались, launchd терял supervised PID после detach tmux.
-
-  Wrapper-скрипт:
-    1. Source-ит channel.env (секреты остаются в env, не в plist)
-    2. Стартует tmux-сессию с claude
-    3. Прокидывает Enter в welcome-промты
-    4. Блокируется на polling has-session — launchd видит живой supervised PID
-    5. На SIGTERM от launchctl делает trap-cleanup и убивает tmux-сессию
-
-  Загрузка:
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist
-
-  См. docs/03-installation-macos.md для полной инструкции.
--->
 <plist version="1.0">
 <dict>
-    <!-- Уникальный идентификатор agent'а в launchd namespace -->
     <key>Label</key>
-    <string>com.dashi-plugin.channel-myagent</string>
-
-    <!--
-      ProgramArguments — путь к wrapper-скрипту.
-      Скрипт должен быть исполняемым (chmod +x) и owned вашим user.
-      См. examples/launchd-wrapper.sh.example
-    -->
+    <string>com.dashi-plugin.channel-<agent></string>
     <key>ProgramArguments</key>
-    <array>
-        <string>/Users/&lt;you&gt;/.claude-lab/myagent/scripts/launchd-wrapper.sh</string>
-    </array>
-
-    <!--
-      WorkingDirectory — КРИТИЧНО.
-      Должен указывать ВНУТРЬ plugin/ каталога ВНУТРИ workspace агента.
-      Claude Code от этого CWD ищет CLAUDE.md upward.
-      См. docs/02-where-to-place-plugin.md
-    -->
+    <array><string><wrapper></string></array>
     <key>WorkingDirectory</key>
-    <string>/Users/&lt;you&gt;/.claude-lab/myagent/.claude/dashi-plugin-claude-code/plugin</string>
-
-    <!--
-      EnvironmentVariables — переменные окружения для процесса.
-      Только non-secret здесь. Bot token и т.п. — wrapper source-ит из channel.env.
-    -->
+    <string><plugin-dir></string>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>HOME</key>
-        <string>/Users/&lt;you&gt;</string>
-        <!--
-          PATH: bun, tmux, claude. Проверьте что claude binary доступен.
-          Если Claude Code не в PATH — добавьте /Applications/Claude.app/Contents/...
-        -->
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/&lt;you&gt;/.bun/bin</string>
-        <key>LANG</key>
-        <string>en_US.UTF-8</string>
+        <key>HOME</key><string><home></string>
+        <key>PATH</key><string><path></string>
     </dict>
-
-    <!-- Запуск при загрузке plist (вход в систему GUI user) -->
-    <key>RunAtLoad</key>
-    <true/>
-
-    <!--
-      KeepAlive: respawn только если предыдущий exit был НЕ 0.
-
-      SuccessfulExit=false означает: «перезапускай unless prior exit code == 0».
-      Wrapper differentiates:
-        - exit 0 → operator-initiated stop (SIGTERM от launchctl, trap cleanup).
-                   launchd НЕ respawn-ит. `launchctl kill SIGTERM` реально стопает.
-        - exit 1 → tmux session died unexpectedly (claude crash, manual
-                   kill-session, OOM). launchd respawn-ит через ThrottleInterval.
-        - exit 78 (EX_CONFIG) → channel.env отсутствует. Тоже non-zero, тоже
-                   respawn — лечится правкой env, не плагином.
-
-      Почему НЕ `Crashed=true`: ловит только сигналы (SIGSEGV/SIGABRT), но НЕ
-      ловит «процесс штатно завершился с non-zero exit code» (например wrapper
-      детектит мёртвую tmux и сам выходит с exit 1). С Crashed=true такой
-      «штатный exit 1» НЕ перезапускается — agent остаётся мёртвым. SuccessfulExit
-      покрывает оба кейса (signal-death и штатный exit 1) одинаково.
-
-      НЕ ставьте `<key>KeepAlive</key><true/>` (булево) — это infinite respawn
-      при welcome-промтах без persistent approvals и игнор операторского stop.
-    -->
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-
-    <!-- Пауза 15 секунд между попытками рестарта (анти-loop при crash) -->
-    <key>ThrottleInterval</key>
-    <integer>15</integer>
-
-    <!--
-      ExitTimeOut — даём wrapper-у 30 секунд на graceful trap cleanup
-      перед SIGKILL. Этого хватает на tmux kill-session и финальный лог.
-    -->
-    <key>ExitTimeOut</key>
-    <integer>30</integer>
-
-    <!-- Логи. Создайте директорию заранее: mkdir -p ~/Library/Logs/dashi-plugin -->
-    <key>StandardOutPath</key>
-    <string>/Users/&lt;you&gt;/Library/Logs/dashi-plugin/channel-myagent.out.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/Users/&lt;you&gt;/Library/Logs/dashi-plugin/channel-myagent.err.log</string>
-
-    <!--
-      ProcessType: Interactive
-      Гарантирует, что launchd не будет агрессивно ограничивать ресурсы
-      (имеет смысл для interactive-приложений типа Claude Code, который читает TTY).
-    -->
-    <key>ProcessType</key>
-    <string>Interactive</string>
-
-    <!--
-      Опционально: Nice — приоритет. 0 = default, -20 высокий, 20 низкий.
-      Для агентов фоновых задач — оставьте default (закомментировано).
-    -->
-    <!--
-    <key>Nice</key>
-    <integer>1</integer>
-    -->
+    <!-- LaunchAgent starts at user login after bootstrap; no root required. -->
+    <key>RunAtLoad</key><true/>
+    <!-- Wrapper exits 1 on session loss, 0 on operator TERM/INT. -->
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>15</integer>
+    <key>ExitTimeOut</key><integer>30</integer>
+    <key>StandardOutPath</key><string><state-dir>/channel.out.log</string>
+    <key>StandardErrorPath</key><string><state-dir>/channel.err.log</string>
+    <key>ProcessType</key><string>Interactive</string>
 </dict>
 </plist>

@@ -25,7 +25,7 @@ const FILE = (): string => join(paths.root, 'status-widget.json')
 
 beforeEach(() => {
   stateDir = mkdtempSync(join(tmpdir(), 'dashi-channel-swrec-'))
-  const env = { TELEGRAM_BOT_TOKEN: FAKE_TOKEN, TELEGRAM_STATE_DIR: stateDir }
+  const env = { TELEGRAM_BOT_TOKEN: FAKE_TOKEN, TELEGRAM_ALLOWED_USER_IDS: '164795011', TELEGRAM_STATE_DIR: stateDir }
   paths = getStatePaths(loadConfig(env), env)
   api.ensureStateDirs(paths)
 })

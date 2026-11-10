@@ -340,13 +340,33 @@ function objectRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
+/** Parse only literal shell assignments; never source or evaluate the file. */
+function literalShellEnv(text: string): Map<string, string> | null {
+  const values = new Map<string, string>()
+  for (const line of text.split('\n')) {
+    if (!line.trim() || line.trimStart().startsWith('#')) continue
+    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/)
+    if (!match || values.has(match[1]!)) return null
+    const raw = match[2]!.trim()
+    const quoted = raw.match(/^'([^']*)'(?:\s+#.*)?$/) ?? raw.match(/^"([^"\\$`]*)"(?:\s+#.*)?$/)
+    const bare = raw.replace(/\s+#.*$/, '')
+    if (quoted) values.set(match[1]!, quoted[1]!)
+    else if (/^[A-Za-z0-9_./:@,+%=-]*$/.test(bare)) values.set(match[1]!, bare)
+    else return null
+  }
+  return values
+}
+
 export function resolveDoctorConfig(
   envText: string | null,
   home: string = homedir(),
   read: (path: string) => string = (path) => readFileSync(path, 'utf8'),
   runtimeDir: string = process.cwd(),
+  envLoader: 'unknown' | 'shell' = 'unknown',
 ): DoctorConfigResolution {
-  const value = (key: string): string | undefined => envText === null ? undefined : envValue(envText, key, true) ?? undefined
+  const shellValues = envLoader === 'shell' && envText !== null ? literalShellEnv(envText) : null
+  const value = (key: string): string | undefined => envText === null ? undefined
+    : envLoader === 'shell' ? shellValues?.get(key) : envValue(envText, key, true) ?? undefined
   const stateDir = resolve(runtimeDir, value('TELEGRAM_STATE_DIR') ?? join(home, '.claude', 'channels', 'dashi-telegram-canary'))
   const configPath = resolve(runtimeDir, value('TELEGRAM_CONFIG_FILE') ?? join(stateDir, 'config.json'))
   const source = value('TELEGRAM_CONFIG_FILE') !== undefined ? 'TELEGRAM_CONFIG_FILE' : value('TELEGRAM_STATE_DIR') !== undefined ? 'TELEGRAM_STATE_DIR/config.json' : 'default state directory'
@@ -356,10 +376,11 @@ export function resolveDoctorConfig(
     fix: 'pass --env for this service and make its selected config readable valid JSON; do not treat dependent checks as verified',
   } })
   if (envText === null) return incomplete()
+  if (envLoader === 'shell' && shellValues === null) return incomplete('shell env contains nonliteral syntax or duplicate assignments; only literal assignments are supported')
   // Shell/systemd takes the last assignment; server.ts's .env loader takes the
   // first. Without launch provenance, duplicate keys cannot be resolved safely.
   const seen = new Set<string>()
-  for (const line of envText.split('\n')) {
+  for (const line of envLoader === 'shell' ? [] : envText.split('\n')) {
     const key = line.match(/^\s*(?:export\s+)?(TELEGRAM_[A-Z0-9_]+)=/)?.[1]
     if (key === undefined) continue
     // server.ts loads raw KEY=value; shell normalization can change its meaning.
@@ -382,7 +403,7 @@ export function resolveDoctorConfig(
   }
   // Only fields consumed by doctor checks are projected. This is not full Zod validation.
   const config: Record<string, unknown> = {
-    allowed_user_ids: [164795011], allowed_chat_ids: [164795011], ...file,
+    allowed_user_ids: [], ...file,
   }
   const defaults: Record<string, Record<string, unknown>> = {
     status: { enabled: false }, progress: { enabled: false },
@@ -424,6 +445,7 @@ export function resolveDoctorConfig(
   try {
     assign('TELEGRAM_ALLOWED_USER_IDS', 'allowed_user_ids', undefined, users)
     assign('TELEGRAM_ALLOWED_CHAT_IDS', 'allowed_chat_ids', undefined, chats)
+    if (config.allowed_chat_ids === undefined) config.allowed_chat_ids = config.allowed_user_ids
     assign('TELEGRAM_WORKSPACE_ROOT', 'workspace_root')
     assign('TELEGRAM_WEBHOOK_HOST', 'host', 'webhook')
     assign('TELEGRAM_WEBHOOK_PORT', 'port', 'webhook', integer)
@@ -436,7 +458,7 @@ export function resolveDoctorConfig(
       const block = config[key]
       if (!objectRecord(block) || typeof block.enabled !== 'boolean') return incomplete()
     }
-    if (!Array.isArray(config.allowed_user_ids) || config.allowed_user_ids.length === 0 || !config.allowed_user_ids.every((v: unknown) => typeof v === 'number' && Number.isInteger(v) && v > 0)) return incomplete()
+    if (!Array.isArray(config.allowed_user_ids) || !config.allowed_user_ids.every((v: unknown) => typeof v === 'number' && Number.isInteger(v) && v > 0)) return incomplete()
     if (!Array.isArray(config.allowed_chat_ids) || !config.allowed_chat_ids.every((v: unknown) => typeof v === 'string' || typeof v === 'number')) return incomplete()
     const webhook = config.webhook
     if (!objectRecord(webhook) || typeof webhook.host !== 'string' || typeof webhook.port !== 'number' || !Number.isInteger(webhook.port) || webhook.port < 0) return incomplete()
@@ -2075,6 +2097,7 @@ interface Options {
   mcpPath?: string
   settingsLocalPath?: string
   envPath?: string
+  envLoader?: 'unknown' | 'shell'
   userId?: string
   chatId?: string
   tmuxSession?: string
@@ -2137,6 +2160,12 @@ function parseArgs(argv: string[]): Options | { error: string } {
       case '--env':
         opts.envPath = next()
         break
+      case '--env-loader': {
+        const loader = next()
+        if (loader !== 'shell' && loader !== 'unknown') return { error: '--env-loader must be shell or unknown' }
+        opts.envLoader = loader
+        break
+      }
       case '--user':
         opts.userId = next()
         break
@@ -2177,6 +2206,7 @@ Options:
   --mcp <path>             project .mcp.json
   --settings-local <path>  project .claude/settings.local.json
   --env <path>             channel.env to inspect (allowlists)
+  --env-loader <mode>      shell: known shell-loaded literal env; default unknown
   --user <id>              your numeric Telegram user id
   --chat <id>              a Telegram chat id to verify (group id is -100...)
   --session <name>         tmux channel session (e.g. channel-myagent)
@@ -2341,9 +2371,18 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
 
   // Resolve the same config path and diagnostic fields as runtime before checks.
   const envText = opts.envPath ? readFileSafe(opts.envPath) : null
-  const effective = resolveDoctorConfig(envText, homedir(), undefined, opts.pluginDir)
+  const effective = resolveDoctorConfig(envText, homedir(), undefined, opts.pluginDir, opts.envLoader)
   checks.push(effective.check)
   const stateConfig = effective.config
+  checks.push({
+    id: 'owner-id-configured', title: 'Owner ID configured',
+    status: stateConfig === null ? 'warn' : Array.isArray(stateConfig.allowed_user_ids) && stateConfig.allowed_user_ids.length > 0 ? 'pass' : 'fail',
+    detail: stateConfig === null ? 'effective config unavailable — owner ID coverage unverified'
+      : Array.isArray(stateConfig.allowed_user_ids) && stateConfig.allowed_user_ids.length > 0
+        ? 'effective owner user allowlist is configured'
+        : 'owner ID absent or empty; runtime refuses startup; implicit owner access has been removed',
+    fix: 'set allowed_user_ids in the selected config.json or TELEGRAM_ALLOWED_USER_IDS to positive Telegram owner user IDs; resolve config-source first if coverage is unverified',
+  })
   const profile = selectHookProfile(stateConfig)
   const flag = (key: string): boolean | null => {
     const block = stateConfig?.[key]

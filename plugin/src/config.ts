@@ -1,6 +1,6 @@
 // Config loader with Zod validation and state-dir path resolution.
-// All env vars and config.json keys are validated at boundary; defaults
-// embed canary values (bot 8507713167, prince 164795011).
+// All env vars and config.json keys are validated at boundary. The installation
+// owner is required explicitly; no user receives implicit access.
 
 import { existsSync, readFileSync } from 'fs'
 import { homedir } from 'os'
@@ -42,8 +42,10 @@ export const AppConfigSchema = z.object({
   // ignored. Kept here for backward compatibility with existing
   // config.json files; do NOT remove without a migration pass.
   dm_only: z.boolean().default(true),
-  allowed_user_ids: z.array(z.number().int().positive()).min(1).default([164795011]),
-  allowed_chat_ids: z.array(z.union([z.number(), z.string()])).default([164795011]),
+  allowed_user_ids: z.array(z.number().int().positive(), {
+    required_error: 'owner ID not configured: set allowed_user_ids in config.json or TELEGRAM_ALLOWED_USER_IDS',
+  }).min(1, 'owner ID not configured: set allowed_user_ids in config.json or TELEGRAM_ALLOWED_USER_IDS'),
+  allowed_chat_ids: z.array(z.union([z.number(), z.string()])).default([]),
   // Owner DM chat ids for OWNER-ONLY surfaces (the pinned context HUD + the
   // owner command menu). Distinct from `allowed_chat_ids`, which in multichat
   // ALSO lists group/supergroup ids — a HUD with destructive buttons or the
@@ -89,7 +91,7 @@ export const AppConfigSchema = z.object({
   }).default({}),
   permission_relay: z.object({
     enabled: z.boolean().default(true),
-    allowed_user_ids: z.array(z.number().int().positive()).default([164795011]),
+    allowed_user_ids: z.array(z.number().int().positive()).default([]),
     bash_only_proof: z.boolean().default(true),
   }).default({}),
   commands: z.object({
@@ -694,6 +696,22 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     richMessages.perChatOptOut = parseCsvChatIds(parsedEnv.TELEGRAM_RICH_MESSAGES_PER_CHAT_OPT_OUT).map(String)
   }
   if (Object.keys(richMessages).length > 0) merged.richMessages = richMessages
+
+  if (merged.allowed_user_ids === undefined || (Array.isArray(merged.allowed_user_ids) && merged.allowed_user_ids.length === 0)) {
+    throw new Error('owner ID not configured: set allowed_user_ids in config.json or TELEGRAM_ALLOWED_USER_IDS (comma-separated positive Telegram user IDs); implicit owner access has been removed')
+  }
+
+  // An explicitly configured owner is the only source of implicit DM and
+  // relay recipients. Explicit lists (including intentionally empty ones) win.
+  if (merged.allowed_chat_ids === undefined) merged.allowed_chat_ids = merged.allowed_user_ids
+  if (merged.permission_relay === undefined) {
+    merged.permission_relay = { allowed_user_ids: merged.allowed_user_ids }
+  } else if (merged.permission_relay !== null && typeof merged.permission_relay === 'object' && !Array.isArray(merged.permission_relay)) {
+    const relay = merged.permission_relay as Record<string, unknown>
+    if (relay.allowed_user_ids === undefined) {
+      merged.permission_relay = { ...relay, allowed_user_ids: merged.allowed_user_ids }
+    }
+  }
 
   try {
     return AppConfigSchema.parse(merged)

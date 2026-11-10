@@ -23,19 +23,40 @@ afterEach(() => {
 
 const FAKE_TOKEN = '123456789:AAH-fake_test_token_with_at_least_thirty_chars'
 
-function env(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
+function env(overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
   return {
     TELEGRAM_BOT_TOKEN: FAKE_TOKEN,
     TELEGRAM_STATE_DIR: stateDir,
+    TELEGRAM_ALLOWED_USER_IDS: '42',
     ...overrides,
   }
 }
 
 describe('loadConfig', () => {
-  test('loads default config when no file and no env overrides except token', () => {
+  test('refuses startup without an owner and names the config key and env variable', () => {
+    expect(() => loadConfig(env({ TELEGRAM_ALLOWED_USER_IDS: undefined }))).toThrow(/allowed_user_ids.*TELEGRAM_ALLOWED_USER_IDS/)
+  })
+
+  test('configured owner supplies DM chats and relay approvers without foreign defaults', () => {
+    const cfg = loadConfig(env({ TELEGRAM_ALLOWED_USER_IDS: '42,43' }))
+    expect(cfg.allowed_chat_ids).toEqual([42, 43])
+    expect(cfg.permission_relay.allowed_user_ids).toEqual([42, 43])
+  })
+
+  test('explicit chat and relay lists are preserved', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      allowed_user_ids: [42], allowed_chat_ids: [-100123],
+      permission_relay: { allowed_user_ids: [43] },
+    }))
+    const cfg = loadConfig(env())
+    expect(cfg.allowed_chat_ids).toEqual([-100123])
+    expect(cfg.permission_relay.allowed_user_ids).toEqual([43])
+  })
+
+  test('loads default config with an explicitly configured owner', () => {
     const cfg = loadConfig(env())
     expect(cfg.bot_id).toBe(8507713167)
-    expect(cfg.allowed_user_ids).toEqual([164795011])
+    expect(cfg.allowed_user_ids).toEqual([42])
     expect(cfg.dm_only).toBe(true)
     expect(cfg.status.interval_ms).toBe(700)
     expect(cfg.album.flush_ms).toBe(2000)
@@ -98,7 +119,7 @@ describe('loadConfig', () => {
     writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
       allowed_user_ids: [],
     }))
-    expect(() => loadConfig(env())).toThrow(/allowed_user_ids|too_small|at least 1/i)
+    expect(() => loadConfig(env({ TELEGRAM_ALLOWED_USER_IDS: undefined }))).toThrow(/allowed_user_ids|too_small|at least 1/i)
   })
 
   test('coerces string PORT env to number', () => {
@@ -193,7 +214,7 @@ describe('loadConfig', () => {
       allowed_user_ids: [42, 43],
       workspace_root: '/tmp/ws',
     }))
-    const cfg = loadConfig(env())
+    const cfg = loadConfig(env({ TELEGRAM_ALLOWED_USER_IDS: undefined }))
     expect(cfg.bot_id).toBe(77777777)
     expect(cfg.allowed_user_ids).toEqual([42, 43])
     expect(cfg.workspace_root).toBe('/tmp/ws')
