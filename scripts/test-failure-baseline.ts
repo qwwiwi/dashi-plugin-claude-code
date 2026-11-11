@@ -1,5 +1,6 @@
 // Compare completed Bun console reports without treating pre-existing failures as regressions.
 import { readFileSync, writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 export function parseTestFailures(output: string, exitCode: number): string[] {
   const plain = output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
@@ -47,7 +48,26 @@ if (import.meta.main) {
       const added = addedFailures(before, after)
       console.log(`New failures: ${added.length}`)
       for (const name of added) console.log(`  ${name}`)
-      if (added.length) process.exit(1)
+      if (added.length) {
+        // Explicit relative paths make Bun run these files rather than matching path filters.
+        const files = [...new Set(added.map(name => `./${name.split(' > ')[0]}`))]
+        console.log(`Re-running test files once: ${files.join(', ')}`)
+        const rerun = Bun.spawnSync(['bun', 'test', ...files], {
+          cwd: resolve(import.meta.dir, '../plugin'),
+          env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0' },
+          stdout: 'pipe', stderr: 'pipe',
+        })
+        const output = rerun.stdout.toString() + rerun.stderr.toString()
+        console.log(output)
+        const repeated = new Set(parseTestFailures(output, rerun.exitCode))
+        const flaky = added.filter(name => !repeated.has(name))
+        const confirmed = added.filter(name => repeated.has(name))
+        console.log(`Flaky new failures: ${flaky.length}`)
+        for (const name of flaky) console.log(`  ${name}: flaky, passed on re-run`)
+        console.log(`Confirmed new failures: ${confirmed.length}`)
+        for (const name of confirmed) console.log(`  ${name}`)
+        if (confirmed.length) process.exit(1)
+      }
     } else throw new Error('Invalid test-baseline helper arguments')
   } catch {
     console.error('Cannot establish test failures: test runner failed to start/complete or its report is unreadable.')

@@ -29,7 +29,7 @@ read_context
 if [[ "$RESTART" == 1 ]] && inside_channel; then restart_hint; fail "Refusing --restart inside tmux session $SESSION; run from an external terminal"; fi
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "DRY RUN: record current commit $CURRENT; timestamp backup config/env/settings/metadata/service"
-  echo 'DRY RUN: baseline (cd plugin && bun test); git pull --ff-only; (cd plugin && bun install && bun test); compare failure names; rollback on new failures, runner or dependency failure'
+  echo 'DRY RUN: baseline (cd plugin && bun test); git pull --ff-only; (cd plugin && bun install && bun test); re-run files with new failures once; rollback on confirmed new failures, runner or dependency failure'
   echo 'DRY RUN: re-register standard plugin/scripts/install-hooks.sh; doctor --check-latest summary'
   restart_hint
   exit 0
@@ -61,6 +61,7 @@ echo 'Installing plugin dependencies'
 (cd "$REPO/plugin" && bun install) || rollback
 echo 'Running plugin tests after pull and comparing failure names'
 capture_tests after After-update || rollback
+# The comparison re-runs only files with new failures before confirming a regression.
 bun "$REPO/scripts/test-failure-baseline.ts" compare "$TEST_REPORT_DIR/before.json" "$TEST_REPORT_DIR/after.json" || rollback
 require_file "$REPO/plugin/scripts/install-hooks.sh"
 echo 'Re-registering standard plugin hooks'

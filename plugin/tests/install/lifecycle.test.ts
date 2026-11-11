@@ -25,20 +25,23 @@ function fixture() {
   command('bun', `if [[ "\${1:-}" == "--version" ]]; then echo 1.3.14
 elif [[ "\${1:-}" == "install" ]]; then echo 'bun install' >> "$TEST_LOG"
 elif [[ "\${1:-}" == "test" ]]; then
-  echo 'bun test' >> "$TEST_LOG"
+  echo "bun $*" >> "$TEST_LOG"
   phase=before; [[ "$(cat "$TEST_HEAD")" != new-commit ]] || phase=after
+  [[ "$#" == 1 ]] || phase=rerun
   if [[ "\${TEST_RUNNER_FAIL_PHASE:-}" == "$phase" ]]; then echo 'test runner failed to start' >&2; exit 127; fi
   failures="\${TEST_BASELINE_FAILURES:-}"
-  if [[ "$phase" == after ]]; then
+  if [[ "$phase" != before ]]; then
     failures="\${TEST_AFTER_FAILURES-\${TEST_BASELINE_FAILURES:-}}"
     [[ "\${TEST_FAIL_TESTS:-0}" != 1 ]] || failures='new regression'
   fi
+  if [[ "$phase" == rerun ]]; then failures="\${TEST_RERUN_FAILURES-$failures}"; fi
   echo 'bun test v1.3.14'
   echo 'tests/mock.test.ts:'
   count=0
   while IFS= read -r name; do
     if [[ -n "$name" ]]; then echo "(fail) $name [1.00ms]"; count=$((count + 1)); fi
   done <<< "$failures"
+  if [[ "\${TEST_RUNNER_TRUNCATE_PHASE:-}" == "$phase" ]]; then exit 1; fi
   echo ' 1 pass'; echo " $count fail"; echo "Ran $((count + 1)) tests across 1 file. [2.00ms]"
   [[ "$count" == 0 ]] || exit 1
 elif [[ "\${1:-}" == *doctor.ts ]]; then echo 'doctor summary (stub)'; echo "doctor $*" >> "$TEST_LOG"
@@ -152,6 +155,45 @@ describe('clone lifecycle scripts (no network or real services)', () => {
     expect(r.out).toContain('New failures: 1'); expect(r.out).toContain('tests/mock.test.ts > new regression')
     expect(readFileSync(f.log, 'utf8')).toContain('git reset --hard old-commit')
     expect(readFileSync(f.log, 'utf8')).not.toContain('--check-latest')
+  })
+  test('new failure passes on re-run and update completes after retrying only its file once', () => {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0); writeFileSync(f.log, '')
+    const r = f.run('update.sh', ['--state-dir', f.state], {
+      TEST_BASELINE_FAILURES: 'old failure', TEST_AFTER_FAILURES: 'old failure\nflaky one\nflaky two',
+      TEST_RERUN_FAILURES: 'old failure',
+    })
+    expect(r.code).toBe(0); expect(readFileSync(f.head, 'utf8').trim()).toBe('new-commit')
+    expect(r.out).toContain('tests/mock.test.ts > flaky one: flaky, passed on re-run')
+    expect(r.out).toContain('tests/mock.test.ts > flaky two: flaky, passed on re-run')
+    expect(r.out).toContain('Confirmed new failures: 0'); expect(r.out).toContain('Update validated')
+    const calls = readFileSync(f.log, 'utf8')
+    expect(calls.split('\n').filter(line => line.startsWith('bun test'))).toEqual([
+      'bun test', 'bun test', 'bun test ./tests/mock.test.ts',
+    ])
+    expect(calls).not.toContain('git reset')
+  })
+  test('new failure fails again on re-run and rolls back while listing flaky and confirmed failures', () => {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0); writeFileSync(f.log, '')
+    const r = f.run('update.sh', ['--state-dir', f.state], {
+      TEST_AFTER_FAILURES: 'flaky failure\nnew regression', TEST_RERUN_FAILURES: 'new regression',
+    })
+    expect(r.code).not.toBe(0); expect(readFileSync(f.head, 'utf8').trim()).toBe('old-commit')
+    expect(r.out).toContain('tests/mock.test.ts > flaky failure: flaky, passed on re-run')
+    expect(r.out).toContain('Confirmed new failures: 1\n  tests/mock.test.ts > new regression')
+    const calls = readFileSync(f.log, 'utf8')
+    expect(calls.match(/bun test/g)).toHaveLength(3)
+    expect(calls).toContain('git reset --hard old-commit'); expect(calls).not.toContain('--check-latest')
+  })
+  test('broken re-run runner or incomplete re-run report rolls back', () => {
+    for (const broken of [{ TEST_RUNNER_FAIL_PHASE: 'rerun' }, { TEST_RUNNER_TRUNCATE_PHASE: 'rerun' }]) {
+      const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0); writeFileSync(f.log, '')
+      const r = f.run('update.sh', ['--state-dir', f.state], { TEST_AFTER_FAILURES: 'new regression', ...broken })
+      expect(r.code).not.toBe(0); expect(readFileSync(f.head, 'utf8').trim()).toBe('old-commit')
+      expect(r.out).toContain('Cannot establish test failures')
+      const calls = readFileSync(f.log, 'utf8')
+      expect(calls.match(/bun test/g)).toHaveLength(3)
+      expect(calls).toContain('git reset --hard old-commit'); expect(calls).not.toContain('--check-latest')
+    }
   })
   test('baseline runner startup failure stops before pulling; after-update startup failure rolls back', () => {
     for (const phase of ['before', 'after']) {
