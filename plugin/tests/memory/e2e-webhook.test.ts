@@ -30,6 +30,7 @@ beforeEach(() => {
   delete process.env.TELEGRAM_WEBHOOK_TOKEN
   const env = {
     TELEGRAM_BOT_TOKEN: FAKE_TOKEN,
+    TELEGRAM_ALLOWED_USER_IDS: '164795011',
     TELEGRAM_STATE_DIR: stateDir,
   }
   baseConfig = loadConfig(env)

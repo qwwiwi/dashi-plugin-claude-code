@@ -1,5 +1,71 @@
 # Установка на macOS (launchd)
 
+## Быстрая установка
+
+**Рекомендуемый путь — [установка через агента](00-install-with-agent.md).** Откройте Codex
+или Claude Code и вставьте готовый промпт: агент подключится к серверу, подготовит
+плагин и доведёт запуск до проверки в Telegram. Вход в Claude и команды `sudo`
+вы выполните сами; токен бота вводится только в терминале сервера.
+
+### Самостоятельная установка
+
+От непривилегированного пользователя агента установите `claude`, Bun, `tmux` и Git,
+пройдите вход командой `claude`, затем:
+
+```bash
+mkdir -p ~/.claude-lab/myagent/.claude
+cd ~/.claude-lab/myagent/.claude
+git clone https://github.com/qwwiwi/dashi-plugin-claude-code.git
+cd dashi-plugin-claude-code
+./install.sh
+# Обновление из этого же каталога:
+./update.sh
+```
+
+Установщик проверит зависимости, спросит имя агента, workspace, токен бота
+(ввод скрыт) и положительный числовой Telegram user ID. Без ID установка не
+завершится. Токен хранится только в приватном `channel.env` с правами `600`.
+Установщик запускает `bun install`, ставит обычные hooks плагина, создаёт config,
+launchd plist и wrapper с автономным профилем, затем показывает сводку doctor.
+Перед заменой файлов создаются копии с датой. `--dry-run` ничего не записывает.
+
+Без `--start` plist только записывается в
+`~/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist` и не загружается
+в launchd. Для регистрации и первого запуска выполните установщик с `--start`
+либо его напечатанную команду:
+
+```bash
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist"
+```
+
+После регистрации `RunAtLoad` запускает агента при входе GUI-пользователя,
+`KeepAlive` перезапускает после сбоя. Это LaunchAgent пользователя: после
+перезагрузки нужен вход в его macOS account. Wrapper и приватный `channel.env`
+находятся в каталоге состояния (по умолчанию `~/.claude/channels/myagent/`).
+
+Для автоматизации: `--agent NAME --workspace PATH --owner-id ID --non-interactive`;
+токен передайте через `TELEGRAM_BOT_TOKEN`, ID можно через `TELEGRAM_OWNER_ID`.
+Флаг `--bot-token TOKEN` тоже есть, но env не оставляет токен в истории команд.
+Доступны `--state-dir PATH`, `--settings PATH`, `--start`, `--dry-run`.
+`./update.sh` сохраняет config/settings, отказывается от грязного checkout,
+обновляет код через `--ff-only`, запускает тесты и обновляет hooks. Рестарт только
+вручную по напечатанной команде либо с `--restart` из отдельного терминала;
+из tmux-сессии обновляемого Telegram-канала рестарт запрещён. Update также принимает
+`--dry-run`, `--state-dir PATH`, `--settings PATH`.
+
+Для `update.sh` нужен `install.json` от установщика/renderer. Старую ручную
+установку сначала перенесите в выбранный state-каталог (приватный env и config),
+затем повторите `./install.sh --state-dir PATH` с теми же agent/workspace/owner:
+config/env сохранятся. До запуска проверьте doctor. При нескольких агентах
+или своём пути используйте `./update.sh --state-dir PATH`.
+
+При обновлении старой установки до рестарта задайте свой `allowed_user_ids`
+в используемом `config.json` или `TELEGRAM_ALLOWED_USER_IDS=123456789` в окружении
+канала: прежнего встроенного ID больше нет, отсутствие владельца блокирует запуск.
+`TELEGRAM_OWNER_ID` — вход установщика, не замена runtime-настройки.
+Тесты плагина/установщика: `cd plugin && bun test`; doctor из корня:
+`bun test skills/doctor-dashi-plugin/scripts/doctor.test.ts`. Ручной путь — ниже.
+
 > **Linux пользователь?** → [03-installation-linux.md](03-installation-linux.md)
 > **Не уверены какой OS выбрать?** → [03-installation.md](03-installation.md)
 
@@ -128,181 +194,82 @@ AGENT_ID=myagent
 
 ---
 
-## Шаг 6. Wrapper-скрипт и launchd plist
+## Шаг 6. Wrapper и launchd plist
 
-**Почему два файла, а не один inline `sh -c` в plist:** Claude Code требует TTY (поэтому tmux), а tmux-сессию нужно запустить **detached** (`new-session -d`), чтобы launchd не висел на foreground tmux client. При этом launchd должен супервизить **живой** PID — иначе KeepAlive/Restart работают неправильно. Прежний inline-вариант (`exec tmux new-session -d ...; sleep; send-keys`) был сломан: `exec` подменяет shell процессом tmux client, который сразу завершается с success после detach, и команды `sleep; send-keys` после `exec` никогда не запускаются. Wrapper-скрипт решает обе проблемы: source-ит env, стартует tmux, шлёт Enter в welcome-промты, и блокируется на polling пока tmux-сессия жива.
+Launchd должен наблюдать живой foreground-процесс. Общий wrapper из
+`examples/launchd-wrapper.sh.example` запускает detached tmux, отслеживает его
+сессию и выходит с кодом 1 при её неожиданном завершении. SIGTERM от launchd
+останавливает tmux и завершает wrapper с кодом 0.
 
-### 6.1. Wrapper-скрипт
-
-Скопируйте example и подставьте свои значения:
-
-```bash
-cp ~/.claude-lab/myagent/.claude/dashi-plugin-claude-code/examples/launchd-wrapper.sh.example \
-   ~/.claude-lab/myagent/scripts/launchd-wrapper.sh
-chmod +x ~/.claude-lab/myagent/scripts/launchd-wrapper.sh
-$EDITOR ~/.claude-lab/myagent/scripts/launchd-wrapper.sh
-```
-
-По умолчанию `--permission-mode bypassPermissions` отключает подтверждения действий Claude Code: агент работает автономно. Для запуска с подтверждениями уберите `--permission-mode bypassPermissions` из команды запуска; при необходимости добавьте `--permission-gate` к команде `scripts/install-hooks.sh` с вашими параметрами установки и включите `permission_gate.enabled=true` в конфигурации плагина. Первичные welcome-промты проходят отдельно.
-
-В скрипте замените `<you>` на ваш macOS username, `<agent>` на имя агента, и проверьте `TMUX_BIN` (Apple Silicon: `/opt/homebrew/bin/tmux`, Intel: `/usr/local/bin/tmux`).
-
-Минимальный рабочий wrapper:
-
-```sh
-#!/bin/sh
-set -eu
-
-AGENT="myagent"
-USER_HOME="/Users/<you>"
-ENV_FILE="${USER_HOME}/.claude-lab/${AGENT}/secrets/channel.env"
-TMUX_SESSION="channel-${AGENT}"
-TMUX_BIN="/opt/homebrew/bin/tmux"
-CLAUDE_CMD="claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel"
-
-log() { printf '[%s] launchd-wrapper: %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
-
-# Source secrets без коммита в plist
-if [ -f "${ENV_FILE}" ]; then
-  set -a; . "${ENV_FILE}"; set +a
-else
-  log "FATAL: env file not found: ${ENV_FILE}"
-  exit 78
-fi
-
-# Кill stale session если предыдущий запуск не сделал cleanup
-if "${TMUX_BIN}" has-session -t "${TMUX_SESSION}" 2>/dev/null; then
-  "${TMUX_BIN}" kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
-fi
-
-# EXPECTED_SHUTDOWN: ставится в 1 при operator-initiated stop (SIGTERM от launchctl)
-# Используется ниже чтобы различить graceful stop и unexpected tmux death.
-EXPECTED_SHUTDOWN=0
-
-# Trap для graceful shutdown по SIGTERM от launchctl
-cleanup() {
-  EXPECTED_SHUTDOWN=1
-  log "cleanup: killing tmux session (operator-initiated)"
-  "${TMUX_BIN}" kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
-  exit 0
-}
-trap cleanup TERM INT
-
-# Стартуем claude в detached tmux
-"${TMUX_BIN}" new-session -d -s "${TMUX_SESSION}" "${CLAUDE_CMD}"
-
-# Welcome-промты (фоном, безвредны если persistent approvals уже записаны)
-(
-  sleep 6
-  "${TMUX_BIN}" send-keys -t "${TMUX_SESSION}" Enter 2>/dev/null || true
-  sleep 2
-  "${TMUX_BIN}" send-keys -t "${TMUX_SESSION}" Enter 2>/dev/null || true
-) &
-
-# Foreground supervisor: блокируемся пока tmux session жива
-log "supervising tmux session '${TMUX_SESSION}' (pid wrapper=$$)"
-while "${TMUX_BIN}" has-session -t "${TMUX_SESSION}" 2>/dev/null; do
-  sleep 5
-done
-
-# Различаем operator-stop (exit 0, мы здесь не окажемся — cleanup сделал exit 0)
-# и unexpected tmux death (exit 1 → launchd KeepAlive.SuccessfulExit=false respawn-ит).
-if [ "${EXPECTED_SHUTDOWN}" = "1" ]; then
-  log "tmux session ended (expected), wrapper exiting 0"
-  exit 0
-fi
-log "tmux session died unexpectedly, wrapper exiting 1 (launchd will respawn)"
-exit 1
-```
-
-**Exit-code matrix (важно для launchd):**
-
-| Сценарий | EXPECTED_SHUTDOWN | Exit | Действие launchd |
-|---|---|---|---|
-| `launchctl kill SIGTERM` (operator stop) | 1 (trap) | 0 | НЕ respawn |
-| Claude crash / kill-session / OOM | 0 | 1 | respawn через ThrottleInterval |
-| Отсутствует `channel.env` | n/a | 78 | respawn (лечить env, не плагином) |
-
-Полная версия с дополнительными комментариями — `examples/launchd-wrapper.sh.example`.
-
-### 6.2. Plist (вызывает wrapper)
+Текущие шаблоны используют placeholders `<env-file-shell>`, `<session-shell>`,
+`<tmux-shell>`, `<workspace-shell>`, `<claude-command-shell>` в wrapper и
+`<agent>`, `<wrapper>`, `<plugin-dir>`, `<home>`, `<path>`, `<state-dir>` в plist.
+В них требуется разное экранирование shell/XML. Renderer подставляет их безопасно;
+не копируйте неотрендеренный шаблон непосредственно в LaunchAgents.
+Он не устанавливает зависимости и hooks и не загружает plist в launchd.
 
 ```bash
-mkdir -p ~/Library/LaunchAgents
-cp ~/.claude-lab/myagent/.claude/dashi-plugin-claude-code/examples/launchd-plist.example.plist \
-   ~/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist
-$EDITOR ~/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist
+# Выполняйте под пользователем агента, не root; замените myagent своим именем.
+export INSTALL_AGENT=myagent
+export INSTALL_WORKSPACE="$HOME/.claude-lab/myagent/.claude"
+export INSTALL_REPO="$INSTALL_WORKSPACE/dashi-plugin-claude-code"
+export INSTALL_STATE_DIR="$HOME/.claude-lab/shared/state/myagent/telegram"
+export INSTALL_SETTINGS="$HOME/.claude/settings.json"
+export INSTALL_PLATFORM=Darwin
+export INSTALL_HOME="$HOME"
+export INSTALL_CLAUDE="$(command -v claude)"
+export INSTALL_TMUX="$(command -v tmux)"
+export INSTALL_BUN="$(command -v bun)"
+mkdir -p "$INSTALL_STATE_DIR"
+# Существующий приватный env сохраняется; для новой установки копируем из шага 5.
+if [[ ! -f "$INSTALL_STATE_DIR/channel.env" ]]; then
+  install -m 600 "$HOME/.claude-lab/myagent/secrets/channel.env" "$INSTALL_STATE_DIR/channel.env"
+fi
+read -r -p 'Telegram owner ID (numeric): ' TELEGRAM_OWNER_ID
+export TELEGRAM_OWNER_ID
+bun "$INSTALL_REPO/scripts/render-install.ts"
 ```
 
-Замените все вхождения `<you>` на ваш macOS username, `myagent` на имя агента. Убедитесь что `WorkingDirectory` указывает внутрь `plugin/`.
+Существующие config/env сохраняются; перед заменой wrapper/plist делаются копии
+с датой. Проверьте в приватном `$INSTALL_STATE_DIR/channel.env`, что
+`TELEGRAM_STATE_DIR` равен этому каталогу, `TELEGRAM_WORKSPACE_ROOT` — workspace
+из команды выше. Если задан `TELEGRAM_CONFIG_FILE`, укажите `$INSTALL_STATE_DIR/config.json`
+и поместите используемый config в этот файл.
+Перед ручной правкой сделайте копию файла с датой. Owner ID должен быть разрешён
+существующими config/env; несоответствие renderer отклонит.
 
-Минимальный рабочий plist:
+Renderer создаёт `$INSTALL_STATE_DIR/channel-wrapper.sh`, отдельный MCP config,
+`install.json` и `~/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist`.
+`ProgramArguments` содержит абсолютный путь к wrapper, без токена. Wrapper
+открывает Claude Code в workspace через `tmux new-session -c`; команда внутри
+pane читает приватный env заново, даже если tmux server существовал раньше.
+Supervisor CWD остаётся `plugin/`, MCP использует абсолютные пути.
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.dashi-plugin.channel-myagent</string>
+По умолчанию используется `--permission-mode bypassPermissions`. Для подтверждений
+уберите этот флаг из `CLAUDE_CMD` в сгенерированном wrapper; permission gate
+подключается отдельно через `install-hooks.sh --permission-gate` и
+`permission_gate.enabled=true`.
 
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/&lt;you&gt;/.claude-lab/myagent/scripts/launchd-wrapper.sh</string>
-    </array>
+Проверьте plist и wrapper перед загрузкой:
 
-    <key>WorkingDirectory</key>
-    <string>/Users/&lt;you&gt;/.claude-lab/myagent/.claude/dashi-plugin-claude-code/plugin</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>/Users/&lt;you&gt;</string>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/&lt;you&gt;/.bun/bin</string>
-        <key>LANG</key>
-        <string>en_US.UTF-8</string>
-    </dict>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-
-    <key>ThrottleInterval</key>
-    <integer>15</integer>
-
-    <key>ExitTimeOut</key>
-    <integer>30</integer>
-
-    <key>StandardOutPath</key>
-    <string>/Users/&lt;you&gt;/Library/Logs/dashi-plugin/channel-myagent.out.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/Users/&lt;you&gt;/Library/Logs/dashi-plugin/channel-myagent.err.log</string>
-
-    <key>ProcessType</key>
-    <string>Interactive</string>
-</dict>
-</plist>
+```bash
+plutil -lint "$HOME/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist"
+bash -n "$INSTALL_STATE_DIR/channel-wrapper.sh"
 ```
 
-**Различия от systemd-варианта:**
+| Сценарий | Exit wrapper | Действие launchd |
+|---|---|---|
+| SIGTERM от оператора | 0 | Не перезапускать |
+| Неожиданное завершение tmux/Claude | 1 | Перезапуск через 15 секунд |
+| Отсутствует приватный env | 78 | Повторный запуск; исправьте env |
 
-- `ProgramArguments` — путь к wrapper-скрипту (один аргумент). Wrapper делает то, что в systemd делают `ExecStart` + `ExecStartPost` + `ExecStop` вместе.
-- `EnvironmentVariables` — dict внутри plist для non-secret. Bot token и т.п. wrapper source-ит из `channel.env` (плeist читается любым процессом этого user).
-- `KeepAlive.SuccessfulExit=false` — respawn только если предыдущий exit был НЕ 0. Wrapper выходит с exit 0 при operator-initiated stop (SIGTERM от `launchctl kill` → trap cleanup) и с exit 1 при unexpected tmux death (claude crash, manual `tmux kill-session`, OOM). Так launchd корректно различает: оператор остановил → НЕ респавнить; tmux умер сам по себе → респавнить через ThrottleInterval.
-- `RunAtLoad=true` — запуск при загрузке plist (вход в систему GUI user).
-- `ExitTimeOut=30` — даём wrapper-у 30 сек на trap-cleanup перед SIGKILL.
-- `WorkingDirectory` — критично, как и в systemd. **Внутрь `plugin/`**.
-
-> **Tmux путь:** Homebrew на Apple Silicon ставит в `/opt/homebrew/bin/tmux`, на Intel — в `/usr/local/bin/tmux`. Проверьте `which tmux` в обоих файлах (wrapper и `PATH` в plist).
-
-> **Migration note (от `Crashed=true` к `SuccessfulExit=false`):** Если вы устанавливали плагин ДО этого изменения, ваш plist содержит `<key>Crashed</key><true/>`. Эта семантика **не покрывала** случай, когда wrapper детектил мёртвую tmux и сам выходил с exit 1 (не сигналом) — launchd считал это «штатным завершением» и НЕ перезапускал agent. После claude crash вы получали тихо лежащий сервис. Новая семантика `SuccessfulExit=false` респавнит на ЛЮБОМ non-zero exit. Чтобы мигрировать: замените блок `KeepAlive` в `~/Library/LaunchAgents/com.dashi-plugin.channel-myagent.plist` на новый, обновите wrapper из `examples/launchd-wrapper.sh.example`, затем `launchctl bootout ... && launchctl bootstrap ...` для перезагрузки plist.
+`RunAtLoad=true` запускает агента после загрузки plist и при входе пользователя.
+`KeepAlive.SuccessfulExit=false` покрывает non-zero exit wrapper, включая потерю
+сессии; `ExitTimeOut=30` даёт время на остановку. При обновлении старого plist
+с `Crashed=true` замените его сгенерированным вариантом, затем из отдельного
+терминала выполните `launchctl bootout` и `launchctl bootstrap` с вашим полным
+service target и путём plist. Crash recovery не подтверждает готовность Telegram:
+после запуска нужен реальный DM.
 
 ---
 
@@ -330,7 +297,7 @@ launchctl print gui/$(id -u)/com.dashi-plugin.channel-myagent | head -20
 1. «Allow external CLAUDE.md file imports?» → `1` (Yes)
 2. «--dangerously-load-development-channels» → `1` (I am using this for local development)
 
-Plist через `tmux send-keys` отправит два Enter автоматически (см. ProgramArguments). Если что-то не сработало:
+Wrapper отправит два Enter автоматически. Если промт появился позже или не был принят:
 
 ```bash
 tmux attach -t channel-myagent
@@ -376,8 +343,8 @@ launchctl print gui/$(id -u)/com.dashi-plugin.channel-myagent | head -30
 tmux capture-pane -t channel-myagent -p -S -50 | tail -30
 
 # 3. Логи
-tail -50 ~/Library/Logs/dashi-plugin/channel-myagent.err.log
-tail -50 ~/Library/Logs/dashi-plugin/channel-myagent.out.log
+tail -50 ~/.claude-lab/shared/state/myagent/telegram/channel.err.log
+tail -50 ~/.claude-lab/shared/state/myagent/telegram/channel.out.log
 
 # 4. Telegram очередь
 TOKEN=$(grep TELEGRAM_BOT_TOKEN ~/.claude-lab/myagent/secrets/channel.env | cut -d= -f2-)
@@ -413,8 +380,8 @@ launchctl kickstart -k gui/$(id -u)/com.dashi-plugin.channel-myagent
 | Полностью убрать из launchd | `launchctl bootout gui/$(id -u)/com.dashi-plugin.channel-myagent` |
 | Перезагрузить plist (после правки файла) | `launchctl bootout ... && launchctl bootstrap ...` |
 | Статус | `launchctl print gui/$(id -u)/com.dashi-plugin.channel-myagent` |
-| Логи stdout | `tail -f ~/Library/Logs/dashi-plugin/channel-myagent.out.log` |
-| Логи stderr | `tail -f ~/Library/Logs/dashi-plugin/channel-myagent.err.log` |
+| Логи stdout | `tail -f ~/.claude-lab/shared/state/myagent/telegram/channel.out.log` |
+| Логи stderr | `tail -f ~/.claude-lab/shared/state/myagent/telegram/channel.err.log` |
 | Tmux сессия | `tmux attach -t channel-myagent` (detach Ctrl-B D) |
 
 > **Принципиальная разница vs systemd:** launchd plist работает в **GUI session** вашего user. Если вы logout из macOS (или Mac mini перезагрузился без auto-login) — агент **не запустится** пока вы не войдёте обратно. Для запуска до login — переместить plist в `/Library/LaunchDaemons/` (требует sudo + root ownership), но это уже другая модель (root daemon, не user agent).
@@ -439,9 +406,9 @@ launchd, плагин и Claude Code пишут в три разных мест�
 
 | Что | Где (macOS launchd) | Команда просмотра |
 |---|---|---|
-| Supervisor stdout (wrapper + Claude Code) | `~/Library/Logs/dashi-plugin/channel-<agent>.out.log` (через `StandardOutPath` в plist) | `tail -200 ~/Library/Logs/dashi-plugin/channel-myagent.out.log` |
-| Supervisor stderr | `~/Library/Logs/dashi-plugin/channel-<agent>.err.log` (через `StandardErrorPath`) | `tail -200 ~/Library/Logs/dashi-plugin/channel-myagent.err.log` |
-| Live tail (оба) | то же | `tail -f ~/Library/Logs/dashi-plugin/channel-myagent.{out,err}.log` |
+| Supervisor stdout (wrapper + Claude Code) | `<state-dir>/channel.out.log` (через `StandardOutPath` в plist) | `tail -200 ~/.claude-lab/shared/state/myagent/telegram/channel.out.log` |
+| Supervisor stderr | `<state-dir>/channel.err.log` (через `StandardErrorPath`) | `tail -200 ~/.claude-lab/shared/state/myagent/telegram/channel.err.log` |
+| Live tail (оба) | то же | `tail -f ~/.claude-lab/shared/state/myagent/telegram/channel.{out,err}.log` |
 | launchd state агента (PID, последний exit, ThrottleInterval) | launchd in-memory | `launchctl print gui/$(id -u)/com.dashi-plugin.channel-myagent` |
 | **`bot.pid`** (PID Bun процесса) | `${TELEGRAM_STATE_DIR}/bot.pid` | `cat ~/.claude-lab/shared/state/myagent/telegram/bot.pid` |
 | **`access.json`** (multichat allowlist runtime state) | `${TELEGRAM_STATE_DIR}/access.json` | `jq . ~/.claude-lab/shared/state/myagent/telegram/access.json` |

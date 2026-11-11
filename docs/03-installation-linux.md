@@ -1,5 +1,73 @@
 # Установка на Linux (systemd)
 
+## Быстрая установка
+
+**Рекомендуемый путь — [установка через агента](00-install-with-agent.md).** Откройте Codex
+или Claude Code и вставьте готовый промпт: агент подключится к серверу, подготовит
+плагин и доведёт запуск до проверки в Telegram. Вход в Claude и команды `sudo`
+вы выполните сами; токен бота вводится только в терминале сервера.
+
+### Самостоятельная установка
+
+От непривилегированного пользователя агента установите `claude`, Bun, `tmux` и Git,
+пройдите вход командой `claude`, затем:
+
+```bash
+mkdir -p ~/.claude-lab/myagent/.claude
+cd ~/.claude-lab/myagent/.claude
+git clone https://github.com/qwwiwi/dashi-plugin-claude-code.git
+cd dashi-plugin-claude-code
+./install.sh
+# Обновление из этого же каталога:
+./update.sh
+```
+
+Установщик проверит зависимости, спросит имя агента, workspace, токен бота
+(ввод скрыт) и положительный числовой Telegram user ID. Без ID установка не
+завершится. Токен хранится только в приватном `channel.env` с правами `600`.
+Установщик запускает `bun install`, ставит обычные hooks плагина, создаёт config
+и systemd unit с автономным профилем, затем показывает сводку doctor.
+Перед заменой файлов создаются копии с датой. `--dry-run` ничего не записывает.
+
+Без `--start` сервис не запускается. Unit сначала сохраняется в каталоге состояния
+(по умолчанию `~/.claude/channels/myagent/channel-myagent.service`). Установщик
+печатает команды с вашими путями; для стандартного имени и пути это:
+
+```bash
+sudo install -m 644 "$HOME/.claude/channels/myagent/channel-myagent.service" /etc/systemd/system/channel-myagent.service
+sudo systemctl daemon-reload
+sudo systemctl enable channel-myagent.service
+# Запуск, когда готовы:
+sudo systemctl start channel-myagent.service
+```
+
+`--start` печатает команды для включения и запуска через `sudo`; установщик сам
+не повышает права. Включённый unit запускается после загрузки ОС и перезапускает
+агента после сбоя (`Restart=`).
+
+Для автоматизации: `--agent NAME --workspace PATH --owner-id ID --non-interactive`;
+токен передайте через `TELEGRAM_BOT_TOKEN`, ID можно через `TELEGRAM_OWNER_ID`.
+Флаг `--bot-token TOKEN` тоже есть, но env не оставляет токен в истории команд.
+Доступны `--state-dir PATH`, `--settings PATH`, `--start`, `--dry-run`.
+`./update.sh` сохраняет config/settings, отказывается от грязного checkout,
+обновляет код через `--ff-only`, запускает тесты и обновляет hooks. Рестарт только
+вручную по напечатанной команде либо с `--restart` из отдельного терминала;
+из tmux-сессии обновляемого Telegram-канала рестарт запрещён. Update также принимает
+`--dry-run`, `--state-dir PATH`, `--settings PATH`.
+
+Для `update.sh` нужен `install.json` от установщика/renderer. Старую ручную
+установку сначала перенесите в выбранный state-каталог (приватный env и config),
+затем повторите `./install.sh --state-dir PATH` с теми же agent/workspace/owner:
+config/env сохранятся. До запуска проверьте doctor. При нескольких агентах
+или своём пути используйте `./update.sh --state-dir PATH`.
+
+При обновлении старой установки до рестарта задайте свой `allowed_user_ids`
+в используемом `config.json` или `TELEGRAM_ALLOWED_USER_IDS=123456789` в окружении
+канала: прежнего встроенного ID больше нет, отсутствие владельца блокирует запуск.
+`TELEGRAM_OWNER_ID` — вход установщика, не замена runtime-настройки.
+Тесты плагина/установщика: `cd plugin && bun test`; doctor из корня:
+`bun test skills/doctor-dashi-plugin/scripts/doctor.test.ts`. Ручной путь — ниже.
+
 > **macOS пользователь?** → [03-installation-macos.md](03-installation-macos.md)
 > **Не уверены какой OS выбрать?** → [03-installation.md](03-installation.md)
 
@@ -148,61 +216,75 @@ AGENT_ID=myagent
 
 ---
 
-## Шаг 6. systemd unit
+## Шаг 6. Wrapper и systemd unit
 
-Скопируйте example:
-
-```bash
-sudo cp /home/agentctl/.claude-lab/myagent/.claude/dashi-plugin-claude-code/examples/systemd-unit.service.example \
-        /etc/systemd/system/channel-myagent.service
-sudo $EDITOR /etc/systemd/system/channel-myagent.service
-```
-
-Подставьте свои значения для `User=`, `WorkingDirectory=`, `EnvironmentFile=`:
-
-```ini
-[Unit]
-Description=Dashi Plugin Channel for myagent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=forking
-User=agentctl
-Group=agentctl
-EnvironmentFile=/etc/dashi-plugin/myagent/channel.env
-Environment=HOME=/home/agentctl
-Environment=PATH=/home/agentctl/.bun/bin:/home/agentctl/.local/bin:/usr/local/bin:/usr/bin:/bin
-WorkingDirectory=/home/agentctl/.claude-lab/myagent/.claude/dashi-plugin-claude-code/plugin
-ExecStart=/usr/bin/tmux new-session -d -s channel-myagent \
-  claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dashi-channel
-ExecStartPost=/bin/sh -c 'sleep 6 && /usr/bin/tmux send-keys -t channel-myagent Enter'
-ExecStop=/usr/bin/tmux kill-session -t channel-myagent
-Restart=on-failure
-RestartSec=15s
-
-[Install]
-WantedBy=multi-user.target
-```
-
-По умолчанию `--permission-mode bypassPermissions` отключает подтверждения действий Claude Code: агент работает автономно. Для запуска с подтверждениями уберите `--permission-mode bypassPermissions` из команды запуска; при необходимости добавьте `--permission-gate` к команде `scripts/install-hooks.sh` с вашими параметрами установки и включите `permission_gate.enabled=true` в конфигурации плагина. Первичные welcome-промты проходят отдельно.
-
-**КРИТИЧНО:** `WorkingDirectory=` указывает внутрь `plugin/`. Если опечатка — Claude Code не найдёт project CLAUDE.md и агент будет без identity. См. [02-where-to-place-plugin.md](02-where-to-place-plugin.md).
-
-`Type=forking` нужен потому что `tmux new-session -d` форкается и возвращает управление.
-
-`ExecStartPost` посылает `Enter` через 6 секунд — нужно для прохождения интерактивных welcome-промтов Claude Code (см. ниже).
-
-Активируйте:
+Вместо ручной замены shell-экранированных placeholders используйте отдельный
+renderer. Он не устанавливает зависимости и hooks, не регистрирует и не запускает
+сервис: эти действия остаются отдельными шагами. Он берёт текущие шаблоны
+`examples/launchd-wrapper.sh.example` (общий wrapper для обеих ОС) и
+`examples/systemd-unit.service.example`, создаёт config, MCP config и `install.json`.
+Существующие config/env сохраняются; перед заменой wrapper/unit делаются копии
+с датой. Нужны заполненный env из шага 5 и установленный Bun.
 
 ```bash
+# Выполняйте под пользователем агента, не root; замените myagent своим именем.
+export INSTALL_AGENT=myagent
+export INSTALL_WORKSPACE="$HOME/.claude-lab/myagent/.claude"
+export INSTALL_REPO="$INSTALL_WORKSPACE/dashi-plugin-claude-code"
+export INSTALL_STATE_DIR="$HOME/.claude-lab/shared/state/myagent/telegram"
+export INSTALL_SETTINGS="$HOME/.claude/settings.json"
+export INSTALL_PLATFORM=Linux
+export INSTALL_HOME="$HOME"
+export INSTALL_CLAUDE="$(command -v claude)"
+export INSTALL_TMUX="$(command -v tmux)"
+export INSTALL_BUN="$(command -v bun)"
+mkdir -p "$INSTALL_STATE_DIR"
+# Существующий приватный env сохраняется; для новой установки копируем из шага 5.
+if [[ ! -f "$INSTALL_STATE_DIR/channel.env" ]]; then
+  install -m 600 "/etc/dashi-plugin/myagent/channel.env" "$INSTALL_STATE_DIR/channel.env"
+fi
+read -r -p 'Telegram owner ID (numeric): ' TELEGRAM_OWNER_ID
+export TELEGRAM_OWNER_ID
+bun "$INSTALL_REPO/scripts/render-install.ts"
+```
+
+Проверьте в приватном `$INSTALL_STATE_DIR/channel.env`, что `TELEGRAM_STATE_DIR`
+равен этому каталогу, а `TELEGRAM_WORKSPACE_ROOT` — workspace из команды выше.
+Если задан `TELEGRAM_CONFIG_FILE`, укажите `$INSTALL_STATE_DIR/config.json`
+и поместите используемый config в этот файл. Перед ручной правкой сделайте
+копию файла с датой. Owner ID должен быть разрешён существующими config/env;
+несоответствие renderer отклонит.
+
+Результат: `$INSTALL_STATE_DIR/channel-wrapper.sh` и
+`$INSTALL_STATE_DIR/channel-myagent.service`. В unit используются `Type=simple`,
+`ExecStart=<полный путь к wrapper>`, `Restart=on-failure`, `RestartSec=15s`.
+Wrapper остаётся foreground-процессом, отслеживает detached tmux-сессию и
+выходит с кодом 1 при её неожиданном завершении — systemd видит сбой и
+перезапускает агента. SIGTERM от systemd останавливает tmux и завершает wrapper
+с кодом 0. Проверка `tmux has-session` сама по себе не подтверждает готовность бота.
+
+`WorkingDirectory` сервиса — `plugin/`; реальный CWD Claude Code — workspace
+(`tmux new-session -c`). MCP config содержит абсолютные пути, а команда внутри
+pane читает приватный env заново, даже если tmux server существовал раньше.
+По умолчанию используется `--permission-mode bypassPermissions`. Для подтверждений
+уберите этот флаг из `CLAUDE_CMD` в сгенерированном wrapper; permission gate
+подключается отдельно через `install-hooks.sh --permission-gate` и
+`permission_gate.enabled=true`.
+
+Установите подготовленный unit и включите автозапуск:
+
+```bash
+sudo install -m 644 "$INSTALL_STATE_DIR/channel-myagent.service" /etc/systemd/system/channel-myagent.service
 sudo systemctl daemon-reload
-sudo systemctl enable channel-myagent
-sudo systemctl start channel-myagent
-sudo systemctl status channel-myagent --no-pager -l
+sudo systemctl enable channel-myagent.service
+sudo systemctl start channel-myagent.service
+sudo systemctl status channel-myagent.service --no-pager -l
 ```
 
-Должен быть `active (running)`. Если падает — `journalctl -u channel-myagent --since "5 min ago"`.
+При замене уже установленного unit сначала сохраните его копию с датой.
+Ожидается `active (running)`; ошибки смотрите через
+`journalctl -u channel-myagent.service --since "5 min ago"`. Enable запускает
+сервис после загрузки ОС; crash restart обеспечивает foreground-wrapper.
 
 ---
 
@@ -213,7 +295,7 @@ sudo systemctl status channel-myagent --no-pager -l
 1. **«Allow external CLAUDE.md file imports?»** — если ваш `CLAUDE.md` использует `@-include`. Ответ: `1` (Yes).
 2. **«--dangerously-load-development-channels»** — предупреждение про dev channels. Ответ: `1` (I am using this for local development).
 
-`ExecStartPost` посылает один `Enter` через 6 секунд — это автоматизирует первый промт. Второй промт требует ещё одного Enter. Откройте tmux и нажмите вручную:
+Wrapper отправляет Enter через 6 секунд и ещё раз через 2 секунды. Если welcome-промт появился позже, откройте tmux и подтвердите вручную:
 
 ```bash
 sudo -u agentctl tmux attach -t channel-myagent
@@ -241,7 +323,7 @@ Welcome-промты показываются **при каждом** запус
 
 Точные ключи зависят от версии Claude Code — проверьте `~/.claude/settings.json` после первого ручного прохождения, скопируйте появившиеся ключи. После этого `systemctl restart` пройдёт без интерактива.
 
-> **Известный gap:** на момент написания (Claude Code v2.1.143) часть промтов не сохраняется persistent. Workaround: держите `ExecStartPost` который шлёт несколько `Enter` подряд через `sleep`, и тестируйте `systemctl restart` чтобы убедиться.
+> **Проверка готовности:** задержки welcome-промтов зависят от версии Claude Code. После старта проверьте pane и реальный ответ на DM; активный wrapper ещё не означает готовый Telegram-канал.
 
 ---
 
