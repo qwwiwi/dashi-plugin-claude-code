@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -191,3 +191,28 @@ test('paths with literal shell metacharacters survive rendering, doctor, and a s
   expect(again.exitCode).toBe(0)
   expect(again.stdout.toString() + again.stderr.toString()).not.toContain(token)
 })
+
+
+test('systemd WorkingDirectory is unquoted, preserves spaces and escapes specifiers; ExecStart stays quoted', () => {
+  const f = fixture()
+  const checkout = join(f.root, 'checkout with spaces %h')
+  symlinkSync(repo, checkout, 'dir')
+  f.env.INSTALL_REPO = checkout
+  expect(f.run().exitCode).toBe(0)
+  const unit = readFileSync(join(f.state, 'channel-student.service'), 'utf8')
+  expect(unit.split('\n').find(line => line.startsWith('WorkingDirectory='))).toBe(`WorkingDirectory=${checkout.replaceAll('%', '%%')}/plugin`)
+  expect(unit).toContain(`ExecStart="${f.state}/channel-wrapper.sh"`)
+})
+
+for (const suffix of ['back\\slash', 'control\tcharacter']) {
+  test(`rejects unsupported systemd directory characters before writing: ${JSON.stringify(suffix)}`, () => {
+    const f = fixture()
+    const checkout = join(f.root, suffix)
+    symlinkSync(repo, checkout, 'dir')
+    f.env.INSTALL_REPO = checkout
+    const result = f.run()
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr.toString()).toContain('systemd WorkingDirectory')
+    expect(existsSync(f.state)).toBe(false)
+  })
+}

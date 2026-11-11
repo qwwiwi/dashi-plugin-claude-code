@@ -19,6 +19,7 @@ import { createHash } from 'crypto'
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 import { homedir, platform } from 'os'
+import { parseEnvValue, parseLiteralEnv } from '../../../scripts/env-parser'
 
 export type Status = 'pass' | 'warn' | 'fail' | 'skip'
 
@@ -342,19 +343,7 @@ function objectRecord(value: unknown): value is Record<string, unknown> {
 
 /** Parse only literal shell assignments; never source or evaluate the file. */
 function literalShellEnv(text: string): Map<string, string> | null {
-  const values = new Map<string, string>()
-  for (const line of text.split('\n')) {
-    if (!line.trim() || line.trimStart().startsWith('#')) continue
-    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/)
-    if (!match || values.has(match[1]!)) return null
-    const raw = match[2]!.trim()
-    const quoted = raw.match(/^'([^']*)'(?:\s+#.*)?$/) ?? raw.match(/^"([^"\\$`]*)"(?:\s+#.*)?$/)
-    const bare = raw.replace(/\s+#.*$/, '')
-    if (quoted) values.set(match[1]!, quoted[1]!)
-    else if (/^[A-Za-z0-9_./:@,+%=-]*$/.test(bare)) values.set(match[1]!, bare)
-    else return null
-  }
-  return values
+  try { return parseLiteralEnv(text) } catch { return null }
 }
 
 export function resolveDoctorConfig(
@@ -893,15 +882,8 @@ export function checkCommsConsistency(mcp: unknown, settingsLocal: unknown): Che
  * would otherwise corrupt the parse (e.g. `=42 # me` → id "42 # me").
  */
 export function parseEnvList(envText: string, key: string): string[] | null {
-  const m = envText.match(new RegExp(`^(?:export\\s+)?${key}=(.*)$`, 'm'))
-  if (!m) return null
-  let v = (m[1] ?? '').trim()
-  v = v.replace(/\s+#.*$/, '').trim() // strip inline comment
-  v = v.replace(/^["']|["']$/g, '') // strip surrounding quotes
-  return v
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
+  const value = envValue(envText, key, true)
+  return value === null ? null : value.split(',').map(s => s.trim()).filter(Boolean)
 }
 
 function allowlistCheck(id: string, title: string, key: string, ids: string[] | null, wanted?: string): Check {
@@ -1691,9 +1673,7 @@ export function envValue(envText: string, key: string, preserveEmpty = false): s
   for (const line of envText.split('\n')) {
     const m = line.match(new RegExp(`^\\s*(?:export\\s+)?${key}=(.*)$`))
     if (m) {
-      let v = (m[1] ?? '').trim()
-      v = v.replace(/\s+#.*$/, '').trim()
-      v = v.replace(/^["']|["']$/g, '')
+      const v = parseEnvValue(m[1] ?? '')
       return preserveEmpty ? v : v || null
     }
   }
@@ -2062,14 +2042,18 @@ export function discoverLaunchd(
   if (unreadable) return unknown('one or more plists unreadable; unique match cannot be verified')
   if (matches.length !== 1) return unknown(matches.length > 1 ? 'multiple matching launchd agents' : 'no exact WorkingDirectory match')
   const plist = matches[0]!
-  const args = plist.ProgramArguments
-  if (!Array.isArray(args) || !args.every((arg) => typeof arg === 'string') || args.length === 0) return unknown('ProgramArguments does not identify a wrapper')
-  const program = typeof plist.Program === 'string' ? plist.Program : args[0]
+  const rawArgs: unknown = plist.ProgramArguments
+  if (!Array.isArray(rawArgs) || rawArgs.length === 0) return unknown('ProgramArguments does not identify a wrapper')
+  const args = rawArgs.filter((arg): arg is string => typeof arg === 'string')
+  const firstArg = args[0]
+  if (args.length !== rawArgs.length || firstArg === undefined) return unknown('ProgramArguments does not identify a wrapper')
+  const program = typeof plist.Program === 'string' ? plist.Program : firstArg
   if (program !== args[0]) return unknown('Program and ProgramArguments are ambiguous')
   let wrapperPath: string | null = null
   if (/^\/bin\/(?:ba|z|k)?sh$/.test(program)) {
-    if (args.length === 2 && !args[1].startsWith('-')) wrapperPath = args[1]
-    else if (args.length === 3 && args[1] === '--') wrapperPath = args[2]
+    const [, second, third] = args
+    if (args.length === 2 && second !== undefined && !second.startsWith('-')) wrapperPath = second
+    else if (args.length === 3 && second === '--' && third !== undefined) wrapperPath = third
   } else if (args.length === 1) wrapperPath = program
   if (!wrapperPath?.startsWith('/')) return unknown('wrapper command is dynamic or ambiguous')
   const wrapper = read(wrapperPath)
@@ -2567,7 +2551,7 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
     }
     const text = `${cap.stdout}\n${cap.stderr}`
     if (cap.code !== 0 || detectCrashLoop(text)) {
-      checks.push({ id: 'live-session', title: `Channel session ${opts.tmuxSession} alive`, status: 'fail', detail: detectCrashLoop(text) ? 'tmux server gone — crash loop (claude exits, supervisor relaunches)' : 'tmux session not found', fix: 'stop the service, run claude by hand with a TTY to read the real error, fix it, then start' })
+      checks.push({ id: 'live-session', title: `Channel session ${opts.tmuxSession} alive`, status: 'fail', detail: detectCrashLoop(text) ? 'tmux server gone — crash loop (claude exits, supervisor relaunches)' : 'tmux session not found', fix: 'from an external terminal, stop the service, run claude by hand with a TTY to read and fix the real error, then restart the installed unit; Linux user unit: systemctl --user restart channel-NAME.service; Linux system unit: sudo systemctl restart channel-NAME.service (root omits sudo)' })
     } else if (detectAuthExpired(cap.stdout)) {
       checks.push({ id: 'auth', title: 'Claude Code authenticated', status: 'fail', detail: 'session shows a /login or 401 prompt', fix: 'attach the tmux session and run /login under Anthropic Max' })
     } else if (detectWelcomeHang(cap.stdout)) {

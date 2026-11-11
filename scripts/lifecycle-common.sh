@@ -47,7 +47,7 @@ read_context() {
   local context
   require_file "$STATE_DIR/install.json"
   context="$(bun "$REPO/scripts/lifecycle-context.ts" "$STATE_DIR" "$SETTINGS")" || fail 'Cannot read installation context; rerun install.sh with explicit inputs'
-  { IFS= read -r AGENT; IFS= read -r WORKSPACE; IFS= read -r SETTINGS; IFS= read -r ENV_FILE; IFS= read -r SERVICE; IFS= read -r SESSION; IFS= read -r OWNER_ID; IFS= read -r WEBHOOK_URL; IFS= read -r CONFIG_FILE; IFS= read -r CHAT_ID; } <<< "$context"
+  { IFS= read -r AGENT; IFS= read -r WORKSPACE; IFS= read -r SETTINGS; IFS= read -r ENV_FILE; IFS= read -r SERVICE; IFS= read -r SESSION; IFS= read -r OWNER_ID; IFS= read -r WEBHOOK_URL; IFS= read -r CONFIG_FILE; IFS= read -r CHAT_ID; IFS= read -r SERVICE_KIND; } <<< "$context"
 }
 run_doctor() {
   local latest="${1:-}"
@@ -57,7 +57,10 @@ run_doctor() {
   if ! bun "${args[@]}"; then echo 'Doctor reported FAIL or incomplete coverage. Follow the summary actions, then rerun doctor after starting the channel.'; fi
 }
 restart_hint() {
-  if [[ "$PLATFORM" == Linux ]]; then printf 'Restart from an external terminal: sudo systemctl restart %q\n' "channel-$AGENT.service"
+  if [[ "$PLATFORM" == Linux ]]; then
+    if [[ "$SERVICE_KIND" == user ]]; then printf 'Restart from an external terminal: systemctl --user restart %q\n' "channel-$AGENT.service"
+    elif [[ "$(id -u)" == 0 ]]; then printf 'Restart from an external terminal: systemctl restart %q\n' "channel-$AGENT.service"
+    else printf 'Restart from an external terminal: sudo systemctl restart %q\n' "channel-$AGENT.service"; fi
   else printf 'Restart from an external terminal: launchctl kickstart -k %q\n' "gui/$(id -u)/com.dashi-plugin.channel-$AGENT"; fi
 }
 inside_channel() {

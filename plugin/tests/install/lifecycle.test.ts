@@ -21,6 +21,11 @@ function fixture() {
   command('claude', 'echo "2.1.80 (Claude Code)"')
   command('tmux', 'if [[ "${1:-}" == "-V" ]]; then echo "tmux 3.4"; elif [[ "${1:-}" == "display-message" ]]; then echo "${TEST_SESSION:-other}"; fi')
   command('uname', 'echo "${TEST_PLATFORM:-Linux}"')
+  command('id', 'if [[ "${1:-}" == -u ]]; then echo "${TEST_UID:-1000}"; else echo student; fi')
+  command('systemctl', 'echo "systemctl $*" >> "$TEST_LOG"; if [[ "$*" == "--user show-environment" && "${TEST_NO_USER_BUS:-0}" == 1 ]]; then exit 1; fi')
+  command('loginctl', 'echo "${TEST_LINGER:-yes}"')
+  command('sudo', 'echo "sudo $*" >> "$TEST_LOG"; exit 95')
+  command('install', 'echo "install $*" >> "$TEST_LOG"; if [[ "${!#}" == /etc/systemd/system/* ]]; then /usr/bin/install -m 644 "${3}" "$TEST_SYSTEM_UNIT"; else exec /usr/bin/install "$@"; fi')
   command('launchctl', 'echo "launchctl $*" >> "$TEST_LOG"')
   command('bun', `if [[ "\${1:-}" == "--version" ]]; then echo 1.3.14
 elif [[ "\${1:-}" == "install" ]]; then echo 'bun install' >> "$TEST_LOG"
@@ -56,7 +61,7 @@ reset) echo old-commit > "$TEST_HEAD";;
 esac`)
   const state = join(dir, 'state'); const workspace = join(dir, 'workspace'); mkdirSync(workspace)
   const home = join(dir, 'home'); mkdirSync(home)
-  const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, TEST_LOG: log, TEST_HEAD: head,
+  const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, TEST_LOG: log, TEST_HEAD: head, TEST_SYSTEM_UNIT: join(dir, 'system-unit.service'),
     TELEGRAM_BOT_TOKEN: '123456:private_TEST_secret', TELEGRAM_OWNER_ID: '987654321',
     INSTALL_AGENT: 'student', TELEGRAM_STATE_DIR: state }
   function run(script: string, args: string[] = [], overrides: Record<string, string> = {}) {
@@ -77,7 +82,7 @@ describe('clone lifecycle scripts (no network or real services)', () => {
   test('dry run writes nothing, logs every phase and never prints token', () => {
     const f = fixture(); const r = f.run('install.sh', [...f.installArgs, '--dry-run'])
     expect(r.code).toBe(0); expect(existsSync(f.state)).toBe(false)
-    for (const phase of ['bun install', 'install-hooks', 'doctor', 'systemctl enable']) expect(r.out).toContain(phase)
+    for (const phase of ['bun install', 'install-hooks', 'doctor', 'systemctl --user enable']) expect(r.out).toContain(phase)
     expect(r.out).not.toContain(f.env.TELEGRAM_BOT_TOKEN)
     expect(existsSync(f.log) ? readFileSync(f.log, 'utf8') : '').not.toContain('bun install')
   })
@@ -130,7 +135,7 @@ describe('clone lifecycle scripts (no network or real services)', () => {
     const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0)
     const r = f.run('update.sh', ['--state-dir', f.state])
     expect(r.code).toBe(0)
-    expect(readdirSync(f.state).some(n => n.startsWith('channel-student.service.bak.'))).toBe(true)
+    expect(readdirSync(join(f.home, '.config/systemd/user')).some(n => n.startsWith('channel-student.service.bak.'))).toBe(true)
     expect(readFileSync(f.log, 'utf8')).toContain('--check-latest')
     expect(readFileSync(f.log, 'utf8')).toContain(`--mcp ${join(f.state, 'channel.mcp.json')}`)
   })
@@ -218,5 +223,102 @@ describe('clone lifecycle scripts (no network or real services)', () => {
     expect(own.code).not.toBe(0); expect(own.out).toContain('channel-student'); expect(readFileSync(f.log, 'utf8')).not.toContain('launchctl kickstart')
     const external = f.run('update.sh', ['--restart', '--state-dir', f.state], { TEST_PLATFORM: 'Darwin', TMUX: '' })
     expect(external.code).toBe(0); expect(readFileSync(f.log, 'utf8')).toContain('launchctl kickstart -k'); expect(external.out).toContain('doctor summary')
+  })
+})
+
+
+describe('Linux service registration', () => {
+  test('normal user installs and enables a user unit and --start runs it', () => {
+    const f = fixture()
+    const r = f.run('install.sh', [...f.installArgs, '--start'])
+    expect(r.code).toBe(0)
+    const service = join(f.home, '.config/systemd/user/channel-student.service')
+    expect(existsSync(service)).toBe(true)
+    const unit = readFileSync(service, 'utf8')
+    expect(unit).not.toMatch(/^User=/m)
+    expect(unit).toContain('WantedBy=default.target')
+    expect(JSON.parse(readFileSync(join(f.state, 'install.json'), 'utf8')).serviceFile).toBe(service)
+    const calls = readFileSync(f.log, 'utf8')
+    expect(calls).toContain('systemctl --user daemon-reload\nsystemctl --user enable channel-student.service\nsystemctl --user start channel-student.service')
+    expect(calls).not.toMatch(/^sudo /m)
+    expect(r.out).not.toContain('start the service externally')
+  })
+
+  test('root installs the system unit, enables and starts it without sudo', () => {
+    const f = fixture()
+    const r = f.run('install.sh', [...f.installArgs, '--start'], { TEST_UID: '0' })
+    expect(r.code).toBe(0)
+    expect(existsSync(f.env.TEST_SYSTEM_UNIT)).toBe(true)
+    expect(readFileSync(f.env.TEST_SYSTEM_UNIT, 'utf8')).toContain('WantedBy=multi-user.target')
+    expect(JSON.parse(readFileSync(join(f.state, 'install.json'), 'utf8')).serviceFile).toBe('/etc/systemd/system/channel-student.service')
+    const calls = readFileSync(f.log, 'utf8')
+    expect(calls).toContain('systemctl daemon-reload\nsystemctl enable channel-student.service\nsystemctl start channel-student.service')
+    expect(calls).toContain('/etc/systemd/system/channel-student.service')
+    expect(calls).not.toContain('systemctl --user')
+    expect(calls).not.toMatch(/^sudo /m)
+  })
+
+  test('without --start only enables; missing linger prints the single human step and logout warning', () => {
+    const f = fixture()
+    const r = f.run('install.sh', f.installArgs, { TEST_LINGER: 'no' })
+    expect(r.code).toBe(0)
+    expect(readFileSync(f.log, 'utf8')).toContain('systemctl --user enable channel-student.service')
+    expect(readFileSync(f.log, 'utf8')).not.toContain('systemctl --user start')
+    expect(r.out).toContain('sudo loginctl enable-linger student')
+    expect(r.out).toContain('will not survive logout')
+    expect(r.out.match(/sudo loginctl enable-linger/g)).toHaveLength(1)
+    expect(readFileSync(f.log, 'utf8')).not.toMatch(/^sudo /m)
+  })
+
+  test('no user bus prints manual commands and exits with an explicit non-success summary', () => {
+    const f = fixture()
+    const r = f.run('install.sh', [...f.installArgs, '--start'], { TEST_NO_USER_BUS: '1' })
+    expect(r.code).not.toBe(0)
+    expect(r.out).toContain('no user bus')
+    expect(r.out).toContain('systemctl --user daemon-reload')
+    expect(r.out).toContain('systemctl --user enable channel-student.service')
+    expect(r.out).toContain('systemctl --user start channel-student.service')
+    expect(r.out).toContain('INSTALL INCOMPLETE: service was not registered or started')
+    const calls = readFileSync(f.log, 'utf8')
+    expect(calls).not.toContain('systemctl --user enable')
+    expect(calls).not.toMatch(/^sudo /m)
+  })
+
+  test('dry-run prints root and user registration/start plans without invoking service commands or copying units', () => {
+    for (const uid of ['0', '1000']) {
+      const f = fixture()
+      const r = f.run('install.sh', [...f.installArgs, '--dry-run', '--start'], { TEST_UID: uid })
+      expect(r.code).toBe(0)
+      expect(r.out).toContain(uid === '0' ? '/etc/systemd/system/channel-student.service' : '.config/systemd/user/channel-student.service')
+      expect(r.out).toContain(uid === '0' ? 'systemctl start channel-student.service' : 'systemctl --user start channel-student.service')
+      expect(existsSync(f.state)).toBe(false)
+      expect(existsSync(f.env.TEST_SYSTEM_UNIT)).toBe(false)
+      expect(readFileSync(f.log, 'utf8')).not.toMatch(/^(systemctl|install|sudo) /m)
+    }
+  })
+
+  test('update --restart targets the recorded user unit and hints both unit kinds correctly', () => {
+    const f = fixture()
+    expect(f.run('install.sh', f.installArgs).code).toBe(0)
+    writeFileSync(f.log, '')
+    const user = f.run('update.sh', ['--restart', '--state-dir', f.state])
+    expect(user.code).toBe(0)
+    expect(readFileSync(f.log, 'utf8')).toContain('systemctl --user restart channel-student.service')
+    expect(user.out).toContain('systemctl --user restart channel-student.service')
+    expect(user.out).not.toContain('sudo systemctl')
+    const path = join(f.state, 'install.json')
+    const meta = JSON.parse(readFileSync(path, 'utf8'))
+    meta.serviceFile = '/etc/systemd/system/channel-student.service'
+    meta.serviceKind = 'system'
+    writeFileSync(path, JSON.stringify(meta))
+    writeFileSync(f.log, '')
+    const system = f.run('update.sh', ['--restart', '--state-dir', f.state])
+    expect(system.code).toBe(0)
+    expect(system.out).toContain('sudo systemctl restart channel-student.service')
+    expect(readFileSync(f.log, 'utf8')).not.toMatch(/^(sudo|systemctl) /m)
+    writeFileSync(f.log, '')
+    const root = f.run('update.sh', ['--restart', '--state-dir', f.state], { TEST_UID: '0' })
+    expect(root.code).toBe(0)
+    expect(readFileSync(f.log, 'utf8')).toContain('systemctl restart channel-student.service')
   })
 })

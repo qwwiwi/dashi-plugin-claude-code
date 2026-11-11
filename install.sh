@@ -35,6 +35,15 @@ absolute "$STATE_DIR"; absolute "$SETTINGS"
 platform; prerequisites
 for file in scripts/render-install.ts plugin/scripts/install-hooks.sh examples/config.example.json examples/channel.env.example skills/doctor-dashi-plugin/scripts/doctor.ts; do require_file "$REPO/$file"; done
 ENV_FILE="$STATE_DIR/channel.env"; SESSION="channel-$AGENT"
+SERVICE_KIND=system; SERVICE="$STATE_DIR/channel-$AGENT.service"
+SYSTEMCTL=(systemctl)
+if [[ "$PLATFORM" == Linux ]]; then
+  SERVICE="/etc/systemd/system/channel-$AGENT.service"
+  if [[ "$(id -u)" != 0 ]]; then
+    SERVICE_KIND=user; SERVICE="$HOME/.config/systemd/user/channel-$AGENT.service"
+    SYSTEMCTL+=(--user)
+  fi
+fi
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "DRY RUN: create workspace $WORKSPACE and private state $STATE_DIR"
   echo 'DRY RUN: render config and private mode-600 channel.env from examples; preserve existing config/env; timestamp backups before rewriting settings/service/wrapper/metadata'
@@ -45,7 +54,7 @@ else
   echo "Installing dependencies in $REPO/plugin"
   (cd "$REPO/plugin" && bun install)
   echo 'Rendering config/env and service from examples (credentials hidden)'
-  INSTALL_AGENT="$AGENT" INSTALL_WORKSPACE="$WORKSPACE" INSTALL_STATE_DIR="$STATE_DIR" INSTALL_SETTINGS="$SETTINGS" INSTALL_PLATFORM="$PLATFORM" INSTALL_REPO="$REPO" INSTALL_HOME="$HOME" INSTALL_CLAUDE="$(command -v claude)" INSTALL_TMUX="$(command -v tmux)" INSTALL_BUN="$(command -v bun)" TELEGRAM_BOT_TOKEN="$TOKEN" TELEGRAM_OWNER_ID="$OWNER_ID" bun "$REPO/scripts/render-install.ts"
+  INSTALL_AGENT="$AGENT" INSTALL_WORKSPACE="$WORKSPACE" INSTALL_STATE_DIR="$STATE_DIR" INSTALL_SETTINGS="$SETTINGS" INSTALL_PLATFORM="$PLATFORM" INSTALL_SERVICE_KIND="$SERVICE_KIND" INSTALL_SERVICE_FILE="$SERVICE" INSTALL_REPO="$REPO" INSTALL_HOME="$HOME" INSTALL_CLAUDE="$(command -v claude)" INSTALL_TMUX="$(command -v tmux)" INSTALL_BUN="$(command -v bun)" TELEGRAM_BOT_TOKEN="$TOKEN" TELEGRAM_OWNER_ID="$OWNER_ID" bun "$REPO/scripts/render-install.ts"
   unset TOKEN TELEGRAM_BOT_TOKEN
   read_context
   backup "$SETTINGS"
@@ -53,11 +62,46 @@ else
   TELEGRAM_STATE_DIR="$STATE_DIR" bash "$REPO/plugin/scripts/install-hooks.sh" --settings "$SETTINGS" --chat-id "$CHAT_ID" --webhook-url "$WEBHOOK_URL" --agent-id "$AGENT"
 fi
 if [[ "$PLATFORM" == Linux ]]; then
-  echo 'Register the staged service and enable boot startup (requires sudo):'
-  printf 'sudo install -m 644 %q %q\n' "$STATE_DIR/channel-$AGENT.service" "/etc/systemd/system/channel-$AGENT.service"
-  echo 'sudo systemctl daemon-reload'
-  printf 'sudo systemctl enable %q\n' "channel-$AGENT.service"
-  if [[ "$START" == 1 ]]; then printf 'sudo systemctl start %q\n' "channel-$AGENT.service"; echo 'Run these sudo commands externally; no automatic privilege escalation.'; fi
+  print_registration() {
+    [[ "$SERVICE_KIND" != user ]] || printf 'mkdir -p %q\n' "${SERVICE%/*}"
+    printf 'install -m 644 %q %q\n' "$STATE_DIR/channel-$AGENT.service" "$SERVICE"
+    printf '%s daemon-reload\n' "${SYSTEMCTL[*]}"
+    printf '%s enable %q\n' "${SYSTEMCTL[*]}" "channel-$AGENT.service"
+    [[ "$START" != 1 ]] || printf '%s start %q\n' "${SYSTEMCTL[*]}" "channel-$AGENT.service"
+  }
+  if [[ "$DRY_RUN" == 1 ]]; then
+    echo "DRY RUN: install $SERVICE_KIND unit at $SERVICE (back up any existing unit first)"
+    print_registration
+    if [[ "$SERVICE_KIND" == user ]]; then
+      echo 'DRY RUN: check user lingering; if not enabled, the service will not survive logout until this human step:'
+      printf 'sudo loginctl enable-linger %q\n' "$(id -un)"
+    fi
+  else
+    if [[ "$START" == 1 ]] && inside_channel; then fail "Cannot start/restart own tmux session $SESSION; use an external terminal"; fi
+    if [[ "$SERVICE_KIND" == user ]]; then
+      if [[ "$(loginctl show-user "$(id -un)" --property=Linger --value 2>/dev/null || true)" != yes ]]; then
+        echo 'User lingering is not confirmed enabled: the service will not survive logout until you run this one human step:'
+        printf 'sudo loginctl enable-linger %q\n' "$(id -un)"
+      fi
+      if ! systemctl --user show-environment >/dev/null 2>&1; then
+        echo 'User service manager unavailable (no user bus). Run these commands from a user login session:' >&2
+        print_registration
+        echo 'INSTALL INCOMPLETE: service was not registered or started; restore the user bus and rerun install.sh.' >&2
+        exit 1
+      fi
+      mkdir -p "${SERVICE%/*}"
+    fi
+    backup "$SERVICE"
+    install -m 644 "$STATE_DIR/channel-$AGENT.service" "$SERVICE"
+    "${SYSTEMCTL[@]}" daemon-reload || fail 'Service daemon-reload failed; service registration is incomplete'
+    "${SYSTEMCTL[@]}" enable "channel-$AGENT.service" || fail 'Service enable failed; service registration is incomplete'
+    if [[ "$START" == 1 ]]; then
+      "${SYSTEMCTL[@]}" start "channel-$AGENT.service" || fail 'Service start failed; inspect systemctl status and the service journal'
+      echo "Registered, enabled and started $SERVICE_KIND service channel-$AGENT.service"
+    else
+      printf 'Service registered and enabled. Start now: %s start %q\n' "${SYSTEMCTL[*]}" "channel-$AGENT.service"
+    fi
+  fi
 else
   echo 'LaunchAgent rendered with RunAtLoad and crash recovery; starts at next GUI login after registration.'
   printf 'Register/start: launchctl bootstrap %q %q\n' "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.dashi-plugin.channel-$AGENT.plist"
@@ -69,6 +113,6 @@ else
 fi
 if [[ "$DRY_RUN" == 1 ]]; then echo 'DRY RUN: run doctor with explicit config/env/settings/session and print summary'
 else run_doctor; fi
-echo 'Next: authenticate Claude with claude /login if needed; start the service externally and verify a real Telegram DM.'
+echo 'Next: authenticate Claude with claude /login if needed; verify a real Telegram DM after service startup.'
 printf 'Inspect session: tmux attach -t %q\n' "$SESSION"
 printf 'Update later: %q/update.sh --state-dir %q\n' "$REPO" "$STATE_DIR"

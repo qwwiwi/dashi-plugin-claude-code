@@ -3,6 +3,7 @@
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { userInfo } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
+import { parseLiteralEnv } from './env-parser'
 
 function required(key: string): string {
   const value = process.env[key]
@@ -22,23 +23,7 @@ function envLiteral(value: string): string {
   if (value.includes("'")) throw new Error('Environment paths cannot contain a single quote')
   return `'${value}'`
 }
-function assignments(text: string): Map<string, string> {
-  const values = new Map<string, string>()
-  for (const line of text.split('\n')) {
-    if (!line.trim() || line.trimStart().startsWith('#')) continue
-    const match = line.match(/^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*)$/)
-    if (!match) throw new Error('Existing channel.env has unsupported syntax; preserve and review it manually')
-    const key = match[1]!
-    if (values.has(key)) throw new Error(`Existing channel.env has duplicate ${key}`)
-    const raw = match[2]!.trim()
-    const quoted = raw.match(/^'([^']*)'(?:\s+#.*)?$/) ?? raw.match(/^"([^"\\$`]*)"(?:\s+#.*)?$/)
-    const bare = raw.replace(/\s+#.*$/, '').trim()
-    if (quoted) values.set(key, quoted[1]!)
-    else if (/^[A-Za-z0-9_./:@,+%=-]*$/.test(bare)) values.set(key, bare)
-    else throw new Error(`Existing channel.env has unsupported ${key} syntax`)
-  }
-  return values
-}
+function assignments(text: string): Map<string, string> { return parseLiteralEnv(text, true) }
 function render(template: string, values: Record<string, string>): string {
   let result = template
   for (const [key, value] of Object.entries(values)) {
@@ -73,6 +58,9 @@ try {
   const session = `channel-${agent}`
   const service = platform === 'Linux' ? `${session}.service` : `com.dashi-plugin.${session}`
   const serviceFile = platform === 'Linux' ? join(stateDir, service) : join(home, 'Library/LaunchAgents', `${service}.plist`)
+  const serviceKind = platform === 'Linux' ? process.env.INSTALL_SERVICE_KIND ?? 'system' : 'launchd'
+  if (platform === 'Linux' && !['system', 'user'].includes(serviceKind)) throw new Error('Invalid INSTALL_SERVICE_KIND')
+  const installedServiceFile = platform === 'Linux' && process.env.INSTALL_SERVICE_FILE ? absolute('INSTALL_SERVICE_FILE') : serviceFile
   // Read and validate every existing owner source before creating or replacing files.
   let config: Record<string, any> = existsSync(configFile) ? JSON.parse(readFileSync(configFile, 'utf8')) : JSON.parse(readFileSync(join(repo, 'examples/config.example.json'), 'utf8'))
   if (!existsSync(configFile)) config = { ...config, allowed_user_ids: [owner], allowed_chat_ids: [owner], owner_chat_ids: [owner], permission_relay: { allowed_user_ids: [owner] }, memory: { ...config.memory, workspace_path: workspace, agent_label: agent } }
@@ -106,8 +94,14 @@ try {
   const wrapperText = render(template('launchd-wrapper.sh.example'), { 'env-file-shell': shell(envFile), 'session-shell': shell(session), 'tmux-shell': shell(tmux), 'workspace-shell': shell(workspace), 'claude-command-shell': shell(command) })
   const values = { agent, 'service-user': userInfo().username, 'plugin-dir': pluginDir, home, path, wrapper, 'state-dir': stateDir }
   const escaped = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, platform === 'Linux' ? systemd(value) : xml(value)]))
-  if (platform === 'Linux') { escaped.wrapper = `"${escaped.wrapper!.replaceAll('$', () => '$$')}"`; escaped['plugin-dir'] = `"${escaped['plugin-dir']}"` }
-  const serviceText = render(template(platform === 'Linux' ? 'systemd-unit.service.example' : 'launchd-plist.example.plist'), escaped)
+  if (platform === 'Linux') {
+    // WorkingDirectory is a literal path, unlike the quoted ExecStart argv.
+    if (/[\\\x00-\x1f\x7f]/.test(pluginDir)) throw new Error('systemd WorkingDirectory cannot contain backslashes or control characters; choose another checkout path')
+    escaped['plugin-dir'] = pluginDir.replaceAll('%', '%%')
+    escaped.wrapper = `"${escaped.wrapper!.replaceAll('$', () => '$$')}"`
+  }
+  let serviceText = render(template(platform === 'Linux' ? 'systemd-unit.service.example' : 'launchd-plist.example.plist'), escaped)
+  if (serviceKind === 'user') serviceText = serviceText.replace(/^User=.*\n/m, '').replace('WantedBy=multi-user.target', 'WantedBy=default.target')
   const stamp = `${new Date().toISOString().replaceAll(':', '-')}-${process.pid}`
   function write(file: string, content: string, mode = 0o600): void {
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
@@ -129,7 +123,7 @@ try {
   write(mcp, JSON.stringify({ mcpServers: { 'dashi-channel': { command: bun, args: [join(pluginDir, 'src/server.ts')] } } }, null, 2) + '\n')
   write(wrapper, wrapperText, 0o700)
   write(serviceFile, serviceText, 0o644)
-  write(join(stateDir, 'install.json'), JSON.stringify({ agent, workspace, stateDir, settings, platform, service, serviceFile, session, envFile, pluginDir }, null, 2) + '\n')
+  write(join(stateDir, 'install.json'), JSON.stringify({ agent, workspace, stateDir, settings, platform, service, serviceFile: installedServiceFile, serviceKind, session, envFile, pluginDir }, null, 2) + '\n')
 } catch (error) {
   // Validation never interpolates environment values or parser contents.
   console.error(`Install rendering failed: ${error instanceof SyntaxError ? 'Invalid existing config.json' : error instanceof Error ? error.message : 'unknown error'}`)

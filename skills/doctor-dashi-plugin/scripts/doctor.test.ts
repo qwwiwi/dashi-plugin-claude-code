@@ -340,6 +340,13 @@ describe('parseEnvList — tolerates real .env noise', () => {
     expect(parseEnvList('TELEGRAM_ALLOWED_USER_IDS="1,2"', 'TELEGRAM_ALLOWED_USER_IDS')).toEqual(['1', '2'])
     expect(parseEnvList('export TELEGRAM_ALLOWED_USER_IDS=7', 'TELEGRAM_ALLOWED_USER_IDS')).toEqual(['7'])
   })
+  test('quoted hashes survive while only comments outside quotes are removed', () => {
+    for (const quote of ["'", '"']) {
+      expect(envValue(`PATH_VALUE=${quote}/private/state # owner${quote} # comment`, 'PATH_VALUE')).toBe('/private/state # owner')
+      expect(parseEnvList(`IDS=${quote}1,2 # literal${quote} # comment`, 'IDS')).toEqual(['1', '2 # literal'])
+    }
+    expect(envValue('VALUE=word#literal # comment', 'VALUE')).toBe('word#literal')
+  })
   test('missing key → null, empty value → []', () => {
     expect(parseEnvList('OTHER=1', 'TELEGRAM_ALLOWED_USER_IDS')).toBeNull()
     expect(parseEnvList('TELEGRAM_ALLOWED_USER_IDS=', 'TELEGRAM_ALLOWED_USER_IDS')).toEqual([])
@@ -1930,4 +1937,22 @@ describe('explicit shell env-loader provenance', () => {
       } finally { rmSync(fixture, { recursive: true, force: true }) }
     })
   }
+})
+
+test('dead-session remediation labels both Linux systemd unit kinds', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'doctor-restart-hint-'))
+  try {
+    writeFileSync(join(fixture, 'settings.json'), '{}')
+    const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'),
+      '--json', '--no-autodetect', '--plugin-dir', fixture,
+      '--settings', join(fixture, 'settings.json'), '--session', 'channel-student',
+    ], { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+    const report = JSON.parse(result.stdout) as { checks: Check[] }
+    const check = report.checks.find(c => c.id === 'live-session')
+    expect(check?.status).toBe('fail')
+    expect(check?.fix).toContain('user unit: systemctl --user restart channel-NAME.service')
+    expect(check?.fix).toContain('system unit: sudo systemctl restart channel-NAME.service')
+    expect(check?.fix).toContain('root omits sudo')
+    expect(check?.fix).toContain('external terminal')
+  } finally { rmSync(fixture, { recursive: true, force: true }) }
 })

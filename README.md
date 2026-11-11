@@ -7,7 +7,8 @@
 **Recommended: [install through an agent (Russian guide)](docs/00-install-with-agent.md).**
 Open Codex or Claude Code and paste the ready prompt. The agent connects to your
 server, installs the plugin and helps verify a Telegram reply. You handle Claude
-login and the printed `sudo` commands; enter the bot token only in the server terminal.
+login (if needed), the bot token in the server terminal, and on non-root Linux
+the printed `sudo loginctl enable-linger USER` command if lingering is disabled.
 
 ### Install yourself
 
@@ -28,10 +29,16 @@ cd dashi-plugin-claude-code
 The installer asks for the agent name, workspace path, bot token (hidden input)
 and your positive numeric Telegram user ID. It writes the token only to a private
 `channel.env` (mode `600`), installs standard plugin hooks and renders an autonomous
-service. Existing config/env are preserved; replaced files receive timestamped backups. Nothing starts unless you
-pass `--start`; on Linux it prints the exact `sudo` commands to install and enable
-the staged unit. On macOS `--start` registers the LaunchAgent, which runs at login.
-Both services restart after a crash. See the [Linux](docs/03-installation-linux.md)
+service. Existing config/env are preserved; replaced files receive timestamped backups.
+On Linux, root installs a system unit in `/etc/systemd/system`; a normal user installs
+one in `~/.config/systemd/user`. The installer runs daemon-reload and enable with
+`systemctl` or `systemctl --user`, and starts the service only with `--start`.
+It never calls sudo. If user lingering is disabled, run the single printed
+`sudo loginctl enable-linger USER` command yourself; until then the service will
+not survive logout. If there is no user bus, the installer prints manual commands
+and exits with a non-success summary and a nonzero status. On macOS `--start`
+registers the LaunchAgent, which runs at login. Both services restart after a crash.
+The autonomous wrapper accepts Claude startup prompts itself. See the [Linux](docs/03-installation-linux.md)
 and [macOS](docs/03-installation-macos.md) guides for the manual path below.
 
 For automation use `--agent NAME --workspace PATH --owner-id ID --non-interactive`
@@ -42,7 +49,10 @@ locations; `--dry-run` previews actions without writing or starting anything.
 
 `./update.sh` refuses a dirty checkout, backs up config/settings, pulls with
 `--ff-only`, installs dependencies, runs tests and refreshes plugin hooks. It prints
-a restart command and never restarts automatically. `--restart` is allowed only
+a restart command and never restarts automatically. For a Linux user unit use
+`systemctl --user restart channel-myagent.service`; for a system unit use
+`systemctl restart channel-myagent.service` as root (or sudo from an admin account).
+`--restart` is allowed only
 outside the channel's own tmux session; always update/restart from a separate
 terminal, never from the Telegram channel being updated. Update also supports
 `--dry-run`, `--state-dir PATH` and `--settings PATH`. Plugin and installer tests: `cd plugin && bun test`. From the repository root,

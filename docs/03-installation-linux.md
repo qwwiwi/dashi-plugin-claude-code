@@ -4,8 +4,9 @@
 
 **Рекомендуемый путь — [установка через агента](00-install-with-agent.md).** Откройте Codex
 или Claude Code и вставьте готовый промпт: агент подключится к серверу, подготовит
-плагин и доведёт запуск до проверки в Telegram. Вход в Claude и команды `sudo`
-вы выполните сами; токен бота вводится только в терминале сервера.
+плагин и доведёт запуск до проверки в Telegram. Вы сами пройдёте вход в Claude
+(если нужен), введёте токен в терминале сервера и при необходимости включите lingering
+командой `sudo loginctl enable-linger USER`.
 
 ### Самостоятельная установка
 
@@ -29,21 +30,28 @@ cd dashi-plugin-claude-code
 и systemd unit с автономным профилем, затем показывает сводку doctor.
 Перед заменой файлов создаются копии с датой. `--dry-run` ничего не записывает.
 
-Без `--start` сервис не запускается. Unit сначала сохраняется в каталоге состояния
-(по умолчанию `~/.claude/channels/myagent/channel-myagent.service`). Установщик
-печатает команды с вашими путями; для стандартного имени и пути это:
+Без `--start` сервис не запускается. Установщик всегда регистрирует и включает unit,
+не вызывая sudo:
+
+- root: системный unit `/etc/systemd/system/channel-myagent.service`, затем
+  `systemctl daemon-reload` и `systemctl enable channel-myagent.service`;
+- обычный пользователь: `~/.config/systemd/user/channel-myagent.service`, затем
+  `systemctl --user daemon-reload` и `systemctl --user enable channel-myagent.service`.
+
+С `--start` установщик также выполняет start для выбранного вида unit. Если у
+пользователя выключен lingering, установщик выводит одну оставшуюся ручную команду:
 
 ```bash
-sudo install -m 644 "$HOME/.claude/channels/myagent/channel-myagent.service" /etc/systemd/system/channel-myagent.service
-sudo systemctl daemon-reload
-sudo systemctl enable channel-myagent.service
-# Запуск, когда готовы:
-sudo systemctl start channel-myagent.service
+sudo loginctl enable-linger USER
 ```
 
-`--start` печатает команды для включения и запуска через `sudo`; установщик сам
-не повышает права. Включённый unit запускается после загрузки ОС и перезапускает
-агента после сбоя (`Restart=`).
+Подставьте пользователя из вывода установщика. До её выполнения сервис не переживёт выход пользователя;
+после включения user manager сможет работать без активной сессии и после загрузки ОС.
+Если `systemctl --user` недоступен (нет user bus), установщик только печатает команды
+для ручной регистрации и завершает работу с ненулевым кодом и явной сводкой о
+незавершённой установке. Откройте полноценную сессию пользователя на хосте и повторите
+установку. `--dry-run` печатает план без записи unit и вызовов, меняющих сервис.
+Оба вида unit перезапускают агента после сбоя (`Restart=`).
 
 Для автоматизации: `--agent NAME --workspace PATH --owner-id ID --non-interactive`;
 токен передайте через `TELEGRAM_BOT_TOKEN`, ID можно через `TELEGRAM_OWNER_ID`.
@@ -52,7 +60,10 @@ sudo systemctl start channel-myagent.service
 `./update.sh` сохраняет config/settings, отказывается от грязного checkout,
 обновляет код через `--ff-only`, запускает тесты и обновляет hooks. Рестарт только
 вручную по напечатанной команде либо с `--restart` из отдельного терминала;
-из tmux-сессии обновляемого Telegram-канала рестарт запрещён. Update также принимает
+из tmux-сессии обновляемого Telegram-канала рестарт запрещён. Для user unit:
+`systemctl --user restart channel-myagent.service`; для системного unit:
+`systemctl restart channel-myagent.service` от root или с sudo администратора.
+Update также принимает
 `--dry-run`, `--state-dir PATH`, `--settings PATH`.
 
 Для `update.sh` нужен `install.json` от установщика/renderer. Старую ручную
@@ -224,7 +235,12 @@ renderer. Он не устанавливает зависимости и hooks, 
 `examples/launchd-wrapper.sh.example` (общий wrapper для обеих ОС) и
 `examples/systemd-unit.service.example`, создаёт config, MCP config и `install.json`.
 Существующие config/env сохраняются; перед заменой wrapper/unit делаются копии
-с датой. Нужны заполненный env из шага 5 и установленный Bun.
+с датой. Нужны заполненный env из шага 5 и установленный Bun. Ниже выбран системный
+unit. Для user unit перед запуском renderer замените две переменные сервиса на
+`INSTALL_SERVICE_KIND=user` и
+`INSTALL_SERVICE_FILE="$HOME/.config/systemd/user/channel-myagent.service"`.
+Renderer сам выбирает `User=` и `WantedBy=`; `install.json` сохраняет вид и конечный
+путь unit для последующих обновлений и команд рестарта.
 
 ```bash
 # Выполняйте под пользователем агента, не root; замените myagent своим именем.
@@ -234,6 +250,8 @@ export INSTALL_REPO="$INSTALL_WORKSPACE/dashi-plugin-claude-code"
 export INSTALL_STATE_DIR="$HOME/.claude-lab/shared/state/myagent/telegram"
 export INSTALL_SETTINGS="$HOME/.claude/settings.json"
 export INSTALL_PLATFORM=Linux
+export INSTALL_SERVICE_KIND=system
+export INSTALL_SERVICE_FILE="/etc/systemd/system/channel-myagent.service"
 export INSTALL_HOME="$HOME"
 export INSTALL_CLAUDE="$(command -v claude)"
 export INSTALL_TMUX="$(command -v tmux)"
@@ -271,7 +289,22 @@ pane читает приватный env заново, даже если tmux se
 подключается отдельно через `install-hooks.sh --permission-gate` и
 `permission_gate.enabled=true`.
 
-Установите подготовленный unit и включите автозапуск:
+При ручном использовании renderer зарегистрируйте unit самостоятельно. Он сохраняет
+подготовленный файл в state-каталоге. Для выбранного выше `INSTALL_SERVICE_KIND=user`
+выполните под пользователем агента:
+
+```bash
+mkdir -p "$HOME/.config/systemd/user"
+install -m 644 "$INSTALL_STATE_DIR/channel-myagent.service" "$HOME/.config/systemd/user/channel-myagent.service"
+systemctl --user daemon-reload
+systemctl --user enable --now channel-myagent.service
+systemctl --user status channel-myagent.service --no-pager -l
+```
+
+Для user unit при необходимости администратор один раз выполняет
+`sudo loginctl enable-linger USER`. Логи: `journalctl --user -u channel-myagent.service`.
+Установщик выбирает вид unit сам; эти команды нужны только для ручного renderer.
+Для системного unit установите подготовленный файл и включите автозапуск:
 
 ```bash
 sudo install -m 644 "$INSTALL_STATE_DIR/channel-myagent.service" /etc/systemd/system/channel-myagent.service
@@ -307,7 +340,7 @@ sudo -u agentctl tmux attach -t channel-myagent
 
 ### Persistent welcome approvals (чтобы не нажимать Enter после каждого рестарта)
 
-Welcome-промты показываются **при каждом** запуске Claude Code, включая `systemctl restart`. Это значит, после рестарта сервиса нужен человек с tmux чтобы пройти 2 промта.
+Welcome-промты могут появляться при повторном запуске Claude Code. Автономный wrapper принимает их сам, в том числе после рестарта сервиса; ручное подтверждение не является штатным шагом установки.
 
 **Решение** (требует Claude Code v2.1.140+):
 

@@ -223,6 +223,8 @@ returns the checkout to the recorded commit and exits non-zero. Preserve any
 local work before retrying and inspect [CHANGELOG](../../CHANGELOG.md), especially
 the explicit owner-ID migration, before the next channel restart.
 
+Linux restart commands depend on the installed unit: user unit `systemctl --user restart channel-NAME.service`; system unit `sudo systemctl restart channel-NAME.service` (root omits `sudo`). Run the matching command from an external terminal.
+
 By default it prints the exact service restart command. `./update.sh --restart`
 requests restart only outside the channel's own tmux session; never restart your
 own communication channel mid-session. After an external restart verify a real

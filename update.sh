@@ -49,7 +49,16 @@ echo 'Running plugin tests before pull to record baseline failures'
 capture_tests before Baseline || fail 'Baseline test runner unavailable; checkout was not updated'
 for file in "$CONFIG_FILE" "$ENV_FILE" "$SETTINGS" "$STATE_DIR/install.json" "$SERVICE" "$STATE_DIR/channel-wrapper.sh" "$STATE_DIR/channel.mcp.json"; do backup "$file"; done
 rollback() {
+  local tracked_changes stash_ref
   echo "Update validation failed. Restoring recorded commit $CURRENT; configuration backups retained." >&2
+  tracked_changes="$(git status --porcelain --untracked-files=no)" || fail 'Rollback stopped: cannot inspect tracked changes. Inspect git status and save the tracked changes before retrying rollback.'
+  if [[ -n "$tracked_changes" ]]; then
+    if ! git stash push -m "channel-update-rollback-$(date -u +%Y%m%dT%H%M%SZ)"; then
+      fail "Rollback stopped: cannot stash tracked changes. Inspect git status, save the tracked changes manually, then run: git reset --hard $CURRENT"
+    fi
+    stash_ref="$(git rev-parse refs/stash)" || fail 'Rollback stopped: cannot identify the saved stash. Inspect git stash list before resetting.'
+    echo "Saved tracked changes in stash $stash_ref. Restore after rollback with: git stash apply $stash_ref" >&2
+  fi
   git reset --hard "$CURRENT"
   echo 'Restoring dependencies for the recorded revision (channel was not restarted).'
   (cd "$REPO/plugin" && bun install) || echo 'Dependency restoration failed; rerun bun install before restarting.' >&2
@@ -72,8 +81,9 @@ if [[ "$RESTART" == 1 ]]; then
   # Check again after tests: never sever an active conversation.
   if inside_channel; then fail "Refusing restart inside tmux session $SESSION"; fi
   if [[ "$PLATFORM" == Linux ]]; then
-    if [[ "$(id -u)" == 0 ]]; then systemctl restart "channel-$AGENT.service"
+    if [[ "$SERVICE_KIND" == user ]]; then systemctl --user restart "channel-$AGENT.service"
+    elif [[ "$(id -u)" == 0 ]]; then systemctl restart "channel-$AGENT.service"
     else echo 'Run the printed sudo restart command externally; no automatic privilege escalation.'; fi
   else launchctl kickstart -k "gui/$(id -u)/com.dashi-plugin.channel-$AGENT"; fi
 fi
-echo 'Update validated. Verify a real Telegram DM after the external restart.'
+echo 'Update validated. Verify a real Telegram DM after restarting the service.'

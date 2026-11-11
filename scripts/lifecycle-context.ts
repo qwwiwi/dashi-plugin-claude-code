@@ -1,6 +1,7 @@
 // Read lifecycle metadata and the effective hook destination without executing env files.
 import { readFileSync, existsSync, realpathSync } from 'node:fs'
 import { join, isAbsolute, resolve } from 'node:path'
+import { parseLiteralEnv } from './env-parser'
 const state = process.argv[2] ?? ''
 const settingsOverride = process.argv[3] ?? ''
 try {
@@ -11,14 +12,7 @@ try {
   }
   const envFile = meta.envFile
   if (typeof envFile !== 'string' || !isAbsolute(envFile)) throw new Error('env path')
-  const env: Record<string, string> = {}
-  for (const raw of readFileSync(envFile, 'utf8').split(/\r?\n/)) {
-    const m = raw.match(/^\s*(?:export\s+)?([A-Z_][A-Z_0-9]*)=(.*)$/)
-    if (!m) continue
-    let value = m[2]!.trim()
-    if ((value.startsWith("'") && value.endsWith("'")) || (value.startsWith('"') && value.endsWith('"'))) value = value.slice(1, -1)
-    env[m[1]!] = value
-  }
+  const env = Object.fromEntries(parseLiteralEnv(readFileSync(envFile, 'utf8'), true))
   const configPath = resolve(meta.workspace, env.TELEGRAM_CONFIG_FILE || join(env.TELEGRAM_STATE_DIR || state, 'config.json'))
   const config = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf8')) : {}
   const owner = env.TELEGRAM_ALLOWED_USER_IDS !== undefined ? env.TELEGRAM_ALLOWED_USER_IDS.split(',')[0]?.trim() ?? '' : String(config.allowed_user_ids?.[0] ?? '')
@@ -28,7 +22,7 @@ try {
   const host = env.TELEGRAM_WEBHOOK_HOST || config.webhook?.host || '127.0.0.1'
   const port = env.TELEGRAM_WEBHOOK_PORT || config.webhook?.port || 8089
   if (!['127.0.0.1', 'localhost', '::1'].includes(host) || !/^\d+$/.test(String(port))) throw new Error('webhook address')
-  const values = [meta.agent, meta.workspace, settingsOverride || meta.settings, envFile, meta.serviceFile, meta.session, owner, `http://${host === '::1' ? '[::1]' : host}:${port}/hooks/agent`, configPath, chat]
+  const values = [meta.agent, meta.workspace, settingsOverride || meta.settings, envFile, meta.serviceFile, meta.session, owner, `http://${host === '::1' ? '[::1]' : host}:${port}/hooks/agent`, configPath, chat, meta.serviceKind ?? (meta.serviceFile.startsWith(join(process.env.HOME ?? '', '.config/systemd/user') + '/') ? 'user' : 'system')]
   if (values.some(v => typeof v !== 'string' || !v || /[\r\n\0]/.test(v))) throw new Error('metadata')
   if (!/^[a-z][a-z0-9_-]*$/.test(meta.agent) || meta.session !== `channel-${meta.agent}`) throw new Error('agent/session')
   process.stdout.write(values.join('\n') + '\n')
