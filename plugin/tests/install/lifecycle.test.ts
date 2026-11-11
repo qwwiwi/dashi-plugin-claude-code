@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir, userInfo } from 'node:os'
 import { join, resolve } from 'node:path'
 
 const root = resolve(import.meta.dir, '../../..')
@@ -21,13 +21,15 @@ function fixture() {
   command('claude', 'echo "2.1.80 (Claude Code)"')
   command('tmux', 'if [[ "${1:-}" == "-V" ]]; then echo "tmux 3.4"; elif [[ "${1:-}" == "display-message" ]]; then echo "${TEST_SESSION:-other}"; fi')
   command('uname', 'echo "${TEST_PLATFORM:-Linux}"')
-  command('id', 'if [[ "${1:-}" == -u ]]; then echo "${TEST_UID:-1000}"; else echo student; fi')
+  command('getent', `[[ "$1" == passwd && "$2" == '${userInfo().username}' ]] || exit 2; printf '%s:x:%s:%s::%s:/bin/bash\\n' '${userInfo().username}' "\${TEST_TARGET_UID:-${userInfo().uid}}" '${userInfo().gid}' "$TEST_TARGET_HOME"`)
+  command('runuser', 'echo "runuser $1 $2 $3" >> "$TEST_LOG"; shift 3; export TEST_AS_USER=1; exec "$@"')
+  command('id', 'if [[ "${1:-}" == -u ]]; then echo "${TEST_UID:-1000}"; elif [[ "${1:-}" == -gn ]]; then echo staff; else echo student; fi')
   command('systemctl', 'echo "systemctl $*" >> "$TEST_LOG"; if [[ "$*" == "--user show-environment" && "${TEST_NO_USER_BUS:-0}" == 1 ]]; then exit 1; fi')
   command('loginctl', 'echo "${TEST_LINGER:-yes}"')
   command('sudo', 'echo "sudo $*" >> "$TEST_LOG"; exit 95')
-  command('install', 'echo "install $*" >> "$TEST_LOG"; if [[ "${!#}" == /etc/systemd/system/* ]]; then /usr/bin/install -m 644 "${3}" "$TEST_SYSTEM_UNIT"; else exec /usr/bin/install "$@"; fi')
+  command('install', 'echo "install $*" >> "$TEST_LOG"; if [[ "${!#}" == /etc/systemd/system/* ]]; then args=("$@"); /usr/bin/install -m 644 "${args[$#-2]}" "$TEST_SYSTEM_UNIT"; else exec /usr/bin/install "$@"; fi')
   command('launchctl', 'echo "launchctl $*" >> "$TEST_LOG"')
-  command('bun', `if [[ "\${1:-}" == "--version" ]]; then echo 1.3.14
+  command('bun', `if [[ \"\${TEST_UID:-1000}\" == 0 && \"\${TEST_AS_USER:-0}\" != 1 ]]; then echo 'Bun attempted as root' >&2; exit 96; fi\nif [[ "\${1:-}" == "--version" ]]; then echo 1.3.14
 elif [[ "\${1:-}" == "install" ]]; then echo 'bun install' >> "$TEST_LOG"
 elif [[ "\${1:-}" == "test" ]]; then
   echo "bun $*" >> "$TEST_LOG"
@@ -63,7 +65,7 @@ esac`)
   const home = join(dir, 'home'); mkdirSync(home)
   const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, TEST_LOG: log, TEST_HEAD: head, TEST_SYSTEM_UNIT: join(dir, 'system-unit.service'),
     TELEGRAM_BOT_TOKEN: '123456:private_TEST_secret', TELEGRAM_OWNER_ID: '987654321',
-    INSTALL_AGENT: 'student', TELEGRAM_STATE_DIR: state }
+    INSTALL_AGENT: 'student', TELEGRAM_STATE_DIR: state, TEST_TARGET_HOME: home }
   function run(script: string, args: string[] = [], overrides: Record<string, string> = {}) {
     const p = Bun.spawnSync(['bash', join(repo, script), ...args], { cwd: repo, env: { ...env, ...overrides }, stdout: 'pipe', stderr: 'pipe' })
     return { code: p.exitCode, out: p.stdout.toString() + p.stderr.toString() }
@@ -235,7 +237,7 @@ describe('Linux service registration', () => {
     const service = join(f.home, '.config/systemd/user/channel-student.service')
     expect(existsSync(service)).toBe(true)
     const unit = readFileSync(service, 'utf8')
-    expect(unit).not.toMatch(/^User=/m)
+    expect(unit).not.toMatch(/^(?:User|Group)=/m)
     expect(unit).toContain('WantedBy=default.target')
     expect(JSON.parse(readFileSync(join(f.state, 'install.json'), 'utf8')).serviceFile).toBe(service)
     const calls = readFileSync(f.log, 'utf8')
@@ -244,12 +246,20 @@ describe('Linux service registration', () => {
     expect(r.out).not.toContain('start the service externally')
   })
 
-  test('root installs the system unit, enables and starts it without sudo', () => {
+  test('root --run-as installs a non-root system unit and delegates user file creation', () => {
     const f = fixture()
-    const r = f.run('install.sh', [...f.installArgs, '--start'], { TEST_UID: '0' })
+    const r = f.run('install.sh', [...f.installArgs, '--start', '--run-as', userInfo().username], { TEST_UID: '0' })
     expect(r.code).toBe(0)
     expect(existsSync(f.env.TEST_SYSTEM_UNIT)).toBe(true)
     expect(readFileSync(f.env.TEST_SYSTEM_UNIT, 'utf8')).toContain('WantedBy=multi-user.target')
+    expect(readFileSync(f.env.TEST_SYSTEM_UNIT, 'utf8')).toContain(`User=${userInfo().username}`)
+    expect(readFileSync(f.env.TEST_SYSTEM_UNIT, 'utf8')).toContain('Group=staff')
+    expect(readFileSync(f.env.TEST_SYSTEM_UNIT, 'utf8')).toContain(`HOME=${f.home}`)
+    expect(statSync(join(f.state, 'channel.env')).mode & 0o777).toBe(0o600)
+    for (const path of [f.state, join(f.dir, 'workspace/.claude'), join(f.dir, 'workspace/.claude/settings.json'), ...readdirSync(f.state).map(name => join(f.state, name))]) {
+      expect(statSync(path).uid).toBe(userInfo().uid)
+    }
+    expect(readFileSync(f.log, 'utf8')).toContain(`runuser -u ${userInfo().username} --`)
     expect(JSON.parse(readFileSync(join(f.state, 'install.json'), 'utf8')).serviceFile).toBe('/etc/systemd/system/channel-student.service')
     const calls = readFileSync(f.log, 'utf8')
     expect(calls).toContain('systemctl daemon-reload\nsystemctl enable channel-student.service\nsystemctl start channel-student.service')
@@ -287,7 +297,7 @@ describe('Linux service registration', () => {
   test('dry-run prints root and user registration/start plans without invoking service commands or copying units', () => {
     for (const uid of ['0', '1000']) {
       const f = fixture()
-      const r = f.run('install.sh', [...f.installArgs, '--dry-run', '--start'], { TEST_UID: uid })
+      const r = f.run('install.sh', [...f.installArgs, '--dry-run', '--start', ...(uid === '0' ? ['--run-as', userInfo().username] : [])], { TEST_UID: uid })
       expect(r.code).toBe(0)
       expect(r.out).toContain(uid === '0' ? '/etc/systemd/system/channel-student.service' : '.config/systemd/user/channel-student.service')
       expect(r.out).toContain(uid === '0' ? 'systemctl start channel-student.service' : 'systemctl --user start channel-student.service')
@@ -318,7 +328,115 @@ describe('Linux service registration', () => {
     expect(readFileSync(f.log, 'utf8')).not.toMatch(/^(sudo|systemctl) /m)
     writeFileSync(f.log, '')
     const root = f.run('update.sh', ['--restart', '--state-dir', f.state], { TEST_UID: '0' })
-    expect(root.code).toBe(0)
-    expect(readFileSync(f.log, 'utf8')).toContain('systemctl restart channel-student.service')
+    expect(root.code).not.toBe(0)
+    expect(root.out).toContain('service user')
+    expect(readFileSync(f.log, 'utf8')).not.toMatch(/git |bun |systemctl /)
   })
+})
+
+for (const platform of ['Linux', 'Darwin']) {
+  test(`root ${platform} without --run-as refuses before writes and suggests both normal-user routes`, () => {
+    const f = fixture()
+    const r = f.run('install.sh', f.installArgs, { TEST_UID: '0', TEST_PLATFORM: platform, SUDO_USER: userInfo().username })
+    expect(r.code).not.toBe(0)
+    expect(r.out).toContain('normal user'); expect(r.out).toContain('create'); expect(r.out).toContain('re-run')
+    expect(r.out).toContain(`--run-as ${userInfo().username}`)
+    expect(existsSync(f.state)).toBe(false)
+    expect(existsSync(f.log)).toBe(false)
+  })
+}
+test('macOS root refuses even with --run-as', () => {
+  const f = fixture(); const r = f.run('install.sh', [...f.installArgs, '--run-as', userInfo().username], { TEST_UID: '0', TEST_PLATFORM: 'Darwin' })
+  expect(r.code).not.toBe(0); expect(r.out).toContain('normal user'); expect(existsSync(f.state)).toBe(false)
+})
+for (const [user, overrides] of [['root', {}], ['unknown', {}], [userInfo().username, { TEST_TARGET_UID: '0' }]] as const) {
+  test(`root rejects invalid service account ${user} ${JSON.stringify(overrides)} without writes`, () => {
+    const f = fixture(); const r = f.run('install.sh', [...f.installArgs, '--run-as', user], { TEST_UID: '0', ...overrides })
+    expect(r.code).not.toBe(0); expect(r.out).toMatch(/non-root|unknown|Unknown/)
+    expect(existsSync(f.state)).toBe(false); expect(existsSync(f.log)).toBe(false)
+  })
+}
+test('root --run-as defaults are resolved from getent home instead of root HOME', () => {
+  const f = fixture()
+  const r = f.run('install.sh', ['--non-interactive', '--agent', 'student', '--run-as', userInfo().username], { TEST_UID: '0', TELEGRAM_STATE_DIR: '', TELEGRAM_WORKSPACE_ROOT: '', HOME: '/root' })
+  expect(r.code).toBe(0)
+  const state = join(f.home, '.claude/channels/student')
+  const meta = JSON.parse(readFileSync(join(state, 'install.json'), 'utf8'))
+  expect(meta.workspace).toBe(join(f.home, 'workspace/student'))
+  expect(meta.settings).toBe(join(f.home, 'workspace/student/.claude/settings.json'))
+  expect(readFileSync(join(state, 'channel-wrapper.sh'), 'utf8')).toContain(f.home)
+})
+for (const location of ['repo', 'workspace']) {
+  for (const mode of [0o500, 0o300]) {
+    test(`root --run-as refuses ${location} without ${mode === 0o500 ? 'write' : 'read'} access before writes and prints exact chown hint`, () => {
+      const f = fixture(); const path = location === 'repo' ? f.repo : join(f.dir, 'workspace')
+      chmodSync(path, mode)
+      try {
+        const r = f.run('install.sh', [...f.installArgs, '--run-as', userInfo().username], { TEST_UID: '0' })
+        expect(r.code).not.toBe(0); expect(r.out).toContain('readable/writable')
+        expect(r.out).toContain(`chown -R ${userInfo().username}:staff ${path.replaceAll(' ', '\\ ')}`)
+        expect(existsSync(f.state)).toBe(false)
+        const calls = readFileSync(f.log, 'utf8'); expect(calls).not.toContain('bun install'); expect(calls).not.toMatch(/^chown /m)
+      } finally { chmodSync(path, 0o700) }
+    })
+  }
+}
+test('non-root cannot select another service user', () => {
+  const f = fixture(); const r = f.run('install.sh', [...f.installArgs, '--run-as', 'root'])
+  expect(r.code).not.toBe(0); expect(existsSync(f.state)).toBe(false)
+})
+
+test('root resolves Claude executable as the service user rather than from root PATH', () => {
+  const f = fixture()
+  const userClaude = join(f.dir, 'user-claude')
+  writeFileSync(userClaude, '#!/bin/bash\necho "2.1.80 (Claude Code)"\n', { mode: 0o755 })
+  writeFileSync(join(f.dir, 'bin/runuser'), `#!/bin/bash
+shift 3
+export TEST_AS_USER=1
+if [[ "$*" == *'command -v claude'* ]]; then printf '%s\\n' '${userClaude}'; exit 0; fi
+exec "$@"
+`, { mode: 0o755 })
+  const r = f.run('install.sh', [...f.installArgs, '--run-as', userInfo().username], { TEST_UID: '0' })
+  expect(r.code).toBe(0)
+  expect(readFileSync(join(f.state, 'channel-wrapper.sh'), 'utf8')).toContain(userClaude)
+})
+
+test('root --run-as accepts a writable checkout with immutable readable Git objects', () => {
+  const f = fixture()
+  const objects = join(f.repo, '.git/objects/ab'); mkdirSync(objects, { recursive: true })
+  const object = join(objects, 'object'); writeFileSync(object, 'git object', { mode: 0o444 })
+  const r = f.run('install.sh', [...f.installArgs, '--run-as', userInfo().username], { TEST_UID: '0' })
+  expect(r.code).toBe(0)
+  expect(statSync(object).mode & 0o777).toBe(0o444)
+  expect(existsSync(join(f.state, 'channel.env'))).toBe(true)
+})
+
+test('service-user update backs up a system unit into state without writing its protected system directory', () => {
+  const f = fixture(); expect(f.run('install.sh', [...f.installArgs, '--run-as', userInfo().username], { TEST_UID: '0' }).code).toBe(0)
+  const system = join(f.dir, 'systemd/system'); mkdirSync(system, { recursive: true })
+  const unit = join(system, 'channel-student.service'); cpSync(f.env.TEST_SYSTEM_UNIT, unit)
+  const metadata = join(f.state, 'install.json')
+  const meta = JSON.parse(readFileSync(metadata, 'utf8')); meta.serviceFile = unit; writeFileSync(metadata, JSON.stringify(meta))
+  chmodSync(system, 0o555)
+  try {
+    const r = f.run('update.sh', ['--state-dir', f.state])
+    expect(r.code).toBe(0)
+    expect(readdirSync(system)).toEqual(['channel-student.service'])
+    const saved = readdirSync(f.state).find(name => name.startsWith('channel-student.service.bak.'))
+    expect(saved).toBeDefined()
+    expect(readFileSync(join(f.state, saved!), 'utf8')).toBe(readFileSync(unit, 'utf8'))
+  } finally { chmodSync(system, 0o700) }
+}, 15000)
+
+test('missing workspace ownership hint names the requested directory, not a shared ancestor', () => {
+  const f = fixture(); const parent = join(f.dir, 'protected'); mkdirSync(parent)
+  const workspace = join(parent, 'new-workspace')
+  chmodSync(parent, 0o500)
+  try {
+    const r = f.run('install.sh', [...f.installArgs, '--workspace', workspace, '--run-as', userInfo().username], { TEST_UID: '0' })
+    expect(r.code).not.toBe(0)
+    expect(r.out).toContain(`chown -R ${userInfo().username}:staff ${workspace.replaceAll(' ', '\\ ')}`)
+    expect(r.out).not.toContain(`chown -R ${userInfo().username}:staff ${parent.replaceAll(' ', '\\ ')}\n`)
+    expect(existsSync(workspace)).toBe(false)
+  } finally { chmodSync(parent, 0o700) }
 })

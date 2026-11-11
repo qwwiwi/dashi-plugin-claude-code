@@ -33,6 +33,7 @@ function render(template: string, values: Record<string, string>): string {
 }
 
 try {
+  if (process.getuid?.() === 0) throw new Error('The agent must run as a normal user; re-run install.sh as that user or use --run-as USER on Linux')
   const agent = required('INSTALL_AGENT')
   if (!/^[a-z][a-z0-9_-]{0,47}$/.test(agent)) throw new Error('Invalid agent name')
   const ownerText = required('TELEGRAM_OWNER_ID')
@@ -92,7 +93,7 @@ try {
   const paneScript = `export HOME=${shell(home)} PATH=${shell(path)}; set -a; source ${shell(envFile)}; set +a; export TELEGRAM_CONFIG_FILE=${shell(configFile)}; exec ${claudeCommand}`
   const command = ['/bin/bash', '-c', paneScript].map(shell).join(' ')
   const wrapperText = render(template('launchd-wrapper.sh.example'), { 'env-file-shell': shell(envFile), 'session-shell': shell(session), 'tmux-shell': shell(tmux), 'workspace-shell': shell(workspace), 'claude-command-shell': shell(command) })
-  const values = { agent, 'service-user': userInfo().username, 'plugin-dir': pluginDir, home, path, wrapper, 'state-dir': stateDir }
+  const values = { agent, 'service-user': userInfo().username, 'service-group': process.env.INSTALL_SERVICE_GROUP || String(userInfo().gid), 'plugin-dir': pluginDir, home, path, wrapper, 'state-dir': stateDir }
   const escaped = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, platform === 'Linux' ? systemd(value) : xml(value)]))
   if (platform === 'Linux') {
     // WorkingDirectory is a literal path, unlike the quoted ExecStart argv.
@@ -101,7 +102,7 @@ try {
     escaped.wrapper = `"${escaped.wrapper!.replaceAll('$', () => '$$')}"`
   }
   let serviceText = render(template(platform === 'Linux' ? 'systemd-unit.service.example' : 'launchd-plist.example.plist'), escaped)
-  if (serviceKind === 'user') serviceText = serviceText.replace(/^User=.*\n/m, '').replace('WantedBy=multi-user.target', 'WantedBy=default.target')
+  if (serviceKind === 'user') serviceText = serviceText.replace(/^(?:User|Group)=.*\n/gm, '').replace('WantedBy=multi-user.target', 'WantedBy=default.target')
   const stamp = `${new Date().toISOString().replaceAll(':', '-')}-${process.pid}`
   function write(file: string, content: string, mode = 0o600): void {
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 })

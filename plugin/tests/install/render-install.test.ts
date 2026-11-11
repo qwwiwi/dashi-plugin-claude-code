@@ -216,3 +216,16 @@ for (const suffix of ['back\\slash', 'control\tcharacter']) {
     expect(existsSync(f.state)).toBe(false)
   })
 }
+
+for (const platform of ['Linux', 'Darwin']) {
+  test(`renderer refuses direct root ${platform} invocation before creating artifacts`, () => {
+    const f = fixture(platform)
+    const result = Bun.spawnSync([process.execPath, '-e', `
+      process.getuid = () => 0;
+      await import(${JSON.stringify(join(repo, 'scripts/render-install.ts'))});
+    `], { env: f.env })
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr.toString()).toContain('normal user')
+    expect(existsSync(f.state)).toBe(false)
+  })
+}

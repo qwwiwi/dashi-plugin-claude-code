@@ -13,6 +13,8 @@ while [[ $# -gt 0 ]]; do
     *) fail 'Unknown option (use --help)';;
   esac
 done
+# Never create root-owned Git/Bun artifacts in an unprivileged installation.
+[[ "$(id -u)" != 0 ]] || fail 'Run update.sh as the service user, not root (for example: sudo -iu USER, then cd to the checkout and run ./update.sh). Restart a system service separately as administrator.'
 # A clone may serve several agents: require an unambiguous recorded installation.
 if [[ -z "$STATE_DIR" ]]; then
   matches=()
@@ -47,7 +49,11 @@ capture_tests() {
 echo "Recorded commit: $CURRENT"
 echo 'Running plugin tests before pull to record baseline failures'
 capture_tests before Baseline || fail 'Baseline test runner unavailable; checkout was not updated'
-for file in "$CONFIG_FILE" "$ENV_FILE" "$SETTINGS" "$STATE_DIR/install.json" "$SERVICE" "$STATE_DIR/channel-wrapper.sh" "$STATE_DIR/channel.mcp.json"; do backup "$file"; done
+for file in "$CONFIG_FILE" "$ENV_FILE" "$SETTINGS" "$STATE_DIR/install.json" "$STATE_DIR/channel-wrapper.sh" "$STATE_DIR/channel.mcp.json"; do backup "$file"; done
+# The service account cannot write beside a system unit in /etc/systemd/system.
+if [[ "$PLATFORM" == Linux && "$SERVICE_KIND" == system ]]; then
+  backup "$SERVICE" '' "$STATE_DIR/${SERVICE##*/}"
+else backup "$SERVICE"; fi
 rollback() {
   local tracked_changes stash_ref
   echo "Update validation failed. Restoring recorded commit $CURRENT; configuration backups retained." >&2

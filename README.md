@@ -30,9 +30,20 @@ The installer asks for the agent name, workspace path, bot token (hidden input)
 and your positive numeric Telegram user ID. It writes the token only to a private
 `channel.env` (mode `600`), installs standard plugin hooks and renders an autonomous
 service. Existing config/env are preserved; replaced files receive timestamped backups.
-On Linux, root installs a system unit in `/etc/systemd/system`; a normal user installs
-one in `~/.config/systemd/user`. The installer runs daemon-reload and enable with
-`systemctl` or `systemctl --user`, and starts the service only with `--start`.
+The channel must run as a normal user: Claude refuses `bypassPermissions` as root.
+On Linux, root must pass `--run-as USER` for an existing non-root account; otherwise
+the installer stops before writing and shows how to create a user and rerun as that
+user, or use `--run-as USER` (suggesting `SUDO_USER` when suitable). Root with
+`--run-as USER` installs a system unit in `/etc/systemd/system` with that account
+as `User=`/`Group=`. Its `HOME` comes from Linux `getent`; default workspace, state
+and settings paths are `~/workspace/AGENT`, `~/.claude/channels/AGENT` and
+`WORKSPACE/.claude/settings.json` under that account. Installer-created artifacts
+belong to it, including the mode-`600` env file. The checkout and workspace must
+be readable/writable by it; refusal prints the exact `chown` command to review
+and run yourself, without silently changing checkout ownership. A normal user
+installs a user unit in `~/.config/systemd/user`. macOS refuses root installation,
+including `--run-as`; log in as the normal user for its LaunchAgent.
+The installer runs daemon-reload and enable with `systemctl` or `systemctl --user`, and starts the service only with `--start`.
 It never calls sudo. If user lingering is disabled, run the single printed
 `sudo loginctl enable-linger USER` command yourself; until then the service will
 not survive logout. If there is no user bus, the installer prints manual commands
@@ -47,7 +58,11 @@ installer input). `--bot-token TOKEN` is supported; prefer the environment to ke
 secrets out of shell history. `--state-dir PATH` and `--settings PATH` select custom
 locations; `--dry-run` previews actions without writing or starting anything.
 
-`./update.sh` refuses a dirty checkout, backs up config/settings, pulls with
+`./update.sh` refuses all root invocations before Git/Bun work, including installs
+made with `--run-as`. Run it as the service user: `sudo -iu USER`, then enter the
+checkout and run `./update.sh`; restart a system unit separately with administrator
+`sudo systemctl restart channel-myagent.service`. It refuses a dirty checkout,
+backs up config/settings, pulls with
 `--ff-only`, installs dependencies, runs tests and refreshes plugin hooks. It prints
 a restart command and never restarts automatically. For a Linux user unit use
 `systemctl --user restart channel-myagent.service`; for a system unit use

@@ -1956,3 +1956,136 @@ test('dead-session remediation labels both Linux systemd unit kinds', () => {
     expect(check?.fix).toContain('external terminal')
   } finally { rmSync(fixture, { recursive: true, force: true }) }
 })
+
+
+describe('root bypass launch diagnostics', () => {
+  for (const user of ['root', '0', '']) {
+    test(`system unit rejects bypass with User=${user || '(omitted)'}`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), 'doctor-root-'))
+      try {
+        writeFileSync(join(fixture, 'channel-root.service'), `[Service]\n${user ? `User=${user}\n` : ''}WorkingDirectory=/installed/plugin\nExecStart=/usr/bin/tmux new-session -d -s root 'claude --permission-mode bypassPermissions'`)
+        const agents = doctor.scanFleet(fixture)
+        expect(doctor.checkFleet(agents, null).find((c) => c.id === 'fleet-root-bypass')?.status).toBe('fail')
+      } finally { rmSync(fixture, { recursive: true, force: true }) }
+    })
+  }
+  test('non-root service and non-bypass root service are not rejected', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'doctor-root-'))
+    try {
+      writeFileSync(join(fixture, 'channel-user.service'), `[Service]\nUser=agent\nExecStart=/usr/bin/tmux new-session -d 'claude --permission-mode bypassPermissions'`)
+      writeFileSync(join(fixture, 'channel-root.service'), `[Service]\nUser=root\nExecStart=/usr/bin/tmux new-session -d 'claude'`)
+      expect(doctor.checkFleet(doctor.scanFleet(fixture), null).find((c) => c.id === 'fleet-root-bypass')?.status).not.toBe('fail')
+    } finally { rmSync(fixture, { recursive: true, force: true }) }
+  })
+  test('a user unit without User does not inherit the system-unit root default', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'doctor-user-unit-'))
+    try {
+      const units = join(fixture, '.config', 'systemd', 'user')
+      mkdirSync(units, { recursive: true })
+      writeFileSync(join(units, 'channel-user.service'), `[Service]\nExecStart=/usr/bin/tmux new-session -d 'claude --permission-mode bypassPermissions'`)
+      expect(doctor.checkFleet(doctor.scanFleet(units), null).find((c) => c.id === 'fleet-root-bypass')?.status).not.toBe('fail')
+    } finally { rmSync(fixture, { recursive: true, force: true }) }
+  })
+  test('wrapper unit reports root bypass in the CLI fleet report', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'doctor-wrapper-root-'))
+    try {
+      const units = join(fixture, 'units')
+      mkdirSync(units)
+      const shell = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+      const command = ['/bin/bash', '-c', "export HOME='/root' PATH='/bin'; set -a; source '/root/channel.env'; set +a; export TELEGRAM_CONFIG_FILE='/root/config.json'; exec '/bin/claude' '--settings' '/root/settings.json' '--mcp-config' '/root/mcp.json' '--permission-mode' 'bypassPermissions' '--dangerously-load-development-channels' 'server:dashi-channel'"].map(shell).join(' ')
+      const wrapper = join(fixture, 'launch.sh')
+      writeFileSync(wrapper, `ENV_FILE='${fixture}/channel.env'\nTMUX_SESSION='root'\nTMUX_BIN='/bin/tmux'\nCLAUDE_CMD=${shell(command)}\nsource "$ENV_FILE"\n"$TMUX_BIN" new-session -d -s "$TMUX_SESSION" "$CLAUDE_CMD"\n`)
+      writeFileSync(join(units, 'channel-root.service'), `[Service]\nUser=root\nWorkingDirectory=${fixture}\nExecStart="${wrapper}"`)
+      const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'), '--json', '--fleet', '--plugin-dir', fixture, '--fleet-dir', units],
+        { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+      const report = JSON.parse(result.stdout) as { checks: Check[] }
+      expect(report.checks.find((c) => c.id === 'fleet-root-bypass')?.status).toBe('fail')
+      expect(result.status).toBe(1)
+    } finally { rmSync(fixture, { recursive: true, force: true }) }
+  })
+  test('a matched root process fails even when the configured service user is non-root', () => {
+    expect(doctor.checkRootBypass('agent', true, '0').status).toBe('fail')
+    expect(doctor.checkRootBypass('agent', true, '1001').status).toBe('pass')
+    expect(doctor.checkRootBypass('root', false, '0').status).not.toBe('fail')
+  })
+})
+
+
+test('live root process is rejected with settings-only bypass in the CLI', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'doctor-live-root-'))
+  try {
+    for (const [command, output] of [['pgrep', '424242'], ['lsof', `n${fixture}`], ['readlink', fixture], ['ps', '0']] as const) {
+      writeFileSync(join(fixture, command), `#!/bin/sh\nprintf '%s\\n' '${output}'\n`, { mode: 0o700 })
+    }
+    writeFileSync(join(fixture, 'settings.json'), JSON.stringify({ permissions: { defaultMode: 'bypassPermissions' } }))
+    const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'), '--json', '--no-autodetect', '--plugin-dir', fixture, '--settings', join(fixture, 'settings.json')],
+      { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+    const report = JSON.parse(result.stdout) as { checks: Check[] }
+    expect(report.checks.find((c) => c.id === 'service-root-bypass')?.status).toBe('fail')
+  } finally { rmSync(fixture, { recursive: true, force: true }) }
+})
+
+
+describe('wrapper bypass evidence is argv, not arbitrary command text', () => {
+  for (const argv of [
+    ['claude', '--append-system-prompt', '--permission-mode bypassPermissions', '--permission-mode', 'default'],
+    ['claude', '--settings', '/tmp/settings --permission-mode bypassPermissions', '--permission-mode', 'default'],
+    ['claude', '--permission-mode', 'bypassPermissions', '--permission-mode', 'default'],
+  ]) {
+    test(`does not report root bypass for ${JSON.stringify(argv)}`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), 'doctor-wrapper-evidence-'))
+      try {
+        const shell = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+        const command = ['/bin/bash', '-c', `export HOME='/root'; exec ${argv.map(shell).join(' ')}`].map(shell).join(' ')
+        const wrapper = join(fixture, 'launch.sh')
+        writeFileSync(wrapper, `TMUX_BIN='/bin/tmux'\nTMUX_SESSION='root'\nCLAUDE_CMD=${shell(command)}\n"$TMUX_BIN" new-session -d -s "$TMUX_SESSION" "$CLAUDE_CMD"\n`)
+        writeFileSync(join(fixture, 'channel-root.service'), `[Service]\nUser=root\nExecStart="${wrapper}"`)
+        expect(doctor.checkFleet(doctor.scanFleet(fixture), null).find((c) => c.id === 'fleet-root-bypass')?.status).not.toBe('fail')
+      } finally { rmSync(fixture, { recursive: true, force: true }) }
+    })
+  }
+})
+
+function generatedLaunchWrapper(fixture: string): string {
+  const shell = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+  const command = ['/bin/bash', '-c', `export HOME=${shell(fixture)}; exec '/bin/claude' '--settings' '${fixture}/settings.json' '--mcp-config' '${fixture}/mcp.json' '--permission-mode' 'bypassPermissions' '--dangerously-load-development-channels' 'server:dashi-channel'`].map(shell).join(' ')
+  let wrapper = readFileSync(join(import.meta.dir, '../../../examples/launchd-wrapper.sh.example'), 'utf8')
+  for (const [key, value] of Object.entries({ 'env-file-shell': join(fixture, 'channel.env'), 'session-shell': 'root', 'tmux-shell': '/bin/tmux', 'workspace-shell': fixture, 'claude-command-shell': command })) {
+    wrapper = wrapper.replaceAll(`'<${key}>'`, () => shell(value))
+  }
+  return wrapper
+}
+
+test('launchd discovery recognizes bypass in the installer-generated nested wrapper', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'doctor-generated-mac-'))
+  try {
+    const wrapper = join(fixture, 'launch.sh')
+    writeFileSync(wrapper, generatedLaunchWrapper(fixture))
+    writeFileSync(join(fixture, 'agent.plist'), JSON.stringify({ WorkingDirectory: fixture, ProgramArguments: [wrapper] }))
+    const launch = doctor.discoverLaunchd(fixture, fixture, (path) => JSON.parse(readFileSync(path, 'utf8')))
+    expect(launch.bypassPermissions).toBe(true)
+    expect(launch.check.status).toBe('pass')
+    expect(doctor.checkRootBypass(null, launch.bypassPermissions, '0').status).toBe('fail')
+  } finally { rmSync(fixture, { recursive: true, force: true }) }
+})
+
+test.skipIf(process.platform !== 'darwin')('live root process with generated launchd wrapper fails without settings bypass', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'doctor-generated-mac-cli-'))
+  try {
+    const launchDir = join(fixture, 'Library', 'LaunchAgents')
+    mkdirSync(launchDir, { recursive: true })
+    const wrapper = join(fixture, 'launch.sh')
+    writeFileSync(wrapper, generatedLaunchWrapper(fixture))
+    writeFileSync(join(fixture, 'settings.json'), '{}')
+    writeFileSync(join(fixture, 'channel.env'), 'TELEGRAM_ALLOWED_USER_IDS=42\nTELEGRAM_ALLOWED_CHAT_IDS=42')
+    const xml = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+    writeFileSync(join(launchDir, 'agent.plist'), `<?xml version="1.0"?><plist version="1.0"><dict><key>WorkingDirectory</key><string>${xml(fixture)}</string><key>ProgramArguments</key><array><string>${xml(wrapper)}</string></array></dict></plist>`)
+    for (const [command, output] of [['pgrep', '424242'], ['lsof', `n${fixture}`], ['ps', '0']] as const) {
+      writeFileSync(join(fixture, command), `#!/bin/sh\nprintf '%s\\n' '${output}'\n`, { mode: 0o700 })
+    }
+    const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'), '--json', '--plugin-dir', fixture, '--settings', join(fixture, 'settings.json')],
+      { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+    const report = JSON.parse(result.stdout) as { checks: Check[] }
+    expect(report.checks.find((c) => c.id === 'service-root-bypass')?.status).toBe('fail')
+  } finally { rmSync(fixture, { recursive: true, force: true }) }
+})

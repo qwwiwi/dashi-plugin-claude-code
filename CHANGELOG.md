@@ -47,6 +47,16 @@ retroactively marks the state of `main` on 2026-06-14.
   and explain how to opt into confirmations.
 
 ### Fixed
+- Prevent root channel services with the autonomous `bypassPermissions` launch mode.
+  Root Linux installs now require `--run-as USER` for an existing non-root account;
+  its `getent` home supplies HOME/default paths and generated files belong to it
+  (env remains `0600`). Inaccessible checkout/workspace paths are refused with an
+  explicit ownership hint, without silently changing checkout ownership. macOS
+  refuses root installation. Root `update.sh` invocations are refused before
+  Git/Bun; update as the service user and restart system units separately as admin.
+  Doctor reports FAIL for root unit/process identity with bypass launch mode.
+  Installation guides now start root-only VPS setup by creating a normal user,
+  cloning under its home and authorizing Claude as that user.
 - Doctor accepts bypass without a gate as an autonomous profile, including fleet
   checks; it still reports configured gate/hook mismatches and incomplete evidence.
   macOS probes fall back to `/usr/sbin/lsof` and discover exact launchd

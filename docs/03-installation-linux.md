@@ -33,10 +33,33 @@ cd dashi-plugin-claude-code
 Без `--start` сервис не запускается. Установщик всегда регистрирует и включает unit,
 не вызывая sudo:
 
-- root: системный unit `/etc/systemd/system/channel-myagent.service`, затем
+- root с `--run-as USER`: системный unit `/etc/systemd/system/channel-myagent.service`
+  с `User=` и `Group=` существующего непривилегированного пользователя, затем
   `systemctl daemon-reload` и `systemctl enable channel-myagent.service`;
 - обычный пользователь: `~/.config/systemd/user/channel-myagent.service`, затем
   `systemctl --user daemon-reload` и `systemctl --user enable channel-myagent.service`.
+
+Канал никогда не должен работать под root: Claude отказывается запускать
+`bypassPermissions` с UID 0. Без `--run-as USER` root-установка останавливается
+до записи файлов. Выберите один путь:
+
+1. Создайте обычного пользователя (`useradd -m -s /bin/bash agentctl`), войдите
+   как он (`su - agentctl`), клонируйте репозиторий под его домашним каталогом,
+   авторизуйте Claude и запустите установщик от него.
+2. Передайте root-установщику `./install.sh --run-as agentctl` для уже существующего
+   пользователя. `root`, другие аккаунты с UID 0 и неизвестные пользователи
+   отклоняются; если задан непривилегированный `SUDO_USER`, установщик предлагает его.
+
+При `--run-as` домашний каталог берётся из `getent passwd USER`, а не из root HOME.
+По умолчанию workspace — `HOME/workspace/AGENT`, state —
+`HOME/.claude/channels/AGENT`, settings — `WORKSPACE/.claude/settings.json`.
+Все созданные установщиком файлы и каталоги принадлежат выбранному пользователю;
+`channel.env` остаётся с правами `0600`. Checkout и workspace должны быть доступны
+этому пользователю для чтения и записи. При отказе установщик печатает точную
+команду `chown` для проблемного пути: проверьте и выполните её сами либо перенесите
+checkout под домашний каталог пользователя. Установщик не меняет владельца
+checkout автоматически. Установите зависимости и авторизуйте Claude именно
+для пользователя сервиса; root-авторизация не подходит.
 
 С `--start` установщик также выполняет start для выбранного вида unit. Если у
 пользователя выключен lingering, установщик выводит одну оставшуюся ручную команду:
@@ -57,7 +80,11 @@ sudo loginctl enable-linger USER
 токен передайте через `TELEGRAM_BOT_TOKEN`, ID можно через `TELEGRAM_OWNER_ID`.
 Флаг `--bot-token TOKEN` тоже есть, но env не оставляет токен в истории команд.
 Доступны `--state-dir PATH`, `--settings PATH`, `--start`, `--dry-run`.
-`./update.sh` сохраняет config/settings, отказывается от грязного checkout,
+`./update.sh` отказывает при любом запуске под root до выполнения Git/Bun,
+включая установку с `--run-as`. Переключитесь через `sudo -iu USER`, перейдите в
+checkout и запустите обновление от пользователя сервиса. Системный unit
+перезапускайте отдельно через `sudo systemctl restart channel-myagent.service`
+администратора. Скрипт сохраняет config/settings, отказывается от грязного checkout,
 обновляет код через `--ff-only`, запускает тесты и обновляет hooks. Рестарт только
 вручную по напечатанной команде либо с `--restart` из отдельного терминала;
 из tmux-сессии обновляемого Telegram-канала рестарт запрещён. Для user unit:

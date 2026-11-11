@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Shared nonsecret orchestration for the clone lifecycle entrypoints.
 set -euo pipefail
+AS_USER=(env)
 
 fail() { echo "Error: $*" >&2; exit 1; }
 backup() {
-  local target="$1" dest serial=0
+  local target="$1" base="${3:-$1}" dest serial=0
   if [[ -e "$target" ]]; then
-    dest="${target}.bak.$(date -u +%Y%m%dT%H%M%S).$$"
+    dest="${base}.bak.$(date -u +%Y%m%dT%H%M%S).$$"
     while [[ -e "$dest" ]]; do serial=$((serial + 1)); dest="${dest}.${serial}"; done
     echo "Backup: $target -> $dest"
     cp -p "$target" "$dest"
+    [[ -z "${2:-}" ]] || chown "$2" "$dest"
   fi
 }
 require_file() { [[ -f "$1" ]] || fail "Missing required file: $1"; }
@@ -46,7 +48,7 @@ absolute() { [[ "$1" == /* && "$1" != *$'\n'* && "$1" != *$'\r'* ]] || fail 'Pat
 read_context() {
   local context
   require_file "$STATE_DIR/install.json"
-  context="$(bun "$REPO/scripts/lifecycle-context.ts" "$STATE_DIR" "$SETTINGS")" || fail 'Cannot read installation context; rerun install.sh with explicit inputs'
+  context="$("${AS_USER[@]}" bun "$REPO/scripts/lifecycle-context.ts" "$STATE_DIR" "$SETTINGS")" || fail 'Cannot read installation context; rerun install.sh with explicit inputs'
   { IFS= read -r AGENT; IFS= read -r WORKSPACE; IFS= read -r SETTINGS; IFS= read -r ENV_FILE; IFS= read -r SERVICE; IFS= read -r SESSION; IFS= read -r OWNER_ID; IFS= read -r WEBHOOK_URL; IFS= read -r CONFIG_FILE; IFS= read -r CHAT_ID; IFS= read -r SERVICE_KIND; } <<< "$context"
 }
 run_doctor() {
@@ -54,7 +56,7 @@ run_doctor() {
   local args=("$REPO/skills/doctor-dashi-plugin/scripts/doctor.ts" --plugin-dir "$REPO/plugin" --settings "$SETTINGS" --mcp "$STATE_DIR/channel.mcp.json" --env "$ENV_FILE" --env-loader shell --user "$OWNER_ID" --chat "$CHAT_ID" --session "$SESSION" --no-autodetect)
   [[ -z "$latest" ]] || args+=(--check-latest)
   echo 'Running doctor (read-only; readiness may require starting/authenticating the channel)'
-  if ! bun "${args[@]}"; then echo 'Doctor reported FAIL or incomplete coverage. Follow the summary actions, then rerun doctor after starting the channel.'; fi
+  if ! "${AS_USER[@]}" bun "${args[@]}"; then echo 'Doctor reported FAIL or incomplete coverage. Follow the summary actions, then rerun doctor after starting the channel.'; fi
 }
 restart_hint() {
   if [[ "$PLATFORM" == Linux ]]; then

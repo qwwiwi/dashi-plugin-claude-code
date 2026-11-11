@@ -1595,6 +1595,8 @@ function parseJsonSafe(text: string | null): unknown {
 export interface FleetAgent {
   name: string
   unitPath: string
+  /** Effective systemd User; null/undefined when unknown (for example a user unit). */
+  serviceUser?: string | null
   /** Distinct tmux socket names used by the unit's Exec lines ('' = default socket). */
   sockets: string[]
   envPath: string | null
@@ -1623,6 +1625,8 @@ export interface FleetAgent {
 }
 
 export interface ParsedUnit {
+  serviceUser: string | null
+  wrapperPath: string | null
   envPath: string | null
   sockets: string[]
   workingDirectory: string | null
@@ -1638,8 +1642,14 @@ export function parseUnitFile(text: string): ParsedUnit {
   let workingDirectory: string | null = null
   let sessionName: string | null = null
   let bypassPermissions = false
+  let serviceUser: string | null = null
+  let wrapperPath: string | null = null
   const sockets = new Set<string>()
   for (const line of text.split('\n')) {
+    const user = line.match(/^\s*User=\s*(.*?)\s*$/)
+    if (user) serviceUser = user[1] || null
+    const exec = line.match(/^\s*ExecStart=(?:"([^"\n]+)"|(\/\S+))\s*$/)
+    if (exec) wrapperPath = (exec[1] ?? exec[2]!).replaceAll('%%', '%').replaceAll('$$', '$')
     const env = line.match(/^\s*EnvironmentFile=-?(\S+)/)
     if (env?.[1]) envPath = env[1]
     const wd = line.match(/^\s*WorkingDirectory=(\S+)/)
@@ -1660,7 +1670,7 @@ export function parseUnitFile(text: string): ParsedUnit {
       if (/^\s*ExecStart=/.test(line) && sess?.[1]) sessionName = sess[1]
     }
   }
-  return { envPath, sockets: [...sockets], workingDirectory, sessionName, bypassPermissions }
+  return { serviceUser, wrapperPath, envPath, sockets: [...sockets], workingDirectory, sessionName, bypassPermissions }
 }
 
 /**
@@ -1742,6 +1752,9 @@ export function checkFleet(agents: FleetAgent[], sharedSettingsRaw: string | nul
     }
     return [...seen.values()].filter((group) => group.length > 1).map((group) => `${group.join(' & ')} share a ${label}`)
   }
+
+  const rootBypass = agents.filter((agent) => checkRootBypass(agent.serviceUser, agent.bypassPermissions).status === 'fail')
+  if (rootBypass.length) out.push({ ...checkRootBypass('root', true), id: 'fleet-root-bypass', detail: `Root permission-bypass launch: ${rootBypass.map((agent) => agent.name).join(', ')}; Claude refuses this mode under root` })
 
   const portDupes = dupBy('webhook port', (a) => a.port)
   out.push(
@@ -1841,6 +1854,46 @@ export function checkFleet(agents: FleetAgent[], sharedSettingsRaw: string | nul
   return out
 }
 
+/** Root cannot launch Claude with permission bypass, regardless of gate configuration. */
+export function checkRootBypass(serviceUser: string | null | undefined, bypass: boolean | null, liveUid: string | null = null): Check {
+  const root = serviceUser === 'root' || serviceUser === '0' || liveUid === '0'
+  return { id: 'service-root-bypass', title: 'Permission bypass runs as a normal user',
+    status: bypass === true && root ? 'fail' : 'pass',
+    detail: bypass === true && root ? 'Claude refuses permission bypass under root; the channel service will crash-loop' : 'no root permission-bypass launch detected',
+    ...(bypass === true && root ? { fix: 'create a normal user, clone and authorize Claude under that user, then reinstall as that user or use --run-as USER' } : {}) }
+}
+
+/** Decode only shell literals emitted by the installer; never execute a wrapper. */
+function wrapperAssignment(text: string, key: string): string | null {
+  const lines = text.split('\n').filter((line) => new RegExp(`^${key}=`).test(line))
+  if (lines.length !== 1) return null
+  const value = lines[0]!.slice(key.length + 1)
+  const simple = shellLiteral(value)
+  if (simple !== null) return simple
+  if (!value.startsWith("'") || !value.endsWith("'")) return null
+  const pieces = value.slice(1, -1).split("'\\''")
+  return pieces.every((piece) => !piece.includes("'")) ? pieces.join("'") : null
+}
+
+function parseSupervisedWrapper(text: string): LaunchWrapper {
+  const parsed = parseLaunchWrapper(text)
+  const launches = text.split('\n').filter((line) => /^\s*"\$TMUX_BIN"\s+new-session\b/.test(line) && /"\$CLAUDE_CMD"\s*$/.test(line))
+  if (launches.length !== 1) return parsed
+  const command = wrapperAssignment(text, 'CLAUDE_CMD')
+  if (command === null) return parsed
+  let words = literalShellWords(command)
+  if (words?.length === 3 && /(?:^|\/)bash$/.test(words[0] ?? '') && words[1] === '-c') {
+    const script = literalShellWords(words[2]!, true)
+    // Only the final exec is Claude's argv. Prefix commands and quoted
+    // prompt/path values cannot supply permission-mode evidence.
+    const exec = script?.slice(script.lastIndexOf(null) + 1)
+    words = exec?.[0] === 'exec' ? exec.slice(1) : null
+  }
+  const bypass = words !== null && !words.includes(null) ? literalClaudeArgv(words as string[], true) : null
+  return { ...parsed, envPath: wrapperAssignment(text, 'ENV_FILE'), sessionName: wrapperAssignment(text, 'TMUX_SESSION'),
+    sockets: parsed.sockets.length ? parsed.sockets : [''], bypassPermissions: bypass }
+}
+
 /** Discover channel-*.service units and build FleetAgents. IO wrapper around the pure parsers. */
 export function scanFleet(unitDir: string): FleetAgent[] {
   let entries: string[] = []
@@ -1855,7 +1908,15 @@ export function scanFleet(unitDir: string): FleetAgent[] {
     const text = readFileSafe(unitPath)
     if (text == null) continue
     const name = f.replace(/^channel-/, '').replace(/\.service$/, '')
-    const { envPath, sockets, workingDirectory, sessionName, bypassPermissions } = parseUnitFile(text)
+    const parsed = parseUnitFile(text)
+    const wrapper = parsed.wrapperPath ? readFileSafe(parsed.wrapperPath) : null
+    const inferred = wrapper !== null ? parseSupervisedWrapper(wrapper) : null
+    const envPath = parsed.envPath ?? inferred?.envPath ?? null
+    const sockets = parsed.sockets.length ? parsed.sockets : inferred?.sockets ?? []
+    const workingDirectory = parsed.workingDirectory
+    const sessionName = parsed.sessionName ?? inferred?.sessionName ?? null
+    const bypassPermissions = parsed.bypassPermissions || inferred?.bypassPermissions === true
+    const serviceUser = parsed.serviceUser ?? (/\/systemd\/user(?:\/|$)/.test(unitDir) ? null : 'root')
     // Not every channel-*.service is a channel: helper units (webhook
     // listeners, sync timers) share the prefix but never run tmux. A channel
     // unit always supervises a tmux session — skip anything that doesn't.
@@ -1892,6 +1953,7 @@ export function scanFleet(unitDir: string): FleetAgent[] {
     agents.push({
       name,
       unitPath,
+      serviceUser,
       sockets,
       envPath,
       envReadable: envText != null,
@@ -1984,10 +2046,40 @@ export function parseLaunchWrapper(text: string): LaunchWrapper {
     sockets: socketName ? [socketName] : [], bypassPermissions, socketKnown: sockets.length === 0 || (sockets.length === 1 && socketName !== null) }
 }
 
-/** Recognize the documented simple launch; unknown CLI grammar stays unknown. */
+/** Decode shell words without expansion or execution; null separates commands. */
+function literalShellWords(command: string, separators = false): (string | null)[] | null {
+  const words: (string | null)[] = []
+  let word = '', quote = '', active = false
+  const finish = (): void => { if (active) words.push(word); word = ''; active = false }
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!
+    if (quote === "'") { if (ch === "'") quote = ''; else word += ch; continue }
+    if (quote === '"') {
+      if (ch === '"') quote = ''
+      else if (/[\\$`]/.test(ch)) return null
+      else word += ch
+      continue
+    }
+    if (ch === "'" || ch === '"') { quote = ch; active = true }
+    else if (ch === '\\') { if (++i === command.length) return null; word += command[i]; active = true }
+    else if (/\s/.test(ch)) finish()
+    else if (ch === ';' && separators) { finish(); words.push(null) }
+    else if (/[;$`|&<>()#]/.test(ch)) return null
+    else { word += ch; active = true }
+  }
+  if (quote) return null
+  finish()
+  return words
+}
+
+/** Recognize only literal Claude argv; dynamic/repeated mode flags stay unknown. */
 function literalClaudeMode(command: string | null): boolean | null {
-  if (command === null || /['"\\;$`|&<>()\n]/.test(command)) return null
-  const args = command.trim().split(/\s+/)
+  const words = command === null ? null : literalShellWords(command)
+  return words !== null && !words.includes(null) ? literalClaudeArgv(words as string[]) : null
+}
+
+function literalClaudeArgv(words: string[], generated = false): boolean | null {
+  const args = [...words]
   if (!/^(?:\/[A-Za-z0-9_.+-]+)*\/?claude$/.test(args.shift() ?? '')) return null
   let mode: boolean | null = null
   for (let i = 0; i < args.length; i++) {
@@ -1997,8 +2089,8 @@ function literalClaudeMode(command: string | null): boolean | null {
       const value = arg === '--dangerously-skip-permissions' ? 'bypassPermissions' : arg === '--permission-mode' ? args[++i] : arg.slice('--permission-mode='.length)
       if (!value || value.startsWith('-')) return null
       mode = value === 'bypassPermissions'
-    } else if (arg === '--model' || arg === '-m' || arg === '--dangerously-load-development-channels') {
-      if (!args[++i] || args[i]!.startsWith('-')) return null
+    } else if (arg === '--model' || arg === '-m' || arg === '--dangerously-load-development-channels' || (generated && ['--settings', '--mcp-config', '--append-system-prompt'].includes(arg))) {
+      if (args[++i] === undefined || (!generated && args[i]!.startsWith('-'))) return null
     } else if (arg !== '--continue' && arg !== '-c' && arg !== 'server:dashi-channel') {
       return null
     }
@@ -2058,7 +2150,7 @@ export function discoverLaunchd(
   if (!wrapperPath?.startsWith('/')) return unknown('wrapper command is dynamic or ambiguous')
   const wrapper = read(wrapperPath)
   if (wrapper === null) return unknown('wrapper unreadable')
-  const inferred = parseLaunchWrapper(wrapper)
+  const inferred = parseSupervisedWrapper(wrapper)
   const missing = [!inferred.envPath ? 'ENV_FILE' : null, !inferred.sessionName ? 'tmux session' : null, !inferred.socketKnown ? 'tmux socket' : null, inferred.bypassPermissions === null ? 'launch permission mode' : null].filter(Boolean)
   return { ...inferred, wrapperPath,
     check: { id: 'autodetect', title: 'Autodetect: launchd agent matched to this plugin',
@@ -2300,12 +2392,14 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
   // fleet host several plugin servers run at once — match by CWD across ALL
   // of them ("first pgrep PID" compared another agent's server, 2026-06-09).
   let runtimeMatched = false
+  let liveUid: string | null = null
   const live = probe('pgrep', ['-f', 'bun.*src/server.ts'])
   const pids = live.stdout.trim().split(/\s+/).filter(Boolean)
   if (pids.length > 0) {
     const candidates: RuntimeCandidate[] = pids.map((p) => ({ pid: p, cwd: liveCwd(p, opts.os) }))
     const { match, others } = findMatchingRuntime(candidates, opts.pluginDir)
     runtimeMatched = match !== null
+    if (match) liveUid = probe('ps', ['-o', 'uid=', '-p', match.pid]).stdout.trim() || null
     checks.push(
       match
         ? { id: 'dev-vs-runtime', title: 'Inspected plugin matches a running copy', status: 'pass', detail: `runtime CWD ${match.cwd} (PID ${match.pid})${others > 0 ? `; ${others} other channel server(s) on this host` : ''}` }
@@ -2378,6 +2472,8 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
 
   // settings.json hooks + token leak
   const settings = parseJsonSafe(readFileSafe(opts.settingsPath))
+  const settingsBypass = (settings as SettingsPermShape | null)?.permissions?.defaultMode === 'bypassPermissions'
+  if (unitAgent || liveUid !== null) checks.push(checkRootBypass(unitAgent?.serviceUser, unitBypass === true || settingsBypass, liveUid))
   let gateRegistered = false
   if (settings == null) {
     checks.push({

@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 # Install as the unprivileged account that owns the Claude login.
 User=<service-user>
+Group=<service-group>
 WorkingDirectory=<plugin-dir>
 Environment="HOME=<home>"
 Environment="PATH=<path>"
