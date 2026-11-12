@@ -49,6 +49,7 @@ import type { GuestQueryRegistry } from '../telegram/guest-queries.js'
 import {
   isTelegramHtmlParseError,
   markdownToTelegramHtml,
+  telegramHtmlVisibleText,
 } from '../format/html.js'
 import { splitMessage, TELEGRAM_MAX_MESSAGE } from '../format/chunk.js'
 import { assertSendableFile, isPhotoExtension } from '../security/paths.js'
@@ -146,7 +147,12 @@ export interface EditOpts {
 export interface SendDocumentOpts {
   reply_to_message_id?: number
   caption?: string
+  // Applies to caption only (reply as_caption). Absent = plain caption.
+  parse_mode?: 'MarkdownV2' | 'HTML'
 }
+
+// Bot API caption limit for sendPhoto/sendDocument, counted after entity parsing.
+export const TELEGRAM_MAX_CAPTION = 1024
 
 // Options for the rich-message send. Threading only for M1; M3/M4 extend.
 export interface SendRichMessageOpts {
@@ -384,6 +390,7 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
         other.reply_parameters = { message_id: opts.reply_to_message_id }
       }
       if (opts.caption !== undefined) other.caption = opts.caption
+      if (opts.parse_mode !== undefined) other.parse_mode = opts.parse_mode
       const sent = await bot.api.sendDocument(chatId, new InputFile(filePath), other)
       return { message_id: sent.message_id }
     },
@@ -393,6 +400,7 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
         other.reply_parameters = { message_id: opts.reply_to_message_id }
       }
       if (opts.caption !== undefined) other.caption = opts.caption
+      if (opts.parse_mode !== undefined) other.parse_mode = opts.parse_mode
       const sent = await bot.api.sendPhoto(chatId, new InputFile(filePath), other)
       return { message_id: sent.message_id }
     },
@@ -467,6 +475,12 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
           default: 'html',
           description:
             "Rendering mode. Default: 'html' — markdown (**bold**, *italic*, `code`, ```fenced```, [text](url), tables, # headings) is auto-converted to Telegram's HTML subset and auto-chunked at 4000 chars. Plain `<`, `>`, `&` in regular text are safe — they get auto-escaped before sending. On parse error the chunk re-sends as plain text so the reply still ships. Use 'text' only to bypass markdown conversion entirely (e.g. sending pre-built Telegram entity strings verbatim). 'markdownv2' passes raw — caller escapes per Telegram rules. 'rich' is never required: DM replies auto-upgrade to Telegram's native markdown rendering when available; the explicit value just forces the same gate.",
+        },
+        as_caption: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Send text as the caption of the single attached file (one message, e.g. a post to forward); ignored with a note in the result if files count is not exactly 1 or the rendered caption exceeds 1024 chars.',
         },
       },
       required: ['chat_id', 'text'],
@@ -888,6 +902,39 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
 
         const replyToId = args.reply_to !== undefined ? Number(args.reply_to) : undefined
 
+        // as_caption (opt-in): the text rides as the caption of the single
+        // attachment, so the post is ONE Telegram message. Any case Telegram
+        // cannot take as a caption falls back to the default separate text +
+        // files, and the note tells the agent why.
+        let captionPlan: { caption: string; parse_mode?: 'MarkdownV2' | 'HTML'; plain: string } | undefined
+        let captionNote: string | undefined
+        if (args.as_caption) {
+          if (canonicalFiles.length !== 1) {
+            captionNote = `as_caption ignored: needs exactly 1 file, got ${canonicalFiles.length} (sent text and files separately)`
+          } else {
+            let plan: { caption: string; parse_mode?: 'MarkdownV2' | 'HTML'; plain: string }
+            let visibleLength: number
+            if (args.format === 'html' || args.format === 'rich') {
+              const rendered = markdownToTelegramHtml(args.text)
+              const visible = telegramHtmlVisibleText(rendered)
+              plan = { caption: rendered, parse_mode: 'HTML', plain: visible }
+              visibleLength = visible.length
+            } else if (args.format === 'markdownv2') {
+              // Raw length (escapes included): stricter than Telegram's count.
+              plan = { caption: args.text, parse_mode: 'MarkdownV2', plain: args.text }
+              visibleLength = args.text.length
+            } else {
+              plan = { caption: args.text, plain: args.text }
+              visibleLength = args.text.length
+            }
+            if (visibleLength > TELEGRAM_MAX_CAPTION) {
+              captionNote = `as_caption ignored: caption over ${TELEGRAM_MAX_CAPTION} (${visibleLength} chars, sent text and file separately)`
+            } else {
+              captionPlan = plan
+            }
+          }
+        }
+
         const sentIds: number[] = []
 
         // ── M1 Rich Messages (Bot API 10.1) ─────────────────────────────
@@ -954,7 +1001,10 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           // else res.fallback === true → fall through to the HTML path below.
         }
 
-        if (richSent) {
+        if (captionPlan !== undefined) {
+          // as_caption: the text ships as the attachment's caption below.
+          // (Rich is impossible here: richEligible required no files.)
+        } else if (richSent) {
           // Rich shipped the whole body — nothing else to send for text.
           // (Attachments are impossible here: richEligible required
           // files.length === 0.)
@@ -1017,10 +1067,33 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         for (const canonical of canonicalFiles) {
           const opts: SendDocumentOpts = {}
           if (args.reply_to !== undefined) opts.reply_to_message_id = Number(args.reply_to)
-          const out = isPhotoExtension(canonical)
-            ? await telegramApi.sendPhoto(args.chat_id, canonical, opts)
-            : await telegramApi.sendDocument(args.chat_id, canonical, opts)
-          sentIds.push(out.message_id)
+          const sendFile = (o: SendDocumentOpts): Promise<{ message_id: number }> =>
+            isPhotoExtension(canonical)
+              ? telegramApi.sendPhoto(args.chat_id, canonical, o)
+              : telegramApi.sendDocument(args.chat_id, canonical, o)
+          if (captionPlan === undefined) {
+            const out = await sendFile(opts)
+            sentIds.push(out.message_id)
+            continue
+          }
+          const captionOpts: SendDocumentOpts = { ...opts, caption: captionPlan.caption }
+          if (captionPlan.parse_mode !== undefined) captionOpts.parse_mode = captionPlan.parse_mode
+          try {
+            const out = await sendFile(captionOpts)
+            sentIds.push(out.message_id)
+          } catch (err) {
+            if (captionPlan.parse_mode === 'HTML' && isTelegramHtmlParseError(err)) {
+              // Same policy as the text path: better a missing <b> than a
+              // missing post. Retry once with the visible text, no parse_mode.
+              log.warn('telegram HTML caption parse failed, retrying as plain caption', {
+                error: err instanceof Error ? err.message : String(err),
+              })
+              const out = await sendFile({ ...opts, caption: captionPlan.plain })
+              sentIds.push(out.message_id)
+            } else {
+              throw err
+            }
+          }
         }
 
         // Real answer shipped — clear the transient status. complete() is
@@ -1069,6 +1142,7 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         // advisory hint (M3) when a mandate is active and the body self-gated,
         // plus the observe-only format hint. Each is optional and independent.
         const resultParts = [result]
+        if (captionNote) resultParts.push(captionNote)
         if (askGuardHint) resultParts.push(askGuardHint)
         if (hint) resultParts.push(hint)
         const resultText = resultParts.join('\n')

@@ -7,12 +7,10 @@
 //      body is invalid Telegram HTML, we downgrade by removing parse_mode
 //      and shipping the body as plain text. Telegram will accept it.
 //
-// Methods that don't accept user text (sendDocument, sendPhoto, downloadFile,
-// setMessageReaction, deleteMessage, sendChatAction) are forwarded verbatim.
-// Captions on document/photo sends DO contain user text — Phase A1 keeps the
-// scope tight to text-only methods; PR-A2 can extend to captions if needed
-// (most callers route formatted text through sendMessage with attachment
-// resolution done as a separate call).
+// Captions on sendDocument/sendPhoto get the same two steps (reply
+// as_caption puts the reply body there). Methods that don't accept user text
+// (downloadFile, setMessageReaction, deleteMessage, sendChatAction) are
+// forwarded verbatim.
 //
 // The wrapper returns a fresh TelegramApi-shaped object whose every method
 // is a thin function. Callers swap the raw instance for this one and need
@@ -140,6 +138,21 @@ export function createSafeTelegramApi(
       return { text: validated.text, parseMode: undefined }
     }
     return { text: validated.text, parseMode }
+  }
+
+  // Captions carry user text (reply as_caption): same redact + HTML-validate
+  // pass as a message body. parse_mode only matters together with a caption.
+  const sanitizeCaption = (opts: SendDocumentOpts): SendDocumentOpts => {
+    const safeOpts: SendDocumentOpts = { ...opts }
+    if (typeof safeOpts.caption !== 'string') return safeOpts
+    const { text: safeCaption, parseMode } = sanitize(safeOpts.caption, safeOpts.parse_mode)
+    safeOpts.caption = safeCaption
+    if (parseMode === undefined) {
+      delete safeOpts.parse_mode
+    } else {
+      safeOpts.parse_mode = parseMode
+    }
+    return safeOpts
   }
 
   // Fail-closed guard for widget code/state (see sendWidget). The message names
@@ -322,22 +335,11 @@ export function createSafeTelegramApi(
     },
 
     async sendDocument(chatId: string, filePath: string, opts: SendDocumentOpts): Promise<{ message_id: number }> {
-      // Caption is plain text on Telegram unless parse_mode is set on the
-      // raw call (we don't expose that here). Redact it defensively in case
-      // the caller threaded user text into the caption.
-      const safeOpts: SendDocumentOpts = { ...opts }
-      if (typeof safeOpts.caption === 'string') {
-        safeOpts.caption = redactSecrets(safeOpts.caption, extraSecrets)
-      }
-      return raw.sendDocument(chatId, filePath, safeOpts)
+      return raw.sendDocument(chatId, filePath, sanitizeCaption(opts))
     },
 
     async sendPhoto(chatId: string, filePath: string, opts: SendDocumentOpts): Promise<{ message_id: number }> {
-      const safeOpts: SendDocumentOpts = { ...opts }
-      if (typeof safeOpts.caption === 'string') {
-        safeOpts.caption = redactSecrets(safeOpts.caption, extraSecrets)
-      }
-      return raw.sendPhoto(chatId, filePath, safeOpts)
+      return raw.sendPhoto(chatId, filePath, sanitizeCaption(opts))
     },
 
     async downloadFile(fileId: string, destDir: string): Promise<DownloadResult> {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -1097,5 +1097,161 @@ describe('edit_message rich gate and retry (#149 review)', () => {
     expect(attempts.length).toBe(2)
     expect(attempts[0]!.parse_mode).toBe('HTML')
     expect(attempts[1]).toEqual({ text: '**готово**', parse_mode: undefined })
+  })
+})
+
+describe('reply as_caption', () => {
+  interface FileCall { method: 'photo' | 'document'; path: string; opts: SendDocumentOpts }
+  function makeCaptionHarness(fileNames: string[]): {
+    deps: ToolDeps
+    paths: string[]
+    messages: Array<{ text: string; opts: SendMessageOpts }>
+    files: FileCall[]
+    cleanup: () => void
+  } {
+    const workspace = mkdtempSync(join(tmpdir(), 'dashi-caption-ws-'))
+    const paths = fileNames.map((n) => {
+      const p = join(workspace, n)
+      writeFileSync(p, 'x')
+      return p
+    })
+    const messages: Array<{ text: string; opts: SendMessageOpts }> = []
+    const files: FileCall[] = []
+    const api = makeStubApi({
+      sendMessage: async (_c, text, opts) => { messages.push({ text, opts }); return { message_id: 10 } },
+      sendPhoto: async (_c, path, opts) => { files.push({ method: 'photo', path, opts }); return { message_id: 20 } },
+      sendDocument: async (_c, path, opts) => { files.push({ method: 'document', path, opts }); return { message_id: 30 } },
+    })
+    const deps = makeDeps({ telegramApi: api, config: makeConfig({ workspace_root: workspace }) })
+    return {
+      deps,
+      paths,
+      messages,
+      files,
+      cleanup: () => {
+        rmSync(workspace, { recursive: true, force: true })
+        rmSync(deps.statePaths.root, { recursive: true, force: true })
+      },
+    }
+  }
+
+  test('one photo + short text → ONE sendPhoto with HTML caption and reply_to, no sendMessage', async () => {
+    const h = makeCaptionHarness(['post.png'])
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: '**Hello** post', files: h.paths, as_caption: true, reply_to: '55' }),
+      h.deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(h.messages).toHaveLength(0)
+    expect(h.files).toHaveLength(1)
+    expect(h.files[0]!.method).toBe('photo')
+    expect(h.files[0]!.opts).toEqual({ reply_to_message_id: 55, caption: '<b>Hello</b> post', parse_mode: 'HTML' })
+    expect(result.content[0]?.text).toBe('sent (id: 20)')
+    h.cleanup()
+  })
+
+  test('document + format=text → caption verbatim, no parse_mode', async () => {
+    const h = makeCaptionHarness(['report.pdf'])
+    await callTool(
+      callReq('reply', { chat_id: '164795011', text: '**raw**', files: h.paths, as_caption: true, format: 'text' }),
+      h.deps,
+    )
+    expect(h.messages).toHaveLength(0)
+    expect(h.files[0]!.method).toBe('document')
+    expect(h.files[0]!.opts).toEqual({ caption: '**raw**' })
+    h.cleanup()
+  })
+
+  test('format=markdownv2 → caption raw with parse_mode MarkdownV2', async () => {
+    const h = makeCaptionHarness(['post.jpg'])
+    await callTool(
+      callReq('reply', { chat_id: '164795011', text: '*bold*', files: h.paths, as_caption: true, format: 'markdownv2' }),
+      h.deps,
+    )
+    expect(h.messages).toHaveLength(0)
+    expect(h.files[0]!.opts).toEqual({ caption: '*bold*', parse_mode: 'MarkdownV2' })
+    h.cleanup()
+  })
+
+  test('limit counts visible text: 1024 visible chars with markup still rides as caption', async () => {
+    const h = makeCaptionHarness(['post.png'])
+    const text = '**' + 'a'.repeat(1020) + '** <>'
+    await callTool(callReq('reply', { chat_id: '164795011', text, files: h.paths, as_caption: true }), h.deps)
+    expect(h.messages).toHaveLength(0)
+    expect(h.files[0]!.opts.caption).toBe('<b>' + 'a'.repeat(1020) + '</b> &lt;&gt;')
+    h.cleanup()
+  })
+
+  test('caption over 1024 → fallback to separate text + file, note in result', async () => {
+    const h = makeCaptionHarness(['post.png'])
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: 'a'.repeat(1025), files: h.paths, as_caption: true }),
+      h.deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(h.messages).toHaveLength(1)
+    expect(h.files).toHaveLength(1)
+    expect(h.files[0]!.opts.caption).toBeUndefined()
+    expect(result.content[0]?.text).toContain('as_caption ignored: caption over 1024')
+    h.cleanup()
+  })
+
+  test('two files → fallback to separate text + files, note in result', async () => {
+    const h = makeCaptionHarness(['a.png', 'b.png'])
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: 'post', files: h.paths, as_caption: true }),
+      h.deps,
+    )
+    expect(h.messages).toHaveLength(1)
+    expect(h.files).toHaveLength(2)
+    expect(h.files.every((f) => f.opts.caption === undefined)).toBe(true)
+    expect(result.content[0]?.text).toContain('as_caption ignored: needs exactly 1 file, got 2')
+    h.cleanup()
+  })
+
+  test('zero files → plain text reply, note in result', async () => {
+    const h = makeCaptionHarness([])
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: 'post', as_caption: true }),
+      h.deps,
+    )
+    expect(h.messages).toHaveLength(1)
+    expect(h.files).toHaveLength(0)
+    expect(result.content[0]?.text).toContain('as_caption ignored: needs exactly 1 file, got 0')
+    h.cleanup()
+  })
+
+  test('default (as_caption absent) is unchanged: text message + bare file, no note', async () => {
+    const h = makeCaptionHarness(['post.png'])
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: 'post', files: h.paths }),
+      h.deps,
+    )
+    expect(h.messages).toHaveLength(1)
+    expect(h.files).toHaveLength(1)
+    expect(h.files[0]!.opts).toEqual({})
+    expect(result.content[0]?.text).toBe('sent 2 parts (ids: 10, 20)')
+    h.cleanup()
+  })
+
+  test('HTML caption parse error → one retry as plain visible-text caption', async () => {
+    const h = makeCaptionHarness(['post.png'])
+    const attempts: SendDocumentOpts[] = []
+    h.deps.telegramApi.sendPhoto = async (_c, _p, opts) => {
+      attempts.push(opts)
+      if (attempts.length === 1) throw new Error("Bad Request: can't parse entities: Unsupported start tag")
+      return { message_id: 21 }
+    }
+    const result = await callTool(
+      callReq('reply', { chat_id: '164795011', text: '**Hi** & bye', files: h.paths, as_caption: true, reply_to: '7' }),
+      h.deps,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(attempts).toHaveLength(2)
+    expect(attempts[0]!.parse_mode).toBe('HTML')
+    expect(attempts[1]).toEqual({ reply_to_message_id: 7, caption: 'Hi & bye' })
+    expect(h.messages).toHaveLength(0)
+    expect(result.content[0]?.text).toBe('sent (id: 21)')
+    h.cleanup()
   })
 })

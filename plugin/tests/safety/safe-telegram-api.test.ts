@@ -415,3 +415,42 @@ describe('createSafeTelegramApi — non-inline reply_markup passthrough', () => 
     expect(sent.inline_keyboard).toBeUndefined()
   })
 })
+
+describe('createSafeTelegramApi — captions (reply as_caption)', () => {
+  function makeCaptionApi(): { api: TelegramApi; photo: SendDocumentOpts[]; doc: SendDocumentOpts[] } {
+    const { api } = makeStubApi()
+    const photo: SendDocumentOpts[] = []
+    const doc: SendDocumentOpts[] = []
+    api.sendPhoto = async (_c, _f, opts) => { photo.push(opts); return { message_id: 1 } }
+    api.sendDocument = async (_c, _f, opts) => { doc.push(opts); return { message_id: 2 } }
+    return { api, photo, doc }
+  }
+
+  test('photo caption is redacted and keeps valid HTML parse_mode', async () => {
+    const { api, photo } = makeCaptionApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    const token = '8507713167:AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRR'
+    await safe.sendPhoto('1', '/tmp/x.png', { caption: `<b>post</b> ${token}`, parse_mode: 'HTML' })
+    expect(photo[0]!.caption).not.toContain(token)
+    expect(photo[0]!.caption).toContain('<b>post</b>')
+    expect(photo[0]!.parse_mode).toBe('HTML')
+  })
+
+  test('document caption with invalid HTML downgrades: parse_mode removed', async () => {
+    const { api, doc } = makeCaptionApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    await safe.sendDocument('1', '/tmp/x.pdf', { caption: '<script>x</script>', parse_mode: 'HTML' })
+    expect(doc[0]!.parse_mode).toBeUndefined()
+    expect(doc[0]!.caption).not.toContain('<script>')
+  })
+
+  test('no caption → opts forwarded without parse_mode or caption', async () => {
+    const { api, photo } = makeCaptionApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    await safe.sendPhoto('1', '/tmp/x.png', { reply_to_message_id: 5 })
+    expect(photo[0]).toEqual({ reply_to_message_id: 5 })
+  })
+})

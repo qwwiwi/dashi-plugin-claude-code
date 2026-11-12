@@ -37,6 +37,22 @@ export function escapeHtmlAttr(text: string): string {
   return escapeHtml(text).replace(/'/g, '&#39;')
 }
 
+/**
+ * The text a reader sees once Telegram parses our HTML subset: tags dropped,
+ * the entities escapeHtml/escapeHtmlAttr emit decoded. Used to measure a
+ * caption against Telegram's 1024-character limit (counted after entity
+ * parsing) and as the plain-text retry body when Telegram rejects the HTML.
+ */
+export function telegramHtmlVisibleText(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Parse error fingerprint
 // ─────────────────────────────────────────────────────────────────────
