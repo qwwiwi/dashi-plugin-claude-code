@@ -30,6 +30,11 @@ export const ReplyArgsSchema = z.object({
   // HTML fallback. The explicit 'rich' value is reserved for forcing the rich
   // attempt; behaviourally it joins the same auto-upgrade gate as 'html'.
   format: z.enum(['text', 'markdownv2', 'html', 'rich']).default('html'),
+  // Opt-in: ship the text as the caption of the ONE attached file (one
+  // Telegram message, forwardable whole). Falls back to separate text +
+  // files (with a note in the tool result) when files count is not 1 or the
+  // rendered caption is over 1024 characters.
+  as_caption: z.boolean().default(false),
   // Guest Mode: when the inbound <channel> meta carried guest_query_id,
   // pass it back here — the reply is delivered via answerGuestQuery into
   // the chat where the bot was @-mentioned (the bot is NOT a member of
