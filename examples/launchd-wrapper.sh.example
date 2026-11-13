@@ -7,6 +7,9 @@ TMUX_SESSION='<session-shell>'
 TMUX_BIN='<tmux-shell>'
 WORKSPACE='<workspace-shell>'
 CLAUDE_CMD='<claude-command-shell>'
+# scripts/confirm-startup-screen.sh of this repository. When the agent uses a
+# dedicated tmux socket, add `-L <name>` (or `-S <path>`) to its call below.
+CONFIRM_SCRIPT='<confirm-script-shell>'
 
 # Existence check only. Do not source the file here: a tmux server copies its
 # first client's environment into its global environment, which would expose the
@@ -20,38 +23,44 @@ if "$TMUX_BIN" has-session -t "$TMUX_SESSION" 2>/dev/null; then
   exit 1
 fi
 STARTED=0
-WELCOME_PID=''
+CONFIRM_PID=''
 cleanup() {
   trap - TERM INT
-  if [[ -n "$WELCOME_PID" ]]; then kill "$WELCOME_PID" 2>/dev/null || true; fi
+  if [[ -n "$CONFIRM_PID" ]]; then kill "$CONFIRM_PID" 2>/dev/null || true; fi
   if [[ "$STARTED" == 1 ]]; then "$TMUX_BIN" kill-session -t "$TMUX_SESSION" 2>/dev/null || true; fi
   exit 0
 }
 trap cleanup TERM INT
 # Claude's real working directory is the requested workspace. The MCP config
 # uses absolute executable/source paths, independent of that directory.
+# Shell-based start: the pane is a plain shell first, and the start command is
+# typed into that shell, which this wrapper created a moment ago.
 echo "Starting $TMUX_SESSION"
-"$TMUX_BIN" new-session -d -s "$TMUX_SESSION" -c "$WORKSPACE" "$CLAUDE_CMD"
+"$TMUX_BIN" new-session -d -s "$TMUX_SESSION" -c "$WORKSPACE" /bin/bash
 STARTED=1
-(
-  DELAY_PID=''
-  stop_welcome() {
-    if [[ -n "$DELAY_PID" ]]; then kill "$DELAY_PID" 2>/dev/null || true; fi
-    exit 0
-  }
-  trap stop_welcome TERM INT
-  sleep 6 &
-  DELAY_PID=$!
-  wait "$DELAY_PID" || exit 0
-  "$TMUX_BIN" send-keys -t "$TMUX_SESSION" Enter 2>/dev/null || true
-  sleep 2 &
-  DELAY_PID=$!
-  wait "$DELAY_PID" || exit 0
-  "$TMUX_BIN" send-keys -t "$TMUX_SESSION" Enter 2>/dev/null || true
-) &
-WELCOME_PID=$!
+if ! "$TMUX_BIN" send-keys -t "$TMUX_SESSION" -l "exec ${CLAUDE_CMD}" \
+  || ! "$TMUX_BIN" send-keys -t "$TMUX_SESSION" C-m; then
+  echo "Could not type the start command into $TMUX_SESSION" >&2
+  "$TMUX_BIN" kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+  exit 1
+fi
+# Startup dialogs. Never send blind input: no timed Enter, no key "just in
+# case". The only automatic key is the content-matched confirm below. It reads
+# the pane and presses Enter only while the "Loading development channels"
+# warning is showing with option 1 (local development) under the cursor. Any
+# other dialog (trust folder, login, update, external imports) is only logged
+# and waits for an operator who has looked at the pane.
+# Off switch: STARTUP_CONFIRM_DISABLE=1 in the supervisor environment.
+if [[ -f "$CONFIRM_SCRIPT" ]]; then
+  TMUX_BIN="$TMUX_BIN" /bin/bash "$CONFIRM_SCRIPT" "$TMUX_SESSION" &
+  CONFIRM_PID=$!
+else
+  echo "Confirm script not found: $CONFIRM_SCRIPT; startup dialogs need an operator." >&2
+fi
 while "$TMUX_BIN" has-session -t "$TMUX_SESSION" 2>/dev/null; do sleep 1; done
-kill "$WELCOME_PID" 2>/dev/null || true
-wait "$WELCOME_PID" 2>/dev/null || true
+if [[ -n "$CONFIRM_PID" ]]; then
+  kill "$CONFIRM_PID" 2>/dev/null || true
+  wait "$CONFIRM_PID" 2>/dev/null || true
+fi
 echo "Session $TMUX_SESSION exited unexpectedly; supervisor will restart it." >&2
 exit 1

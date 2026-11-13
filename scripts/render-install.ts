@@ -105,7 +105,7 @@ try {
   // private file inside the actual pane, without passing secrets in argv.
   const paneScript = `export HOME=${shell(home)} PATH=${shell(path)}; set -a; source ${shell(envFile)}; set +a; export TELEGRAM_CONFIG_FILE=${shell(configFile)}; exec ${claudeCommand}`
   const command = ['/bin/bash', '-c', paneScript].map(shell).join(' ')
-  const wrapperText = render(template('launchd-wrapper.sh.example'), { 'env-file-shell': shell(envFile), 'session-shell': shell(session), 'tmux-shell': shell(tmux), 'workspace-shell': shell(workspace), 'claude-command-shell': shell(command) })
+  const wrapperText = render(template('launchd-wrapper.sh.example'), { 'env-file-shell': shell(envFile), 'session-shell': shell(session), 'tmux-shell': shell(tmux), 'workspace-shell': shell(workspace), 'claude-command-shell': shell(command), 'confirm-script-shell': shell(join(repo, 'scripts', 'confirm-startup-screen.sh')) })
   const values = { agent, 'service-user': userInfo().username, 'plugin-dir': pluginDir, home, path, wrapper, 'state-dir': stateDir }
   const escaped = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, platform === 'Linux' ? (key === 'plugin-dir' ? systemdPlain(value) : systemd(value)) : xml(value)]))
   // ExecStart= parses quoted words; WorkingDirectory= does not unquote at all (quotes make the path
