@@ -290,7 +290,7 @@ launchctl print gui/$(id -u)/com.dashi-plugin.channel-myagent | head -20
 1. «Allow external CLAUDE.md file imports?» → `1` (Yes)
 2. «--dangerously-load-development-channels» → `1` (I am using this for local development)
 
-Wrapper отправит два Enter автоматически. Если промт появился позже или не был принят:
+Второй вопрос wrapper подтверждает сам: `scripts/confirm-startup-screen.sh` нажимает Enter, только когда на экране именно предупреждение dev-channels с курсором на пункте 1 (подробнее – [07-startup-screen-confirm.md](07-startup-screen-confirm.md)). Слепых нажатий по таймеру wrapper не делает, поэтому первый вопрос и любой другой диалог подтвердите вручную, посмотрев на экран:
 
 ```bash
 tmux attach -t channel-myagent

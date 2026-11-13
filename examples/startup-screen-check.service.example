@@ -1,0 +1,18 @@
+# Periodic hung-startup-screen check (Linux). Pair with
+# startup-screen-check.timer.example. Install both as
+# /etc/systemd/system/startup-screen-check.{service,timer}, then:
+#   systemctl daemon-reload && systemctl enable --now startup-screen-check.timer
+# The job only reads panes; it never sends keys.
+[Unit]
+Description=Dashi Plugin: alert when an agent is stuck on a Claude Code startup screen
+
+[Service]
+Type=oneshot
+# The account that owns the agents' tmux servers.
+User=<service-user>
+Environment="PATH=<path>"
+Environment="STARTUP_CHECK_STATE_DIR=<state-dir>/startup-screen-state"
+# Optional file with STARTUP_ALERT_CMD=... (runs once per incident; agent, kind
+# and seconds arrive as $1 $2 $3). See examples/startup-alert.sh.example.
+EnvironmentFile=-<state-dir>/startup-screen-check.env
+ExecStart=/bin/bash <plugin-repo>/scripts/check-startup-screen.sh --config <state-dir>/startup-screen-check.agents --threshold 120

@@ -14,7 +14,7 @@ scripts/confirm-startup-screen.sh and these fixtures together.
 
 from __future__ import annotations
 
-import os
+import plistlib
 import stat
 import subprocess
 import tempfile
@@ -490,6 +490,64 @@ class CheckStartupScreenTest(FakeTmuxCase):
         second = self.check(1200)
         for text in (first.stderr, first.stdout, second.stderr, second.stdout, "\n".join(self.event_lines())):
             self.assertNotIn(SECRET, text)
+
+
+class WrapperTemplateAndExamplesTest(unittest.TestCase):
+    """Static guards: the template sends no blind key; examples are well-formed."""
+
+    WRAPPER = REPO_ROOT / "examples" / "launchd-wrapper.sh.example"
+
+    def _code_lines(self) -> list[str]:
+        lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
+        return [line for line in lines if not line.strip().startswith("#")]
+
+    def test_wrapper_sends_only_its_own_start_command(self) -> None:
+        sends = [line.strip() for line in self._code_lines() if "send-keys" in line]
+        self.assertEqual(len(sends), 2, sends)
+        self.assertIn('-l "exec ${CLAUDE_CMD}"', sends[0])
+        self.assertIn("C-m", sends[1])
+        self.assertFalse(any("Enter" in line for line in sends), sends)
+
+    def test_wrapper_starts_a_shell_and_calls_the_confirm_script(self) -> None:
+        code = "\n".join(self._code_lines())
+        self.assertRegex(code, r'new-session -d -s "\$TMUX_SESSION" -c "\$WORKSPACE" /bin/bash')
+        self.assertIn('"$CONFIRM_SCRIPT" "$TMUX_SESSION" &', code)
+        self.assertNotIn("sleep 6", code)
+        self.assertIn("Never send blind input", self.WRAPPER.read_text(encoding="utf-8"))
+
+    def test_check_plist_example_is_valid_and_periodic(self) -> None:
+        with (REPO_ROOT / "examples" / "startup-screen-check.plist.example").open("rb") as handle:
+            data = plistlib.load(handle)
+        self.assertEqual(data["StartInterval"], 60)
+        self.assertTrue(data["ProgramArguments"][1].endswith("scripts/check-startup-screen.sh"))
+        self.assertIn("STARTUP_ALERT_CMD", data["EnvironmentVariables"])
+
+    def test_systemd_timer_example_runs_the_check(self) -> None:
+        service = (REPO_ROOT / "examples" / "startup-screen-check.service.example").read_text(encoding="utf-8")
+        timer = (REPO_ROOT / "examples" / "startup-screen-check.timer.example").read_text(encoding="utf-8")
+        self.assertIn("Type=oneshot", service)
+        self.assertIn("scripts/check-startup-screen.sh", service)
+        self.assertIn("OnUnitActiveSec=", timer)
+
+    def test_alert_example_writes_outbox_line_without_network(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "alerts.log"
+            proc = subprocess.run(
+                ["/bin/bash", str(REPO_ROOT / "examples" / "startup-alert.sh.example"), "kael", "dev-channels", "130"],
+                env={"PATH": "/usr/bin:/bin", "HOME": tmp, "STARTUP_ALERT_OUTBOX": str(outbox)},
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            line = outbox.read_text(encoding="utf-8")
+            self.assertIn("to=arthas agent=kael kind=dev-channels seconds=130", line)
+
+    def test_no_secrets_or_urls_baked_into_shipped_files(self) -> None:
+        for name in ("scripts/confirm-startup-screen.sh", "scripts/check-startup-screen.sh", "examples/startup-alert.sh.example"):
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+            self.assertNotRegex(text, r"https?://", name)
 
 
 if __name__ == "__main__":

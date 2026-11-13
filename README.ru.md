@@ -616,6 +616,7 @@ bun ../skills/doctor-dashi-plugin/scripts/doctor.ts --plugin-dir "$PWD"
 | [skills/doctor-dashi-plugin/SKILL.md](skills/doctor-dashi-plugin/SKILL.md) | **Доктор миграции** — read-only диагностика: размещение, hooks (профили), permission gate + policy, мультичат, webhook bind, гигиена токена, MCP, allowlist, флот, живая сессия |
 | [docs/05-troubleshooting.md](docs/05-troubleshooting.md) | Типовые ошибки: симптом → корень → фикс |
 | [docs/06-how-claude-loads-session.md](docs/06-how-claude-loads-session.md) | Как Claude Code находит `CLAUDE.md`, CWD upward search, `@-include` |
+| [docs/07-startup-screen-confirm.md](docs/07-startup-screen-confirm.md) | Стартовый экран dev-channels: подтверждение по содержимому, оповещение о зависании |
 | [plugin/docs/progress-reporter-setup.md](plugin/docs/progress-reporter-setup.md) | Установка hooks в 3 шага + troubleshooting |
 | [plugin/docs/canary-smoke.md](plugin/docs/canary-smoke.md) | Live smoke-матрица против тест-бота |
 
@@ -746,23 +747,17 @@ TELEGRAM_WEBHOOK_TOKEN=<random hex>
 
 На холодном старте welcome-промпт dev-channels может отрисоваться позже 8 секунд. Слепой `sleep 6 && tmux send-keys Enter` в `ExecStartPost` стреляет в пустоту, systemd помечает юнит готовым, а канал так и не начинает слушать.
 
-Вместо этого — confirm-цикл: capture-pane каждые 3 секунды, Enter только когда промпт реально виден на экране, exit `0` только при появлении баннера канала. Тогда exit-код `ExecStartPost` равен реальной готовности.
+Никакого слепого ввода. Используйте подтверждение по содержимому из этого репозитория: `scripts/confirm-startup-screen.sh` до 90 секунд смотрит на экран и нажимает Enter, только пока показано предупреждение «Loading development channels» и курсор стоит на пункте 1 («I am using this for local development»). Любой другой экран (доверие к папке, вход, обновление, обычная строка ввода) клавиш не получает – скрипт только называет его в логе. Код `0` – сессия работает либо экран исчез после нашего Enter, то есть код выхода равен реальной готовности.
 
 ```bash
-#!/usr/bin/env bash
-# /usr/local/bin/channel-confirm-arthas.sh
-for i in $(seq 1 30); do
-  pane="$(tmux -L channel-arthas capture-pane -pt channel-arthas 2>/dev/null || true)"
-  if printf '%s' "$pane" | grep -q 'messages from server:dashi-channel inject\|Listening for channel messages'; then
-    exit 0
-  fi
-  if printf '%s' "$pane" | grep -q 'Enter to confirm\|I am using this for local development\|Do you trust'; then
-    tmux -L channel-arthas send-keys -t channel-arthas Enter
-  fi
-  sleep 3
-done
-exit 1
+# в wrapper агента, сразу после запуска Claude Code в tmux:
+/bin/bash /path/to/dashi-plugin-claude-code/scripts/confirm-startup-screen.sh -L channel-arthas channel-arthas &
+
+# посмотреть, как скрипт видит экран сейчас, ничего не нажимая:
+bash scripts/confirm-startup-screen.sh --classify -L channel-arthas channel-arthas
 ```
+
+Wrapper, который создаёт `./install.sh` (`examples/launchd-wrapper.sh.example`, общий для launchd и systemd), уже делает этот вызов. Периодическая проверка `scripts/check-startup-screen.sh` поднимает одно событие на инцидент, если агент стоит на стартовом диалоге дольше 120 секунд (команда оповещения задаётся в `STARTUP_ALERT_CMD`; образец для агента-наблюдателя – `examples/startup-alert.sh.example`). Коды выхода, установка на существующего агента, проверка на отдельной сессии и выключение: [docs/07-startup-screen-confirm.md](docs/07-startup-screen-confirm.md).
 
 ### Плюсы
 

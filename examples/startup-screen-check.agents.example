@@ -1,0 +1,7 @@
+# Agents watched by scripts/check-startup-screen.sh, one per line:
+#   <agent> -L <tmux-socket-name> <tmux-target>
+#   <agent> -S <tmux-socket-path> <tmux-target>
+#   <agent> default <tmux-target>          (tmux default socket)
+# <agent> is only a label for the alert and the state file ([A-Za-z0-9._-]).
+myagent   -L channel-myagent   channel-myagent
+otheragent default channel-otheragent

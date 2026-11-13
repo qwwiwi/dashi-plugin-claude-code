@@ -15,6 +15,24 @@ retroactively marks the state of `main` on 2026-06-14.
 
 ## [Unreleased]
 
+### Added
+- `scripts/confirm-startup-screen.sh`: content-aware confirm of the Claude Code
+  "Loading development channels" startup screen. It presses Enter only while that
+  warning shows with option 1 under the cursor (at most two presses, verified
+  after each); every other screen is only classified. `--classify` prints how the
+  current pane is seen without pressing anything. Patterns sit at the top of the
+  file and can be overridden through the environment.
+- `scripts/check-startup-screen.sh`: periodic hung-startup-screen check with one
+  alert per incident through a pluggable `STARTUP_ALERT_CMD`; examples for launchd,
+  a systemd timer, the agent list and an alert command under `examples/`.
+- `docs/07-startup-screen-confirm.md`.
+
+### Changed
+- The wrapper template (`examples/launchd-wrapper.sh.example`) starts a plain shell
+  in tmux, types the start command into it and calls the confirm script. The blind
+  timed double Enter is gone, so the "external CLAUDE.md imports" prompt is no
+  longer answered automatically: an operator confirms it after reading the pane.
+
 ### Breaking
 - `install.sh` no longer accepts `--bot-token TOKEN`: a secret in argv is readable
   in `ps` and `/proc/<pid>/cmdline` and stays in shell history. Supply the token via

@@ -1,0 +1,48 @@
+#!/bin/bash
+# Example alert command for scripts/check-startup-screen.sh. It tells the
+# fleet-monitoring agent (here: arthas) that another agent is stuck on a
+# Claude Code startup screen.
+#
+# Wire it up through the environment of the periodic check:
+#   STARTUP_ALERT_CMD='/bin/bash /path/to/startup-alert.sh "$1" "$2" "$3"'
+#
+# Two delivery routes:
+#   1. STARTUP_ALERT_WEBHOOK_URL set: POST to the monitoring agent's
+#      webhook-listener of this repository (webhook-listener/listener.py,
+#      POST /hooks/agent, Bearer token read from STARTUP_ALERT_BEARER_FILE).
+#      The listener wakes that agent with the title and body below.
+#   2. Otherwise: append one line to STARTUP_ALERT_OUTBOX, for whatever
+#      already tails files on your host.
+# No URL or token is baked in: both come from the environment / a 0600 file.
+# Any other transport (your swarm CLI, a chat bot) fits the same three
+# arguments; replace the body of this script.
+set -euo pipefail
+agent="${1:?agent name}"
+kind="${2:?screen kind}"
+seconds="${3:?seconds}"
+MONITOR_AGENT="${STARTUP_ALERT_MONITOR_AGENT:-arthas}"
+OUTBOX="${STARTUP_ALERT_OUTBOX:-$HOME/.local/state/dashi-startup-screen/alerts.log}"
+host="$(hostname 2>/dev/null || echo unknown-host)"
+title="Agent $agent is stuck on a startup screen ($kind)"
+body="Agent $agent on $host has been showing the Claude Code startup screen $kind for ${seconds}s and does not read Telegram. Look at its tmux pane; press a key only after reading the screen."
+
+if [[ -n "${STARTUP_ALERT_WEBHOOK_URL:-}" ]]; then
+  bearer_file="${STARTUP_ALERT_BEARER_FILE:?set STARTUP_ALERT_BEARER_FILE to the token file}"
+  if [[ ! -r "$bearer_file" ]]; then
+    echo "startup-alert: cannot read the bearer file" >&2
+    exit 1
+  fi
+  # agent, kind and seconds are [A-Za-z0-9._-] only (the check enforces it for
+  # the agent name; kinds are fixed words), so they are safe inside JSON.
+  # The token travels through stdin, never through argv.
+  payload="{\"from_agent\":\"startup-screen-check\",\"task_id\":\"startup-screen-$agent\",\"title\":\"$title\",\"body\":\"$body\"}"
+  printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\r\n' < "$bearer_file")" \
+    | curl --silent --show-error --fail --max-time 15 --config - \
+        --header 'Content-Type: application/json' --data "$payload" \
+        "$STARTUP_ALERT_WEBHOOK_URL" >/dev/null
+  echo "startup-alert: sent to $MONITOR_AGENT via webhook" >&2
+else
+  mkdir -p "$(dirname "$OUTBOX")"
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') to=$MONITOR_AGENT agent=$agent kind=$kind seconds=$seconds host=$host" >> "$OUTBOX"
+  echo "startup-alert: written to the outbox for $MONITOR_AGENT" >&2
+fi
