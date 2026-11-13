@@ -20,7 +20,12 @@
     </array>
     <key>EnvironmentVariables</key>
     <dict>
+        <!-- launchd starts jobs with a bare PATH (no Homebrew). Both are set on
+             purpose: PATH for the tools, TMUX_BIN as the exact tmux to run
+             (`command -v tmux` in a terminal; /usr/local/bin/tmux on Intel Macs).
+             A wrong value shows up as "tmux-not-found" (exit 3) in the err log. -->
         <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>TMUX_BIN</key><string>/opt/homebrew/bin/tmux</string>
         <key>STARTUP_CHECK_STATE_DIR</key><string>REPLACE_STATE_DIR/startup-screen-state</string>
         <!-- Runs once per incident; gets agent, kind, seconds as $1 $2 $3. -->
         <key>STARTUP_ALERT_CMD</key><string>/bin/bash REPLACE_STATE_DIR/startup-alert.sh "$1" "$2" "$3"</string>

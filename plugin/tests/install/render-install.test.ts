@@ -276,11 +276,11 @@ for (const screen of ['dev-channels', 'trust-folder'] as const) {
       : 'Do you trust the files in this folder?\n\n ❯ 1. Yes, proceed\n   2. No, exit\n\n Enter to confirm · Esc to cancel\n'
     writeFileSync(pane, text)
     const fakeTmux = join(f.root, 'tmux')
-    writeFileSync(fakeTmux, `#!/bin/bash\ncase "$1" in\n has-session) test -f '${alive}' ;;\n new-session) touch '${alive}' ;;\n kill-session) rm -f '${alive}' ;;\n capture-pane) if grep -qx Enter '${keys}' 2>/dev/null; then echo 'Listening for channel messages'; else cat '${pane}'; fi ;;\n send-keys) shift; printf '%s\\n' "\${!#}" >> '${keys}' ;;\nesac\n`, { mode: 0o700 })
+    writeFileSync(fakeTmux, `#!/bin/bash\ncase "$1" in\n has-session) test -f '${alive}' ;;\n new-session) touch '${alive}' ;;\n kill-session) rm -f '${alive}' ;;\n display-message) echo '%0' ;;\n capture-pane) if grep -qx Enter '${keys}' 2>/dev/null; then echo 'Listening for channel messages'; else cat '${pane}'; fi ;;\n send-keys) shift; printf '%s\\n' "\${!#}" >> '${keys}' ;;\nesac\n`, { mode: 0o700 })
     f.env.INSTALL_TMUX = fakeTmux
     expect(f.run().exitCode).toBe(0)
     const child = Bun.spawn(['/bin/bash', join(f.state, 'channel-wrapper.sh')], { stdout: 'ignore', stderr: 'ignore',
-      env: { ...process.env, STARTUP_CONFIRM_INTERVAL: '0.05', STARTUP_CONFIRM_PRESS_PAUSE: '0.05', STARTUP_CONFIRM_TIMEOUT: '1' } })
+      env: { ...process.env, STARTUP_CONFIRM_INTERVAL: '0.05', STARTUP_CONFIRM_PRESS_PAUSE: '0.05', STARTUP_CONFIRM_TIMEOUT: '1', STARTUP_CONFIRM_LOCK_DIR: join(f.root, 'locks') } })
     try {
       await waitFor(() => existsSync(keys) && readFileSync(keys, 'utf8').includes('C-m'))
       if (screen === 'dev-channels') await waitFor(() => readFileSync(keys, 'utf8').split('\n').includes('Enter'))

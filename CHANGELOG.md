@@ -21,9 +21,16 @@ retroactively marks the state of `main` on 2026-06-14.
   warning shows with option 1 under the cursor (at most two presses, verified
   after each); every other screen is only classified. `--classify` prints how the
   current pane is seen without pressing anything. Patterns sit at the top of the
-  file and can be overridden through the environment.
+  file and can be overridden through the environment. The key is sent only when
+  the pane holds exactly one dialog (no marker of any other dialog, one confirm
+  hint, one cursor); the target is pinned to its tmux pane id and one confirmer
+  per pane is enforced with a lock directory (exit 8 for the second one); the
+  deadline holds on every loop iteration; a logged-out session is `login`, not
+  `ready`; a missing tmux binary is exit 9. The look-then-send window between
+  `capture-pane` and `send-keys` remains and is documented.
 - `scripts/check-startup-screen.sh`: periodic hung-startup-screen check with one
-  alert per incident through a pluggable `STARTUP_ALERT_CMD`; examples for launchd,
+  alert per incident through a pluggable `STARTUP_ALERT_CMD` (per-agent lock and
+  atomic state file, so concurrent runs alert once); examples for launchd,
   a systemd timer, the agent list and an alert command under `examples/`.
 - `docs/07-startup-screen-confirm.md`.
 

@@ -51,6 +51,9 @@ fi
 # other dialog (trust folder, login, update, external imports) is only logged
 # and waits for an operator who has looked at the pane.
 # Off switch: STARTUP_CONFIRM_DISABLE=1 in the supervisor environment.
+# TMUX_BIN is handed over explicitly as the absolute path rendered above:
+# launchd and non-interactive ssh have no Homebrew directory on PATH, and the
+# confirm script would otherwise stop with "tmux not found" (exit 9).
 if [[ -f "$CONFIRM_SCRIPT" ]]; then
   TMUX_BIN="$TMUX_BIN" /bin/bash "$CONFIRM_SCRIPT" "$TMUX_SESSION" &
   CONFIRM_PID=$!

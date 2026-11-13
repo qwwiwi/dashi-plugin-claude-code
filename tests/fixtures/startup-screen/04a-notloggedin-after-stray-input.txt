@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.323
+▝▜██████▀  Fable 5.2 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/startup-853-test/work
+
+⚠ 1 MCP server needs authentication · run /mcp
+
+▎ Channels (experimental) messages from server:dummy inject directly in this session · restart without --dangerously-load-development-channels to stop
+
+❯ clear; cd /tmp/startup-853-test/work2 && claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dummy
+  ⎿  Not logged in · Please run /login
+     · Run in another terminal: security unlock-keychain
+
+✻ Baked for 0s · done 4:01 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                     tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on' to ~/.tmux.conf for wheel scroll
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  лимиты: нет данных
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

@@ -10,6 +10,8 @@ Description=Dashi Plugin: alert when an agent is stuck on a Claude Code startup 
 Type=oneshot
 # The account that owns the agents' tmux servers.
 User=<service-user>
+# PATH must contain the directory of tmux, or set TMUX_BIN to its full path:
+# a tmux that cannot be found is exit 3 ("tmux-not-found"), not "no session".
 Environment="PATH=<path>"
 Environment="STARTUP_CHECK_STATE_DIR=<state-dir>/startup-screen-state"
 # Optional file with STARTUP_ALERT_CMD=... (runs once per incident; agent, kind
