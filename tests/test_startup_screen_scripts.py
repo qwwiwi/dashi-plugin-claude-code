@@ -54,6 +54,13 @@ case "$cmd" in
     ;;
   capture-pane)
     [ -e "$d/gone" ] && exit 1
+    # hang: this call never answers (a stuck tmux server).
+    [ -e "$d/hang" ] && exec sleep 60
+    # delay.<k>: capture number k (from 0) answers that many seconds late.
+    k=0
+    [ -f "$d/captures.all" ] && k=$(wc -l < "$d/captures.all" | tr -d ' ')
+    echo x >> "$d/captures.all"
+    [ -f "$d/delay.$k" ] && sleep "$(cat "$d/delay.$k")"
     if [ -d "$d/cycle" ]; then
       # Alternating panes: capture number c shows cycle/<c mod count>.txt.
       c=0
@@ -187,6 +194,31 @@ OTHER_DIALOG = """\
 
 SHELL_ONLY = "bash-3.2$ \n"
 
+LOCK_BLOCK_START = "# >>> lock functions"
+LOCK_BLOCK_END = "# <<< lock functions"
+
+
+def lock_block(script: Path) -> str:
+    """The lock functions of one script: the text between the two marker lines."""
+    text = script.read_text(encoding="utf-8")
+    if LOCK_BLOCK_START not in text or LOCK_BLOCK_END not in text:
+        raise AssertionError(f"{script.name} has no marked lock block")
+    return text[text.index(LOCK_BLOCK_START) : text.index(LOCK_BLOCK_END)]
+
+
+def age_tree(path: Path, seconds: int) -> None:
+    """Make a lock directory and everything in it look `seconds` old."""
+    stamp = time.time() - seconds
+    for entry in [*path.rglob("*"), path]:
+        os.utime(entry, (stamp, stamp))
+
+
+def dead_pid() -> int:
+    """Pid of a process that has already ended and was reaped."""
+    proc = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+    proc.wait()
+    return proc.pid
+
 
 @dataclass
 class Result:
@@ -275,6 +307,39 @@ class FakeTmuxCase(unittest.TestCase):
         if proc.poll() is None:
             proc.kill()
         proc.communicate()
+
+    # ── Lock records ─────────────────────────────────────────────────────────
+
+    def lock_lib(self) -> Path:
+        """The lock functions of confirm-startup-screen.sh as a file a shell can source."""
+        lib = self.root / "lock-lib.sh"
+        if not lib.exists():
+            lib.write_text(lock_block(CONFIRM), encoding="utf-8")
+        return lib
+
+    def process_identity(self, pid: int) -> str:
+        """Identity of a running process, exactly as the scripts record it."""
+        proc = subprocess.run(
+            ["/bin/bash", "-c", '. "$1"; lock_proc_id "$2"', "identity", str(self.lock_lib()), str(pid)],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        self.assertTrue(proc.stdout, "no identity for a running process")
+        return proc.stdout
+
+    def write_lock(self, lock: Path, pid: int, identity: str, *, legacy_pid: bool = False) -> None:
+        """Put an owner record into a lock directory, as if process `pid` held the lock.
+
+        legacy_pid also writes the `pid` file the previous lock format used, so the
+        same test shows what the old age rule did.
+        """
+        lock.mkdir(parents=True, exist_ok=True)
+        (lock / "held").write_text(f"{pid} {pid}-1-test {identity}\n", encoding="utf-8")
+        if legacy_pid:
+            (lock / "pid").write_text(f"{pid}\n", encoding="utf-8")
+
+    def pane_lock(self) -> Path:
+        """Lock directory of the pane the fake tmux reports for `-L channel-test`."""
+        return self.root / "locks" / "-Lchannel-test__7.lock"
 
 
 class ConfirmStartupScreenTest(FakeTmuxCase):
@@ -507,11 +572,116 @@ class ConfirmStartupScreenTest(FakeTmuxCase):
 
     def test_text_above_the_warning_is_allowed(self) -> None:
         # A shell prompt, a redirect and the flag name itself above the dialog.
-        above = "❯ echo start > /tmp/log\n$ claude --dangerously-load-development-channels server:x\n"
+        above = "bash-3.2$ echo start > /tmp/log\n$ claude --dangerously-load-development-channels server:x\n"
         self.screens(above + DEV_CHANNELS, READY)
         result = self.confirm()
         self.assertEqual(result.code, 0, result.stderr)
         self.assertEqual(result.keys, ["Enter"])
+
+    # ── N1: above the warning only non-dialog text ───────────────────────────
+
+    def test_shell_text_above_the_warning_keeps_the_dialog_pressable(self) -> None:
+        # Prompts ending in $ % #, and `>` inside a shell line, are not a selection cursor.
+        allowed = {
+            "bash prompt with redirect": "bash-3.2$ echo start > /tmp/log\n",
+            "zsh prompt": "host% ls -la >> out.txt 2>&1\n",
+            "root prompt": "root@box:/srv# cat a > b\n",
+            "arrow inside a line": "$ echo 'a -> b' | grep '>'\n",
+            "glyph inside a line": "note: press ❯ to move, see docs › page 2\n",
+            "plain notice": "The default interactive shell is now zsh.\n",
+        }
+        for name, above in allowed.items():
+            with self.subTest(name):
+                self.screens(above + DEV_CHANNELS)
+                result = self.run_script(CONFIRM, "--classify", "-L", "channel-test", "channel-test")
+                self.assertEqual(result.stdout.strip(), "dev-channels", result.stderr)
+                self.assertEqual(result.code, 10, result.stderr)
+
+    def test_selection_dialog_above_the_warning_gets_no_keys(self) -> None:
+        refused = {
+            "unnumbered dialog (review N1)": "Choose access:\n❯ Allow all actions\n  Deny\nEsc to cancel\n",
+            "cursor line only": "Choose access:\n  ❯ Allow all actions\n    Deny\n",
+            "ascii cursor at line start": "Choose access:\n> Allow all actions\n  Deny\n",
+            "other cursor glyph": " › Allow all actions\n   Deny\n",
+            "cursor inside a box": "╭──────────────╮\n│ ❯ Allow all  │\n│   Deny       │\n╰──────────────╯\n",
+            "footer only": "Allow all actions?\nEsc to cancel\n",
+            "footer wrapped over two lines": "Allow all actions?\n  Esc to\n  cancel\n",
+            "prompt drawn with the cursor glyph": "❯ echo start > /tmp/log\n",
+        }
+        for name, above in refused.items():
+            with self.subTest(name):
+                self.screens(above + DEV_CHANNELS)
+                keys_log = self.fake / "keys.log"
+                if keys_log.exists():
+                    keys_log.unlink()
+                classified = self.run_script(CONFIRM, "--classify", "-L", "channel-test", "channel-test")
+                self.assertEqual(classified.stdout.strip(), "dev-channels-unrecognized", classified.stderr)
+                self.assertEqual(classified.code, 4, classified.stderr)
+                result = self.confirm()
+                self.assertEqual(result.keys, [])
+                self.assertEqual(result.code, 4, result.stderr)
+
+    def test_escaped_capture_with_a_dialog_above_gets_no_keys(self) -> None:
+        above = f"{ESC}[1mChoose access:{ESC}[0m\n{ESC}[36m❯{ESC}[0m Allow all actions\n  Deny\n"
+        self.screens(above + DEV_CHANNELS_ESCAPES)
+        result = self.confirm()
+        self.assertEqual(result.keys, [])
+        self.assertEqual(result.code, 4, result.stderr)
+
+    # ── N2: no key after the deadline ────────────────────────────────────────
+
+    def test_slow_second_look_past_the_deadline_sends_no_key(self) -> None:
+        # The deadline is 2 s; the look right before the key answers late. 2.6 s
+        # is inside the error of a whole-second clock: only a real timer sees it.
+        self.screens(DEV_CHANNELS, READY)
+        for delay in ("2.6", "2.6", "2.6", "4"):
+            with self.subTest(delay):
+                for name in ("captures.all", "keys.log"):
+                    if (self.fake / name).exists():
+                        (self.fake / name).unlink()
+                (self.fake / "delay.1").write_text(f"{delay}\n", encoding="utf-8")
+                result = self.run_script(
+                    CONFIRM, "--timeout", "2", "--interval", "0.05", "--press-pause", "0.05",
+                    "-L", "channel-test", "channel-test", timeout=20,
+                )
+                self.assertEqual(result.keys, [])
+                self.assertEqual(result.code, 3, result.stderr)
+                self.assertIn("action=timeout", result.stderr)
+
+    def test_hung_tmux_call_ends_at_the_hard_ceiling_and_frees_the_lock(self) -> None:
+        self.screens(DEV_CHANNELS)
+        (self.fake / "hang").write_text("", encoding="utf-8")
+        started = time.monotonic()
+        result = self.run_script(
+            CONFIRM, "--timeout", "1", "--interval", "0.05", "-L", "channel-test", "channel-test",
+            env={"STARTUP_CONFIRM_HARD_MARGIN": "1"}, timeout=30,
+        )
+        self.assertLess(time.monotonic() - started, 12)
+        self.assertEqual(result.code, 11, result.stderr)
+        self.assertIn("action=hard-ceiling", result.stderr)
+        self.assertEqual(result.keys, [])
+        self.assertFalse((self.pane_lock() / "held").exists())
+        # The freed lock is usable at once.
+        (self.fake / "hang").unlink()
+        self.screens(DEV_CHANNELS, READY)
+        again = self.confirm()
+        self.assertEqual(again.code, 0, again.stderr)
+        self.assertEqual(again.keys, ["Enter"])
+
+    def test_watchdog_leaves_no_process_behind_after_a_normal_run(self) -> None:
+        self.screens(READY)
+        marker = "86399"
+        started = time.monotonic()
+        result = self.run_script(
+            CONFIRM, "--timeout", marker, "-L", "channel-test", "channel-test",
+            env={"STARTUP_CONFIRM_HARD_MARGIN": "1"},
+        )
+        self.assertEqual(result.code, 0, result.stderr)
+        # subprocess.run returned: nothing kept the output pipes open.
+        self.assertLess(time.monotonic() - started, 10)
+        time.sleep(0.3)
+        ps = subprocess.run(["ps", "-A", "-o", "args="], capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("sleep 86400", ps)
 
     def test_flag_name_on_the_shell_line_alone_is_not_the_warning(self) -> None:
         self.screens("bash-3.2$ claude --dangerously-load-development-channels server:dummy\n")
@@ -560,6 +730,165 @@ class ConfirmStartupScreenTest(FakeTmuxCase):
         self.assertEqual(result.code, 0, result.stderr)
         self.assertEqual(result.keys, ["Enter"])
         self.assertEqual(list(locks.iterdir()), [])
+
+    # ── Lock ownership: identity, not age ────────────────────────────────────
+
+    def test_live_owner_with_an_old_lock_is_not_robbed(self) -> None:
+        # Review B2: a real confirmer that has held the lock "for two hours".
+        holder, locks = self._holder()
+        self.assertTrue(locks.is_dir() and any(locks.iterdir()), "the first confirmer took no lock")
+        for lock in locks.iterdir():
+            age_tree(lock, 7200)
+        self.screens(DEV_CHANNELS, READY)
+        result = self.confirm()
+        self.assertEqual(result.code, 8, result.stderr)
+        self.assertEqual(result.keys, [])
+        self.assertIn("action=lock-held", result.stderr)
+        self.assertIsNone(holder.poll(), "the lock holder must still be running")
+
+    def test_old_record_of_a_live_process_is_not_robbed(self) -> None:
+        self.write_lock(self.pane_lock(), os.getpid(), self.process_identity(os.getpid()), legacy_pid=True)
+        age_tree(self.pane_lock(), 7200)
+        self.screens(DEV_CHANNELS, READY)
+        result = self.confirm()
+        self.assertEqual(result.code, 8, result.stderr)
+        self.assertEqual(result.keys, [])
+
+    def test_lock_of_a_dead_pid_is_recovered(self) -> None:
+        self.write_lock(self.pane_lock(), dead_pid(), "ps:Thu_Jan__1_00:00:00_1970")
+        self.screens(DEV_CHANNELS, READY)
+        result = self.confirm()
+        self.assertEqual(result.code, 0, result.stderr)
+        self.assertEqual(result.keys, ["Enter"])
+        self.assertFalse(self.pane_lock().exists())
+
+    def test_lock_of_a_reused_pid_is_recovered(self) -> None:
+        # Same pid, alive, but started at another time: not the process that took the lock.
+        identity = self.process_identity(os.getpid())
+        self.write_lock(self.pane_lock(), os.getpid(), identity + "0", legacy_pid=True)
+        self.screens(DEV_CHANNELS, READY)
+        result = self.confirm()
+        self.assertEqual(result.code, 0, result.stderr)
+        self.assertEqual(result.keys, ["Enter"])
+        self.assertFalse((self.pane_lock() / "held").exists())
+
+    def test_identity_recorded_by_another_method_is_treated_as_held(self) -> None:
+        # Fail closed: a start time we cannot compare never proves the owner gone.
+        identity = self.process_identity(os.getpid())
+        other = "ps:Thu_Jan__1_00:00:00_1970" if identity.startswith("proc:") else "proc:x:1"
+        self.write_lock(self.pane_lock(), os.getpid(), other)
+        self.screens(DEV_CHANNELS, READY)
+        result = self.confirm()
+        self.assertEqual(result.code, 8, result.stderr)
+        self.assertEqual(result.keys, [])
+
+    def test_record_without_identity_and_bare_lock_directory_do_not_block(self) -> None:
+        # A record is published complete (hard link), so a live owner never has a
+        # garbled one; a directory without `held` is not a lock at all.
+        lock = self.pane_lock()
+        cases = {"empty record": "", "garbage": "not a record\n", "pid zero": "0 0-1-test ps:x\n", "no record": None}
+        for name, content in cases.items():
+            with self.subTest(name):
+                lock.mkdir(parents=True, exist_ok=True)
+                if content is not None:
+                    (lock / "held").write_text(content, encoding="utf-8")
+                keys_log = self.fake / "keys.log"
+                if keys_log.exists():
+                    keys_log.unlink()
+                self.screens(DEV_CHANNELS, READY)
+                result = self.confirm()
+                self.assertEqual(result.code, 0, result.stderr)
+                self.assertEqual(result.keys, ["Enter"])
+                self.assertFalse(lock.exists())
+
+    def test_record_being_prepared_by_another_process_is_left_alone(self) -> None:
+        # Another process is between writing its record and publishing it.
+        lock = self.pane_lock()
+        lock.mkdir(parents=True)
+        pending = lock / "tmp.4242-1-other"
+        pending.write_text("4242 4242-1-other ps:x\n", encoding="utf-8")
+        self.screens(DEV_CHANNELS, READY)
+        result = self.confirm()
+        self.assertEqual(result.code, 0, result.stderr)
+        self.assertEqual(pending.read_text(encoding="utf-8"), "4242 4242-1-other ps:x\n")
+
+    def test_marker_of_a_recoverer_that_died_does_not_block_recovery(self) -> None:
+        lock = self.pane_lock()
+        gone = dead_pid()
+        self.write_lock(lock, gone, "ps:Thu_Jan__1_00:00:00_1970")
+        # A recoverer claimed the record of that owner and died before removing it.
+        other = dead_pid()
+        (lock / f"bury.{gone}-1-test").write_text(f"{other} {other}-2-test ps:Thu_Jan__1_00:00:00_1970\n", encoding="utf-8")
+        self.screens(DEV_CHANNELS, READY)
+        result = self.confirm()
+        self.assertEqual(result.code, 0, result.stderr)
+        self.assertEqual(result.keys, ["Enter"])
+        self.assertFalse(lock.exists())
+
+    def test_marker_of_a_live_recoverer_is_respected(self) -> None:
+        lock = self.pane_lock()
+        gone = dead_pid()
+        self.write_lock(lock, gone, "ps:Thu_Jan__1_00:00:00_1970")
+        mine = self.process_identity(os.getpid())
+        (lock / f"bury.{gone}-1-test").write_text(f"{os.getpid()} {os.getpid()}-2-test {mine}\n", encoding="utf-8")
+        self.screens(DEV_CHANNELS, READY)
+        result = self.confirm()
+        self.assertEqual(result.code, 8, result.stderr)
+        self.assertEqual(result.keys, [])
+        self.assertTrue((lock / "held").exists())
+
+    def _race(self, lock: Path, count: int) -> list[int]:
+        """Start `count` real processes that take `lock` at once; return the winners' pids."""
+        winners = self.root / f"winners.{lock.name}"
+        go = self.root / f"go.{lock.name}"
+        driver = self.root / "race.sh"
+        driver.write_text(
+            'set -u\n. "$1"\nwhile [ ! -e "$4" ]; do :; done\n'
+            'if lock_take "$2"; then echo "$$" >> "$3"; sleep 1.5; lock_mine || echo lost >> "$3"; lock_release; exit 0; fi\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        procs = [
+            subprocess.Popen(["/bin/bash", str(driver), str(self.lock_lib()), str(lock), str(winners), str(go)])
+            for _ in range(count)
+        ]
+        time.sleep(0.3)
+        go.write_text("", encoding="utf-8")
+        codes = [proc.wait(timeout=60) for proc in procs]
+        lines = winners.read_text(encoding="utf-8").split() if winners.exists() else []
+        self.assertNotIn("lost", lines)
+        self.assertEqual(codes.count(0), len(lines))
+        return [int(line) for line in lines]
+
+    def test_processes_recovering_one_abandoned_lock_at_once_have_exactly_one_winner(self) -> None:
+        for round_number in range(6):
+            with self.subTest(round_number):
+                lock = self.root / "race-locks" / f"abandoned-{round_number}.lock"
+                self.write_lock(lock, dead_pid(), "ps:Thu_Jan__1_00:00:00_1970")
+                self.assertEqual(len(self._race(lock, 8)), 1)
+                self.assertFalse((lock / "held").exists())
+
+    def test_processes_taking_one_free_lock_at_once_have_exactly_one_winner(self) -> None:
+        for round_number in range(3):
+            with self.subTest(round_number):
+                lock = self.root / "race-locks" / f"free-{round_number}.lock"
+                self.assertEqual(len(self._race(lock, 8)), 1)
+
+    def test_confirmers_recovering_one_abandoned_lock_at_once_press_once(self) -> None:
+        # Real confirmers on one pane; the winner holds the lock for its whole run.
+        self.write_lock(self.pane_lock(), dead_pid(), "ps:Thu_Jan__1_00:00:00_1970")
+        self.screens(SHELL_ONLY)
+        procs = [
+            self.spawn(CONFIRM, "--timeout", "3", "--interval", "0.1", "-L", "channel-test", "channel-test")
+            for _ in range(6)
+        ]
+        codes = sorted(proc.wait(timeout=60) for proc in procs)
+        self.assertEqual(codes, [6, 8, 8, 8, 8, 8])
+        self.assertFalse(self.pane_lock().exists())
+
+    def test_both_scripts_carry_the_same_lock_functions(self) -> None:
+        self.assertEqual(lock_block(CONFIRM), lock_block(CHECK))
+        self.assertIn("lock_take()", lock_block(CHECK))
 
     def test_pane_id_that_cannot_be_resolved_gets_no_keys(self) -> None:
         self.screens(DEV_CHANNELS)
@@ -762,18 +1091,134 @@ class CheckStartupScreenTest(FakeTmuxCase):
         self.screens(DEV_CHANNELS)
         self.check(1000)
         lock = self.state / "kael.lock"
-        lock.mkdir()
-        (lock / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+        self.write_lock(lock, os.getpid(), self.process_identity(os.getpid()))
         result = self.check(1200)
         self.assertEqual(result.code, 0, result.stderr)
         self.assertIn("reason=locked", result.stderr)
         self.assertEqual(self.event_lines(), [])
-        # A lock whose owner is dead is stale: the next run takes it over and alerts.
-        (lock / "pid").write_text("999999999\n", encoding="utf-8")
+        # A lock whose owner is gone is abandoned: the next run takes it over and alerts.
+        self.write_lock(lock, dead_pid(), "ps:Thu_Jan__1_00:00:00_1970")
         result = self.check(1200)
         self.assertEqual(result.code, 0, result.stderr)
         self.assertEqual(self.event_lines(), ["kael dev-channels 200"])
         self.assertFalse(lock.exists())
+
+    # ── Lock ownership: identity, not age ────────────────────────────────────
+
+    def test_live_run_with_an_old_lock_is_not_robbed_and_alerts_once(self) -> None:
+        # Review B2 with real processes: the first run is inside its (slow) alert
+        # command and its lock looks two hours old.
+        self.screens(DEV_CHANNELS)
+        self.check(1000)
+        slow = f"sleep 3; printf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> '{self.events}'"
+        env = {"STARTUP_CHECK_NOW": "1200", "STARTUP_ALERT_CMD": slow}
+        args = ("--state-dir", str(self.state), "kael -L channel-kael channel-kael")
+        lock = self.state / "kael.lock"
+        first = self.spawn(CHECK, *args, env=env)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not (lock.is_dir() and any(lock.iterdir())):
+            time.sleep(0.02)
+        self.assertTrue(lock.is_dir() and any(lock.iterdir()), "the first run took no lock")
+        age_tree(lock, 7200)
+        second = self.check(1200, env={"STARTUP_ALERT_CMD": slow})
+        self.assertIsNone(first.poll(), "the first run must still be inside its alert command")
+        self.assertIn("action=skip", second.stderr)
+        self.assertEqual(first.wait(timeout=30), 0)
+        self.assertEqual(self.event_lines(), ["kael dev-channels 200"])
+        # A lock that old is reported (exit 1), never taken.
+        self.assertEqual(second.code, 1, second.stderr)
+        self.assertIn("reason=lock-held-too-long", second.stderr)
+
+    def test_old_record_of_a_live_process_is_not_robbed(self) -> None:
+        self.screens(DEV_CHANNELS)
+        self.check(1000)
+        lock = self.state / "kael.lock"
+        self.write_lock(lock, os.getpid(), self.process_identity(os.getpid()), legacy_pid=True)
+        age_tree(lock, 7200)
+        result = self.check(1200)
+        self.assertIn("action=skip", result.stderr)
+        self.assertEqual(self.event_lines(), [])
+        self.assertTrue((lock / "held").exists())
+
+    def test_lock_of_a_reused_pid_is_recovered(self) -> None:
+        self.screens(DEV_CHANNELS)
+        self.check(1000)
+        lock = self.state / "kael.lock"
+        self.write_lock(lock, os.getpid(), self.process_identity(os.getpid()) + "0", legacy_pid=True)
+        result = self.check(1200)
+        self.assertEqual(result.code, 0, result.stderr)
+        self.assertEqual(self.event_lines(), ["kael dev-channels 200"])
+        self.assertFalse((lock / "held").exists())
+
+    def test_runs_recovering_one_abandoned_lock_at_once_raise_one_alert(self) -> None:
+        self.screens(DEV_CHANNELS)
+        self.check(1000)
+        self.write_lock(self.state / "kael.lock", dead_pid(), "ps:Thu_Jan__1_00:00:00_1970")
+        slow = f"sleep 1; printf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> '{self.events}'"
+        env = {"STARTUP_CHECK_NOW": "1200", "STARTUP_ALERT_CMD": slow}
+        args = ("--state-dir", str(self.state), "kael -L channel-kael channel-kael")
+        procs = [self.spawn(CHECK, *args, env=env) for _ in range(6)]
+        codes = [proc.wait(timeout=60) for proc in procs]
+        self.assertEqual(codes, [0] * 6)
+        self.assertEqual(self.event_lines(), ["kael dev-channels 200"])
+        self.assertEqual([p.name for p in self.state.iterdir()], ["kael.startup-screen"])
+
+    # ── Bounded steps: a live owner cannot hold the lock forever ─────────────
+
+    def test_hanging_alert_command_is_killed_and_retried_next_run(self) -> None:
+        self.screens(DEV_CHANNELS)
+        self.check(1000)
+        child = self.root / "alert-child.pid"
+        hanging = f"sleep 300 & echo $! > '{child}'; wait"
+        started = time.monotonic()
+        result = self.check(1200, env={"STARTUP_ALERT_CMD": hanging, "STARTUP_ALERT_TIMEOUT": "1"})
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertEqual(result.code, 1, result.stderr)
+        self.assertIn("delivered=no", result.stderr)
+        self.assertIn("reason=alert-timeout", result.stderr)
+        # No job-control chatter of the shell next to the log lines.
+        for line in result.stderr.splitlines():
+            self.assertIn(" check-startup-screen ", line)
+        # The whole command tree is gone, the lock is released, the alert is still owed.
+        time.sleep(0.3)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(child.read_text(encoding="utf-8")), 0)
+        self.assertFalse((self.state / "kael.lock").exists())
+        self.assertEqual((self.state / "kael.startup-screen").read_text(encoding="utf-8"), "1000 dev-channels 0\n")
+        self.assertEqual(self.event_lines(), [])
+        self.check(1260)
+        self.assertEqual(self.event_lines(), ["kael dev-channels 260"])
+
+    def test_alert_command_does_not_read_the_agent_list(self) -> None:
+        # The alert command gets an empty stdin, not the rest of the agent list.
+        self.screens(DEV_CHANNELS)
+        both = ("--state-dir", str(self.state), "kael -L channel-kael channel-kael", "sil -L channel-sil channel-sil")
+        self.run_script(CHECK, *both, env={"STARTUP_CHECK_NOW": "1000"})
+        eater = f"cat > /dev/null; printf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> '{self.events}'"
+        result = self.run_script(CHECK, *both, env={"STARTUP_CHECK_NOW": "1200", "STARTUP_ALERT_CMD": eater})
+        self.assertEqual(result.code, 0, result.stderr)
+        self.assertEqual(sorted(self.event_lines()), ["kael dev-channels 200", "sil dev-channels 200"])
+
+    def test_hung_tmux_look_is_cut_off_and_keeps_the_state(self) -> None:
+        self.screens(DEV_CHANNELS)
+        self.check(1000)
+        (self.fake / "hang").write_text("", encoding="utf-8")
+        started = time.monotonic()
+        result = self.check(1200, env={"STARTUP_CHECK_CLASSIFY_TIMEOUT": "1"})
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertEqual(result.code, 1, result.stderr)
+        self.assertIn("reason=classify-timeout", result.stderr)
+        self.assertEqual(self.event_lines(), [])
+        self.assertFalse((self.state / "kael.lock").exists())
+        self.assertEqual((self.state / "kael.startup-screen").read_text(encoding="utf-8"), "1000 dev-channels 0\n")
+
+    def test_bad_time_limits_are_usage_errors(self) -> None:
+        self.screens(DEV_CHANNELS)
+        for name in ("STARTUP_ALERT_TIMEOUT", "STARTUP_CHECK_CLASSIFY_TIMEOUT", "STARTUP_LOCK_WARN_MIN"):
+            for value in ("soon", "0", ""):
+                with self.subTest(f"{name}={value!r}"):
+                    result = self.check(1000, env={name: value})
+                    self.assertEqual(result.code, 2 if value else 0, result.stderr)
 
     def test_malformed_timestamp_in_state_resets_the_incident(self) -> None:
         self.screens(DEV_CHANNELS)

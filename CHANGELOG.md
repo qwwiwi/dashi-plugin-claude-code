@@ -24,13 +24,27 @@ retroactively marks the state of `main` on 2026-06-14.
   file and can be overridden through the environment. The key is sent only when
   the pane holds exactly one dialog (no marker of any other dialog, one confirm
   hint, one cursor); the target is pinned to its tmux pane id and one confirmer
-  per pane is enforced with a lock directory (exit 8 for the second one); the
-  deadline holds on every loop iteration; a logged-out session is `login`, not
-  `ready`; a missing tmux binary is exit 9. The look-then-send window between
-  `capture-pane` and `send-keys` remains and is documented.
+  per pane is enforced with a lock (exit 8 for the second one); the deadline is
+  taken again after every look at the pane, so a slow look never leads to a late
+  key; a logged-out session is `login`, not `ready`; a missing tmux binary is
+  exit 9. Text above the warning may only be plain text: a line starting with a
+  selection cursor or a dialog footer phrase there means another dialog, nothing
+  is pressed. A run that is still alive 30 s after its timeout (a tmux call that
+  never answered) is ended by its own watchdog (exit 11). The look-then-send
+  window between `capture-pane` and `send-keys` remains and is documented.
+- Lock model of both scripts (`docs/07-startup-screen-confirm.md`, "Locking
+  model"): the owner record is published with a hard link (one owner, complete
+  from its first moment) and carries pid, a token and the process start time. A
+  lock is taken over only from an owner that is provably gone (no such process,
+  or the pid belongs to another process now), never because of its age; recovery
+  is bound to the token of the dead record, so it cannot remove the record of a
+  new owner.
 - `scripts/check-startup-screen.sh`: periodic hung-startup-screen check with one
   alert per incident through a pluggable `STARTUP_ALERT_CMD` (per-agent lock and
-  atomic state file, so concurrent runs alert once); examples for launchd,
+  atomic state file, so concurrent runs alert once). The alert command and the
+  look at the pane are time-limited (`STARTUP_ALERT_TIMEOUT`, 30 s;
+  `STARTUP_CHECK_CLASSIFY_TIMEOUT`, 20 s): a hung alert command is killed with
+  its process group, counts as not delivered and is retried. Examples for launchd,
   a systemd timer, the agent list and an alert command under `examples/`.
 - `docs/07-startup-screen-confirm.md`.
 
