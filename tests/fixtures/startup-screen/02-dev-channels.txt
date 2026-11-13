@@ -1,0 +1,50 @@
+export PATH=/opt/homebrew/bin:$HOME/.local/bin:$PATH; cd /tmp/startup-853-test/work && claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dummy
+The default interactive shell is now zsh.
+To update your account to use zsh, please run `chsh -s /bin/zsh`.
+For more details, please visit https://support.apple.com/kb/HT208050.
+bash-3.2$ export PATH=/opt/homebrew/bin:$HOME/.local/bin:$PATH; cd /tmp/startup-853-test/work && claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dummy
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development only. Do not use this option to run channels you have downloaded off the internet.
+
+  Please use --channels to run a list of approved channels.
+
+  Channels: server:dummy
+
+  ❯ 1. I am using this for local development
+    2. Exit
+
+  Enter to confirm · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -626,6 +626,7 @@ On the first launch, Claude Code asks 2 interactive questions (allow external im
 | [skills/doctor-dashi-plugin/SKILL.md](skills/doctor-dashi-plugin/SKILL.md) | **Migration doctor** — read-only diagnostic skill that checks placement, hooks, comms config, allowlist, and live-session health before/after cutover |
 | [docs/05-troubleshooting.md](docs/05-troubleshooting.md) | Common errors: symptom → root cause → fix |
 | [docs/06-how-claude-loads-session.md](docs/06-how-claude-loads-session.md) | How Claude Code finds `CLAUDE.md`, CWD upward search, `@-include` |
+| [docs/07-startup-screen-confirm.md](docs/07-startup-screen-confirm.md) | Dev-channels startup screen: content-aware confirm, hung-screen alert |
 | [plugin/docs/progress-reporter-setup.md](plugin/docs/progress-reporter-setup.md) | Installing the hooks in 3 steps + troubleshooting |
 | [plugin/docs/canary-smoke.md](plugin/docs/canary-smoke.md) | A live smoke matrix against a test bot |
 
@@ -758,23 +759,17 @@ These are not preferences. Each one came from a real production failure.
 
 On a cold start the dev-channels welcome prompt can render after 8+ seconds. A blind `sleep 6 && tmux send-keys Enter` in `ExecStartPost` fires into the void, systemd marks the unit ready, and the channel never starts listening.
 
-Use a confirm loop instead: capture the pane every 3 seconds, send Enter only when a confirm prompt is actually visible, and exit `0` only when the channel banner appears. Then the `ExecStartPost` exit code equals real readiness.
+Never send blind input. Use the content-aware confirm shipped in this repo: `scripts/confirm-startup-screen.sh` watches the pane for up to 90 seconds and presses Enter only while the "Loading development channels" warning is showing with option 1 ("I am using this for local development") under the cursor. Any other screen (trust folder, login, update, a normal prompt) gets no input and is only named in the log. It exits `0` when the session is at the normal prompt, or when the dialog went away after its Enter. The second case is not proof of readiness: the pane then shows something the script does not classify, so confirm readiness separately (`--classify` printing `ready`, or the periodic check below). One confirmer per pane: a second one started on the same pane exits `8` without pressing; a missing `tmux` binary is exit `9`, not "no session".
 
 ```bash
-#!/usr/bin/env bash
-# /usr/local/bin/channel-confirm-arthas.sh
-for i in $(seq 1 30); do
-  pane="$(tmux -L channel-arthas capture-pane -pt channel-arthas 2>/dev/null || true)"
-  if printf '%s' "$pane" | grep -q 'messages from server:dashi-channel inject\|Listening for channel messages'; then
-    exit 0
-  fi
-  if printf '%s' "$pane" | grep -q 'Enter to confirm\|I am using this for local development\|Do you trust'; then
-    tmux -L channel-arthas send-keys -t channel-arthas Enter
-  fi
-  sleep 3
-done
-exit 1
+# in the agent's wrapper, right after Claude Code is started in tmux:
+/bin/bash /path/to/dashi-plugin-claude-code/scripts/confirm-startup-screen.sh -L channel-arthas channel-arthas &
+
+# see how the current pane is classified, without pressing anything:
+bash scripts/confirm-startup-screen.sh --classify -L channel-arthas channel-arthas
 ```
+
+The wrapper rendered by `./install.sh` (`examples/launchd-wrapper.sh.example`, shared by launchd and systemd) already makes this call. A periodic `scripts/check-startup-screen.sh` raises one alert per incident when an agent sits on a startup dialog for longer than 120 seconds (pluggable `STARTUP_ALERT_CMD`; example for a monitoring agent in `examples/startup-alert.sh.example`). Exit codes, install on an existing agent, a throwaway-session test and the off switch: [docs/07-startup-screen-confirm.md](docs/07-startup-screen-confirm.md).
 
 ### Pros
 

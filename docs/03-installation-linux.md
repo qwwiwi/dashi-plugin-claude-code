@@ -288,7 +288,7 @@ sudo systemctl status channel-myagent.service --no-pager -l
 1. **«Allow external CLAUDE.md file imports?»** — если ваш `CLAUDE.md` использует `@-include`. Ответ: `1` (Yes).
 2. **«--dangerously-load-development-channels»** — предупреждение про dev channels. Ответ: `1` (I am using this for local development).
 
-Wrapper отправляет Enter через 6 секунд и ещё раз через 2 секунды. Если welcome-промт появился позже, откройте tmux и подтвердите вручную:
+Второй вопрос wrapper подтверждает сам: `scripts/confirm-startup-screen.sh` нажимает Enter, только когда на экране именно предупреждение dev-channels с курсором на пункте 1 (подробнее – [07-startup-screen-confirm.md](07-startup-screen-confirm.md)). Слепых нажатий по таймеру wrapper не делает, поэтому первый вопрос и любой другой диалог подтвердите вручную, посмотрев на экран:
 
 ```bash
 sudo -u agentctl tmux attach -t channel-myagent

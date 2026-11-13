@@ -89,13 +89,12 @@ Claude Code при первом запуске показывает **2 инте
 
 ### Как не повторить
 
-В systemd unit `ExecStartPost`:
+Не отправляйте Enter по таймеру (`sleep 6 && tmux send-keys … Enter`): промт может появиться позже, а клавиша попадёт в другой диалог. Вместо этого:
 
-```ini
-ExecStartPost=/bin/sh -c 'sleep 6 && /usr/bin/tmux send-keys -t channel-<agent> Enter && sleep 2 && /usr/bin/tmux send-keys -t channel-<agent> Enter'
-```
+- подтверждение по содержимому – `scripts/confirm-startup-screen.sh` в wrapper агента: Enter только на экране dev-channels с курсором на пункте 1;
+- проверка зависания – `scripts/check-startup-screen.sh` раз в минуту: одно оповещение, если стартовый диалог висит дольше 120 секунд.
 
-(два Enter с паузой — на оба промта)
+Установка, коды выхода и проверка на отдельной сессии – [07-startup-screen-confirm.md](07-startup-screen-confirm.md).
 
 Persistent fix — записать accepts в `~/.claude/settings.json` (см. [03-installation.md → Шаг 7](03-installation.md#persistent-welcome-approvals-чтобы-не-нажимать-enter-после-каждого-рестарта)).
 

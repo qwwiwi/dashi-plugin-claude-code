@@ -106,7 +106,7 @@ for (const mode of ['session loss', 'operator stop'] as const) {
     const alive = join(f.root, 'alive')
     const fakeTmux = join(f.root, 'tmux')
     const argsLog = join(f.root, 'args.json')
-    writeFileSync(fakeTmux, `#!/bin/bash\nset -euo pipefail\ncase "$1" in\n has-session) test -f '${alive}' ;;\n new-session) printf '%s\\n' "$@" > '${argsLog}'; touch '${alive}' ;;\n kill-session) rm -f '${alive}' ;;\n send-keys) : ;;\nesac\n`, { mode: 0o700 })
+    writeFileSync(fakeTmux, `#!/bin/bash\nset -euo pipefail\ncase "$1" in\n has-session) test -f '${alive}' ;;\n new-session) printf '%s\\n' "$@" > '${argsLog}'; touch '${alive}' ;;\n kill-session) rm -f '${alive}' ;;\n send-keys) printf '%s\\n' "$@" >> '${argsLog}' ;;\nesac\n`, { mode: 0o700 })
     f.env.INSTALL_TMUX = fakeTmux
     expect(f.run().exitCode).toBe(0)
     const child = Bun.spawn(['/bin/bash', join(f.state, 'channel-wrapper.sh')], { stdout: 'pipe', stderr: 'pipe' })
@@ -134,7 +134,7 @@ test('Claude receives private env even when a preexisting tmux server clears cli
   writeFileSync(fakeClaude, `#!/bin/bash\nprintf '%s' "\${TELEGRAM_ALLOWED_USER_IDS:-absent}" > '${observed}'\n`, { mode: 0o700 })
   const fakeTmux = join(f.root, 'tmux')
   const alive = join(f.root, 'alive')
-  writeFileSync(fakeTmux, `#!/bin/bash\ncase "$1" in\n has-session) test -f '${alive}' ;;\n new-session) /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash -c "\${!#}"; touch '${alive}' ;;\n kill-session) rm -f '${alive}' ;;\n send-keys) : ;;\nesac\n`, { mode: 0o700 })
+  writeFileSync(fakeTmux, `#!/bin/bash\ncase "$1" in\n has-session) test -f '${alive}' ;;\n new-session) touch '${alive}' ;;\n kill-session) rm -f '${alive}' ;;\n send-keys) if [ "$4" = -l ]; then /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash -c "$5"; fi ;;\nesac\n`, { mode: 0o700 })
   f.env.INSTALL_TMUX = fakeTmux
   f.env.INSTALL_CLAUDE = fakeClaude
   expect(f.run().exitCode).toBe(0)
@@ -262,3 +262,37 @@ test('WorkingDirectory= escapes only % and keeps backslashes literal', () => {
   const line = unit.split('\n').find(l => l.startsWith('WorkingDirectory='))
   expect(line).toBe(`WorkingDirectory=${join(fakeRepo, 'plugin').replaceAll('%', '%%')}`)
 })
+
+// The wrapper may type its own start command into the shell it has just created; after that the only
+// automatic key is Enter from confirm-startup-screen.sh, and only on the dev-channels screen.
+for (const screen of ['dev-channels', 'trust-folder'] as const) {
+  test(`wrapper confirms by pane content, never blindly: ${screen} screen`, async () => {
+    const f = fixture()
+    const alive = join(f.root, 'alive')
+    const keys = join(f.root, 'keys.log')
+    const pane = join(f.root, 'pane.txt')
+    const text = screen === 'dev-channels'
+      ? 'WARNING: Loading development channels\n\n ❯ 1. I am using this for local development\n   2. Exit\n\n Enter to confirm · Esc to cancel\n'
+      : 'Do you trust the files in this folder?\n\n ❯ 1. Yes, proceed\n   2. No, exit\n\n Enter to confirm · Esc to cancel\n'
+    writeFileSync(pane, text)
+    const fakeTmux = join(f.root, 'tmux')
+    writeFileSync(fakeTmux, `#!/bin/bash\ncase "$1" in\n has-session) test -f '${alive}' ;;\n new-session) touch '${alive}' ;;\n kill-session) rm -f '${alive}' ;;\n display-message) echo '%0' ;;\n capture-pane) if grep -qx Enter '${keys}' 2>/dev/null; then echo 'Listening for channel messages'; else cat '${pane}'; fi ;;\n send-keys) shift; printf '%s\\n' "\${!#}" >> '${keys}' ;;\nesac\n`, { mode: 0o700 })
+    f.env.INSTALL_TMUX = fakeTmux
+    expect(f.run().exitCode).toBe(0)
+    const child = Bun.spawn(['/bin/bash', join(f.state, 'channel-wrapper.sh')], { stdout: 'ignore', stderr: 'ignore',
+      env: { ...process.env, STARTUP_CONFIRM_INTERVAL: '0.05', STARTUP_CONFIRM_PRESS_PAUSE: '0.05', STARTUP_CONFIRM_TIMEOUT: '1', STARTUP_CONFIRM_LOCK_DIR: join(f.root, 'locks') } })
+    try {
+      await waitFor(() => existsSync(keys) && readFileSync(keys, 'utf8').includes('C-m'))
+      if (screen === 'dev-channels') await waitFor(() => readFileSync(keys, 'utf8').split('\n').includes('Enter'))
+      await Bun.sleep(1500)
+      const sent = readFileSync(keys, 'utf8').trim().split('\n')
+      // First the start command typed into the fresh shell, then at most the one matched Enter.
+      expect(sent[0]).toStartWith('exec ')
+      expect(sent[1]).toBe('C-m')
+      expect(sent.slice(2)).toEqual(screen === 'dev-channels' ? ['Enter'] : [])
+    } finally {
+      child.kill('SIGTERM')
+      await child.exited
+    }
+  })
+}

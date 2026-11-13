@@ -1,0 +1,50 @@
+export PATH=/opt/homebrew/bin:$HOME/.local/bin:$PATH; cd /tmp/startup-853-test/work && claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dummy
+The default interactive shell is now zsh.
+To update your account to use zsh, please run `chsh -s /bin/zsh`.
+For more details, please visit https://support.apple.com/kb/HT208050.
+bash-3.2$ export PATH=/opt/homebrew/bin:$HOME/.local/bin:$PATH; cd /tmp/startup-853-test/work && claude --permission-mode bypassPermissions --dangerously-load-development-channels server:dummy
+
+[38;5;211m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [1m[38;5;211mWARNING:[0m [1m[38;5;211mLoading[0m [1m[38;5;211mdevelopment[0m [1m[38;5;211mchannels[0m
+
+  --dangerously-load-development-channels is for local channel development only. Do not use this option to run channels you have downloaded off the internet.
+
+  Please use --channels to run a list of approved channels.
+
+  [38;5;246mChannels:[39m [38;5;246mserver:dummy[39m
+
+  [38;5;153m❯[39m [38;5;246m1.[39m [38;5;153mI[39m [38;5;153mam[39m [38;5;153musing[39m [38;5;153mthis[39m [38;5;153mfor[39m [38;5;153mlocal[39m [38;5;153mdevelopment[39m
+    [38;5;246m2.[39m Exit
+
+  [3m[38;5;246mEnter[0m [3m[38;5;246mto[0m [3m[38;5;246mconfirm[0m [3m[38;5;246m·[0m [3m[38;5;246mEsc[0m [3m[38;5;246mto[0m [3m[38;5;246mcancel[0m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

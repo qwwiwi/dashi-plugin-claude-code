@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Periodic hung-startup-screen check (macOS LaunchAgent).
+     Replace every REPLACE_... value, save as
+     ~/Library/LaunchAgents/com.dashi-plugin.startup-screen-check.plist and load:
+       launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.dashi-plugin.startup-screen-check.plist
+     The job only reads panes; it never sends keys. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dashi-plugin.startup-screen-check</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>REPLACE_PLUGIN_REPO/scripts/check-startup-screen.sh</string>
+        <string>--config</string>
+        <string>REPLACE_STATE_DIR/startup-screen-check.agents</string>
+        <string>--threshold</string>
+        <string>120</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd starts jobs with a bare PATH (no Homebrew). Both are set on
+             purpose: PATH for the tools, TMUX_BIN as the exact tmux to run
+             (`command -v tmux` in a terminal; /usr/local/bin/tmux on Intel Macs).
+             A wrong value shows up as "tmux-not-found" (exit 3) in the err log. -->
+        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>TMUX_BIN</key><string>/opt/homebrew/bin/tmux</string>
+        <key>STARTUP_CHECK_STATE_DIR</key><string>REPLACE_STATE_DIR/startup-screen-state</string>
+        <!-- Runs once per incident; gets agent, kind, seconds as $1 $2 $3. -->
+        <key>STARTUP_ALERT_CMD</key><string>/bin/bash REPLACE_STATE_DIR/startup-alert.sh "$1" "$2" "$3"</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>StartInterval</key><integer>60</integer>
+    <key>StandardOutPath</key><string>REPLACE_STATE_DIR/startup-screen-check.out.log</string>
+    <key>StandardErrorPath</key><string>REPLACE_STATE_DIR/startup-screen-check.err.log</string>
+    <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
