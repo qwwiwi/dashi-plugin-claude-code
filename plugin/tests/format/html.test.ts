@@ -4,6 +4,7 @@ import {
   escapeHtml,
   escapeHtmlAttr,
   isTelegramHtmlParseError,
+  isTelegramMarkupError,
   markdownToTelegramHtml,
 } from '../../src/format/html.js'
 import { validateTelegramHtml } from '../../src/safety/html-validator.js'
@@ -161,6 +162,16 @@ describe('markdownToTelegramHtml', () => {
       expect(html).toContain('<b>out <b>in</b> out</b>')
       expect(validateTelegramHtml(html).downgraded).toBe(false)
     })
+  })
+})
+
+describe('isTelegramMarkupError', () => {
+  test('matches button / reply markup rejections, not parse or network errors', () => {
+    expect(isTelegramMarkupError(new Error('Bad Request: BUTTON_URL_INVALID'))).toBe(true)
+    expect(isTelegramMarkupError({ description: 'Bad Request: reply markup is invalid' })).toBe(true)
+    expect(isTelegramMarkupError(new Error("Bad Request: can't parse entities"))).toBe(false)
+    expect(isTelegramMarkupError(new Error('network down'))).toBe(false)
+    expect(isTelegramMarkupError(null)).toBe(false)
   })
 })
 

@@ -363,6 +363,14 @@ export function createSafeTelegramApi(
       } else {
         safeOpts.parse_mode = parseMode
       }
+      // The guest button text/url also land in a public chat: same secret
+      // redaction as every other inline keyboard.
+      if (opts.reply_markup !== undefined) {
+        safeOpts.reply_markup = redactReplyMarkup(
+          opts.reply_markup,
+          extraSecrets,
+        ) as unknown as NonNullable<AnswerGuestQueryOpts['reply_markup']>
+      }
       return raw.answerGuestQuery(guestQueryId, safeText, safeOpts)
     },
   }

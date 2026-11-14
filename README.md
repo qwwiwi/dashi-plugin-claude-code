@@ -961,6 +961,7 @@ DM replies auto-upgrade to `sendRichMessage`: Telegram renders **raw markdown se
 
 - **Fail-closed:** only allowlisted user ids can summon the bot; anyone else is dropped before a handler runs.
 - **One-shot contract:** exactly one answer per query, ≤4096 chars, no attachments, no threading; the query expires ~15 minutes after arrival.
+- **Collapsed layout + optional button:** a guest answer longer than `guest_mode.collapse_threshold` visible characters (default 350) is wrapped by the plugin in ONE `<blockquote expandable>` (a few lines visible, a chevron expands the rest); short answers stay plain, and the model's own blockquote tags are stripped. Link previews are disabled. The `reply` tool takes an optional `guest_button: {text, url}` — one inline URL button (https only, text 1–40 chars) under the answer; an invalid button fails the call before the query is spent, and if Telegram rejects the markup the answer is retried once as plain text without the button.
 - **Inbound media (v1.3.0):** the agent receives the mention's own media *and* the replied-to message's media at DM parity — photos are downloaded, voice is transcribed, files/video/GIF surface as `file_id` `<media>` descriptors. Reply-target media is metadata-only (the reply author isn't allowlisted). Pull the bytes for any guest attachment with the `download_attachment` tool, passing the same `guest_query_id`.
 - **Enabling requires both switches:** the Guest Mode toggle in BotFather AND `guest_mode.enabled=true` in config (a missing block means OFF).
 

@@ -55,6 +55,21 @@ const PARSE_ERR_RE =
  * common locations.
  */
 export function isTelegramHtmlParseError(error: unknown): boolean {
+  return errorDescriptionMatches(error, PARSE_ERR_RE)
+}
+
+// Telegram rejections that are about an inline keyboard / button (invalid
+// url, bad button type, malformed reply markup). Used by the guest path to
+// decide that a retry WITHOUT reply_markup can succeed.
+const MARKUP_ERR_RE =
+  /BUTTON_\w+|REPLY_MARKUP|reply markup|reply_markup|inline keyboard|wrong http url|url host is empty|unsupported url protocol/i
+
+/** True when `error` looks like a Telegram 400 about reply_markup/buttons. */
+export function isTelegramMarkupError(error: unknown): boolean {
+  return errorDescriptionMatches(error, MARKUP_ERR_RE)
+}
+
+function errorDescriptionMatches(error: unknown, re: RegExp): boolean {
   if (error == null) return false
 
   const candidates: string[] = []
@@ -81,7 +96,7 @@ export function isTelegramHtmlParseError(error: unknown): boolean {
   }
 
   visit(error, 0)
-  return candidates.some(s => PARSE_ERR_RE.test(s))
+  return candidates.some(s => re.test(s))
 }
 
 // ─────────────────────────────────────────────────────────────────────

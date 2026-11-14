@@ -221,6 +221,28 @@ describe('createSafeTelegramApi — pass-through methods', () => {
     expect(entries.some((e) => e.msg === 'telegram html downgrade')).toBe(true)
   })
 
+  test('answerGuestQuery: expandable blockquote keeps HTML; button url secrets are redacted, shape kept', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log, ['MY_EXTRA_SECRET'])
+    await safe.answerGuestQuery('gq', '<blockquote expandable>текст <b>жирный</b></blockquote>', {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: { inline_keyboard: [[{ text: 'Открыть', url: 'https://example.com/?k=MY_EXTRA_SECRET' }]] },
+    })
+    const opts = calls[0]!.opts as unknown as {
+      parse_mode?: string
+      link_preview_options?: unknown
+      reply_markup: { inline_keyboard: { text: string; url: string }[][] }
+    }
+    expect(opts.parse_mode).toBe('HTML')
+    expect(opts.link_preview_options).toEqual({ is_disabled: true })
+    expect(opts.reply_markup.inline_keyboard.length).toBe(1)
+    expect(opts.reply_markup.inline_keyboard[0]!.length).toBe(1)
+    expect(opts.reply_markup.inline_keyboard[0]![0]!.url).not.toContain('MY_EXTRA_SECRET')
+    expect(opts.reply_markup.inline_keyboard[0]![0]!.text).toBe('Открыть')
+  })
+
   test('answerGuestQuery: valid HTML keeps parse_mode', async () => {
     const { api, calls } = makeStubApi()
     const { log } = makeLog()

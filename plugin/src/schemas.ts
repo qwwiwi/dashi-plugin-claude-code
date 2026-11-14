@@ -11,6 +11,25 @@ export const BotIdentitySchema = z.object({
 })
 export type BotIdentity = z.infer<typeof BotIdentitySchema>
 
+// Guest answer URL button: https:// links only (incl. https://t.me/...).
+function isHttpsUrl(value: string): boolean {
+  if (value.length > 2048) return false
+  try {
+    const u = new URL(value)
+    return u.protocol === 'https:' && u.hostname !== '' && u.username === '' && u.password === ''
+  } catch {
+    return false
+  }
+}
+
+export const GuestButtonSchema = z
+  .object({
+    text: z.string().min(1).max(40),
+    url: z.string().refine(isHttpsUrl, { message: 'url must be an https:// link (https://t.me/... allowed)' }),
+  })
+  .strict()
+export type GuestButton = z.infer<typeof GuestButtonSchema>
+
 // Tool args - reply
 export const ReplyArgsSchema = z.object({
   chat_id: z.string().min(1),
@@ -37,6 +56,11 @@ export const ReplyArgsSchema = z.object({
   // Telegram accepts exactly one answer per guest query. Attachments and
   // reply_to are unsupported on this path and rejected loudly.
   guest_query_id: z.string().min(1).optional(),
+  // Guest Mode only: ONE optional inline URL button under the collapsed
+  // answer. Strict (no callback_data / web_app / switch_inline_query), https
+  // only (https://t.me/... is a https link). Validated here so a bad button
+  // fails the tool call BEFORE the one-shot query is claimed.
+  guest_button: GuestButtonSchema.optional(),
 })
 export type ReplyArgs = z.infer<typeof ReplyArgsSchema>
 

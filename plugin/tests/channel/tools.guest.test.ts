@@ -599,3 +599,173 @@ describe('reply tool — guest path', () => {
     expect(stub.guestCalls.length).toBe(1)
   })
 })
+
+// ── Guest layout: one collapsed block + optional URL button (#861) ──────
+const OPEN = '<blockquote expandable>'
+const CLOSE = '</blockquote>'
+const LONG_LINE = 'Длинная строка ответа про агентов и их настройку. '
+
+function longMarkdown(): string {
+  return `**Суть:** ${LONG_LINE.repeat(8)}\n\n**Подраздел**\n- пункт ${LONG_LINE}\n- пункт ${LONG_LINE}`
+}
+
+async function sendGuest(
+  stub: ReturnType<typeof makeStubApi>,
+  id: string,
+  args: Record<string, unknown>,
+): Promise<Awaited<ReturnType<typeof callTool>>> {
+  const registry = new GuestQueryRegistry()
+  registered(registry, id)
+  const deps = makeDeps({ api: stub.api, registry })
+  return callTool(replyReq({ chat_id: '-100987', guest_query_id: id, ...args }), deps)
+}
+
+describe('reply tool — guest layout (collapsed block, button)', () => {
+  test('long answer is wrapped in ONE expandable blockquote, previews disabled', async () => {
+    const stub = makeStubApi()
+    const result = await sendGuest(stub, 'gl-1', { text: longMarkdown() })
+    expect(result.isError).toBeUndefined()
+    const call = stub.guestCalls[0]!
+    expect(call.text.startsWith(OPEN)).toBe(true)
+    expect(call.text.endsWith(CLOSE)).toBe(true)
+    expect(call.text.split('<blockquote').length - 1).toBe(1)
+    expect(call.text).toContain('<b>Подраздел</b>')
+    expect(call.opts.parse_mode).toBe('HTML')
+    expect(call.opts.link_preview_options).toEqual({ is_disabled: true })
+    expect(call.opts.reply_markup).toBeUndefined()
+  })
+
+  test('short answer (≤ threshold visible chars) is sent unwrapped', async () => {
+    const stub = makeStubApi()
+    await sendGuest(stub, 'gl-2', { text: '**жирный** ответ' })
+    expect(stub.guestCalls[0]!.text).toBe('<b>жирный</b> ответ')
+  })
+
+  test('already exactly one expandable blockquote is not double-wrapped', async () => {
+    const stub = makeStubApi()
+    const inner = LONG_LINE.repeat(8)
+    await sendGuest(stub, 'gl-3', { text: `${OPEN}${inner}${CLOSE}` })
+    const text = stub.guestCalls[0]!.text
+    expect(text.split('<blockquote').length - 1).toBe(1)
+    expect(text.split('</blockquote>').length - 1).toBe(1)
+    expect(text.startsWith(OPEN)).toBe(true)
+  })
+
+  test('inner blockquote tags are stripped (text kept) before wrapping', async () => {
+    const stub = makeStubApi()
+    const body = `Вступление. ${LONG_LINE.repeat(5)}\n\n<blockquote>цитата внутри</blockquote>\n\n${LONG_LINE.repeat(4)}`
+    await sendGuest(stub, 'gl-4', { text: body })
+    const text = stub.guestCalls[0]!.text
+    expect(text.split('<blockquote').length - 1).toBe(1)
+    expect(text.split('</blockquote>').length - 1).toBe(1)
+    expect(text).toContain('цитата внутри')
+    expect(text.startsWith(OPEN)).toBe(true)
+  })
+
+  test('4096 cap holds after wrapping (truncated long answer)', async () => {
+    const stub = makeStubApi()
+    const result = await sendGuest(stub, 'gl-5', { text: 'а'.repeat(9000) })
+    expect(result.content[0]!.text).toContain('TRUNCATED')
+    const text = stub.guestCalls[0]!.text
+    expect(text.length).toBeLessThanOrEqual(4096)
+    expect(text.startsWith(OPEN)).toBe(true)
+    expect(text.endsWith(CLOSE)).toBe(true)
+  })
+
+  test('markdownv2 / text answers are not wrapped', async () => {
+    const stub = makeStubApi()
+    await sendGuest(stub, 'gl-6', { text: LONG_LINE.repeat(10), format: 'text' })
+    expect(stub.guestCalls[0]!.text).not.toContain('<blockquote')
+  })
+
+  test('guest_button is passed as one URL button in one row', async () => {
+    const stub = makeStubApi()
+    const result = await sendGuest(stub, 'gl-7', {
+      text: longMarkdown(),
+      guest_button: { text: 'Спросить ещё ↗', url: 'https://t.me/somebot?start=ask' },
+    })
+    expect(result.isError).toBeUndefined()
+    expect(stub.guestCalls[0]!.opts.reply_markup).toEqual({
+      inline_keyboard: [[{ text: 'Спросить ещё ↗', url: 'https://t.me/somebot?start=ask' }]],
+    })
+  })
+
+  test.each([
+    ['http url', { text: 'x', url: 'http://example.com' }],
+    ['javascript url', { text: 'x', url: 'javascript:alert(1)' }],
+    ['tg:// url', { text: 'x', url: 'tg://resolve?domain=a' }],
+    ['empty text', { text: '', url: 'https://example.com' }],
+    ['text > 40', { text: 'я'.repeat(41), url: 'https://example.com' }],
+    ['extra callback_data', { text: 'x', url: 'https://example.com', callback_data: 'a' }],
+  ])('invalid guest_button (%s) is rejected BEFORE the claim is spent', async (_n, button) => {
+    const stub = makeStubApi()
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'gl-8')
+    const deps = makeDeps({ api: stub.api, registry })
+    const result = await callTool(
+      replyReq({ chat_id: '-100987', guest_query_id: 'gl-8', text: longMarkdown(), guest_button: button }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(stub.guestCalls.length).toBe(0)
+    expect(registry.claim('gl-8').kind).toBe('ok')
+  })
+
+  test('guest_button without guest_query_id is rejected', async () => {
+    const stub = makeStubApi()
+    const deps = makeDeps({ api: stub.api })
+    const result = await callTool(
+      replyReq({
+        chat_id: '164795011',
+        text: 'x',
+        guest_button: { text: 'x', url: 'https://example.com' },
+      }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+  })
+
+  test('markup rejection by Telegram → one retry as plain text WITHOUT reply_markup', async () => {
+    const stub = makeStubApi({ failures: [new Error('Bad Request: BUTTON_URL_INVALID')] })
+    const result = await sendGuest(stub, 'gl-9', {
+      text: longMarkdown(),
+      guest_button: { text: 'Открыть', url: 'https://example.com/x' },
+    })
+    expect(result.isError).toBeUndefined()
+    expect(stub.guestCalls.length).toBe(1)
+    const call = stub.guestCalls[0]!
+    expect(call.opts.reply_markup).toBeUndefined()
+    expect(call.opts.parse_mode).toBeUndefined()
+    expect(call.text).not.toContain('<blockquote')
+    expect(call.opts.link_preview_options).toEqual({ is_disabled: true })
+  })
+
+  test('parse error on wrapped body → plain fallback drops markup too', async () => {
+    const stub = makeStubApi({ failures: [htmlParseError()] })
+    await sendGuest(stub, 'gl-10', {
+      text: longMarkdown(),
+      guest_button: { text: 'Открыть', url: 'https://example.com/x' },
+    })
+    expect(stub.guestCalls[0]!.opts.reply_markup).toBeUndefined()
+    expect(stub.guestCalls[0]!.opts.parse_mode).toBeUndefined()
+  })
+
+  test('unrelated hard error with a button still releases the claim (no retry)', async () => {
+    const stub = makeStubApi({ failures: [new Error('network down')] })
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'gl-11')
+    const deps = makeDeps({ api: stub.api, registry })
+    const result = await callTool(
+      replyReq({
+        chat_id: '-100987',
+        guest_query_id: 'gl-11',
+        text: longMarkdown(),
+        guest_button: { text: 'Открыть', url: 'https://example.com/x' },
+      }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(registry.claim('gl-11').kind).toBe('ok')
+  })
+})
+
