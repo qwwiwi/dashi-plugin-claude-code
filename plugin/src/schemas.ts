@@ -11,6 +11,43 @@ export const BotIdentitySchema = z.object({
 })
 export type BotIdentity = z.infer<typeof BotIdentitySchema>
 
+// Guest answer URL button: https:// links only (incl. https://t.me/...).
+// The literal prefix, no whitespace/control characters and no userinfo are
+// required, and the CANONICAL form (URL.href) is what gets sent, so what was
+// validated is what ships.
+const URL_FORBIDDEN_CHARS_RE = /[\s\u0000-\u001f\u007f-\u009f]/
+
+function canonicalHttpsUrl(value: string): string | undefined {
+  if (value.length > 2048) return undefined
+  if (!value.startsWith('https://') || URL_FORBIDDEN_CHARS_RE.test(value)) return undefined
+  try {
+    const u = new URL(value)
+    if (u.protocol !== 'https:' || u.hostname === '' || u.username !== '' || u.password !== '') {
+      return undefined
+    }
+    return u.href
+  } catch {
+    return undefined
+  }
+}
+
+export const GuestButtonSchema = z
+  .object({
+    text: z
+      .string()
+      .min(1)
+      .max(40)
+      .refine(t => t.trim().length > 0, { message: 'button text must not be blank' }),
+    url: z
+      .string()
+      .refine(v => canonicalHttpsUrl(v) !== undefined, {
+        message: 'url must be a literal https:// link without spaces or control characters (https://t.me/... allowed)',
+      })
+      .transform(v => canonicalHttpsUrl(v) as string),
+  })
+  .strict()
+export type GuestButton = z.infer<typeof GuestButtonSchema>
+
 // Tool args - reply
 export const ReplyArgsSchema = z.object({
   chat_id: z.string().min(1),
@@ -37,6 +74,11 @@ export const ReplyArgsSchema = z.object({
   // Telegram accepts exactly one answer per guest query. Attachments and
   // reply_to are unsupported on this path and rejected loudly.
   guest_query_id: z.string().min(1).optional(),
+  // Guest Mode only: ONE optional inline URL button under the collapsed
+  // answer. Strict (no callback_data / web_app / switch_inline_query), https
+  // only (https://t.me/... is a https link). Validated here so a bad button
+  // fails the tool call BEFORE the one-shot query is claimed.
+  guest_button: GuestButtonSchema.optional(),
 })
 export type ReplyArgs = z.infer<typeof ReplyArgsSchema>
 

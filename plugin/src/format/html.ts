@@ -55,6 +55,39 @@ const PARSE_ERR_RE =
  * common locations.
  */
 export function isTelegramHtmlParseError(error: unknown): boolean {
+  return errorDescriptionMatches(error, PARSE_ERR_RE)
+}
+
+// Telegram rejections that are about an inline keyboard / button (invalid
+// url, bad button type, malformed reply markup). Used by the guest path to
+// decide that a retry WITHOUT reply_markup can succeed.
+const MARKUP_ERR_RE =
+  /BUTTON_\w+|REPLY_MARKUP|reply markup|reply_markup|inline keyboard|wrong http url|url host is empty|unsupported url protocol/i
+
+/**
+ * True when `error` is a Telegram 400 (`error_code === 400`, on the error or
+ * a nested response/cause) whose description is about reply_markup/buttons.
+ * The code is required: a bare message match (network error text, 5xx) must
+ * not trigger the one-shot plain retry.
+ */
+export function isTelegramMarkupError(error: unknown): boolean {
+  return hasErrorCode(error, 400) && errorDescriptionMatches(error, MARKUP_ERR_RE)
+}
+
+function hasErrorCode(error: unknown, code: number): boolean {
+  const visited = new Set<unknown>()
+  const visit = (value: unknown, depth: number): boolean => {
+    if (value == null || typeof value !== 'object' || depth > 4) return false
+    if (visited.has(value)) return false
+    visited.add(value)
+    const obj = value as Record<string, unknown>
+    if (obj.error_code === code) return true
+    return [obj.response, obj.error, obj.cause, obj.body, obj.payload].some(v => visit(v, depth + 1))
+  }
+  return visit(error, 0)
+}
+
+function errorDescriptionMatches(error: unknown, re: RegExp): boolean {
   if (error == null) return false
 
   const candidates: string[] = []
@@ -81,7 +114,7 @@ export function isTelegramHtmlParseError(error: unknown): boolean {
   }
 
   visit(error, 0)
-  return candidates.some(s => PARSE_ERR_RE.test(s))
+  return candidates.some(s => re.test(s))
 }
 
 // ─────────────────────────────────────────────────────────────────────

@@ -19,7 +19,7 @@ import type { ReactionTypeEmoji } from 'grammy/types'
 import { z } from 'zod'
 
 import type { AppConfig, StatePaths } from '../config.js'
-import { resolveAskGuardMode } from '../config.js'
+import { resolveAskGuardMode, resolveGuestCollapseThreshold } from '../config.js'
 import type { Logger } from '../log.js'
 import type { MultichatPolicy } from '../chats/policy-loader.js'
 import type { StatusManager, StatusState } from '../status/status-manager.js'
@@ -48,8 +48,18 @@ import { assertAllowedChat } from '../telegram/gate.js'
 import type { GuestQueryRegistry } from '../telegram/guest-queries.js'
 import {
   isTelegramHtmlParseError,
+  isTelegramMarkupError,
   markdownToTelegramHtml,
 } from '../format/html.js'
+import {
+  boundPlain,
+  GUEST_INNER_MAX,
+  htmlToPlainText,
+  shouldCollapseGuestAnswer,
+  stripBlockquoteTags,
+  truncateHtmlBalanced,
+  wrapGuestBlock,
+} from '../format/guest-layout.js'
 import { splitMessage, TELEGRAM_MAX_MESSAGE } from '../format/chunk.js'
 import { assertSendableFile, isPhotoExtension } from '../security/paths.js'
 import {
@@ -63,7 +73,7 @@ import {
 } from '../format/rich.js'
 import { analyzeFormat, formatHint } from '../format/format-check.js'
 import type { RichLatch } from '../safety/rich-latch.js'
-import { redactSecrets } from '../safety/redact.js'
+import { redactSecrets, urlCarriesSecret } from '../safety/redact.js'
 import { checkWidgetChat, checkWidgetPayload } from './widget.js'
 import { WidgetPreSendError } from '../safety/pre-send-error.js'
 
@@ -201,8 +211,17 @@ export type ChatAction =
   | 'upload_video_note'
 
 // Options for the one-shot guest answer (Guest Mode, Bot API 10.0).
+// Exactly one URL button in one row (the only shape the guest path builds).
+export interface GuestReplyMarkup {
+  inline_keyboard: { text: string; url: string }[][]
+}
+
 export interface AnswerGuestQueryOpts {
   parse_mode?: 'MarkdownV2' | 'HTML'
+  // One inline URL button (guest_button) as InlineQueryResultArticle.reply_markup.
+  reply_markup?: GuestReplyMarkup
+  // Guest answers never unfurl link previews in a public foreign chat.
+  link_preview_options?: { is_disabled: boolean }
 }
 
 export interface TelegramApi {
@@ -425,7 +444,13 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
         input_message_content: {
           message_text: text,
           ...(opts.parse_mode !== undefined ? { parse_mode: opts.parse_mode } : {}),
+          ...(opts.link_preview_options !== undefined
+            ? { link_preview_options: opts.link_preview_options }
+            : {}),
         },
+        ...(opts.reply_markup !== undefined
+          ? { reply_markup: opts.reply_markup }
+          : {}),
       })
     },
   }
@@ -440,7 +465,7 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'reply',
     description:
-      'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents. GUEST MODE: when the inbound <channel> meta carries guest_query_id (guest="1"), pass that guest_query_id here too — the answer is delivered into the foreign chat via answerGuestQuery. Guest answers are ONE-SHOT (exactly one reply, no attachments, no reply_to, single message ≤4096 chars — be concise).',
+      'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents. GUEST MODE: when the inbound <channel> meta carries guest_query_id (guest="1"), pass that guest_query_id here too — the answer is delivered into the foreign chat via answerGuestQuery. Guest answers are ONE-SHOT (exactly one reply, no attachments, no reply_to, single message ≤4096 chars — be concise). Long guest answers are collapsed automatically into one expandable quote (do not add blockquote tags yourself); optionally pass guest_button {text, url} for one https URL button under the answer.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -450,6 +475,17 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
           type: 'string',
           description:
             'Guest Mode only: the guest_query_id from the inbound <channel> meta. When set, the reply goes through answerGuestQuery (one-shot) instead of sendMessage.',
+        },
+        guest_button: {
+          type: 'object',
+          description:
+            'Guest Mode only, optional: ONE inline URL button under the answer. url must be https:// (https://t.me/... allowed); text 1-40 chars. Omit for no button. Invalid values fail the call before the one-shot query is spent.',
+          properties: {
+            text: { type: 'string', minLength: 1, maxLength: 40 },
+            url: { type: 'string', pattern: '^https://' },
+          },
+          required: ['text', 'url'],
+          additionalProperties: false,
         },
         reply_to: {
           type: 'string',
@@ -676,6 +712,9 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         const parsed = ReplyArgsSchema.safeParse(rawArgs)
         if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
         const args = parsed.data
+        if (args.guest_button !== undefined && args.guest_query_id === undefined) {
+          return toolError(name, 'guest_button is only valid together with guest_query_id (Guest Mode replies)')
+        }
 
         // Guest Mode path (2026-07-04). Authorization = registry membership
         // (only allowlisted callers' queries get registered), NOT the chat
@@ -701,24 +740,74 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           // no rich_message payload, and raw markdown in a public foreign
           // chat reads worse than our rendered HTML subset.
           const guestFormat = args.format === 'rich' ? 'html' : args.format
+          // Model-written blockquote tags are stripped BEFORE the long/short
+          // decision (short answers too): Telegram forbids nesting, an
+          // attribute-carrying quote can downgrade the whole answer, and
+          // the layout is ours to choose. Escaped `&lt;blockquote&gt;`
+          // is text and stays.
           const body =
-            guestFormat === 'html' ? markdownToTelegramHtml(args.text) : args.text
-          const chunks = splitMessage(body)
-          const single = chunks[0]
-          if (single === undefined) {
+            guestFormat === 'html'
+              ? stripBlockquoteTags(markdownToTelegramHtml(args.text))
+              : args.text
+          // Layout (#861): a long HTML answer becomes ONE collapsed
+          // expandable quote. The cut happens on the INNER text with a
+          // budget that leaves room for the wrapper, then
+          // truncateHtmlBalanced closes whatever the cut left open. The
+          // safe wrapper re-enforces the cap on the FINAL payload (after
+          // redaction), so this is the first of two bounds, not the only one.
+          const collapse =
+            guestFormat === 'html' &&
+            shouldCollapseGuestAnswer(body, resolveGuestCollapseThreshold(config))
+          const innerMax = collapse ? GUEST_INNER_MAX : TELEGRAM_MAX_MESSAGE
+          const chunks = splitMessage(collapse ? body.trim() : body, collapse ? GUEST_INNER_MAX : undefined)
+          const rawFirst = chunks[0]
+          const first =
+            rawFirst === undefined
+              ? undefined
+              : guestFormat === 'html'
+                ? truncateHtmlBalanced(rawFirst, innerMax)
+                : rawFirst
+          if (first === undefined || first.trim() === '') {
             return toolError(name, 'guest reply rendered to an empty message — nothing to send')
           }
+          const single = collapse ? wrapGuestBlock(first) : first
           const truncated = chunks.length > 1
           // Plain-text fallback body: the PRE-render text (Fable #3) — a
           // parse failure means our markup was bad, and raw <b> tag soup in
           // a public foreign chat reads worse than unrendered markdown.
-          const plainBody = splitMessage(args.text)[0] ?? single
-          const guestOpts: AnswerGuestQueryOpts =
-            guestFormat === 'html'
-              ? { parse_mode: 'HTML' }
+          // Tags the model wrote are stripped (and entities decoded) so the
+          // fallback shows neither visible tags nor literal &lt;…&gt;.
+          const plainSource = guestFormat === 'html' ? htmlToPlainText(args.text) : args.text
+          const plainBody = boundPlain(
+            plainSource.trim() === '' ? htmlToPlainText(single) : plainSource,
+            TELEGRAM_MAX_MESSAGE,
+          )
+          // Guest answers never unfurl link previews in a public chat. The
+          // optional button was already validated by the schema (before the
+          // claim); without guest_button no reply_markup is sent.
+          const noPreview = { link_preview_options: { is_disabled: true } } as const
+          const guestOpts: AnswerGuestQueryOpts = {
+            ...(guestFormat === 'html'
+              ? { parse_mode: 'HTML' as const }
               : guestFormat === 'markdownv2'
-                ? { parse_mode: 'MarkdownV2' }
-                : {}
+                ? { parse_mode: 'MarkdownV2' as const }
+                : {}),
+            ...noPreview,
+            ...(args.guest_button !== undefined
+              ? {
+                  reply_markup: {
+                    inline_keyboard: [[{ text: args.guest_button.text, url: args.guest_button.url }]],
+                  },
+                }
+              : {}),
+          }
+
+          // A button URL carrying a secret (raw or percent-encoded, e.g.
+          // `?%74oken=…`) is refused BEFORE the claim; the safe wrapper
+          // additionally drops it for secrets only it knows about.
+          if (args.guest_button !== undefined && urlCarriesSecret(args.guest_button.url)) {
+            return toolError(name, 'guest_button url looks like it carries a secret — remove the credential from the url')
+          }
 
           const claim = deps.guestQueries.claim(args.guest_query_id)
           if (claim.kind !== 'ok') {
@@ -752,13 +841,21 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
             // HTML tags), so without this retry a long markdownv2 guest
             // reply would burn the query's TTL on identical failures.
             // A failed call does not consume the query on Telegram's side.
-            if (guestOpts.parse_mode !== undefined && isTelegramHtmlParseError(err)) {
-              log.warn('guest answer entity parse failed, retrying as plain text', {
+            // The same single retry also covers a 400 about the button
+            // markup: it drops reply_markup AND the wrapper (plain body), so
+            // the one-shot query is never burned by our own layout choices.
+            const parseFailed =
+              guestOpts.parse_mode !== undefined && isTelegramHtmlParseError(err)
+            const markupFailed =
+              guestOpts.reply_markup !== undefined && isTelegramMarkupError(err)
+            if (parseFailed || markupFailed) {
+              log.warn('guest answer rejected, retrying as plain text without markup', {
                 format: args.format,
+                reason: markupFailed ? 'reply_markup' : 'entities',
                 error: err instanceof Error ? err.message : String(err),
               })
               try {
-                await telegramApi.answerGuestQuery(args.guest_query_id, plainBody, {})
+                await telegramApi.answerGuestQuery(args.guest_query_id, plainBody, noPreview)
               } catch (err2) {
                 deps.guestQueries.release(args.guest_query_id)
                 return toolError(name, err2 instanceof Error ? err2.message : String(err2))

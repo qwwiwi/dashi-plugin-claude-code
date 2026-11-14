@@ -7,6 +7,8 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { z } from 'zod'
 
+import { DEFAULT_GUEST_COLLAPSE_THRESHOLD } from './format/guest-layout.js'
+
 // ─────────────────────────────────────────────────────────────────────
 // AppConfig — the merged, validated runtime config.
 // ─────────────────────────────────────────────────────────────────────
@@ -338,6 +340,9 @@ export const AppConfigSchema = z.object({
   guest_mode: z.object({
     enabled: z.boolean().default(false),
     allowed_user_ids: z.array(z.number().int().positive()).optional(),
+    // Visible-character threshold above which a guest answer is wrapped in
+    // one collapsed expandable quote (default 350; see resolveGuestCollapseThreshold).
+    collapse_threshold: z.number().int().min(0).optional(),
   }).optional(),
   // Ask-guard (autonomy M3, 2026-07-10) — the ENFORCEMENT of owner-granted
   // autonomy mandates on the owner-egress reply path. When the agent holds an
@@ -873,6 +878,12 @@ export function resolvePermissionGateAllowedUserIds(
 // which defaults ON — guest handling must be a deliberate opt-in).
 export function resolveGuestModeEnabled(config: AppConfig): boolean {
   return config.guest_mode?.enabled ?? false
+}
+
+// resolveGuestCollapseThreshold — visible characters above which a guest
+// answer is collapsed into one expandable quote. Default 350.
+export function resolveGuestCollapseThreshold(config: AppConfig): number {
+  return config.guest_mode?.collapse_threshold ?? DEFAULT_GUEST_COLLAPSE_THRESHOLD
 }
 
 export function resolveGuestModeAllowedUserIds(
