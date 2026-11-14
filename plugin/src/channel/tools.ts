@@ -52,9 +52,12 @@ import {
   markdownToTelegramHtml,
 } from '../format/html.js'
 import {
+  boundPlain,
   GUEST_INNER_MAX,
+  htmlToPlainText,
   shouldCollapseGuestAnswer,
   stripBlockquoteTags,
+  truncateHtmlBalanced,
   wrapGuestBlock,
 } from '../format/guest-layout.js'
 import { splitMessage, TELEGRAM_MAX_MESSAGE } from '../format/chunk.js'
@@ -70,7 +73,7 @@ import {
 } from '../format/rich.js'
 import { analyzeFormat, formatHint } from '../format/format-check.js'
 import type { RichLatch } from '../safety/rich-latch.js'
-import { redactSecrets } from '../safety/redact.js'
+import { redactSecrets, urlCarriesSecret } from '../safety/redact.js'
 import { checkWidgetChat, checkWidgetPayload } from './widget.js'
 import { WidgetPreSendError } from '../safety/pre-send-error.js'
 
@@ -737,21 +740,33 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           // no rich_message payload, and raw markdown in a public foreign
           // chat reads worse than our rendered HTML subset.
           const guestFormat = args.format === 'rich' ? 'html' : args.format
+          // Model-written blockquote tags are stripped BEFORE the long/short
+          // decision (short answers too): Telegram forbids nesting, an
+          // attribute-carrying quote can downgrade the whole answer, and
+          // the layout is ours to choose. Escaped `&lt;blockquote&gt;`
+          // is text and stays.
           const body =
-            guestFormat === 'html' ? markdownToTelegramHtml(args.text) : args.text
+            guestFormat === 'html'
+              ? stripBlockquoteTags(markdownToTelegramHtml(args.text))
+              : args.text
           // Layout (#861): a long HTML answer becomes ONE collapsed
-          // expandable quote. Inner blockquote tags are stripped first
-          // (Telegram forbids nesting; an answer that is already a single
-          // expandable quote thus comes out as one block, not two). The
-          // cut happens on the INNER text with a budget that leaves room
-          // for the wrapper, so the final message stays ≤ 4096.
+          // expandable quote. The cut happens on the INNER text with a
+          // budget that leaves room for the wrapper, then
+          // truncateHtmlBalanced closes whatever the cut left open. The
+          // safe wrapper re-enforces the cap on the FINAL payload (after
+          // redaction), so this is the first of two bounds, not the only one.
           const collapse =
             guestFormat === 'html' &&
             shouldCollapseGuestAnswer(body, resolveGuestCollapseThreshold(config))
-          const chunks = collapse
-            ? splitMessage(stripBlockquoteTags(body).trim(), GUEST_INNER_MAX)
-            : splitMessage(body)
-          const first = chunks[0]
+          const innerMax = collapse ? GUEST_INNER_MAX : TELEGRAM_MAX_MESSAGE
+          const chunks = splitMessage(collapse ? body.trim() : body, collapse ? GUEST_INNER_MAX : undefined)
+          const rawFirst = chunks[0]
+          const first =
+            rawFirst === undefined
+              ? undefined
+              : guestFormat === 'html'
+                ? truncateHtmlBalanced(rawFirst, innerMax)
+                : rawFirst
           if (first === undefined || first.trim() === '') {
             return toolError(name, 'guest reply rendered to an empty message — nothing to send')
           }
@@ -760,7 +775,13 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
           // Plain-text fallback body: the PRE-render text (Fable #3) — a
           // parse failure means our markup was bad, and raw <b> tag soup in
           // a public foreign chat reads worse than unrendered markdown.
-          const plainBody = splitMessage(args.text)[0] ?? single
+          // Tags the model wrote are stripped (and entities decoded) so the
+          // fallback shows neither visible tags nor literal &lt;…&gt;.
+          const plainSource = guestFormat === 'html' ? htmlToPlainText(args.text) : args.text
+          const plainBody = boundPlain(
+            plainSource.trim() === '' ? htmlToPlainText(single) : plainSource,
+            TELEGRAM_MAX_MESSAGE,
+          )
           // Guest answers never unfurl link previews in a public chat. The
           // optional button was already validated by the schema (before the
           // claim); without guest_button no reply_markup is sent.
@@ -779,6 +800,13 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
                   },
                 }
               : {}),
+          }
+
+          // A button URL carrying a secret (raw or percent-encoded, e.g.
+          // `?%74oken=…`) is refused BEFORE the claim; the safe wrapper
+          // additionally drops it for secrets only it knows about.
+          if (args.guest_button !== undefined && urlCarriesSecret(args.guest_button.url)) {
+            return toolError(name, 'guest_button url looks like it carries a secret — remove the credential from the url')
           }
 
           const claim = deps.guestQueries.claim(args.guest_query_id)

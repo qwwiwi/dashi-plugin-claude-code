@@ -33,7 +33,9 @@ import type {
   EditRichMessageResult,
   TelegramApi,
 } from '../channel/tools.js'
-import { redactSecrets } from './redact.js'
+import { redactSecrets, urlCarriesSecret } from './redact.js'
+import { boundPlain, htmlToPlainText, truncateHtmlBalanced } from '../format/guest-layout.js'
+import { TELEGRAM_MAX_MESSAGE } from '../format/chunk.js'
 import { validateTelegramHtml } from './html-validator.js'
 import { richErrorClass, isNotModifiedError } from '../format/rich.js'
 import type { RichLatch } from './rich-latch.js'
@@ -354,9 +356,30 @@ export function createSafeTelegramApi(
       opts: AnswerGuestQueryOpts,
     ): Promise<void> {
       // Guest answers land in a PUBLIC foreign chat — redaction here is the
-      // last line of defence, exactly like sendMessage. HTML downgrade
-      // follows the same rule: invalid Telegram HTML ships as plain text.
-      const { text: safeText, parseMode } = sanitize(text, opts.parse_mode)
+      // last line of defence, exactly like sendMessage. The 4096 cap is
+      // enforced on the FINAL payload (after redaction, which can grow the
+      // text, and after validation, which can escape it): HTML is cut with
+      // every tag and entity kept balanced; if the result still does not
+      // validate, a bounded PLAIN body (tags stripped, entities decoded) is
+      // sent without parse_mode — a length problem must never make the
+      // one-shot answer undeliverable with the same arguments.
+      const redacted = redactSecrets(text, extraSecrets)
+      let safeText: string
+      let parseMode: AnswerGuestQueryOpts['parse_mode'] = opts.parse_mode
+      if (opts.parse_mode === 'HTML') {
+        const validated = validateTelegramHtml(
+          truncateHtmlBalanced(redacted, TELEGRAM_MAX_MESSAGE),
+        )
+        if (!validated.downgraded && validated.text.length <= TELEGRAM_MAX_MESSAGE) {
+          safeText = validated.text
+        } else {
+          log.warn('telegram html downgrade', { reason: validated.reason ?? 'length' })
+          safeText = boundPlain(htmlToPlainText(redacted), TELEGRAM_MAX_MESSAGE)
+          parseMode = undefined
+        }
+      } else {
+        safeText = boundPlain(redacted, TELEGRAM_MAX_MESSAGE)
+      }
       const safeOpts: AnswerGuestQueryOpts = { ...opts }
       if (parseMode === undefined) {
         delete safeOpts.parse_mode
@@ -364,12 +387,26 @@ export function createSafeTelegramApi(
         safeOpts.parse_mode = parseMode
       }
       // The guest button text/url also land in a public chat: same secret
-      // redaction as every other inline keyboard.
+      // redaction as every other inline keyboard. A secret visible only after
+      // percent-decoding (`?%74oken=…`, an encoded known secret) cannot be
+      // masked in place, so the button is dropped; the answer still goes.
       if (opts.reply_markup !== undefined) {
-        safeOpts.reply_markup = redactReplyMarkup(
-          opts.reply_markup,
-          extraSecrets,
-        ) as unknown as NonNullable<AnswerGuestQueryOpts['reply_markup']>
+        const leaks = opts.reply_markup.inline_keyboard.some(row =>
+          row.some(
+            cell =>
+              redactSecrets(cell.url, extraSecrets) === cell.url &&
+              urlCarriesSecret(cell.url, extraSecrets),
+          ),
+        )
+        if (leaks) {
+          log.warn('guest button dropped: url carries a secret')
+          delete safeOpts.reply_markup
+        } else {
+          safeOpts.reply_markup = redactReplyMarkup(
+            opts.reply_markup,
+            extraSecrets,
+          ) as unknown as NonNullable<AnswerGuestQueryOpts['reply_markup']>
+        }
       }
       return raw.answerGuestQuery(guestQueryId, safeText, safeOpts)
     },

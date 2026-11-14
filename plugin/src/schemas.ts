@@ -12,20 +12,38 @@ export const BotIdentitySchema = z.object({
 export type BotIdentity = z.infer<typeof BotIdentitySchema>
 
 // Guest answer URL button: https:// links only (incl. https://t.me/...).
-function isHttpsUrl(value: string): boolean {
-  if (value.length > 2048) return false
+// The literal prefix, no whitespace/control characters and no userinfo are
+// required, and the CANONICAL form (URL.href) is what gets sent, so what was
+// validated is what ships.
+const URL_FORBIDDEN_CHARS_RE = /[\s\u0000-\u001f\u007f-\u009f]/
+
+function canonicalHttpsUrl(value: string): string | undefined {
+  if (value.length > 2048) return undefined
+  if (!value.startsWith('https://') || URL_FORBIDDEN_CHARS_RE.test(value)) return undefined
   try {
     const u = new URL(value)
-    return u.protocol === 'https:' && u.hostname !== '' && u.username === '' && u.password === ''
+    if (u.protocol !== 'https:' || u.hostname === '' || u.username !== '' || u.password !== '') {
+      return undefined
+    }
+    return u.href
   } catch {
-    return false
+    return undefined
   }
 }
 
 export const GuestButtonSchema = z
   .object({
-    text: z.string().min(1).max(40),
-    url: z.string().refine(isHttpsUrl, { message: 'url must be an https:// link (https://t.me/... allowed)' }),
+    text: z
+      .string()
+      .min(1)
+      .max(40)
+      .refine(t => t.trim().length > 0, { message: 'button text must not be blank' }),
+    url: z
+      .string()
+      .refine(v => canonicalHttpsUrl(v) !== undefined, {
+        message: 'url must be a literal https:// link without spaces or control characters (https://t.me/... allowed)',
+      })
+      .transform(v => canonicalHttpsUrl(v) as string),
   })
   .strict()
 export type GuestButton = z.infer<typeof GuestButtonSchema>

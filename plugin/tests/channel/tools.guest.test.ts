@@ -28,6 +28,8 @@ import {
 import { GuestQueryRegistry } from '../../src/telegram/guest-queries.js'
 import type { AppConfig, StatePaths } from '../../src/config.js'
 import { createLogger } from '../../src/log.js'
+import { createSafeTelegramApi } from '../../src/safety/safe-telegram-api.js'
+import { validateTelegramHtml } from '../../src/safety/html-validator.js'
 
 const silentLog = createLogger('test', {
   stream: { write: () => true } as unknown as NodeJS.WritableStream,
@@ -726,7 +728,7 @@ describe('reply tool — guest layout (collapsed block, button)', () => {
   })
 
   test('markup rejection by Telegram → one retry as plain text WITHOUT reply_markup', async () => {
-    const stub = makeStubApi({ failures: [new Error('Bad Request: BUTTON_URL_INVALID')] })
+    const stub = makeStubApi({ failures: [markupError400()] })
     const result = await sendGuest(stub, 'gl-9', {
       text: longMarkdown(),
       guest_button: { text: 'Открыть', url: 'https://example.com/x' },
@@ -769,3 +771,216 @@ describe('reply tool — guest layout (collapsed block, button)', () => {
   })
 })
 
+
+// ── #861 review fixes: final-payload cap, blockquote strip, button, fallback ──
+
+function markupError400(): Error {
+  return Object.assign(new Error('Bad Request: BUTTON_URL_INVALID'), { error_code: 400 })
+}
+
+// Same stub, but every guest call goes through the REAL safe wrapper — the
+// last layer that redacts and validates (the stub alone misses both).
+function makeSafeStub(extraSecrets: string[] = [], failures: Error[] = []): {
+  stub: ReturnType<typeof makeStubApi>
+  api: TelegramApi
+} {
+  const stub = makeStubApi({ failures })
+  return { stub, api: createSafeTelegramApi(stub.api, silentLog, extraSecrets) }
+}
+
+async function sendViaSafe(
+  api: TelegramApi,
+  id: string,
+  args: Record<string, unknown>,
+): Promise<{ result: Awaited<ReturnType<typeof callTool>>; registry: GuestQueryRegistry }> {
+  const registry = new GuestQueryRegistry()
+  registered(registry, id)
+  const deps = makeDeps({ api, registry })
+  const result = await callTool(replyReq({ chat_id: '-100987', guest_query_id: id, ...args }), deps)
+  return { result, registry }
+}
+
+function expectSendable(call: GuestCall): void {
+  expect(call.text.length).toBeLessThanOrEqual(4096)
+  if (call.opts.parse_mode === 'HTML') {
+    expect(validateTelegramHtml(call.text).downgraded).toBe(false)
+  } else {
+    // plain body: no tags, no escaped entities shown to the reader
+    expect(call.text).not.toContain('&lt;')
+    expect(call.text).not.toMatch(/<\/?[a-z]/i)
+  }
+}
+
+describe('reply tool — guest final-payload cap through the safe wrapper (B1)', () => {
+  test('cut inside <b> (4094-char input) ships ≤ 4096 and is valid', async () => {
+    const { stub, api } = makeSafeStub()
+    const { result } = await sendViaSafe(api, 'f-1', { text: '**' + 'я'.repeat(4090) + '**' })
+    expect(result.isError).toBeUndefined()
+    expect(stub.guestCalls.length).toBe(1)
+    expectSendable(stub.guestCalls[0]!)
+  })
+
+  test('redaction growth (4060-char input) ships ≤ 4096 and is valid', async () => {
+    const { stub, api } = makeSafeStub()
+    const { result } = await sendViaSafe(api, 'f-2', { text: '?key=x '.repeat(5) + 'я'.repeat(4025) })
+    expect(result.isError).toBeUndefined()
+    expect(stub.guestCalls.length).toBe(1)
+    expectSendable(stub.guestCalls[0]!)
+    expect(stub.guestCalls[0]!.text).toContain('[REDACTED]')
+  })
+
+  test('links + redaction + long tail still ships ≤ 4096 and valid', async () => {
+    const { stub, api } = makeSafeStub()
+    const text = '[x](https://example.com/?key=x) '.repeat(150) + 'я'.repeat(3000)
+    const { result } = await sendViaSafe(api, 'f-3', { text })
+    expect(result.isError).toBeUndefined()
+    expectSendable(stub.guestCalls[0]!)
+  })
+
+  test('short (non-collapsed) overflow after redaction is also bounded', async () => {
+    const { stub, api } = makeSafeStub()
+    const { result } = await sendViaSafe(api, 'f-4', { text: '?key=x '.repeat(600), format: 'text' })
+    expect(result.isError).toBeUndefined()
+    expect(stub.guestCalls[0]!.text.length).toBeLessThanOrEqual(4096)
+  })
+})
+
+describe('reply tool — guest blockquote strip before the branch (N1)', () => {
+  test.each([
+    ['plain expandable', '<blockquote expandable>короткий</blockquote>'],
+    ['uppercase', '<BLOCKQUOTE>короткий</BLOCKQUOTE>'],
+    ['attributes', '<blockquote data-x="a" expandable>короткий</blockquote>'],
+  ])('short answer: model-written blockquote (%s) is stripped, text kept', async (_n, text) => {
+    const stub = makeStubApi()
+    await sendGuest(stub, 'n1-a', { text })
+    const sent = stub.guestCalls[0]!.text
+    expect(sent.toLowerCase()).not.toContain('<blockquote')
+    expect(sent).toBe('короткий')
+  })
+
+  test('long answer: uppercase and attribute-carrying blockquote tags are stripped', async () => {
+    const stub = makeStubApi()
+    await sendGuest(stub, 'n1-b', {
+      text: `${LONG_LINE.repeat(4)}\n\n<BLOCKQUOTE data-x="a">цитата</BLOCKQUOTE>\n\n${LONG_LINE.repeat(4)}`,
+    })
+    const sent = stub.guestCalls[0]!.text
+    expect(sent.toLowerCase().split('<blockquote').length - 1).toBe(1)
+    expect(sent).toContain('цитата')
+  })
+
+  test('escaped &lt;blockquote&gt; stays visible text', async () => {
+    const stub = makeStubApi()
+    await sendGuest(stub, 'n1-c', { text: '&lt;blockquote&gt;текст&lt;/blockquote&gt;' })
+    expect(stub.guestCalls[0]!.text).toContain('&amp;lt;blockquote&amp;gt;')
+  })
+})
+
+describe('reply tool — guest_button URL and text validation (N2, N3)', () => {
+  test.each([
+    ['no slashes', 'https:example.com'],
+    ['newline inside', 'https://exa\nmple.com'],
+    ['surrounding spaces', ' https://example.com '],
+    ['tab', 'https://example.com/a\tb'],
+    ['uppercase scheme', 'HTTPS://example.com'],
+  ])('url (%s) is rejected before the claim', async (_n, url) => {
+    const stub = makeStubApi()
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'n2-a')
+    const deps = makeDeps({ api: stub.api, registry })
+    const result = await callTool(
+      replyReq({ chat_id: '-100987', guest_query_id: 'n2-a', text: 'x', guest_button: { text: 'ok', url } }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(stub.guestCalls.length).toBe(0)
+    expect(registry.claim('n2-a').kind).toBe('ok')
+  })
+
+  test('whitespace-only button text is rejected', async () => {
+    const stub = makeStubApi()
+    const result = await sendGuest(stub, 'n2-b', {
+      text: 'x',
+      guest_button: { text: '   ', url: 'https://example.com' },
+    })
+    expect(result.isError).toBe(true)
+    expect(stub.guestCalls.length).toBe(0)
+  })
+
+  test('the validated canonical URL is what gets sent', async () => {
+    const stub = makeStubApi()
+    await sendGuest(stub, 'n2-c', {
+      text: 'x',
+      guest_button: { text: 'ok', url: 'https://Example.com' },
+    })
+    expect(stub.guestCalls[0]!.opts.reply_markup).toEqual({
+      inline_keyboard: [[{ text: 'ok', url: 'https://example.com/' }]],
+    })
+  })
+
+  test('percent-encoded secret key in the URL is rejected before the claim', async () => {
+    const stub = makeStubApi()
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'n3-a')
+    const deps = makeDeps({ api: stub.api, registry })
+    const result = await callTool(
+      replyReq({
+        chat_id: '-100987',
+        guest_query_id: 'n3-a',
+        text: 'x',
+        guest_button: { text: 'ok', url: 'https://example.com/?%74oken=fake-short-secret' },
+      }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(stub.guestCalls.length).toBe(0)
+    expect(registry.claim('n3-a').kind).toBe('ok')
+  })
+
+  test('wrapper drops a button whose URL carries a percent-encoded known secret', async () => {
+    const secret = 'Zq9/known+extra=secret'
+    const { stub, api } = makeSafeStub([secret])
+    const { result } = await sendViaSafe(api, 'n3-b', {
+      text: 'x',
+      guest_button: { text: 'ok', url: `https://example.com/p?v=${encodeURIComponent(secret)}` },
+    })
+    expect(result.isError).toBeUndefined()
+    expect(stub.guestCalls.length).toBe(1)
+    expect(stub.guestCalls[0]!.opts.reply_markup).toBeUndefined()
+    expect(JSON.stringify(stub.guestCalls[0])).not.toContain(encodeURIComponent(secret))
+  })
+})
+
+describe('reply tool — guest retry narrowing and plain fallback', () => {
+  test('markup-looking error WITHOUT error_code 400 is not retried', async () => {
+    const stub = makeStubApi({ failures: [new Error('BUTTON_URL_INVALID')] })
+    const registry = new GuestQueryRegistry()
+    registered(registry, 'r-1')
+    const deps = makeDeps({ api: stub.api, registry })
+    const result = await callTool(
+      replyReq({
+        chat_id: '-100987',
+        guest_query_id: 'r-1',
+        text: 'x',
+        guest_button: { text: 'ok', url: 'https://example.com/x' },
+      }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(stub.guestCalls.length).toBe(0)
+    expect(registry.claim('r-1').kind).toBe('ok')
+  })
+
+  test('plain fallback strips HTML tags from the model text', async () => {
+    const stub = makeStubApi({ failures: [htmlParseError()] })
+    await sendGuest(stub, 'r-2', { text: '<b>жирный</b> текст <a href="https://example.com">ссылка</a>' })
+    const call = stub.guestCalls[0]!
+    expect(call.text).toBe('жирный текст ссылка')
+    expect(call.opts.parse_mode).toBeUndefined()
+  })
+
+  test('plain fallback via the safe wrapper is bounded and has no tags or literal entities', async () => {
+    const { stub, api } = makeSafeStub([], [htmlParseError()])
+    await sendViaSafe(api, 'r-3', { text: '<b>' + 'я'.repeat(5000) + '</b>' })
+    expectSendable(stub.guestCalls[0]!)
+  })
+})
