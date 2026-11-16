@@ -34,6 +34,7 @@ import type { InboundMessage } from '../router/inbox-bridge.js'
 import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
 import { gateTelegramMessage, type GateInput } from './gate.js'
 import { isAddressedToBot } from './addressing.js'
+import { entitiesToHtml, escapeText, hasFormattingEntities, withFormattedBlock } from './inbound-entities.js'
 import {
   buildChannelContent,
   type BotIdentity,
@@ -94,6 +95,9 @@ export interface AlbumEntry {
   mediaPaths: string[]
   /** Trimmed caption text for this item ('' when no caption). */
   caption: string
+  /** #1914: trimmed Telegram-subset HTML of the caption when it carries
+   *  formatting entities; absent otherwise (and in pre-#1914 disk entries). */
+  captionHtml?: string
   /** Per-item message_id — used to surface first message_id in meta. */
   messageId: number | undefined
   /** Reply context, if this item was a reply. First non-null wins on flush. */
@@ -418,6 +422,14 @@ function gateInputFromContext(ctx: Context): GateInput {
   }
 }
 
+// #1914: caption plus a `<formatted format="html">` block when the caption
+// carries formatting entities (bold/italic/spoiler/…), so the agent can
+// repeat a forwarded post with the same markup. Plain caption unchanged.
+function captionWithFormatting(ctx: Context): string {
+  const caption = ctx.message?.caption ?? ''
+  return withFormattedBlock(caption, caption, ctx.message?.caption_entities)
+}
+
 // Shared metadata layout. Identifier-style keys only — notify.normalizeMeta
 // will silently drop hyphens, but we never emit them in the first place.
 function buildMeta(
@@ -701,6 +713,11 @@ export async function handleGuestMessage(ctx: Context, deps: HandlerDeps): Promi
   }
 
   const text = (msg.text ?? msg.caption ?? '').trim()
+  // #1914: formatting entities of whichever field `text` came from.
+  const formattedText =
+    msg.text !== undefined
+      ? withFormattedBlock(text, msg.text, msg.entities)
+      : withFormattedBlock(text, msg.caption ?? '', msg.caption_entities)
 
   // Registry must be wired before any eager media work — a misconfigured
   // deployment drops here without wasting a download / transcription.
@@ -751,7 +768,7 @@ export async function handleGuestMessage(ctx: Context, deps: HandlerDeps): Promi
   }
 
   const content = buildChannelContent({
-    text,
+    text: formattedText,
     bot: deps.bot,
     ...(renderedMedia.length > 0 ? { mediaDescriptors: renderedMedia } : {}),
     ...(msg.reply_to_message ? { reply: adaptReply(msg.reply_to_message)! } : {}),
@@ -872,7 +889,12 @@ async function tryRouteToAlbumBuffer(
 
   const descriptors = await buildDescriptors()
   const rendered = descriptors.map(renderMediaDescriptor)
-  const caption = (ctx.message?.caption ?? '').trim()
+  const rawCaption = ctx.message?.caption ?? ''
+  const caption = rawCaption.trim()
+  const captionEntities = ctx.message?.caption_entities
+  const captionHtml = hasFormattingEntities(rawCaption, captionEntities)
+    ? entitiesToHtml(rawCaption, captionEntities).trim()
+    : undefined
   const reply = ctx.message?.reply_to_message
     ? adaptReply(ctx.message.reply_to_message)
     : undefined
@@ -883,6 +905,7 @@ async function tryRouteToAlbumBuffer(
     descriptors: rendered,
     mediaPaths,
     caption,
+    ...(captionHtml !== undefined ? { captionHtml } : {}),
     messageId: ctx.message?.message_id,
     reply,
     addressedAtPush,
@@ -1112,7 +1135,16 @@ export async function sendAlbumNotification(
   // gateway.py's `"\n\n".join(captions)`. When every caption is empty the
   // merged text is empty — buildChannelContent skips it correctly.
   const captions = album.messages.map((m) => m.caption).filter((c) => c.length > 0)
-  const mergedText = captions.join('\n\n')
+  const plainMerged = captions.join('\n\n')
+  // #1914: when any fragment's caption carried formatting, append the merged
+  // HTML (formatted captions as HTML, the rest escaped) after the plain text.
+  const anyFormatted = album.messages.some((m) => typeof m.captionHtml === 'string')
+  const mergedText = anyFormatted
+    ? `${plainMerged}\n<formatted format="html">\n${album.messages
+        .filter((m) => m.caption.length > 0)
+        .map((m) => (typeof m.captionHtml === 'string' ? m.captionHtml : escapeText(m.caption)))
+        .join('\n\n')}\n</formatted>`
+    : plainMerged
 
   // Concatenate all media descriptors in insertion order.
   const combinedDescriptors: string[] = []
@@ -1367,7 +1399,13 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
   maybeTriggerWatcher(ctx, deps)
   maybeBumpMirror(ctx, deps)
 
-  await gateAndNotify(ctx, deps, () => text, undefined, 'text')
+  await gateAndNotify(
+    ctx,
+    deps,
+    () => withFormattedBlock(text, text, ctx.message?.entities),
+    undefined,
+    'text',
+  )
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1404,7 +1442,7 @@ export async function handleInboundPhoto(ctx: Context, deps: HandlerDeps): Promi
   const buildPhoto = (): Promise<MediaDescriptor[]> =>
     buildPhotoDescriptor(ctx.message?.photo, photoDownloadDeps(deps))
   if (await tryRouteToAlbumBuffer(ctx, deps, buildPhoto, 'photo')) return
-  await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildPhoto, 'photo')
+  await gateAndNotify(ctx, deps, () => captionWithFormatting(ctx), buildPhoto, 'photo')
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1418,7 +1456,7 @@ export async function handleInboundDocument(ctx: Context, deps: HandlerDeps): Pr
   const buildDoc = async (): Promise<MediaDescriptor[]> =>
     buildDocumentDescriptor(ctx.message?.document)
   if (await tryRouteToAlbumBuffer(ctx, deps, buildDoc, 'document')) return
-  await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildDoc, 'document')
+  await gateAndNotify(ctx, deps, () => captionWithFormatting(ctx), buildDoc, 'document')
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1432,7 +1470,7 @@ export async function handleInboundVoice(ctx: Context, deps: HandlerDeps): Promi
   await gateAndNotify(
     ctx,
     deps,
-    () => ctx.message?.caption ?? '',
+    () => captionWithFormatting(ctx),
     () => buildVoiceDescriptor(ctx.message?.voice, voiceTranscribeDeps(deps)),
     'voice',
   )
@@ -1448,7 +1486,7 @@ export async function handleInboundAudio(ctx: Context, deps: HandlerDeps): Promi
   const buildAudio = async (): Promise<MediaDescriptor[]> =>
     buildAudioDescriptor(ctx.message?.audio)
   if (await tryRouteToAlbumBuffer(ctx, deps, buildAudio, 'audio')) return
-  await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildAudio, 'audio')
+  await gateAndNotify(ctx, deps, () => captionWithFormatting(ctx), buildAudio, 'audio')
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1461,7 +1499,7 @@ export async function handleInboundVideo(ctx: Context, deps: HandlerDeps): Promi
   const buildVideo = async (): Promise<MediaDescriptor[]> =>
     buildVideoDescriptor(ctx.message?.video)
   if (await tryRouteToAlbumBuffer(ctx, deps, buildVideo, 'video')) return
-  await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildVideo, 'video')
+  await gateAndNotify(ctx, deps, () => captionWithFormatting(ctx), buildVideo, 'video')
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1479,7 +1517,7 @@ export async function handleInboundAnimation(ctx: Context, deps: HandlerDeps): P
   const buildAnimation = async (): Promise<MediaDescriptor[]> =>
     buildAnimationDescriptor(ctx.message?.animation)
   if (await tryRouteToAlbumBuffer(ctx, deps, buildAnimation, 'animation')) return
-  await gateAndNotify(ctx, deps, () => ctx.message?.caption ?? '', buildAnimation, 'animation')
+  await gateAndNotify(ctx, deps, () => captionWithFormatting(ctx), buildAnimation, 'animation')
 }
 
 // ─────────────────────────────────────────────────────────────────────

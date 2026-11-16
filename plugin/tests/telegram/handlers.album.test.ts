@@ -1451,3 +1451,29 @@ describe('FIX-D M2 — recovery schedules fresh albums for delayed flush', () =>
     rmSync(statePaths.root, { recursive: true, force: true })
   })
 })
+
+// #1914 — a fragment's caption_entities survive buffering and reach the
+// agent as a <formatted format="html"> block after the merged captions.
+describe('album caption entities (#1914)', () => {
+  test('formatted caption on one fragment → merged html block', async () => {
+    const clock = makeClock()
+    const buffer = makeBuffer(50, clock)
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({ albumBuffer: buffer, server: serverSpy.server })
+    const base = { chatId: 164795011, fromId: 164795011, mediaGroupId: 'mg-ent' }
+    const ctx1 = makeAlbumCtx({ ...base, messageId: 1, fileId: 'd1', caption: '  Жир <x>  ' })
+    ;(ctx1.message as unknown as { caption_entities: unknown[] }).caption_entities = [
+      { type: 'bold', offset: 2, length: 3 },
+    ]
+    const ctx2 = makeAlbumCtx({ ...base, messageId: 2, fileId: 'd2' })
+    await handleInboundDocument(ctx1, deps)
+    await handleInboundDocument(ctx2, deps)
+    await clock.tick(60)
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 5))
+
+    expect(serverSpy.calls.length).toBe(1)
+    const content = (serverSpy.calls[0]!.params as { content: string }).content
+    expect(content.endsWith('Жир <x>\n<formatted format="html">\n<b>Жир</b> &lt;x&gt;\n</formatted>')).toBe(true)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+})
