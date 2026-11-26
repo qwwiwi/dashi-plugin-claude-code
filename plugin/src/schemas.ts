@@ -178,6 +178,19 @@ const componentData = z.record(z.unknown(), {
   invalid_type_error: 'data must be a JSON object with the component fields (see component_schema)',
 })
 
+// A Telegram message id given as a string: digits only, > 0 and within
+// Number.MAX_SAFE_INTEGER, so Number(id) is exact (a bare /^\d+$/ let "0" and
+// ids past 2^53 through, which Number() silently rounds).
+function messageIdString(field: string) {
+  return z
+    .string()
+    .regex(/^\d+$/, `${field} must be a message id (digits)`)
+    .refine(v => {
+      const n = Number(v)
+      return Number.isSafeInteger(n) && n > 0
+    }, `${field} must be a positive safe integer`)
+}
+
 // Tool args - send_component. caption replaces the generated fallback caption
 // of the widget; reply_to threads it like reply.reply_to.
 export const SendComponentArgsSchema = z.object({
@@ -185,14 +198,14 @@ export const SendComponentArgsSchema = z.object({
   component: z.enum(COMPONENT_NAMES),
   data: componentData,
   caption: z.string().min(1).max(1024, 'caption must be at most 1024 characters').optional(),
-  reply_to: z.string().regex(/^\d+$/, 'reply_to must be a message id (digits)').optional(),
+  reply_to: messageIdString('reply_to').optional(),
 })
 export type SendComponentArgs = z.infer<typeof SendComponentArgsSchema>
 
 // Tool args - update_component. message_id is the widget to replace.
 export const UpdateComponentArgsSchema = z.object({
   chat_id: z.string().min(1),
-  message_id: z.string().regex(/^\d+$/, 'message_id must be a positive integer'),
+  message_id: messageIdString('message_id'),
   component: z.enum(COMPONENT_NAMES),
   data: componentData,
 })

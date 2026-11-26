@@ -58,15 +58,21 @@ export function renderComponent(name, data, {chatData=false}={}) {
   const chatBytes = chatData ? Buffer.byteLength(JSON.stringify(data)) : 0;
   const template = templates[name];
   const layout = widgetLayout(name,data);
-  const body = layout.shown ? '<div class="compact">'+layout.shown.map(s=>'<div>'+escape(s)+'</div>').join('')+
+  const body = enhanced => layout.shown ? '<div class="compact">'+layout.shown.map(s=>'<div>'+escape(s)+'</div>').join('')+
     (layout.omitted?'<div>…ещё '+layout.omitted+'</div>':'')+'</div>' :
-    (data.title ? '<h1>'+escape(data.title)+'</h1>' : '')+template.body(data);
-  const html = '<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'+
+    (data.title ? '<h1>'+escape(data.title)+'</h1>' : '')+template.body(data,enhanced);
+  const render = enhanced => '<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'+
     '<style>'+(template.visual ? visualCss : name === 'status' && data.m ? statusCss : css)+'</style><main class="'+name+'">'+
-    body+'</main></html>';
-  const error = budgetError(html,chatBytes);
+    body(enhanced)+'</main></html>';
+  let html = render(true);
+  let error = budgetError(html,chatBytes);
+  const fallback = error === 'HTML_LIMIT' && template.visual;
+  if(fallback){
+    html = render(false);
+    error = budgetError(html,chatBytes);
+  }
   if(error) return failure(error);
   let caption = [data.title,template.caption(data)].filter(Boolean).join('\n');
   if (caption.length > 1024) caption = caption.slice(0,1023).replace(/[\uD800-\uDBFF]$/,'')+'…';
-  return {html,caption};
+  return fallback ? {html,caption,variant:'static'} : {html,caption};
 }

@@ -7,7 +7,7 @@ h2{margin:0 0 4px;font-size:12px;line-height:14px;font-weight:500;letter-spacing
 .row,.top{display:flex;align-items:center;gap:6px;min-width:0}
 .row{min-height:12px;font-size:12px;line-height:15px}
 .name{flex:1;min-width:0}
-.pct{flex:none;width:32px;text-align:right;font-size:12px;font-weight:500}
+.pct{flex:none;width:32px;min-width:max-content;white-space:nowrap;text-align:right;font-size:12px;font-weight:500}
 .cells{width:58px;height:4px;flex:none;background:#dedcd9}
 .job{min-height:20px;cursor:pointer}
 .step,.detail{font-size:12px;line-height:15px;color:#585b50}

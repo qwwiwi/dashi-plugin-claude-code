@@ -8,6 +8,7 @@ import { readFileSync } from 'fs'
 
 import { renderComponent, templates, validate } from '../../vendor/html-components/index.mjs'
 import { TELEGRAM_MAX_MESSAGE } from '../format/chunk.js'
+import { redactSecrets } from '../safety/redact.js'
 import { COMPONENT_NAMES, type ComponentName } from '../schemas.js'
 
 export { COMPONENT_NAMES, type ComponentName }
@@ -45,6 +46,41 @@ export function componentSchema(name: ComponentName): { component: ComponentName
   return { component: name, schema: read('schema.json'), example: read('example.json') }
 }
 
+// Per-chat ids of the messages send_component / update_component sent (widget
+// or plain-text version). update_component deletes only a message on this
+// record, so it can never delete an arbitrary message of an allowed chat.
+// In memory only: the record lives for the process lifetime, so after a
+// restart an older component cannot be updated (the agent sends a new one).
+// Capped per chat; the oldest ids drop out first.
+export const COMPONENT_IDS_PER_CHAT = 200
+
+export class ComponentMessageRegistry {
+  private readonly byChat = new Map<string, Set<number>>()
+
+  record(chatId: string, messageId: number): void {
+    let ids = this.byChat.get(chatId)
+    if (ids === undefined) {
+      ids = new Set<number>()
+      this.byChat.set(chatId, ids)
+    }
+    ids.delete(messageId)
+    ids.add(messageId)
+    while (ids.size > COMPONENT_IDS_PER_CHAT) {
+      const oldest = ids.values().next().value
+      if (oldest === undefined) break
+      ids.delete(oldest)
+    }
+  }
+
+  has(chatId: string, messageId: number): boolean {
+    return this.byChat.get(chatId)?.has(messageId) ?? false
+  }
+
+  forget(chatId: string, messageId: number): void {
+    this.byChat.get(chatId)?.delete(messageId)
+  }
+}
+
 function isPrimitive(value: unknown): value is string | number | boolean {
   return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
 }
@@ -77,7 +113,17 @@ function capToOneMessage(text: string): string {
 // Valid data uses the pack's own caption builder (the same text old clients
 // see under the widget); anything else falls back to a generic flattening.
 // Always non-empty and within one Telegram message.
-export function componentFallbackText(name: string, data: unknown, header?: string): string {
+//
+// `redact` (default: the built-in secret patterns; the server passes the
+// configured extra secrets too) runs on the FULL text before the cap: a cut
+// made first could split a secret so its visible prefix no longer matches any
+// redaction rule downstream.
+export function componentFallbackText(
+  name: string,
+  data: unknown,
+  header?: string,
+  redact: (text: string) => string = text => redactSecrets(text),
+): string {
   const record = typeof data === 'object' && data !== null && !Array.isArray(data) ? (data as Record<string, unknown>) : {}
   const title = typeof record.title === 'string' ? record.title : undefined
   let body: string | undefined
@@ -95,5 +141,5 @@ export function componentFallbackText(name: string, data: unknown, header?: stri
   }
   const parts = [header, title, body].filter((p): p is string => p !== undefined && p.trim().length > 0)
   const text = parts.join('\n')
-  return capToOneMessage(text.length > 0 ? text : `(${name}: no data)`)
+  return capToOneMessage(redact(text.length > 0 ? text : `(${name}: no data)`))
 }

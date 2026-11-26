@@ -43,10 +43,18 @@ via `component_schema`).
 - Do not use one for plain answers: a short reply, an opinion, a yes/no, a
   conversation. Text is enough there.
 - At most one component per reply.
-- Always also send 1–2 lines of plain text with `reply` that say what the
-  component shows: the owner reads on a phone and the text is what notifies.
+- When the result says the component was sent **as a widget** (private chats
+  only), also send 1–2 lines of plain text with `reply` that say what it
+  shows: the owner reads on a phone and the text is what notifies.
+- In a group chat do not call `reply` for that text: the outbox delivers your
+  final text (see above); put the 1–2 lines there.
 - If the result says a plain-text version was sent instead, the owner already
   has the data: do not resend it.
+- If the result says the delivery status is unknown, the widget may already be
+  on screen: do not resend it blindly.
+- `update_component` works only on a message id returned by `send_component`
+  / `update_component` while the channel has been running; after a restart
+  send a new component instead.
 
 ## Reminders
 

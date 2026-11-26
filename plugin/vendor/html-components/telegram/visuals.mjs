@@ -24,9 +24,9 @@ export function visualPacks(escape){
   return Object.fromEntries(Object.entries(programs).map(([kind,source])=>[kind,{
     visual:true,
     caption:d=>[...(d.labels?[d.labels.join(' · ')]:[]),...rows(d).map(([l,v])=>l+' '+v)].join('\n'),
-    body(d){
+    body(d,enhanced=true){
       const legend=rows(d).map(([label,value,state],i)=>{
-        const name=kind==='donut'?'<button aria-pressed="false">'+escape(label)+'</button>':'<span>'+escape(label)+'</span>';
+        const name=enhanced&&kind==='donut'?'<button aria-pressed="false">'+escape(label)+'</button>':'<span>'+escape(label)+'</span>';
         let metric=value;
         if(kind==='donut') metric=value+' · '+Math.round(100*value/d.items.reduce((sum,v)=>sum+v.value,0))+'%';
         if(kind==='line-area') metric='· '+d.series[i].values.at(-1)+' к '+d.labels.at(-1);
@@ -39,9 +39,9 @@ export function visualPacks(escape){
       // Keep axis/value pairs available even when SVG or JavaScript is unavailable.
       const matrix=d.series?'<table id="matrix"><thead><tr><td></td>'+d.series.map(s=>'<th>'+escape(s.label)+'</th>').join('')+
         '</tr></thead><tbody>'+d.labels.map((label,i)=>'<tr><th>'+escape(label)+'</th>'+d.series.map(s=>'<td>'+s.values[i]+'</td>').join('')+'</tr>').join('')+'</tbody></table>':'';
-      const json=JSON.stringify(d).replace(/</g,'\\u003c');
+      const json=JSON.stringify(d).replace(/</g,'\\u003c').replace(/\u2028/g,'\\u2028').replace(/\u2029/g,'\\u2029');
       const summary=d.nodes?d.nodes.length+' узлов · '+d.edges.length+' связей':'';
-      return '<div id="stage"></div>'+(summary?'<div class="summary">'+summary+'</div>':'')+'<ol class="ledger">'+legend+'</ol>'+matrix+(source?'<script>(()=>{const kind='+JSON.stringify(kind)+',data='+json+';'+source+'})();</script>':'');
+      return (enhanced?'<div id="stage"></div>':'')+(summary?'<div class="summary">'+summary+'</div>':'')+'<ol class="ledger">'+legend+'</ol>'+matrix+(enhanced&&source?'<script>(()=>{const kind='+JSON.stringify(kind)+',data='+json+';'+source+'})();</script>':'');
     }
   }]));
 }

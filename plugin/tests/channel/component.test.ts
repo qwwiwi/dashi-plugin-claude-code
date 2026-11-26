@@ -20,7 +20,7 @@ import {
   type TelegramApi,
   type ToolDeps,
 } from '../../src/channel/tools.js'
-import { COMPONENT_NAMES, componentFallbackText } from '../../src/channel/components.js'
+import { COMPONENT_NAMES, ComponentMessageRegistry, componentFallbackText } from '../../src/channel/components.js'
 import type { AppConfig, StatePaths } from '../../src/config.js'
 import { createLogger } from '../../src/log.js'
 import { createSafeTelegramApi } from '../../src/safety/safe-telegram-api.js'
@@ -63,8 +63,12 @@ interface Recorded {
 
 // A fake grammY Bot: sendWidget goes through `api.raw` (as in production),
 // sendMessage / deleteMessage through the typed api. `failWidget` makes the
-// Bot API reject the widget; `failText` makes the plain-text send fail too.
-function fakeBot(opts: { failWidget?: string; failText?: string; failDelete?: string } = {}): {
+// Bot API reject the widget (`failWidgetError` throws that exact value, e.g. a
+// timeout); `failText` makes the plain-text send fail too; `failTextOnReply`
+// fails only a THREADED plain-text send (a stale reply target).
+function fakeBot(
+  opts: { failWidget?: string; failWidgetError?: unknown; failText?: string; failTextOnReply?: string; failDelete?: string } = {},
+): {
   bot: Bot
   calls: Recorded[]
 } {
@@ -75,6 +79,7 @@ function fakeBot(opts: { failWidget?: string; failText?: string; failDelete?: st
       raw: {
         sendWidget: async (body: Record<string, unknown>) => {
           calls.push({ method: 'sendWidget', body })
+          if (opts.failWidgetError !== undefined) throw opts.failWidgetError
           if (opts.failWidget !== undefined) throw new Error(opts.failWidget)
           return { message_id: ++nextId }
         },
@@ -82,6 +87,9 @@ function fakeBot(opts: { failWidget?: string; failText?: string; failDelete?: st
       sendMessage: async (chat_id: string, text: string, other: Record<string, unknown>) => {
         calls.push({ method: 'sendMessage', body: { chat_id, text, ...other } })
         if (opts.failText !== undefined) throw new Error(opts.failText)
+        if (opts.failTextOnReply !== undefined && other.reply_parameters !== undefined) {
+          throw new Error(opts.failTextOnReply)
+        }
         return { message_id: ++nextId }
       },
       deleteMessage: async (chat_id: string, message_id: number) => {
@@ -94,12 +102,13 @@ function fakeBot(opts: { failWidget?: string; failText?: string; failDelete?: st
   return { bot, calls }
 }
 
-function chain(bot: Bot): TelegramApi {
-  return createSafeTelegramApi(createTelegramApi(bot, 'unused-token'), silentLog)
+function chain(bot: Bot, extraSecrets?: string[]): TelegramApi {
+  return createSafeTelegramApi(createTelegramApi(bot, 'unused-token'), silentLog, extraSecrets)
 }
 
-function makeDeps(api: TelegramApi): ToolDeps {
+function makeDeps(api: TelegramApi, extra: Partial<ToolDeps> = {}): ToolDeps {
   return {
+    componentMessages: new ComponentMessageRegistry(),
     config: {
       allowed_user_ids: [Number(OWNER_CHAT)],
       allowed_chat_ids: [Number(OWNER_CHAT), Number(GROUP_CHAT)],
@@ -109,6 +118,7 @@ function makeDeps(api: TelegramApi): ToolDeps {
     telegramApi: api,
     log: silentLog,
     statusManager: {} as unknown as ToolDeps['statusManager'],
+    ...extra,
   }
 }
 
@@ -173,6 +183,8 @@ describe('component tools — argument validation (nothing is sent)', () => {
     ['data is a string', { chat_id: OWNER_CHAT, component: 'kpi', data: '{"metrics":[]}' }, 'data'],
     ['missing chat_id', { component: 'kpi', data: example('kpi') }, 'chat_id'],
     ['non-numeric reply_to', { chat_id: OWNER_CHAT, component: 'kpi', data: example('kpi'), reply_to: 'abc' }, 'reply_to'],
+    ['zero reply_to', { chat_id: OWNER_CHAT, component: 'kpi', data: example('kpi'), reply_to: '0' }, 'reply_to'],
+    ['reply_to beyond a safe integer', { chat_id: OWNER_CHAT, component: 'kpi', data: example('kpi'), reply_to: '9007199254740993' }, 'reply_to'],
     ['caption over 1024 characters', { chat_id: OWNER_CHAT, component: 'kpi', data: example('kpi'), caption: 'c'.repeat(1025) }, 'caption'],
   ])('send_component refuses %s', async (_label, args, field) => {
     const { bot, calls } = fakeBot()
@@ -182,10 +194,10 @@ describe('component tools — argument validation (nothing is sent)', () => {
     expect(calls).toHaveLength(0)
   })
 
-  test('update_component refuses a non-numeric message_id', async () => {
+  test.each([['x1'], ['0'], ['9007199254740993']])('update_component refuses message_id %s', async messageId => {
     const { bot, calls } = fakeBot()
     const res = await callTool(
-      req('update_component', { chat_id: OWNER_CHAT, message_id: 'x1', component: 'kpi', data: example('kpi') }),
+      req('update_component', { chat_id: OWNER_CHAT, message_id: messageId, component: 'kpi', data: example('kpi') }),
       makeDeps(chain(bot)),
     )
     expect(res.isError).toBe(true)
@@ -344,53 +356,209 @@ describe('send_component — plain-text fallback (the owner never gets nothing)'
   })
 })
 
+// Sends a component first so its message id is on record (update_component
+// only replaces messages this process sent as components). Returns its id.
+async function sendFirst(deps: ToolDeps, component = 'kpi', chatId = OWNER_CHAT): Promise<string> {
+  const res = await callTool(req('send_component', { chat_id: chatId, component, data: example(component) }), deps)
+  const id = /id: (\d+)/.exec(text(res))?.[1]
+  if (id === undefined) throw new Error(`send_component gave no id: ${text(res)}`)
+  return id
+}
+
 describe('update_component — widget code is frozen, so an update is a fresh widget', () => {
   test('renders the new data, sends a new widget, deletes the old message, returns the new id', async () => {
     const { bot, calls } = fakeBot()
+    const deps = makeDeps(chain(bot))
+    const old = await sendFirst(deps, 'progress')
+    calls.length = 0
     const res = await callTool(
-      req('update_component', { chat_id: OWNER_CHAT, message_id: '77', component: 'progress', data: example('progress') }),
-      makeDeps(chain(bot)),
+      req('update_component', { chat_id: OWNER_CHAT, message_id: old, component: 'progress', data: example('progress') }),
+      deps,
     )
     expect(res.isError).toBeUndefined()
     expect(calls.map(c => c.method)).toEqual(['sendWidget', 'deleteMessage'])
-    expect(calls[1]?.body).toEqual({ chat_id: OWNER_CHAT, message_id: 77 })
-    expect(text(res)).toContain('id: 501')
+    expect(calls[1]?.body).toEqual({ chat_id: OWNER_CHAT, message_id: Number(old) })
+    expect(text(res)).toContain('id: 502')
+    expect(text(res)).toContain(old)
+  })
+
+  test('the new id is on record: a second update replaces the widget the first update sent', async () => {
+    const { bot, calls } = fakeBot()
+    const deps = makeDeps(chain(bot))
+    const first = await sendFirst(deps, 'progress')
+    await callTool(req('update_component', { chat_id: OWNER_CHAT, message_id: first, component: 'progress', data: example('progress') }), deps)
+    calls.length = 0
+    const res = await callTool(
+      req('update_component', { chat_id: OWNER_CHAT, message_id: '502', component: 'progress', data: example('progress') }),
+      deps,
+    )
+    expect(res.isError).toBeUndefined()
+    expect(calls.map(c => c.method)).toEqual(['sendWidget', 'deleteMessage'])
+    expect(calls[1]?.body).toEqual({ chat_id: OWNER_CHAT, message_id: 502 })
+  })
+
+  test('an id that is not a recorded component of this chat: error, nothing sent or deleted', async () => {
+    const { bot, calls } = fakeBot()
+    const deps = makeDeps(chain(bot))
+    const res = await callTool(
+      req('update_component', { chat_id: OWNER_CHAT, message_id: '77', component: 'kpi', data: example('kpi') }),
+      deps,
+    )
+    expect(res.isError).toBe(true)
     expect(text(res)).toContain('77')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('a component id recorded in ANOTHER chat does not authorise a delete here', async () => {
+    const { bot, calls } = fakeBot()
+    const deps = makeDeps(chain(bot))
+    const old = await sendFirst(deps, 'kpi', OWNER_CHAT)
+    calls.length = 0
+    const res = await callTool(
+      req('update_component', { chat_id: GROUP_CHAT, message_id: old, component: 'kpi', data: example('kpi') }),
+      deps,
+    )
+    expect(res.isError).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  test('a deleted component is forgotten: updating the same old id again is refused', async () => {
+    const { bot, calls } = fakeBot()
+    const deps = makeDeps(chain(bot))
+    const old = await sendFirst(deps, 'kpi')
+    await callTool(req('update_component', { chat_id: OWNER_CHAT, message_id: old, component: 'kpi', data: example('kpi') }), deps)
+    calls.length = 0
+    const res = await callTool(
+      req('update_component', { chat_id: OWNER_CHAT, message_id: old, component: 'kpi', data: example('kpi') }),
+      deps,
+    )
+    expect(res.isError).toBe(true)
+    expect(calls).toHaveLength(0)
   })
 
   test('Telegram rejects the new widget: text fallback goes out and the old message is KEPT', async () => {
-    const { bot, calls } = fakeBot({ failWidget: 'Bad Request: INPUT_MEDIA_WIDGET_TOO_LARGE' })
+    const { bot, calls } = fakeBot()
+    const deps = makeDeps(chain(bot))
+    const old = await sendFirst(deps, 'progress')
+    const failing = fakeBot({ failWidget: 'Bad Request: INPUT_MEDIA_WIDGET_TOO_LARGE' })
     const res = await callTool(
-      req('update_component', { chat_id: OWNER_CHAT, message_id: '77', component: 'progress', data: example('progress') }),
-      makeDeps(chain(bot)),
+      req('update_component', { chat_id: OWNER_CHAT, message_id: old, component: 'progress', data: example('progress') }),
+      { ...deps, telegramApi: chain(failing.bot) },
     )
     expect(res.isError).toBeUndefined()
-    expect(calls.map(c => c.method)).toEqual(['sendWidget', 'sendMessage'])
+    expect(calls.map(c => c.method)).toEqual(['sendWidget'])
+    expect(failing.calls.map(c => c.method)).toEqual(['sendWidget', 'sendMessage'])
     expect(text(res)).toContain('plain-text')
     expect(text(res)).toContain('Telegram did not accept the widget: Bad Request')
   })
 
   test('render error: text fallback, no widget attempt, old message kept', async () => {
     const { bot, calls } = fakeBot()
+    const deps = makeDeps(chain(bot))
+    const old = await sendFirst(deps, 'progress')
+    calls.length = 0
     const res = await callTool(
-      req('update_component', { chat_id: OWNER_CHAT, message_id: '77', component: 'progress', data: { label: 'x', value: -1 } }),
-      makeDeps(chain(bot)),
+      req('update_component', { chat_id: OWNER_CHAT, message_id: old, component: 'progress', data: { label: 'x', value: -1 } }),
+      deps,
     )
     expect(res.isError).toBeUndefined()
     expect(calls.map(c => c.method)).toEqual(['sendMessage'])
     expect(text(res)).toContain('INVALID_DATA')
   })
 
-  test('a failed delete of the old message is reported, the new widget still counts as sent', async () => {
-    const { bot, calls } = fakeBot({ failDelete: 'Bad Request: message to delete not found' })
+  test('a failed delete of the old message: new id reported, deletion unconfirmed (not «both on screen»)', async () => {
+    const { bot } = fakeBot()
+    const deps = makeDeps(chain(bot))
+    const old = await sendFirst(deps, 'kpi')
+    const failing = fakeBot({ failDelete: 'Bad Request: message to delete not found' })
     const res = await callTool(
-      req('update_component', { chat_id: OWNER_CHAT, message_id: '77', component: 'kpi', data: example('kpi') }),
+      req('update_component', { chat_id: OWNER_CHAT, message_id: old, component: 'kpi', data: example('kpi') }),
+      { ...deps, telegramApi: chain(failing.bot) },
+    )
+    expect(res.isError).toBeUndefined()
+    expect(failing.calls.map(c => c.method)).toEqual(['sendWidget', 'deleteMessage'])
+    expect(text(res)).toContain('id: 501')
+    expect(text(res)).toContain('deletion unconfirmed')
+    expect(text(res)).toContain('message to delete not found')
+    expect(text(res)).not.toContain('both are on screen')
+  })
+
+  test('an ambiguous new-widget failure (timeout): no fallback, no delete, status unknown', async () => {
+    const { bot } = fakeBot()
+    const deps = makeDeps(chain(bot))
+    const old = await sendFirst(deps, 'kpi')
+    const failing = fakeBot({ failWidgetError: Object.assign(new Error('Network request for sendWidget failed: ETIMEDOUT'), { code: 'ETIMEDOUT' }) })
+    const res = await callTool(
+      req('update_component', { chat_id: OWNER_CHAT, message_id: old, component: 'kpi', data: example('kpi') }),
+      { ...deps, telegramApi: chain(failing.bot) },
+    )
+    expect(failing.calls.map(c => c.method)).toEqual(['sendWidget'])
+    expect(text(res)).toContain('status unknown')
+  })
+})
+
+describe('send_component — delivery edge cases', () => {
+  test('a stale reply_to: after the confirmed missing-reply-target rejection the text goes out unthreaded', async () => {
+    const missing = 'Bad Request: message to be replied not found'
+    const { bot, calls } = fakeBot({ failWidget: missing, failTextOnReply: missing })
+    const res = await callTool(
+      req('send_component', { chat_id: OWNER_CHAT, component: 'kpi', data: example('kpi'), reply_to: '42' }),
       makeDeps(chain(bot)),
     )
     expect(res.isError).toBeUndefined()
-    expect(calls.map(c => c.method)).toEqual(['sendWidget', 'deleteMessage'])
-    expect(text(res)).toContain('id: 501')
-    expect(text(res)).toContain('message to delete not found')
+    const last = calls[calls.length - 1]
+    expect(last?.method).toBe('sendMessage')
+    expect(last?.body.reply_parameters).toBeUndefined()
+    expect(String(last?.body.text)).toContain('Итоги практикума')
+    expect(text(res)).toContain('plain-text')
+  })
+
+  test('a stale reply_to in a group chat (no widget attempt): the text retries unthreaded', async () => {
+    const missing = 'Bad Request: message to be replied not found'
+    const { bot, calls } = fakeBot({ failTextOnReply: missing })
+    const res = await callTool(
+      req('send_component', { chat_id: GROUP_CHAT, component: 'steps', data: example('steps'), reply_to: '42' }),
+      makeDeps(chain(bot)),
+    )
+    expect(res.isError).toBeUndefined()
+    expect(calls.map(c => c.method)).toEqual(['sendMessage', 'sendMessage'])
+    expect(calls[0]?.body.reply_parameters).toEqual({ message_id: 42 })
+    expect(calls[1]?.body.reply_parameters).toBeUndefined()
+  })
+
+  test('a text failure that is NOT a missing reply target is not retried unthreaded', async () => {
+    const { bot, calls } = fakeBot({ failTextOnReply: 'Bad Request: chat not found' })
+    const res = await callTool(
+      req('send_component', { chat_id: GROUP_CHAT, component: 'steps', data: example('steps'), reply_to: '42' }),
+      makeDeps(chain(bot)),
+    )
+    expect(res.isError).toBe(true)
+    expect(calls.map(c => c.method)).toEqual(['sendMessage'])
+  })
+
+  test('an ambiguous widget failure (timeout after send): no plain-text fallback, result says status unknown', async () => {
+    const { bot, calls } = fakeBot({ failWidgetError: Object.assign(new Error('Network request for sendWidget failed: ETIMEDOUT'), { code: 'ETIMEDOUT' }) })
+    const res = await callTool(
+      req('send_component', { chat_id: OWNER_CHAT, component: 'kpi', data: example('kpi') }),
+      makeDeps(chain(bot)),
+    )
+    expect(calls.map(c => c.method)).toEqual(['sendWidget'])
+    expect(text(res)).toContain('status unknown')
+  })
+
+  test('a configured secret straddling the one-message cut is redacted whole, no prefix leaks', async () => {
+    const secret = 'Zq7cfgSecretValue_0123456789abcdefXYZ'
+    // Place the secret so the 4096-char cap falls in its middle.
+    const lead = 'а'.repeat(4096 - 20)
+    const { bot, calls } = fakeBot()
+    const res = await callTool(
+      req('send_component', { chat_id: GROUP_CHAT, component: 'steps', data: { notes: `${lead}${secret} tail` } }),
+      makeDeps(chain(bot, [secret]), { redact: (t: string) => t.split(secret).join('[REDACTED]') }),
+    )
+    expect(res.isError).toBeUndefined()
+    const sent = String(calls[0]?.body.text)
+    expect(sent.length).toBeLessThanOrEqual(4096)
+    expect(sent).not.toContain(secret.slice(0, 8))
   })
 })
 
@@ -415,6 +583,16 @@ describe('componentFallbackText', () => {
     expect(out.length).toBeLessThanOrEqual(4096)
     if (typeof data.title === 'string') expect(out).toContain(data.title)
     expect(out).not.toContain('<')
+  })
+
+  test('redaction runs on the full text before the cap (a pattern secret across the boundary)', () => {
+    const token = 'ghp_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8'
+    for (const offset of [5, 15, 25, 35]) {
+      const lead = 'x'.repeat(4096 - offset)
+      const out = componentFallbackText('steps', { notes: `${lead} ${token} end` })
+      expect(out.length).toBeLessThanOrEqual(4096)
+      expect(out).not.toContain('ghp_A1b2')
+    }
   })
 
   test('a huge payload is cut to one Telegram message', () => {
