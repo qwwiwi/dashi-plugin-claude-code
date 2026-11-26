@@ -321,3 +321,29 @@ export function redactSecrets(
   }
   return out
 }
+
+/**
+ * True when `url` carries a secret in its raw form or after percent-decoding
+ * (up to 3 rounds): `?%74oken=…` or a percent-encoded known secret slip past
+ * redaction of the raw string. Redaction is idempotent, so "the redacted text
+ * differs from the input" is the detector.
+ */
+export function urlCarriesSecret(
+  url: string,
+  extras?: ReadonlyArray<string>,
+): boolean {
+  let current = url
+  for (let round = 0; round < 4; round++) {
+    if (redactSecrets(current, extras) !== current) return true
+    const next = current.replace(/(?:%[0-9a-fA-F]{2})+/g, (run) => {
+      try {
+        return decodeURIComponent(run)
+      } catch {
+        return run
+      }
+    })
+    if (next === current) return false
+    current = next
+  }
+  return false
+}
