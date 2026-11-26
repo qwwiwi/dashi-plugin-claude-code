@@ -72,14 +72,22 @@ retroactively marks the state of `main` on 2026-06-14.
   `update.sh` now refuses such an update before touching code (see Fixed, #167).
 
 ### Fixed
-- `update.sh` (#167): before any pull, backup, test or restart it resolves the owner
-  the way the runtime does (the channel env file, `<state>/.env`, the selected
-  `config.json`; env wins over config) via `scripts/owner-check.ts`. With no owner,
-  an empty or invalid owner list, or an unreadable `config.json` it stops (also in
-  `--dry-run`) with a Russian + English message naming the exact fix: add
+- `update.sh` (#167): before any pull, backup, test or restart it asks the runtime
+  itself whether the channel would start: `plugin/scripts/config-probe.ts` starts
+  `/bin/bash` the way the installed launcher does (cwd = workspace, HOME/PATH only,
+  `set -a; source channel.env; set +a`, the wrapper's pinned
+  `TELEGRAM_CONFIG_FILE=<state>/config.json`), then runs server.ts's `<state>/.env`
+  preboot loader and the real `loadConfig`. So `unset`, comments, quoting and
+  relative paths behave exactly as at boot. After the pull and `bun install` the
+  new code is probed again, before tests, hook registration and any restart; a
+  refusal there restores the recorded commit. With no owner, an empty or invalid
+  owner list, or an unreadable `config.json` (a directory included) it stops (also
+  in `--dry-run`) with a Russian + English message naming the exact fix: add
   `"allowed_user_ids": [<your Telegram user ID>]` to `<path>/config.json` or set
-  `TELEGRAM_ALLOWED_USER_IDS` in the channel env file. It never writes the ID itself.
-  Doctor's “owner ID configured” FAIL carries the same hint.
+  `TELEGRAM_ALLOWED_USER_IDS` in the channel env file. It prints neither IDs nor env
+  values and never writes the ID itself. The lifecycle context (owner, chat, webhook
+  for hooks and doctor) and doctor's “owner ID configured” check for an installed
+  channel use the same probe, so all three agree with the runtime.
 - Linux installer: the rendered systemd unit quoted `WorkingDirectory=`, which
   systemd does not unquote ("path is not absolute", fatal), so the unit never loaded.
   The path is now unquoted (spaces are accepted); `systemd-analyze verify` is tested.

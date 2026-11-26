@@ -11,7 +11,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --state-dir|--settings) [[ $# -ge 2 && -n "$2" ]] || fail 'Option requires a value'; if [[ "$1" == --state-dir ]]; then STATE_DIR="$2"; else SETTINGS="$2"; fi; shift 2;;
     --restart) RESTART=1; shift;; --dry-run) DRY_RUN=1; shift;;
-    -h|--help) echo 'Usage: ./update.sh [--state-dir PATH --settings PATH] [--dry-run] [--restart]'; echo 'Refuses to start if the checkout has any uncommitted change (tracked edits or untracked files). If dependency install or tests fail after the pull, it runs git reset --hard to the recorded commit: tracked files only; untracked and ignored files are never deleted.'; echo 'Refuses to start if the channel has no explicit owner (allowed_user_ids in config.json or TELEGRAM_ALLOWED_USER_IDS); it never writes the ID itself.'; exit 0;;
+    -h|--help) echo 'Usage: ./update.sh [--state-dir PATH --settings PATH] [--dry-run] [--restart]'; echo 'Refuses to start if the checkout has any uncommitted change (tracked edits or untracked files). If dependency install or tests fail after the pull, it runs git reset --hard to the recorded commit: tracked files only; untracked and ignored files are never deleted.'; echo 'Refuses to start if the channel has no explicit owner (allowed_user_ids in config.json or TELEGRAM_ALLOWED_USER_IDS); the pulled code is checked again before tests and any restart (rollback on refusal); it never writes the ID itself.'; exit 0;;
     *) fail 'Unknown option (use --help)';;
   esac
 done
@@ -23,8 +23,11 @@ if [[ -z "$STATE_DIR" ]]; then
   STATE_DIR="${matches[0]}"
 fi
 absolute "$STATE_DIR"; platform; prerequisites
-# Since #157 the runtime refuses to start without an explicit owner: stop before switching code or restarting.
-bun "$REPO/scripts/owner-check.ts" "$STATE_DIR" || exit 1
+# Since #157 the runtime refuses to start without an explicit owner: ask the installed code's own
+# loadConfig under the launcher env and stop before switching code or restarting.
+PROBE="$REPO/plugin/scripts/config-probe.ts"
+require_file "$PROBE"
+bun "$PROBE" --state-dir "$STATE_DIR" || exit 1
 cd "$REPO"
 CURRENT="$(git rev-parse HEAD)"
 CHANGES="$(git status --porcelain --untracked-files=all)"
@@ -33,7 +36,7 @@ read_context
 if [[ "$RESTART" == 1 ]] && inside_channel; then restart_hint; fail "Refusing --restart inside tmux session $SESSION; run from an external terminal"; fi
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "DRY RUN: record current commit $CURRENT; timestamp backup settings/metadata/service/wrapper/mcp (never channel.env)"
-  echo 'DRY RUN: git pull --ff-only; (cd plugin && bun install && bun test with TELEGRAM_* cleared); rollback to recorded commit if dependencies/tests fail'
+  echo 'DRY RUN: git pull --ff-only; (cd plugin && bun install && owner/config probe of the new code && bun test with TELEGRAM_* cleared); rollback to recorded commit if dependencies, probe or tests fail'
   echo 'DRY RUN: re-register standard plugin/scripts/install-hooks.sh; doctor --check-latest summary'
   restart_hint
   exit 0
@@ -53,7 +56,8 @@ rollback() {
 echo 'Installing and testing plugin dependencies'
 # Tests must never see live TELEGRAM_* settings (real state dir, webhook): run them with all of those cleared.
 CLEAR_TELEGRAM=(); while IFS= read -r name; do CLEAR_TELEGRAM+=(-u "$name"); done < <(compgen -e | grep '^TELEGRAM_' || true)
-(cd "$REPO/plugin" && bun install && env ${CLEAR_TELEGRAM[@]+"${CLEAR_TELEGRAM[@]}"} bun test) || rollback
+# The pulled code decides whether the channel would start: probe it before tests, hooks and any restart.
+(cd "$REPO/plugin" && bun install && require_file "$PROBE" && bun "$PROBE" --state-dir "$STATE_DIR" && env ${CLEAR_TELEGRAM[@]+"${CLEAR_TELEGRAM[@]}"} bun test) || rollback
 require_file "$REPO/plugin/scripts/install-hooks.sh"
 echo 'Re-registering standard plugin hooks'
 TELEGRAM_STATE_DIR="$STATE_DIR" bash "$REPO/plugin/scripts/install-hooks.sh" --settings "$SETTINGS" --chat-id "$CHAT_ID" --webhook-url "$WEBHOOK_URL" --agent-id "$AGENT"

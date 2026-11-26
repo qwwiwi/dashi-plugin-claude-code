@@ -582,6 +582,17 @@ function parseCsvChatIds(csv: string): Array<number | string> {
   return ids
 }
 
+/**
+ * The config.json loadConfig reads: TELEGRAM_CONFIG_FILE, else
+ * <TELEGRAM_STATE_DIR or the default state dir>/config.json. Relative paths
+ * resolve against the process cwd (the launch workspace for the channel).
+ */
+export function configFilePath(env: { TELEGRAM_STATE_DIR?: string | undefined, TELEGRAM_CONFIG_FILE?: string | undefined }): string {
+  const stateRoot = env.TELEGRAM_STATE_DIR
+    ?? join(homedir(), '.claude', 'channels', 'dashi-telegram-canary')
+  return env.TELEGRAM_CONFIG_FILE ?? join(stateRoot, 'config.json')
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   let parsedEnv: RuntimeEnv
   try {
@@ -590,10 +601,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     throw new Error(redactToken(`invalid env: ${err instanceof Error ? err.message : String(err)}`))
   }
 
-  // Resolve state dir (we need it to find default config.json path).
-  const stateRoot = parsedEnv.TELEGRAM_STATE_DIR
-    ?? join(homedir(), '.claude', 'channels', 'dashi-telegram-canary')
-  const configPath = parsedEnv.TELEGRAM_CONFIG_FILE ?? join(stateRoot, 'config.json')
+  const configPath = configFilePath(parsedEnv)
 
   // Read config.json if it exists. Missing file is fine — defaults apply.
   let fileConfig: Record<string, unknown> = {}
