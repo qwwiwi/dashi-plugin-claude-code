@@ -365,17 +365,24 @@ export interface RuntimeConfigProbe {
   configPath: string | null
 }
 
-/** null = the probe could not run (old checkout, missing deps): callers keep the diagnostic resolution. */
-function runConfigProbe(pluginDir: string, stateDir: string): RuntimeConfigProbe | null {
+/** The probe exists but gave no verdict (workspace gone, other account, missing deps): update.sh refuses in this state. */
+export interface RuntimeConfigUnverified {
+  unverified: string
+}
+
+/** null = this checkout has no probe (older code): callers keep the diagnostic resolution. */
+function runConfigProbe(pluginDir: string, stateDir: string): RuntimeConfigProbe | RuntimeConfigUnverified | null {
   const probe = join(pluginDir, 'scripts', 'config-probe.ts')
   if (!existsSync(probe)) return null
   const child = spawnSync(process.execPath, [probe, '--state-dir', stateDir, '--json'], { encoding: 'utf8', timeout: 90_000, stdio: ['ignore', 'pipe', 'ignore'] })
   const parsed = parseJsonSafe(typeof child.stdout === 'string' ? child.stdout.trim().split('\n').pop() ?? null : null)
-  if (!objectRecord(parsed) || typeof parsed.ok !== 'boolean') return null
+  if (!objectRecord(parsed) || typeof parsed.ok !== 'boolean') return { unverified: 'the check produced no result (plugin dependencies missing? run bun install in the plugin directory)' }
   const configPath = typeof parsed.configPath === 'string' ? parsed.configPath : null
   if (parsed.ok) return { ok: true, configPath }
   const reason = parsed.reason
-  if (reason !== 'missing' && reason !== 'invalid' && reason !== 'unreadable' && reason !== 'token') return null
+  if (reason !== 'missing' && reason !== 'invalid' && reason !== 'unreadable' && reason !== 'token') {
+    return { unverified: typeof parsed.detail === 'string' && parsed.detail ? parsed.detail : 'the check could not run' }
+  }
   return { ok: false, reason, configPath }
 }
 
@@ -2434,7 +2441,15 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
   // Same verdict as update.sh: the runtime's loadConfig under the launcher env (#167).
   const runtimeVerdict = launch === null ? null : runConfigProbe(opts.pluginDir, launch.stateDir)
   const envLabel = opts.envPath ?? '<channel env file>'
-  if (runtimeVerdict !== null) {
+  if (runtimeVerdict !== null && 'unverified' in runtimeVerdict) {
+    // Never fall back to the static reading here: the updater refuses in this state.
+    checks.push({
+      id: 'owner-id-configured', title: 'Owner ID configured',
+      status: 'warn',
+      detail: `owner ID unverified: the runtime config check could not run under the installed launcher env (${runtimeVerdict.unverified}); update.sh refuses in this state`,
+      fix: 'restore the recorded workspace and plugin dependencies, and run doctor as the account that owns the installation; then rerun doctor',
+    })
+  } else if (runtimeVerdict !== null) {
     const configPath = runtimeVerdict.configPath ?? effective.configPath
     checks.push({
       id: 'owner-id-configured', title: 'Owner ID configured',

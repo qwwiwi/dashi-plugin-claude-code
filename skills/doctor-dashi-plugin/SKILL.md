@@ -112,7 +112,10 @@ prints when it refuses an update for this reason. For an install.sh installation
 (`install.json` beside the `--env` file) the check runs the same probe as `update.sh`
 (`plugin/scripts/config-probe.ts`: the real `loadConfig` under the launcher env, with
 `<state>/.env`, the launch workspace as cwd and the wrapper's pinned `<state>/config.json`),
-and the config source names that pinned file. Set it in the selected config.json or use `TELEGRAM_ALLOWED_USER_IDS`
+and the config source names that pinned file. When that probe cannot run (recorded workspace
+removed, doctor started by an account that does not own the installation, plugin dependencies
+missing) the check is WARN «owner ID unverified», never a static PASS: `update.sh` refuses in
+the same state. Set it in the selected config.json or use `TELEGRAM_ALLOWED_USER_IDS`
 (CSV positive user IDs) before restarting. Missing chat and permission-relay lists
 inherit those explicitly configured owner IDs; explicit lists are preserved. An unreadable/invalid
 file, unknown env source or duplicate env assignments produces incomplete

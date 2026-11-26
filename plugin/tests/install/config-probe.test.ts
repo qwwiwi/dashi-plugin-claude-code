@@ -2,11 +2,11 @@
 // launcher env (plugin/scripts/config-probe.ts). Update scenarios live in
 // lifecycle.test.ts; this file pins the probe's console contract.
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-import { ownerFixHint } from '../../scripts/config-probe.js'
+import { ownerFixHint, probeInstallation, refusal } from '../../scripts/config-probe.js'
 
 const probe = resolve(import.meta.dir, '../../scripts/config-probe.ts')
 const dirs: string[] = []
@@ -47,6 +47,56 @@ describe('config-probe console contract', () => {
     const r = run(dir)
     expect(r.code).toBe(1); expect(r.out).toContain('install.json')
   })
+})
+
+describe('privilege boundary: the launcher env is sourced only by the account that owns it', () => {
+  const marker = (state: string) => join(state, 'sourced.marker')
+  const sourcing = (state: string) => `TELEGRAM_BOT_TOKEN=123456:probe_TEST_secret\nTELEGRAM_ALLOWED_USER_IDS=4815162342\ntouch '${marker(state)}'\n`
+  test('another account (e.g. root) never executes channel.env: refused as "account", no shell ran', () => {
+    const { state, envFile } = installation('', {})
+    writeFileSync(envFile, sourcing(state))
+    const other = (process.geteuid?.() ?? 1000) === 0 ? 1000 : 0
+    const result = probeInstallation(state, other)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason).toBe('account')
+    expect(result.detail).toContain(state)
+    expect(existsSync(marker(state))).toBe(false)
+  })
+  test('the refusal names the owning uid and the command to rerun as that account', () => {
+    const { state, envFile } = installation('TELEGRAM_BOT_TOKEN=123456:probe_TEST_secret\nTELEGRAM_ALLOWED_USER_IDS=4815162342\n', {})
+    const own = process.geteuid?.() ?? 1000
+    const result = probeInstallation(state, own === 0 ? 1000 : 0)
+    if (result.ok) throw new Error('expected a refusal')
+    const text = refusal(result, envFile)
+    expect(text).toContain(`sudo -u '#${own}' ./update.sh`)
+    expect(text).toContain('Обновление остановлено'); expect(text).toContain('Update refused')
+    expect(text).not.toContain('4815162342'); expect(text).not.toContain('probe_TEST_secret')
+  })
+  test('the owning account still runs the launcher replay (control for the marker)', () => {
+    const { state, envFile } = installation('', {})
+    writeFileSync(envFile, sourcing(state))
+    const result = probeInstallation(state)
+    expect(result.ok).toBe(true)
+    expect(existsSync(marker(state))).toBe(true)
+  })
+})
+
+describe('--inner is internal: IDs never reach a console', () => {
+  const env = { HOME: tmpdir(), PATH: process.env.PATH ?? '', TELEGRAM_BOT_TOKEN: '123456:probe_TEST_secret', TELEGRAM_ALLOWED_USER_IDS: '4815162342', TELEGRAM_ALLOWED_CHAT_IDS: '-1007771234' }
+  for (const [name, script] of [
+    ['direct invocation', 'exec "$0" "$1" --inner'],
+    ['fd 3 redirected to the terminal', 'exec "$0" "$1" --inner 3>&1'],
+  ] as const) {
+    test(`${name}: refused with a fixed message, no owner or chat ID`, () => {
+      const dir = mkdtempSync(join(tmpdir(), 'config-probe-')); dirs.push(dir)
+      const p = Bun.spawnSync(['/bin/bash', '-c', script, process.execPath, probe], { cwd: dir, env: { ...env, TELEGRAM_STATE_DIR: dir }, stdout: 'pipe', stderr: 'pipe' })
+      const out = p.stdout.toString() + p.stderr.toString()
+      expect(out).not.toContain('4815162342'); expect(out).not.toContain('1007771234'); expect(out).not.toContain('probe_TEST_secret')
+      expect(p.exitCode).toBe(2)
+      expect(out).toContain('--inner is internal')
+    })
+  }
 })
 
 describe('ownerFixHint', () => {

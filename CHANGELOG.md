@@ -88,6 +88,14 @@ retroactively marks the state of `main` on 2026-06-14.
   values and never writes the ID itself. The lifecycle context (owner, chat, webhook
   for hooks and doctor) and doctor's “owner ID configured” check for an installed
   channel use the same probe, so all three agree with the runtime.
+  The probe executes the env file as shell, so it runs only as the account that
+  owns the state dir, `install.json`, the env file and the workspace: any other
+  account, root included, is refused before anything is sourced (run
+  `sudo -u <service user> ./update.sh`, restart separately). Its internal
+  `--inner` step returns the result over a private inherited file descriptor and
+  prints nothing when started by hand. When the probe cannot run (recorded
+  workspace removed, another account, missing dependencies) doctor reports the
+  owner check as unverified (WARN) instead of a static PASS.
 - Linux installer: the rendered systemd unit quoted `WorkingDirectory=`, which
   systemd does not unquote ("path is not absolute", fatal), so the unit never loaded.
   The path is now unquoted (spaces are accepted); `systemd-analyze verify` is tested.

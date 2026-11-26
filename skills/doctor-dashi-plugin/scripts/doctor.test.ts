@@ -1929,6 +1929,30 @@ describe('installed channel: owner check runs the runtime config probe under the
   }
 })
 
+describe('installed channel: a runtime probe that cannot run is "unverified", never a static PASS (#167)', () => {
+  const pluginDir = resolve(import.meta.dir, '..', '..', '..', 'plugin')
+  test('recorded workspace removed => owner-id-configured warn (unverified), as update.sh refuses', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'doctor-owner-unverified-'))
+    try {
+      const state = join(fixture, 'state'); const workspace = join(fixture, 'ws-removed'); mkdirSync(state)
+      const envPath = join(state, 'channel.env')
+      writeFileSync(join(state, 'config.json'), JSON.stringify({ allowed_user_ids: [42] }))
+      writeFileSync(envPath, `TELEGRAM_BOT_TOKEN=123:probe_TEST_secret\nTELEGRAM_STATE_DIR='${state}'\n`)
+      writeFileSync(join(state, 'install.json'), JSON.stringify({ agent: 'student', workspace, stateDir: state, settings: join(fixture, 'settings.json'), platform: 'Linux', service: 'channel-student.service', serviceFile: join(state, 'channel-student.service'), session: 'channel-student', envFile: envPath, pluginDir }))
+      writeFileSync(join(fixture, 'settings.json'), '{}')
+      const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'),
+        '--json', '--no-autodetect', '--plugin-dir', pluginDir, '--env-loader', 'shell',
+        '--env', envPath, '--settings', join(fixture, 'settings.json'),
+      ], { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+      expect(result.stdout).not.toContain('probe_TEST_secret')
+      const report = JSON.parse(result.stdout) as { checks: Check[] }
+      const check = report.checks.find((c) => c.id === 'owner-id-configured')
+      expect(check?.status).toBe('warn')
+      expect(check?.detail).toContain('unverified')
+    } finally { rmSync(fixture, { recursive: true, force: true }) }
+  })
+})
+
 describe('owner ID FAIL carries the same fix hint as update.sh (#167)', () => {
   const repoRoot = resolve(import.meta.dir, '..', '..', '..')
   for (const { config, status } of [
