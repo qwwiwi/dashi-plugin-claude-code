@@ -17,7 +17,6 @@ import {
 import { Bot } from 'grammy'
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync } from 'fs'
 import { execSync } from 'child_process'
-import { homedir } from 'os'
 import { isAbsolute, join, resolve as resolvePath } from 'path'
 
 import pkg from '../package.json'
@@ -37,6 +36,7 @@ import {
   type StatePaths,
 } from './config.js'
 import { createLogger } from './log.js'
+import { loadEnvFile, prebootEnvFile } from './preboot-env.js'
 import {
   clearStatusWidgetRecord,
   ensureStateDirs,
@@ -188,43 +188,11 @@ function resolveClaudeBinary(): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// .env loader. Plugin-spawned servers don't get an env block — token
-// lives in ${STATE_DIR}/.env. Real env wins over file values.
+// Bootstrap. The state root and the .env loader live in preboot-env.ts,
+// shared with scripts/config-probe.ts (the update guard runs this exact code).
 // ─────────────────────────────────────────────────────────────────────
 
-function loadEnvFile(envFile: string): void {
-  let raw: string
-  try {
-    raw = readFileSync(envFile, 'utf8')
-  } catch {
-    return
-  }
-  for (const line of raw.split('\n')) {
-    const m = line.match(/^(\w+)=(.*)$/)
-    if (!m) continue
-    const key = m[1]
-    const value = m[2]
-    if (key === undefined || value === undefined) continue
-    if (process.env[key] === undefined) process.env[key] = value
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// Bootstrap. We compute the state root the same way config.ts does so we
-// can locate `.env` before validating env vars.
-// ─────────────────────────────────────────────────────────────────────
-
-function prebootStateDir(): string {
-  // Match the default in config.ts (intentional duplicate — we need the dir
-  // BEFORE loadConfig() can run to find the .env file). L6: use homedir()
-  // for parity with config.ts (handles unset $HOME on macOS/Linux + Windows
-  // USERPROFILE fallback).
-  if (process.env.TELEGRAM_STATE_DIR) return process.env.TELEGRAM_STATE_DIR
-  return join(homedir(), '.claude', 'channels', 'dashi-telegram-canary')
-}
-
-const STATE_ROOT_FOR_ENV = prebootStateDir()
-const ENV_FILE = `${STATE_ROOT_FOR_ENV}/.env`
+const ENV_FILE = prebootEnvFile(process.env)
 
 // Try to chmod the .env file to 0600 before loading. No-op if missing.
 try {
@@ -232,7 +200,7 @@ try {
 } catch {
   // Ignore — loadEnvFile handles missing file too.
 }
-loadEnvFile(ENV_FILE)
+loadEnvFile(ENV_FILE, process.env)
 
 if (!process.env.TELEGRAM_BOT_TOKEN) {
   process.stderr.write(

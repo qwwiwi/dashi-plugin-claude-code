@@ -67,8 +67,35 @@ retroactively marks the state of `main` on 2026-06-14.
   Missing chat and permission-relay lists inherit the configured owner list;
   explicitly configured lists remain unchanged. Doctor reports
   “owner ID configured”. `TELEGRAM_OWNER_ID` is an installer input only.
+  (#157) An install that relied on the old implicit owner loses its channel on the
+  first restart after this update: the server exits with «owner ID not configured».
+  `update.sh` now refuses such an update before touching code (see Fixed, #167).
 
 ### Fixed
+- `update.sh` (#167): before any pull, backup, test or restart it asks the runtime
+  itself whether the channel would start: `plugin/scripts/config-probe.ts` starts
+  `/bin/bash` the way the installed launcher does (cwd = workspace, HOME/PATH only,
+  `set -a; source channel.env; set +a`, the wrapper's pinned
+  `TELEGRAM_CONFIG_FILE=<state>/config.json`), then runs server.ts's `<state>/.env`
+  preboot loader and the real `loadConfig`. So `unset`, comments, quoting and
+  relative paths behave exactly as at boot. After the pull and `bun install` the
+  new code is probed again, before tests, hook registration and any restart; a
+  refusal there restores the recorded commit. With no owner, an empty or invalid
+  owner list, or an unreadable `config.json` (a directory included) it stops (also
+  in `--dry-run`) with a Russian + English message naming the exact fix: add
+  `"allowed_user_ids": [<your Telegram user ID>]` to `<path>/config.json` or set
+  `TELEGRAM_ALLOWED_USER_IDS` in the channel env file. It prints neither IDs nor env
+  values and never writes the ID itself. The lifecycle context (owner, chat, webhook
+  for hooks and doctor) and doctor's “owner ID configured” check for an installed
+  channel use the same probe, so all three agree with the runtime.
+  The probe executes the env file as shell, so it runs only as the account that
+  owns the state dir, `install.json`, the env file and the workspace: any other
+  account, root included, is refused before anything is sourced (run
+  `sudo -u <service user> ./update.sh`, restart separately). Its internal
+  `--inner` step returns the result over a private inherited file descriptor and
+  prints nothing when started by hand. When the probe cannot run (recorded
+  workspace removed, another account, missing dependencies) doctor reports the
+  owner check as unverified (WARN) instead of a static PASS.
 - Linux installer: the rendered systemd unit quoted `WorkingDirectory=`, which
   systemd does not unquote ("path is not absolute", fatal), so the unit never loaded.
   The path is now unquoted (spaces are accepted); `systemd-analyze verify` is tested.

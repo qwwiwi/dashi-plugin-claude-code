@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -14,7 +14,8 @@ function fixture() {
     cpSync(join(root, name), join(repo, name), { recursive: true })
   }
   for (const name of ['install.sh', 'update.sh']) if (existsSync(join(root, name))) cpSync(join(root, name), join(repo, name))
-  mkdirSync(join(repo, 'plugin/node_modules'), { recursive: true })
+  // The update guard runs the real loadConfig (zod): share the checkout's installed dependencies.
+  symlinkSync(join(root, 'plugin/node_modules'), join(repo, 'plugin/node_modules'))
   const bin = join(dir, 'bin'); mkdirSync(bin)
   const log = join(dir, 'calls'); const envlog = join(dir, 'envlog'); const leaklog = join(dir, 'leaklog'); writeFileSync(leaklog, ''); const head = join(dir, 'head'); writeFileSync(head, 'old-commit\n')
   const leakProbe = 'env | grep -vE "^(TEST_SECRET)=" | grep -F -- "${TEST_SECRET:-__no_secret__}" | cut -d= -f1 | sed "s/^/$(basename "$0") leaks /" >> "$TEST_LEAKLOG" || true'
@@ -34,7 +35,7 @@ case "\${1:-}" in
 --version) echo 'git version 2.40.0';;
 status) if [[ "\${TEST_DIRTY:-}" == 1 ]]; then echo ' M user-file'; fi;;
 rev-parse) cat "$TEST_HEAD";;
-pull) echo new-commit > "$TEST_HEAD";;
+pull) echo new-commit > "$TEST_HEAD"; if [[ -n "\${TEST_ON_PULL:-}" ]]; then bash -c "$TEST_ON_PULL"; fi;;
 reset) echo old-commit > "$TEST_HEAD";;
 esac`)
   const state = join(dir, 'state'); const workspace = join(dir, 'workspace'); mkdirSync(workspace)
@@ -208,6 +209,98 @@ describe('update hygiene (N5, U1)', () => {
     expect(r.code).toBe(0)
     const lines = envLines(f.envlog); const begin = lines.indexOf('bun-test begin'); const end = lines.indexOf('bun-test end')
     expect(begin).toBeGreaterThanOrEqual(0); expect(lines.slice(begin + 1, end)).toEqual([])
+  })
+})
+
+describe('update refuses when the owner ID is not explicit (#167)', () => {
+  function withoutOwner() {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0)
+    const configPath = join(f.state, 'config.json'); const envPath = join(f.state, 'channel.env')
+    const cfg = JSON.parse(readFileSync(configPath, 'utf8')); delete cfg.allowed_user_ids; writeFileSync(configPath, JSON.stringify(cfg))
+    writeFileSync(envPath, readFileSync(envPath, 'utf8').split('\n').filter(l => !l.startsWith('TELEGRAM_ALLOWED_USER_IDS=')).join('\n'))
+    writeFileSync(f.log, '')
+    return { ...f, configPath, envPath }
+  }
+  test('missing owner: refused before pull/tests/hooks/restart, exact fix named, nothing written', () => {
+    const f = withoutOwner(); const config = readFileSync(f.configPath, 'utf8'); const env = readFileSync(f.envPath, 'utf8')
+    const before = readdirSync(f.state).filter(n => n.includes('.bak.')).sort()
+    const r = f.run('update.sh', ['--restart', '--state-dir', f.state], { TMUX: '' })
+    expect(r.code).not.toBe(0)
+    expect(r.out).toContain('Обновление остановлено'); expect(r.out).toContain('Update refused')
+    expect(r.out).toContain('"allowed_user_ids": [<your Telegram user ID>]'); expect(r.out).toContain(f.configPath)
+    expect(r.out).toContain('TELEGRAM_ALLOWED_USER_IDS'); expect(r.out).toContain(f.envPath)
+    const calls = readFileSync(f.log, 'utf8')
+    for (const step of ['git pull', 'bun install', 'bun test', 'doctor', 'systemctl', 'launchctl']) expect(calls).not.toContain(step)
+    expect(readFileSync(f.configPath, 'utf8')).toBe(config); expect(readFileSync(f.envPath, 'utf8')).toBe(env)
+    expect(readdirSync(f.state).filter(n => n.includes('.bak.')).sort()).toEqual(before)
+    expect(r.out).not.toContain(f.env.TELEGRAM_BOT_TOKEN)
+  })
+  test('dry run reports the same refusal', () => {
+    const f = withoutOwner(); const r = f.run('update.sh', ['--dry-run', '--state-dir', f.state])
+    expect(r.code).not.toBe(0); expect(r.out).toContain('Update refused'); expect(r.out).toContain(f.configPath)
+  })
+  test('an empty TELEGRAM_ALLOWED_USER_IDS overrides the config owner and is refused too', () => {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0); writeFileSync(f.log, '')
+    const envPath = join(f.state, 'channel.env')
+    writeFileSync(envPath, readFileSync(envPath, 'utf8').replace(/^TELEGRAM_ALLOWED_USER_IDS=.*$/m, 'TELEGRAM_ALLOWED_USER_IDS='))
+    const r = f.run('update.sh', ['--state-dir', f.state])
+    expect(r.code).not.toBe(0); expect(r.out).toContain('Update refused'); expect(readFileSync(f.log, 'utf8')).not.toContain('git pull')
+  })
+  test('owner in config.json only: update proceeds', () => {
+    const f = withoutOwner()
+    const cfg = JSON.parse(readFileSync(f.configPath, 'utf8')); cfg.allowed_user_ids = [987654321]; writeFileSync(f.configPath, JSON.stringify(cfg))
+    const r = f.run('update.sh', ['--state-dir', f.state])
+    expect(r.code).toBe(0); expect(r.out).not.toContain('Update refused'); expect(readFileSync(f.log, 'utf8')).toContain('git pull --ff-only')
+  })
+})
+
+describe('update guard asks the runtime loadConfig under the launcher env (#167 fix)', () => {
+  function installed() {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0); writeFileSync(f.log, '')
+    const configPath = join(f.state, 'config.json'); const envPath = join(f.state, 'channel.env'); const workspace = join(f.dir, 'workspace')
+    const withoutEnvOwner = () => readFileSync(envPath, 'utf8').split('\n').filter(l => !l.startsWith('TELEGRAM_ALLOWED_USER_IDS=')).join('\n')
+    const config = (patch: (cfg: Record<string, unknown>) => void) => { const cfg = JSON.parse(readFileSync(configPath, 'utf8')); patch(cfg); writeFileSync(configPath, JSON.stringify(cfg)) }
+    return { ...f, configPath, envPath, workspace, withoutEnvOwner, config }
+  }
+  const refusedBeforePull = (f: ReturnType<typeof installed>, r: { code: number | null, out: string }) => {
+    expect(r.code).not.toBe(0); expect(r.out).toContain('Update refused')
+    expect(readFileSync(f.log, 'utf8')).not.toContain('git pull')
+    expect(r.out).not.toContain(f.env.TELEGRAM_BOT_TOKEN)
+  }
+  test('bash unset after an owner assignment in channel.env is honoured (config {}): refused', () => {
+    const f = installed(); writeFileSync(f.configPath, '{}')
+    writeFileSync(f.envPath, f.withoutEnvOwner() + '\nTELEGRAM_ALLOWED_USER_IDS=42\nunset TELEGRAM_ALLOWED_USER_IDS\n')
+    refusedBeforePull(f, f.run('update.sh', ['--state-dir', f.state]))
+  })
+  test('relative TELEGRAM_STATE_DIR resolves from the launch workspace: an empty owner override there is refused', () => {
+    const f = installed(); f.config(cfg => { cfg.allowed_user_ids = [42] })
+    writeFileSync(f.envPath, f.withoutEnvOwner().replace(/^TELEGRAM_STATE_DIR=.*$/m, 'TELEGRAM_STATE_DIR=state'))
+    mkdirSync(join(f.workspace, 'state')); writeFileSync(join(f.workspace, 'state/.env'), 'TELEGRAM_ALLOWED_USER_IDS=\n')
+    refusedBeforePull(f, f.run('update.sh', ['--state-dir', f.state]))
+  })
+  test('owner only in the absolute state dir .env: guard and lifecycle context both accept, update proceeds', () => {
+    const f = installed(); f.config(cfg => { delete cfg.allowed_user_ids })
+    writeFileSync(f.envPath, f.withoutEnvOwner()); writeFileSync(join(f.state, '.env'), 'TELEGRAM_ALLOWED_USER_IDS=987654321\n')
+    const r = f.run('update.sh', ['--state-dir', f.state])
+    expect(r.out).not.toContain('Update refused'); expect(r.code).toBe(0)
+    expect(readFileSync(f.log, 'utf8')).toContain('git pull --ff-only')
+    expect(readFileSync(f.log, 'utf8')).toContain('--user 987654321')
+  })
+  test('a config path that is a directory is refused as unreadable, not treated as absent', () => {
+    const f = installed(); rmSync(f.configPath); mkdirSync(f.configPath)
+    const r = f.run('update.sh', ['--state-dir', f.state])
+    refusedBeforePull(f, r); expect(r.out).toContain(f.configPath)
+  })
+  test('the new code is probed after pull and bun install: a refusal there rolls back before tests and restart', () => {
+    const f = installed()
+    const config = join(f.repo, 'plugin/src/config.ts')
+    const breakOwner = `perl -0pi -e 's/if \\(merged\\.allowed_user_ids === undefined \\|\\|/if (true ||/' ${JSON.stringify(config)}`
+    const r = f.run('update.sh', ['--restart', '--state-dir', f.state], { TEST_ON_PULL: breakOwner, TMUX: '' })
+    expect(r.code).not.toBe(0); expect(r.out).toContain('Update refused')
+    const calls = readFileSync(f.log, 'utf8')
+    expect(calls).toContain('git pull --ff-only'); expect(calls).toContain('bun install'); expect(calls).toContain('git reset --hard old-commit')
+    for (const step of ['bun test', 'doctor', 'systemctl', 'launchctl']) expect(calls).not.toContain(step)
+    expect(r.out).not.toContain(f.env.TELEGRAM_BOT_TOKEN)
   })
 })
 

@@ -1898,6 +1898,88 @@ describe('owner ID configured CLI check', () => {
   }
 })
 
+describe('installed channel: owner check runs the runtime config probe under the launcher env (#167 fix)', () => {
+  const pluginDir = resolve(import.meta.dir, '..', '..', '..', 'plugin')
+  for (const { name, stateDotEnv, alt, status } of [
+    { name: 'empty owner override in the absolute state .env', stateDotEnv: 'TELEGRAM_ALLOWED_USER_IDS=\n', alt: { allowed_user_ids: [42] }, status: 'fail' },
+    { name: 'wrapper pins <state>/config.json over an alternate TELEGRAM_CONFIG_FILE', stateDotEnv: null, alt: {}, status: 'pass' },
+  ]) {
+    test(`${name} => ${status}`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), 'doctor-owner-probe-'))
+      try {
+        const state = join(fixture, 'state'); const workspace = join(fixture, 'ws'); mkdirSync(state); mkdirSync(workspace)
+        const configPath = join(state, 'config.json'); const envPath = join(state, 'channel.env')
+        writeFileSync(configPath, JSON.stringify({ allowed_user_ids: [42] }))
+        writeFileSync(join(state, 'alt.json'), JSON.stringify(alt))
+        if (stateDotEnv !== null) writeFileSync(join(state, '.env'), stateDotEnv)
+        writeFileSync(envPath, `TELEGRAM_BOT_TOKEN=123:probe_TEST_secret\nTELEGRAM_STATE_DIR='${state}'\nTELEGRAM_CONFIG_FILE='${join(state, 'alt.json')}'\n`)
+        writeFileSync(join(state, 'install.json'), JSON.stringify({ agent: 'student', workspace, stateDir: state, settings: join(fixture, 'settings.json'), platform: 'Linux', service: 'channel-student.service', serviceFile: join(state, 'channel-student.service'), session: 'channel-student', envFile: envPath, pluginDir }))
+        writeFileSync(join(fixture, 'settings.json'), '{}')
+        const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'),
+          '--json', '--no-autodetect', '--plugin-dir', pluginDir, '--env-loader', 'shell',
+          '--env', envPath, '--settings', join(fixture, 'settings.json'),
+        ], { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+        expect(result.stdout).not.toContain('probe_TEST_secret')
+        const report = JSON.parse(result.stdout) as { checks: Check[] }
+        const check = report.checks.find((c) => c.id === 'owner-id-configured')
+        expect(check?.status).toBe(status)
+        if (status === 'fail') expect(check?.fix).toBe(doctor.ownerFixHint(configPath, envPath))
+      } finally { rmSync(fixture, { recursive: true, force: true }) }
+    })
+  }
+})
+
+describe('installed channel: a runtime probe that cannot run is "unverified", never a static PASS (#167)', () => {
+  const pluginDir = resolve(import.meta.dir, '..', '..', '..', 'plugin')
+  test('recorded workspace removed => owner-id-configured warn (unverified), as update.sh refuses', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'doctor-owner-unverified-'))
+    try {
+      const state = join(fixture, 'state'); const workspace = join(fixture, 'ws-removed'); mkdirSync(state)
+      const envPath = join(state, 'channel.env')
+      writeFileSync(join(state, 'config.json'), JSON.stringify({ allowed_user_ids: [42] }))
+      writeFileSync(envPath, `TELEGRAM_BOT_TOKEN=123:probe_TEST_secret\nTELEGRAM_STATE_DIR='${state}'\n`)
+      writeFileSync(join(state, 'install.json'), JSON.stringify({ agent: 'student', workspace, stateDir: state, settings: join(fixture, 'settings.json'), platform: 'Linux', service: 'channel-student.service', serviceFile: join(state, 'channel-student.service'), session: 'channel-student', envFile: envPath, pluginDir }))
+      writeFileSync(join(fixture, 'settings.json'), '{}')
+      const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'),
+        '--json', '--no-autodetect', '--plugin-dir', pluginDir, '--env-loader', 'shell',
+        '--env', envPath, '--settings', join(fixture, 'settings.json'),
+      ], { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+      expect(result.stdout).not.toContain('probe_TEST_secret')
+      const report = JSON.parse(result.stdout) as { checks: Check[] }
+      const check = report.checks.find((c) => c.id === 'owner-id-configured')
+      expect(check?.status).toBe('warn')
+      expect(check?.detail).toContain('unverified')
+    } finally { rmSync(fixture, { recursive: true, force: true }) }
+  })
+})
+
+describe('owner ID FAIL carries the same fix hint as update.sh (#167)', () => {
+  const repoRoot = resolve(import.meta.dir, '..', '..', '..')
+  for (const { config, status } of [
+    { config: {}, status: 'fail' },
+    { config: { allowed_user_ids: [42] }, status: 'pass' },
+  ]) {
+    test(`owner ${JSON.stringify(config)} => ${status}`, async () => {
+      const { ownerFixHint } = await import(join(repoRoot, 'plugin', 'scripts', 'config-probe.ts'))
+      const fixture = mkdtempSync(join(tmpdir(), 'doctor-owner-hint-'))
+      try {
+        const configPath = join(fixture, 'config.json'); const envPath = join(fixture, 'channel.env')
+        writeFileSync(configPath, JSON.stringify(config))
+        writeFileSync(envPath, `TELEGRAM_CONFIG_FILE=${configPath}\n`)
+        writeFileSync(join(fixture, 'settings.json'), '{}')
+        const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'),
+          '--json', '--no-autodetect', '--plugin-dir', fixture,
+          '--env', envPath, '--settings', join(fixture, 'settings.json'),
+        ], { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+        const report = JSON.parse(result.stdout) as { checks: Check[] }
+        const check = report.checks.find((c) => c.id === 'owner-id-configured')
+        expect(check?.status).toBe(status)
+        if (status === 'fail') expect(check?.fix).toBe(ownerFixHint(configPath, envPath))
+      } finally { rmSync(fixture, { recursive: true, force: true }) }
+    })
+  }
+})
+
 describe('explicit shell env-loader provenance', () => {
   for (const { loader, extra, expected } of [
     { loader: true, extra: '', expected: 'pass' },

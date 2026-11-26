@@ -17,7 +17,7 @@
 import { spawnSync } from 'child_process'
 import { createHash } from 'crypto'
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs'
-import { dirname, join, resolve } from 'path'
+import { dirname, isAbsolute, join, resolve } from 'path'
 import { homedir, platform } from 'os'
 
 export type Status = 'pass' | 'warn' | 'fail' | 'skip'
@@ -328,6 +328,64 @@ function hasWorkingHook(entries: SettingsHookEntry[], marker: string): boolean {
   return entries.some((e) => e.marker === marker && entryCommands(e).some((c) => c.length > 0))
 }
 
+/**
+ * Owner-ID fix hint, the same text update.sh prints when it refuses (#167).
+ * Copy of plugin/scripts/config-probe.ts ownerFixHint: doctor stays self-contained;
+ * doctor.test.ts pins the two to be identical.
+ */
+export function ownerFixHint(configPath: string, envFile: string): string {
+  const placeholder = '<your Telegram user ID>'
+  return `Добавьте "allowed_user_ids": [${placeholder}] в ${configPath} или задайте TELEGRAM_ALLOWED_USER_IDS=${placeholder} в ${envFile}; числовой ID пришлёт @userinfobot в Telegram. / `
+    + `Add "allowed_user_ids": [${placeholder}] to ${configPath} or set TELEGRAM_ALLOWED_USER_IDS=${placeholder} in ${envFile}; @userinfobot in Telegram replies with your numeric ID. `
+    + 'The ID is never written automatically / ID автоматически не записывается.'
+}
+
+/** An install.sh installation whose env file doctor inspects (install.json beside it names that env file). */
+export interface InstalledLaunch {
+  stateDir: string
+  /** cwd of the channel (tmux -c): relative env paths resolve here. */
+  workspace: string
+  /** The wrapper's pinned TELEGRAM_CONFIG_FILE. */
+  configFile: string
+}
+
+export function installedLaunch(envPath: string | undefined): InstalledLaunch | null {
+  if (!envPath) return null
+  const stateDir = dirname(resolve(envPath))
+  const meta = parseJsonSafe(readFileSafe(join(stateDir, 'install.json')))
+  if (!objectRecord(meta) || typeof meta.envFile !== 'string' || resolve(meta.envFile) !== resolve(envPath)) return null
+  if (typeof meta.workspace !== 'string' || !isAbsolute(meta.workspace) || typeof meta.stateDir !== 'string' || !isAbsolute(meta.stateDir)) return null
+  return { stateDir, workspace: meta.workspace, configFile: join(meta.stateDir, 'config.json') }
+}
+
+/** Verdict of plugin/scripts/config-probe.ts: the runtime's own loadConfig under the launcher env. */
+export interface RuntimeConfigProbe {
+  ok: boolean
+  reason?: 'missing' | 'invalid' | 'unreadable' | 'token'
+  configPath: string | null
+}
+
+/** The probe exists but gave no verdict (workspace gone, other account, missing deps): update.sh refuses in this state. */
+export interface RuntimeConfigUnverified {
+  unverified: string
+}
+
+/** null = this checkout has no probe (older code): callers keep the diagnostic resolution. */
+function runConfigProbe(pluginDir: string, stateDir: string): RuntimeConfigProbe | RuntimeConfigUnverified | null {
+  const probe = join(pluginDir, 'scripts', 'config-probe.ts')
+  if (!existsSync(probe)) return null
+  const child = spawnSync(process.execPath, [probe, '--state-dir', stateDir, '--json'], { encoding: 'utf8', timeout: 90_000, stdio: ['ignore', 'pipe', 'ignore'] })
+  const parsed = parseJsonSafe(typeof child.stdout === 'string' ? child.stdout.trim().split('\n').pop() ?? null : null)
+  if (!objectRecord(parsed) || typeof parsed.ok !== 'boolean') return { unverified: 'the check produced no result (plugin dependencies missing? run bun install in the plugin directory)' }
+  const configPath = typeof parsed.configPath === 'string' ? parsed.configPath : null
+  if (parsed.ok) return { ok: true, configPath }
+  const reason = parsed.reason
+  if (reason !== 'missing' && reason !== 'invalid' && reason !== 'unreadable' && reason !== 'token') {
+    return { unverified: typeof parsed.detail === 'string' && parsed.detail ? parsed.detail : 'the check could not run' }
+  }
+  return { ok: false, reason, configPath }
+}
+
 /** Diagnostic subset of loadConfig: env > file > runtime defaults; never imports the server. */
 export interface DoctorConfigResolution {
   stateDir: string
@@ -363,13 +421,17 @@ export function resolveDoctorConfig(
   read: (path: string) => string = (path) => readFileSync(path, 'utf8'),
   runtimeDir: string = process.cwd(),
   envLoader: 'unknown' | 'shell' = 'unknown',
+  /** The installed wrapper exports TELEGRAM_CONFIG_FILE=<state>/config.json after sourcing the env file. */
+  pinnedConfigFile?: string,
 ): DoctorConfigResolution {
   const shellValues = envLoader === 'shell' && envText !== null ? literalShellEnv(envText) : null
   const value = (key: string): string | undefined => envText === null ? undefined
     : envLoader === 'shell' ? shellValues?.get(key) : envValue(envText, key, true) ?? undefined
   const stateDir = resolve(runtimeDir, value('TELEGRAM_STATE_DIR') ?? join(home, '.claude', 'channels', 'dashi-telegram-canary'))
-  const configPath = resolve(runtimeDir, value('TELEGRAM_CONFIG_FILE') ?? join(stateDir, 'config.json'))
-  const source = value('TELEGRAM_CONFIG_FILE') !== undefined ? 'TELEGRAM_CONFIG_FILE' : value('TELEGRAM_STATE_DIR') !== undefined ? 'TELEGRAM_STATE_DIR/config.json' : 'default state directory'
+  const configFile = pinnedConfigFile ?? value('TELEGRAM_CONFIG_FILE')
+  const configPath = resolve(runtimeDir, configFile ?? join(stateDir, 'config.json'))
+  const source = pinnedConfigFile !== undefined ? 'TELEGRAM_CONFIG_FILE pinned by the installed wrapper'
+    : configFile !== undefined ? 'TELEGRAM_CONFIG_FILE' : value('TELEGRAM_STATE_DIR') !== undefined ? 'TELEGRAM_STATE_DIR/config.json' : 'default state directory'
   const incomplete = (reason = 'env/config unavailable or invalid'): DoctorConfigResolution => ({ stateDir, configPath, config: null, check: {
     id: 'config-source', title: 'Effective runtime configuration', status: 'warn',
     detail: `${source}: ${configPath}; incomplete coverage — ${reason}`,
@@ -2371,17 +2433,43 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
 
   // Resolve the same config path and diagnostic fields as runtime before checks.
   const envText = opts.envPath ? readFileSafe(opts.envPath) : null
-  const effective = resolveDoctorConfig(envText, homedir(), undefined, opts.pluginDir, opts.envLoader)
+  // An install.sh installation is launched from its workspace with config.json pinned by the wrapper.
+  const launch = installedLaunch(opts.envPath)
+  const effective = resolveDoctorConfig(envText, homedir(), undefined, launch?.workspace ?? opts.pluginDir, opts.envLoader, launch?.configFile)
   checks.push(effective.check)
   const stateConfig = effective.config
-  checks.push({
+  // Same verdict as update.sh: the runtime's loadConfig under the launcher env (#167).
+  const runtimeVerdict = launch === null ? null : runConfigProbe(opts.pluginDir, launch.stateDir)
+  const envLabel = opts.envPath ?? '<channel env file>'
+  if (runtimeVerdict !== null && 'unverified' in runtimeVerdict) {
+    // Never fall back to the static reading here: the updater refuses in this state.
+    checks.push({
+      id: 'owner-id-configured', title: 'Owner ID configured',
+      status: 'warn',
+      detail: `owner ID unverified: the runtime config check could not run under the installed launcher env (${runtimeVerdict.unverified}); update.sh refuses in this state`,
+      fix: 'restore the recorded workspace and plugin dependencies, and run doctor as the account that owns the installation; then rerun doctor',
+    })
+  } else if (runtimeVerdict !== null) {
+    const configPath = runtimeVerdict.configPath ?? effective.configPath
+    checks.push({
+      id: 'owner-id-configured', title: 'Owner ID configured',
+      status: runtimeVerdict.ok ? 'pass' : 'fail',
+      detail: runtimeVerdict.ok ? 'the runtime config loader accepts the owner allowlist under the installed launcher env'
+        : `the runtime config loader refuses startup under the installed launcher env (${runtimeVerdict.reason}); implicit owner access has been removed`,
+      fix: runtimeVerdict.reason === 'unreadable' ? `make ${configPath} a readable JSON object`
+        : runtimeVerdict.reason === 'token' ? `set TELEGRAM_BOT_TOKEN in ${envLabel}`
+          : ownerFixHint(configPath, envLabel),
+    })
+  } else checks.push({
     id: 'owner-id-configured', title: 'Owner ID configured',
     status: stateConfig === null ? 'warn' : Array.isArray(stateConfig.allowed_user_ids) && stateConfig.allowed_user_ids.length > 0 ? 'pass' : 'fail',
     detail: stateConfig === null ? 'effective config unavailable — owner ID coverage unverified'
       : Array.isArray(stateConfig.allowed_user_ids) && stateConfig.allowed_user_ids.length > 0
         ? 'effective owner user allowlist is configured'
         : 'owner ID absent or empty; runtime refuses startup; implicit owner access has been removed',
-    fix: 'set allowed_user_ids in the selected config.json or TELEGRAM_ALLOWED_USER_IDS to positive Telegram owner user IDs; resolve config-source first if coverage is unverified',
+    fix: stateConfig === null
+      ? 'set allowed_user_ids in the selected config.json or TELEGRAM_ALLOWED_USER_IDS to positive Telegram owner user IDs; resolve config-source first if coverage is unverified'
+      : ownerFixHint(effective.configPath, envLabel),
   })
   const profile = selectHookProfile(stateConfig)
   const flag = (key: string): boolean | null => {
