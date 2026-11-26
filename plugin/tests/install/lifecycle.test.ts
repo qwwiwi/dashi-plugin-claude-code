@@ -211,6 +211,48 @@ describe('update hygiene (N5, U1)', () => {
   })
 })
 
+describe('update refuses when the owner ID is not explicit (#167)', () => {
+  function withoutOwner() {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0)
+    const configPath = join(f.state, 'config.json'); const envPath = join(f.state, 'channel.env')
+    const cfg = JSON.parse(readFileSync(configPath, 'utf8')); delete cfg.allowed_user_ids; writeFileSync(configPath, JSON.stringify(cfg))
+    writeFileSync(envPath, readFileSync(envPath, 'utf8').split('\n').filter(l => !l.startsWith('TELEGRAM_ALLOWED_USER_IDS=')).join('\n'))
+    writeFileSync(f.log, '')
+    return { ...f, configPath, envPath }
+  }
+  test('missing owner: refused before pull/tests/hooks/restart, exact fix named, nothing written', () => {
+    const f = withoutOwner(); const config = readFileSync(f.configPath, 'utf8'); const env = readFileSync(f.envPath, 'utf8')
+    const before = readdirSync(f.state).filter(n => n.includes('.bak.')).sort()
+    const r = f.run('update.sh', ['--restart', '--state-dir', f.state], { TMUX: '' })
+    expect(r.code).not.toBe(0)
+    expect(r.out).toContain('Обновление остановлено'); expect(r.out).toContain('Update refused')
+    expect(r.out).toContain('"allowed_user_ids": [<your Telegram user ID>]'); expect(r.out).toContain(f.configPath)
+    expect(r.out).toContain('TELEGRAM_ALLOWED_USER_IDS'); expect(r.out).toContain(f.envPath)
+    const calls = readFileSync(f.log, 'utf8')
+    for (const step of ['git pull', 'bun install', 'bun test', 'doctor', 'systemctl', 'launchctl']) expect(calls).not.toContain(step)
+    expect(readFileSync(f.configPath, 'utf8')).toBe(config); expect(readFileSync(f.envPath, 'utf8')).toBe(env)
+    expect(readdirSync(f.state).filter(n => n.includes('.bak.')).sort()).toEqual(before)
+    expect(r.out).not.toContain(f.env.TELEGRAM_BOT_TOKEN)
+  })
+  test('dry run reports the same refusal', () => {
+    const f = withoutOwner(); const r = f.run('update.sh', ['--dry-run', '--state-dir', f.state])
+    expect(r.code).not.toBe(0); expect(r.out).toContain('Update refused'); expect(r.out).toContain(f.configPath)
+  })
+  test('an empty TELEGRAM_ALLOWED_USER_IDS overrides the config owner and is refused too', () => {
+    const f = fixture(); expect(f.run('install.sh', f.installArgs).code).toBe(0); writeFileSync(f.log, '')
+    const envPath = join(f.state, 'channel.env')
+    writeFileSync(envPath, readFileSync(envPath, 'utf8').replace(/^TELEGRAM_ALLOWED_USER_IDS=.*$/m, 'TELEGRAM_ALLOWED_USER_IDS='))
+    const r = f.run('update.sh', ['--state-dir', f.state])
+    expect(r.code).not.toBe(0); expect(r.out).toContain('Update refused'); expect(readFileSync(f.log, 'utf8')).not.toContain('git pull')
+  })
+  test('owner in config.json only: update proceeds', () => {
+    const f = withoutOwner()
+    const cfg = JSON.parse(readFileSync(f.configPath, 'utf8')); cfg.allowed_user_ids = [987654321]; writeFileSync(f.configPath, JSON.stringify(cfg))
+    const r = f.run('update.sh', ['--state-dir', f.state])
+    expect(r.code).toBe(0); expect(r.out).not.toContain('Update refused'); expect(readFileSync(f.log, 'utf8')).toContain('git pull --ff-only')
+  })
+})
+
 describe('update refuses a dirty checkout and rollback never touches user files (U2, real git)', () => {
   const identity = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.invalid', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }
   function gitIn(cwd: string, ...args: string[]): string {

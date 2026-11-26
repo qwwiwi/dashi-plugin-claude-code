@@ -1898,6 +1898,33 @@ describe('owner ID configured CLI check', () => {
   }
 })
 
+describe('owner ID FAIL carries the same fix hint as update.sh (#167)', () => {
+  const repoRoot = resolve(import.meta.dir, '..', '..', '..')
+  for (const { config, status } of [
+    { config: {}, status: 'fail' },
+    { config: { allowed_user_ids: [42] }, status: 'pass' },
+  ]) {
+    test(`owner ${JSON.stringify(config)} => ${status}`, async () => {
+      const { ownerFixHint } = await import(join(repoRoot, 'scripts', 'owner-check.ts'))
+      const fixture = mkdtempSync(join(tmpdir(), 'doctor-owner-hint-'))
+      try {
+        const configPath = join(fixture, 'config.json'); const envPath = join(fixture, 'channel.env')
+        writeFileSync(configPath, JSON.stringify(config))
+        writeFileSync(envPath, `TELEGRAM_CONFIG_FILE=${configPath}\n`)
+        writeFileSync(join(fixture, 'settings.json'), '{}')
+        const result = spawnSync(process.execPath, [join(import.meta.dir, 'doctor.ts'),
+          '--json', '--no-autodetect', '--plugin-dir', fixture,
+          '--env', envPath, '--settings', join(fixture, 'settings.json'),
+        ], { encoding: 'utf8', env: { ...process.env, HOME: fixture, PATH: fixture } })
+        const report = JSON.parse(result.stdout) as { checks: Check[] }
+        const check = report.checks.find((c) => c.id === 'owner-id-configured')
+        expect(check?.status).toBe(status)
+        if (status === 'fail') expect(check?.fix).toBe(ownerFixHint(configPath, envPath))
+      } finally { rmSync(fixture, { recursive: true, force: true }) }
+    })
+  }
+})
+
 describe('explicit shell env-loader provenance', () => {
   for (const { loader, extra, expected } of [
     { loader: true, extra: '', expected: 'pass' },

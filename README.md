@@ -36,7 +36,9 @@ installer input). There is no `--bot-token` flag: a token in argv is visible in
 Use the environment or the hidden prompt. `--state-dir PATH` and `--settings PATH` select custom
 locations; `--dry-run` previews actions without writing or starting anything.
 
-`./update.sh` refuses a dirty checkout, backs up config/settings, pulls with
+`./update.sh` refuses a dirty checkout and an installation without an explicit owner
+(no `allowed_user_ids` in its `config.json` and no `TELEGRAM_ALLOWED_USER_IDS`; it names
+the exact file to edit and never writes the ID itself), backs up config/settings, pulls with
 `--ff-only`, installs dependencies, runs tests and refreshes plugin hooks. It prints
 a restart command and never restarts automatically. `--restart` is allowed only
 outside the channel's own tmux session; always update/restart from a separate

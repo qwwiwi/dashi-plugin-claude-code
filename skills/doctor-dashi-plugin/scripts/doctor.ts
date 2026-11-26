@@ -328,6 +328,18 @@ function hasWorkingHook(entries: SettingsHookEntry[], marker: string): boolean {
   return entries.some((e) => e.marker === marker && entryCommands(e).some((c) => c.length > 0))
 }
 
+/**
+ * Owner-ID fix hint, the same text update.sh prints when it refuses (#167).
+ * Copy of scripts/owner-check.ts ownerFixHint: doctor stays self-contained;
+ * doctor.test.ts pins the two to be identical.
+ */
+export function ownerFixHint(configPath: string, envFile: string): string {
+  const placeholder = '<your Telegram user ID>'
+  return `Добавьте "allowed_user_ids": [${placeholder}] в ${configPath} или задайте TELEGRAM_ALLOWED_USER_IDS=${placeholder} в ${envFile}; числовой ID пришлёт @userinfobot в Telegram. / `
+    + `Add "allowed_user_ids": [${placeholder}] to ${configPath} or set TELEGRAM_ALLOWED_USER_IDS=${placeholder} in ${envFile}; @userinfobot in Telegram replies with your numeric ID. `
+    + 'The ID is never written automatically / ID автоматически не записывается.'
+}
+
 /** Diagnostic subset of loadConfig: env > file > runtime defaults; never imports the server. */
 export interface DoctorConfigResolution {
   stateDir: string
@@ -2381,7 +2393,9 @@ async function gatherChecks(opts: Options): Promise<{ checks: Check[]; version: 
       : Array.isArray(stateConfig.allowed_user_ids) && stateConfig.allowed_user_ids.length > 0
         ? 'effective owner user allowlist is configured'
         : 'owner ID absent or empty; runtime refuses startup; implicit owner access has been removed',
-    fix: 'set allowed_user_ids in the selected config.json or TELEGRAM_ALLOWED_USER_IDS to positive Telegram owner user IDs; resolve config-source first if coverage is unverified',
+    fix: stateConfig === null
+      ? 'set allowed_user_ids in the selected config.json or TELEGRAM_ALLOWED_USER_IDS to positive Telegram owner user IDs; resolve config-source first if coverage is unverified'
+      : ownerFixHint(effective.configPath, opts.envPath ?? '<channel env file>'),
   })
   const profile = selectHookProfile(stateConfig)
   const flag = (key: string): boolean | null => {

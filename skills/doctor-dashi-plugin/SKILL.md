@@ -107,7 +107,8 @@ merge over runtime defaults; applicable env overrides win. The report names
 the selected path/source and override **keys**, never their credential values.
 An absent config file uses defaults, as runtime does, but owner access has no default.
 The `owner-id-configured` check fails when the effective `allowed_user_ids` is absent
-or empty. Set it in the selected config.json or use `TELEGRAM_ALLOWED_USER_IDS`
+or empty; its fix names the exact config.json and env file, with the same text `update.sh`
+prints when it refuses an update for this reason. Set it in the selected config.json or use `TELEGRAM_ALLOWED_USER_IDS`
 (CSV positive user IDs) before restarting. Missing chat and permission-relay lists
 inherit those explicitly configured owner IDs; explicit lists are preserved. An unreadable/invalid
 file, unknown env source or duplicate env assignments produces incomplete

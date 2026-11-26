@@ -11,7 +11,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --state-dir|--settings) [[ $# -ge 2 && -n "$2" ]] || fail 'Option requires a value'; if [[ "$1" == --state-dir ]]; then STATE_DIR="$2"; else SETTINGS="$2"; fi; shift 2;;
     --restart) RESTART=1; shift;; --dry-run) DRY_RUN=1; shift;;
-    -h|--help) echo 'Usage: ./update.sh [--state-dir PATH --settings PATH] [--dry-run] [--restart]'; echo 'Refuses to start if the checkout has any uncommitted change (tracked edits or untracked files). If dependency install or tests fail after the pull, it runs git reset --hard to the recorded commit: tracked files only; untracked and ignored files are never deleted.'; exit 0;;
+    -h|--help) echo 'Usage: ./update.sh [--state-dir PATH --settings PATH] [--dry-run] [--restart]'; echo 'Refuses to start if the checkout has any uncommitted change (tracked edits or untracked files). If dependency install or tests fail after the pull, it runs git reset --hard to the recorded commit: tracked files only; untracked and ignored files are never deleted.'; echo 'Refuses to start if the channel has no explicit owner (allowed_user_ids in config.json or TELEGRAM_ALLOWED_USER_IDS); it never writes the ID itself.'; exit 0;;
     *) fail 'Unknown option (use --help)';;
   esac
 done
@@ -23,6 +23,8 @@ if [[ -z "$STATE_DIR" ]]; then
   STATE_DIR="${matches[0]}"
 fi
 absolute "$STATE_DIR"; platform; prerequisites
+# Since #157 the runtime refuses to start without an explicit owner: stop before switching code or restarting.
+bun "$REPO/scripts/owner-check.ts" "$STATE_DIR" || exit 1
 cd "$REPO"
 CURRENT="$(git rev-parse HEAD)"
 CHANGES="$(git status --porcelain --untracked-files=all)"

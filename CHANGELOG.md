@@ -67,8 +67,19 @@ retroactively marks the state of `main` on 2026-06-14.
   Missing chat and permission-relay lists inherit the configured owner list;
   explicitly configured lists remain unchanged. Doctor reports
   “owner ID configured”. `TELEGRAM_OWNER_ID` is an installer input only.
+  (#157) An install that relied on the old implicit owner loses its channel on the
+  first restart after this update: the server exits with «owner ID not configured».
+  `update.sh` now refuses such an update before touching code (see Fixed, #167).
 
 ### Fixed
+- `update.sh` (#167): before any pull, backup, test or restart it resolves the owner
+  the way the runtime does (the channel env file, `<state>/.env`, the selected
+  `config.json`; env wins over config) via `scripts/owner-check.ts`. With no owner,
+  an empty or invalid owner list, or an unreadable `config.json` it stops (also in
+  `--dry-run`) with a Russian + English message naming the exact fix: add
+  `"allowed_user_ids": [<your Telegram user ID>]` to `<path>/config.json` or set
+  `TELEGRAM_ALLOWED_USER_IDS` in the channel env file. It never writes the ID itself.
+  Doctor's “owner ID configured” FAIL carries the same hint.
 - Linux installer: the rendered systemd unit quoted `WorkingDirectory=`, which
   systemd does not unquote ("path is not absolute", fatal), so the unit never loaded.
   The path is now unquoted (spaces are accepted); `systemd-analyze verify` is tested.
