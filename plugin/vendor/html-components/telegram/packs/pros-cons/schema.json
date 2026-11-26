@@ -1,0 +1,48 @@
+{
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 48
+    },
+    "pros": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 54
+      },
+      "minItems": 1,
+      "maxItems": 3
+    },
+    "cons": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 54
+      },
+      "minItems": 1,
+      "maxItems": 3
+    },
+    "prosLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 48,
+      "default": "Плюсы"
+    },
+    "consLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 48,
+      "default": "Минусы"
+    }
+  },
+  "required": [
+    "title",
+    "pros",
+    "cons"
+  ],
+  "additionalProperties": false
+}

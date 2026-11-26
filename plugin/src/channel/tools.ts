@@ -1,7 +1,8 @@
 // MCP tool surface for the Telegram channel.
 //
-// 8 tools: reply, react, download_attachment, edit_message, status, autonomy,
-// send_widget, edit_widget_data.
+// 11 tools: reply, react, download_attachment, edit_message, status, autonomy,
+// send_widget, edit_widget_data, send_component, update_component,
+// component_schema.
 // `autonomy` (PR-1) is a READ + resolve surface over the durable autonomy
 // registry (leases + open questions); it can never GRANT a lease.
 //
@@ -27,11 +28,16 @@ import {
   AutonomyArgsSchema,
   DownloadAttachmentArgsSchema,
   EditMessageArgsSchema,
+  ComponentSchemaArgsSchema,
   EditWidgetDataArgsSchema,
   ReactArgsSchema,
   ReplyArgsSchema,
+  SendComponentArgsSchema,
   SendWidgetArgsSchema,
   StatusArgsSchema,
+  UpdateComponentArgsSchema,
+  COMPONENT_NAMES,
+  type ComponentName,
 } from '../schemas.js'
 import {
   activeLeases,
@@ -64,7 +70,8 @@ import {
 import { analyzeFormat, formatHint } from '../format/format-check.js'
 import type { RichLatch } from '../safety/rich-latch.js'
 import { redactSecrets } from '../safety/redact.js'
-import { checkWidgetChat, checkWidgetPayload } from './widget.js'
+import { checkWidgetChat, checkWidgetPayload, WIDGET_CAPTION_MAX_CHARS } from './widget.js'
+import { componentFallbackText, componentSchema, renderComponentWidget } from './components.js'
 import { WidgetPreSendError } from '../safety/pre-send-error.js'
 
 // ─────────────────────────────────────────────────────────────────────
@@ -175,6 +182,8 @@ export interface SendWidgetParams {
   chat_data?: string
   width?: number
   height?: number
+  // Thread the widget under this message (sent as reply_parameters).
+  reply_to_message_id?: number
   // Wrapper-only flag (never sent to Telegram): the reliable layer strips it
   // and skips the outbound-activity stamp, so an internal send (the model-free
   // status card) does not count as the model talking to the owner.
@@ -351,6 +360,9 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       if (params.chat_data !== undefined) body.chat_data = params.chat_data
       if (params.width !== undefined) body.width = params.width
       if (params.height !== undefined) body.height = params.height
+      if (params.reply_to_message_id !== undefined) {
+        body.reply_parameters = { message_id: params.reply_to_message_id }
+      }
       const res = (await rawBotMethod(bot, 'sendWidget')(body)) as RawSendRichResponse
       // Same defensive parse as sendRichMessage: grammY-unwrapped first, then
       // the raw envelope.
@@ -435,6 +447,8 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
 // Tool definitions. Order is stable — Claude Code surfaces tools in
 // listing order, and tests pin the order to catch accidental swaps.
 // ─────────────────────────────────────────────────────────────────────
+
+const COMPONENT_NAMES_FOR_SCHEMA: readonly ComponentName[] = COMPONENT_NAMES
 
 const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
@@ -613,6 +627,68 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
       required: ['chat_id', 'message_id', 'chat_data'],
     },
   },
+  {
+    name: 'send_component',
+    description:
+      'Send data as a ready-made visual component (an html widget) instead of a wall of text. Pick by what the data is:\n' +
+      '- kpi: 1-4 key numbers (totals, counts)\n' +
+      '- bars: a few values to compare as percentages\n' +
+      '- donut: parts of a whole (shares, structure)\n' +
+      '- bars3d: values per category, more visual than bars\n' +
+      '- progress: one percentage (course, task, budget)\n' +
+      '- line-area: a trend over time\n' +
+      '- steps: a short ordered list of actions\n' +
+      '- flowchart: a process with decisions and branches\n' +
+      '- architecture: a system: parts grouped in layers and their links\n' +
+      '- network3d: who/what is connected to whom (a graph)\n' +
+      '- timeline-roadmap: a plan with dates and done/now/next\n' +
+      '- compare: a table comparing options by the same columns\n' +
+      '- radar: options scored on several criteria (percent)\n' +
+      '- pros-cons: pros and cons of one option\n' +
+      '- faq: questions and answers\n' +
+      '- status: a work status card (stages with percent, jobs)\n' +
+      'Call component_schema({component}) for the exact data fields and an example before the first use. ' +
+      'At most one component per reply, and always also send 1-2 lines of plain text with reply. ' +
+      'If the widget cannot be shown (bad data, too much data, group chat, Telegram refuses it) the data is sent as plain text instead and the result says so — then do not resend it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'Chat id from the inbound <channel> meta. Widgets work in private chats; other chats get the plain-text version.' },
+        component: { type: 'string', enum: [...COMPONENT_NAMES_FOR_SCHEMA] },
+        data: { type: 'object', description: 'Component data, a JSON object matching component_schema({component}).' },
+        caption: { type: 'string', description: 'Optional text shown by clients without widget support (≤ 1024 characters). Default: generated from the data.' },
+        reply_to: { type: 'string', description: 'Optional message id to thread under.' },
+      },
+      required: ['chat_id', 'component', 'data'],
+    },
+  },
+  {
+    name: 'update_component',
+    description:
+      'Show new data for a component sent earlier with send_component. Widget code cannot change after sending, so this sends a NEW widget with the new data and deletes the old message (message_id); the result gives the new message id — use it for the next update. If the new widget cannot be shown, the data goes out as plain text and the old widget is kept.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string' },
+        message_id: { type: 'string', description: 'Message id of the component to replace (from send_component / update_component).' },
+        component: { type: 'string', enum: [...COMPONENT_NAMES_FOR_SCHEMA] },
+        data: { type: 'object', description: 'New component data, see component_schema({component}).' },
+      },
+      required: ['chat_id', 'message_id', 'component', 'data'],
+    },
+  },
+  {
+    name: 'component_schema',
+    description:
+      'Return the JSON schema of the data and a working example for one component of send_component. Read-only, sends nothing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        component: { type: 'string', enum: [...COMPONENT_NAMES_FOR_SCHEMA] },
+      },
+      required: ['component'],
+    },
+  },
 ]
 
 export function listTools(): ToolDefinition[] {
@@ -659,6 +735,70 @@ function toolError(name: string, message: string): CallToolResult {
     content: [{ type: 'text', text: `${name} failed: ${message}` }],
     isError: true,
   }
+}
+
+// ─── Components (send_component / update_component) ──────────────────
+
+interface ComponentDelivery {
+  chatId: string
+  component: ComponentName
+  data: Record<string, unknown>
+  caption?: string
+  replyTo?: number
+}
+
+type ComponentDeliveryResult =
+  | { kind: 'widget'; messageId: number }
+  | { kind: 'text'; messageId: number; reason: string }
+  | { kind: 'failed'; reason: string }
+
+// Render the component and send it through the existing widget path. Any
+// reason the widget cannot be shown (private-chat rule, render error, size
+// limit, Telegram rejecting it) degrades to a plain-text rendering of the same
+// data, so the owner never gets nothing. Only when that text also fails is
+// the result 'failed'. The widget send is ONE attempt, like send_widget.
+async function deliverComponent(api: TelegramApi, d: ComponentDelivery): Promise<ComponentDeliveryResult> {
+  let reason = checkWidgetChat(d.chatId)
+  if (reason === undefined) {
+    const rendered = renderComponentWidget(d.component, d.data)
+    if (!rendered.ok) {
+      reason = rendered.reason
+    } else {
+      const caption =
+        d.caption ??
+        (rendered.caption.length > 0
+          ? rendered.caption
+          : componentFallbackText(d.component, d.data).slice(0, WIDGET_CAPTION_MAX_CHARS))
+      const params: SendWidgetParams = { html: rendered.html, caption }
+      if (d.replyTo !== undefined) params.reply_to_message_id = d.replyTo
+      reason = checkWidgetPayload(params)
+      if (reason === undefined) {
+        try {
+          const sent = await api.sendWidget(d.chatId, params)
+          return { kind: 'widget', messageId: sent.message_id }
+        } catch (err) {
+          reason = `Telegram did not accept the widget: ${redactSecrets(err instanceof Error ? err.message : String(err))}`
+        }
+      }
+    }
+  }
+  const text = componentFallbackText(d.component, d.data, d.caption)
+  const opts: SendMessageOpts = {}
+  if (d.replyTo !== undefined) opts.reply_to_message_id = d.replyTo
+  try {
+    const sent = await api.sendMessage(d.chatId, text, opts)
+    return { kind: 'text', messageId: sent.message_id, reason }
+  } catch (err) {
+    const why = redactSecrets(err instanceof Error ? err.message : String(err))
+    return { kind: 'failed', reason: `widget not shown (${reason}) and the plain-text version failed too (${why}) — nothing reached the chat` }
+  }
+}
+
+function textFallbackResult(component: ComponentName, out: { messageId: number; reason: string }): string {
+  return (
+    `component ${component}: widget NOT shown (${out.reason}). A plain-text version of the data was sent instead (id: ${out.messageId}) — ` +
+    `the owner has it, do not resend. For a widget next time check the fields with component_schema({component: "${component}"}).`
+  )
 }
 
 function zodErrorMessage(err: z.ZodError): string {
@@ -1411,6 +1551,76 @@ export async function callTool(req: CallToolRequest, deps: ToolDeps): Promise<Ca
         } catch (err) {
           return toolError(name, redactSecrets(err instanceof Error ? err.message : String(err)))
         }
+      }
+
+      case 'send_component': {
+        const parsed = SendComponentArgsSchema.safeParse(rawArgs)
+        if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
+        const args = parsed.data
+        try {
+          assertAllowedChat(args.chat_id, config, deps.policy)
+        } catch (err) {
+          return toolError(name, err instanceof Error ? err.message : String(err))
+        }
+        const delivery: ComponentDelivery = { chatId: args.chat_id, component: args.component, data: args.data }
+        if (args.caption !== undefined) delivery.caption = args.caption
+        if (args.reply_to !== undefined) delivery.replyTo = Number(args.reply_to)
+        const out = await deliverComponent(telegramApi, delivery)
+        switch (out.kind) {
+          case 'widget':
+            return { content: [{ type: 'text', text: `component ${args.component} sent as a widget (id: ${out.messageId})` }] }
+          case 'text':
+            return { content: [{ type: 'text', text: textFallbackResult(args.component, out) }] }
+          case 'failed':
+            return toolError(name, out.reason)
+        }
+      }
+
+      case 'update_component': {
+        const parsed = UpdateComponentArgsSchema.safeParse(rawArgs)
+        if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
+        const args = parsed.data
+        try {
+          assertAllowedChat(args.chat_id, config, deps.policy)
+        } catch (err) {
+          return toolError(name, err instanceof Error ? err.message : String(err))
+        }
+        const out = await deliverComponent(telegramApi, {
+          chatId: args.chat_id,
+          component: args.component,
+          data: args.data,
+        })
+        switch (out.kind) {
+          case 'widget': {
+            const sent = `component ${args.component} updated: new widget sent (id: ${out.messageId})`
+            try {
+              await telegramApi.deleteMessage(args.chat_id, Number(args.message_id))
+              return { content: [{ type: 'text', text: `${sent}, old message ${args.message_id} deleted` }] }
+            } catch (err) {
+              const why = redactSecrets(err instanceof Error ? err.message : String(err))
+              return {
+                content: [{ type: 'text', text: `${sent}; the old message ${args.message_id} could not be deleted (${why}), so both are on screen` }],
+              }
+            }
+          }
+          case 'text':
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `${textFallbackResult(args.component, out)} The old widget ${args.message_id} was kept and still shows the previous data.`,
+                },
+              ],
+            }
+          case 'failed':
+            return toolError(name, `${out.reason}; the old widget ${args.message_id} was kept`)
+        }
+      }
+
+      case 'component_schema': {
+        const parsed = ComponentSchemaArgsSchema.safeParse(rawArgs)
+        if (!parsed.success) return toolError(name, zodErrorMessage(parsed.error))
+        return { content: [{ type: 'text', text: JSON.stringify(componentSchema(parsed.data.component)) }] }
       }
 
       default:

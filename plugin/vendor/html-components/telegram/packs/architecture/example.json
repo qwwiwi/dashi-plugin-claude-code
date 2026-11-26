@@ -1,0 +1,47 @@
+{
+  "title": "Контур доставки",
+  "nodes": [
+    {
+      "label": "Telegram",
+      "lane": "Каналы"
+    },
+    {
+      "label": "Мост",
+      "lane": "Шлюз"
+    },
+    {
+      "label": "Очередь",
+      "lane": "Шлюз"
+    },
+    {
+      "label": "Codex",
+      "lane": "Агенты"
+    },
+    {
+      "label": "GitHub",
+      "lane": "Каналы"
+    }
+  ],
+  "edges": [
+    {
+      "source": 0,
+      "target": 1,
+      "label": "вход"
+    },
+    {
+      "source": 1,
+      "target": 2,
+      "label": "буфер"
+    },
+    {
+      "source": 2,
+      "target": 3,
+      "label": "задача"
+    },
+    {
+      "source": 3,
+      "target": 4,
+      "label": "патч"
+    }
+  ]
+}

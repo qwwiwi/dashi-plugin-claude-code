@@ -1,0 +1,50 @@
+{
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 48
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "date": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 14
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "done",
+              "now",
+              "next"
+            ],
+            "maxLength": 4
+          }
+        },
+        "required": [
+          "label",
+          "date",
+          "state"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1,
+      "maxItems": 8
+    }
+  },
+  "required": [
+    "title",
+    "items"
+  ],
+  "additionalProperties": false
+}

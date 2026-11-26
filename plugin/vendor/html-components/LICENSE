@@ -1,0 +1,108 @@
+MIT License
+
+Copyright (c) 2026 html-components contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+NOTICE
+--------------------------------------------------------------------------------
+
+1. 21st.dev. The layouts of the components in this repository are inspired by
+   components published on https://21st.dev. The markup, CSS and SVG here were
+   rewritten from scratch as static HTML/CSS; no original source files are
+   redistributed. Check each original page for its own license before any
+   commercial reuse of a similar layout. The inspiration list (21st.dev id,
+   original name, author) follows; the same data is in the `source` field of
+   each entry in CATALOG.json and in the header of each component file.
+   For the pages whose license is "not stated", no license was granted to us.
+
+<!-- NOTICE:START -->
+   - kpi-big-delta: 21st.dev #44850 «Delta Number Ticker», автор dhxwhy
+   - kpi-metric-grid: 21st.dev #29167 «Insight Cards», автор arihantcodes_1f7b8c4d
+   - kpi-price-range: 21st.dev #39900 «Tweenly Chart KPI», автор mirukullacode
+   - kpi-ratio: 21st.dev #5449 «Stats», автор meschacirung
+   - kpi-rings: 21st.dev #30668 «Lighthouse Scores Radial Chart», автор sean0205
+   - kpi-stat-trio: 21st.dev #45564 «Stat Card», автор aadixc0de
+   - data-area-cumulative: 21st.dev #30139 «Area Chart», автор retroui
+   - data-bar-horizontal: 21st.dev #44394 «Bar Chart», автор timmikeladze
+   - data-bar-range-markets: 21st.dev #2395 «Stacked Diverging bar», автор reaviz
+   - data-bar-stacked-months: 21st.dev #2341 «Bar Stack», автор airbnb-visx
+   - data-bar-vertical: 21st.dev #44394 «Bar Chart», автор timmikeladze
+   - data-bars-compare-delta: 21st.dev #29457 «Delta Bars», автор eugeneshilow
+   - data-bullet-margin: 21st.dev #29454 «Bench Matrix», автор eugeneshilow
+   - data-donut-center: 21st.dev #30656 «Donut Chart With Center Stats», автор sean0205
+   - data-funnel: 21st.dev #28422 «Funnel Chart», автор gpt-vis
+   - data-gauge-margin: 21st.dev #1757 «Gauge», автор designali-in
+   - data-heatmap-niche-country: 21st.dev #2346 «Heatmaps», автор airbnb-visx
+   - data-line-niches: 21st.dev #35057 «Line Chart», автор kuratlielia
+   - data-meter: 21st.dev #38114 «Meter», автор redrob-labs
+   - data-pareto-rounds: 21st.dev #38544 «Pareto Chart», автор klyv-ui
+   - data-partition-bar: 21st.dev #26545 «Partition Bar», автор 8starlabs
+   - data-radial-countries: 21st.dev #28963 «Radial Chart», автор arihantcodes_1f7b8c4d
+   - data-sankey-pnl: 21st.dev #30455 «Pipeline Sankey Chart», автор LegionWebDev
+   - data-sparkline-table: 21st.dev #44279 «Spark Table», автор isaiahbjork
+   - data-treemap-markets: 21st.dev #29475 «Treemap», автор eugeneshilow
+   - data-waffle-gdp: 21st.dev #44652 «LED Dot Matrix Chart Card», автор kedhareswer
+   - table-comparison: 21st.dev #26827 «Comparison Table», автор mohammadshehadeh
+   - table-matrix-copilot: 21st.dev #21218 «Feature Comparison Table», автор olewandowski1
+   - table-niches-ru: 21st.dev #23604 «Records Table», автор theshanelevine
+   - table-rounds-leaderboard: 21st.dev #30672 «Leaderboard Table», автор arihantcodes_1f7b8c4d
+   - table-spec-accounting: 21st.dev #39793 «Spec Sheet», автор isaiahbjork
+   - diagram-hub-service: 21st.dev #40264 «Relay Hub Diagram», автор hello_54e122be
+   - diagram-roadmap: 21st.dev #5652 «Roadmap Card», автор beratberkayg
+   - diagram-steps-flow: 21st.dev #46240 «Steps», автор mahmoudilyan
+   - diagram-steps-pilot: 21st.dev #23569 «Task Steps», автор ddoemonn
+   - diagram-timeline-horizontal: 21st.dev #28298 «Timeline», автор slide-cn
+   - diagram-timeline-rounds: 21st.dev #28384 «Milestone Timeline», автор olewandowski1
+   - diagram-tool-wheel: 21st.dev #46565 «Tool Wheel», автор louisstudios
+   - slide-agenda: 21st.dev #28423 «Agent Todo List», автор starc007
+   - slide-before-after: 21st.dev #26826 «Comparison Section», автор mohammadshehadeh
+   - slide-compare-paths: 21st.dev #46761 «Compare Section», автор в заметках не зафиксирован
+   - slide-cta-qr: 21st.dev #35184 «QR Code», автор kevingirelli
+   - slide-faq: 21st.dev #23530 «Accordion», автор ddoemonn
+   - slide-known-unknown: 21st.dev #46640 «Live List», автор ds-spec
+   - slide-logo-quote: 21st.dev #28279 «Logo Cloud 3» (автор mohammadshehadeh), #18907 «Testimonial» (автор ncdai)
+   - slide-logo-wall: 21st.dev #18216 «Logo Clouds», автор support_596fe4b8
+   - slide-pricing-models: 21st.dev #28540 «Pricing Tiers List», автор felipemenezes098
+   - slide-pros-cons: 21st.dev #18096 «Pros & Cons Block», автор contentbit
+   - slide-quote: 21st.dev #18912 «Testimonial 2», автор ncdai
+   - slide-testimonial: 21st.dev #18931 «Testimonials Five», автор meschacirung
+   - slide-three-paths: 21st.dev #18932 «Growth Plans», автор uilayout.contact
+   - slide-title-section: 21st.dev #20146 «Title Slide», автор slide-cn
+   - landing-audience-grid: 21st.dev #28619 «Team Member Cards», автор olewandowski1
+   - landing-author-card: 21st.dev #10392 «Team Member Card», автор Shatlyk1011
+   - landing-banner-waitlist: 21st.dev #23625 «Announcement Banner», автор cnippet-dev
+   - landing-bento: 21st.dev #2201 «Bento Grid», автор shadcnblockscom
+   - landing-case-card: 21st.dev #5964 «Project Card», автор ravikatiyar162
+   - landing-feature-list: 21st.dev #27506 «Feature List Showcase», автор felipemenezes098
+   - landing-hero-dark: 21st.dev #19 «Hero Section Dark», автор kinfe123
+   - landing-hero-light: 21st.dev #5260 «Hero Section», автор ravikatiyar162
+<!-- NOTICE:END -->
+
+2. Fonts. Inter Tight and JetBrains Mono (variable woff2 subsets, folder fonts/)
+   are distributed under the SIL Open Font License 1.1.
+   Inter Tight is published through Google Fonts; JetBrains Mono is by
+   JetBrains s.r.o. Take the full license text and copyright notices from the
+   upstream font projects before redistributing the font files separately from
+   this repository.
+
+3. Demo data. All names, numbers and quotes inside the components are
+   illustrative examples. Company names such as "Компания А" and the marks in
+   the logo wall and the tool wheel are fictional.

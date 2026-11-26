@@ -31,6 +31,23 @@ automatically — do not manually re-send it (that double-posts). The invariant
 still holds: terminal-only text is never visible to the user, so put anything
 they must see into the turn's delivered output.
 
+## Компоненты в ответах
+
+`send_component` turns data into a visual widget (16 components; exact fields
+via `component_schema`).
+
+- Use one when the answer IS data, a process or a plan: numbers and shares
+  (kpi, bars, donut), a trend (line-area), steps or a flow (steps, flowchart),
+  a system (architecture, network3d), a plan with dates (timeline-roadmap), a
+  comparison (compare, radar, pros-cons), questions and answers (faq).
+- Do not use one for plain answers: a short reply, an opinion, a yes/no, a
+  conversation. Text is enough there.
+- At most one component per reply.
+- Always also send 1–2 lines of plain text with `reply` that say what the
+  component shows: the owner reads on a phone and the text is what notifies.
+- If the result says a plain-text version was sent instead, the owner already
+  has the data: do not resend it.
+
 ## Reminders
 
 A UserPromptSubmit hook re-states this on every turn — heed it. This file and
