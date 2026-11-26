@@ -1,0 +1,39 @@
+:root{color-scheme:light dark;--panel:#fffef7;--zone:#ecefe6;--bg:#f7f6ee;--ink:#272c24;--line:#d1d6c8;--muted:#52604f}
+@media(prefers-color-scheme:dark){:root{--panel:#202820;--zone:#303a32;--bg:#191e19;--ink:#f5f5ea;--line:#3e483e;--muted:#b9c6b6}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/18px system-ui,sans-serif}
+main{max-width:430px;margin:auto;padding:10px;max-height:600px;overflow:hidden}
+h1{font-size:22px;line-height:26px;letter-spacing:-.04em;margin:0 0 8px}
+h1{overflow-wrap:anywhere}
+.ledger li>*{white-space:nowrap;text-overflow:ellipsis;overflow:hidden}
+#stage{background:var(--panel);border-radius:14px;position:relative;overflow:hidden}
+svg,canvas{display:block;width:100%;height:220px;font:14px system-ui,sans-serif}
+#stage button{min-height:44px;display:block;margin:2px 6px 4px auto;color:var(--ink);background:var(--zone);border:1px solid #67775b;border-radius:8px}
+.ledger{list-style:none;margin:6px 0 0;padding:0;counter-reset:item}
+.ledger li{height:31px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--line);counter-increment:item}
+.ledger li:before{content:counter(item,decimal-leading-zero);color:var(--muted);font:11px monospace}
+.ledger li>span,.ledger button{flex:1;min-width:0;text-align:left}
+.ledger b{max-width:57%;font:600 12px monospace}.ledger button{font:inherit;color:inherit;border:0;background:transparent}
+.ledger button[aria-pressed=true]{font-weight:750;text-decoration:underline}
+.ledger i{width:9px;height:9px;border-radius:50%;flex:none}
+.timeline-roadmap li{height:48px;position:relative}.timeline-roadmap li:before{content:'';width:10px;height:10px;border:2px solid var(--muted);border-radius:50%;margin:0 7px}
+.timeline-roadmap li+li:after{content:'';position:absolute;left:13px;top:-17px;height:29px;border-left:1px solid var(--line)}
+li.done:before{background:var(--muted)}li.now:before{background:#d4ff00;animation:pulse 1.5s infinite}
+.dash{stroke-dasharray:4 3;animation:flow 1.5s linear infinite}.packet{animation:packet 2s linear infinite}
+.draw{stroke-dasharray:1;animation:draw .9s ease-out}.grow{transform-origin:160px 111px;animation:grow .8s ease-out}.sweep{animation:sweep .8s ease-out}
+@keyframes packet{to{transform:translate(var(--dx),var(--dy))}}@keyframes draw{from{stroke-dashoffset:1}}@keyframes sweep{from{stroke-dasharray:0 100}}@keyframes grow{from{transform:scale(.1)}}@keyframes flow{to{stroke-dashoffset:-14}}@keyframes pulse{50%{box-shadow:0 0 0 4px #99aa5744}}
+#matrix{width:100%;table-layout:fixed;border-spacing:0;font-size:12px}#matrix th,#matrix td{height:23px;line-height:22px;padding:0 3px;white-space:nowrap;text-overflow:ellipsis;overflow:hidden;text-align:right;border-bottom:1px solid var(--line)}#matrix th:first-child{text-align:left}
+
+#stage{max-height:240px;overflow:auto}
+.radar .ledger li{width:100%}.radar .ledger b,.bars3d .ledger b{max-width:none;flex:none}
+#stage svg{height:auto}
+#stage canvas{height:auto;max-height:184px;object-fit:contain}
+.summary{display:none}
+#stage:has(svg,canvas)~.summary{display:block;margin-top:6px}
+:is(.architecture,.flowchart,.network3d) #stage:has(svg,canvas)~.ledger{display:none}
+:is(.radar,.line-area,.bars3d,.donut) #stage:has(svg,canvas)~.ledger{display:flex;flex-wrap:wrap;gap:4px 10px}
+:is(.radar,.line-area,.bars3d,.donut) #stage:has(svg,canvas)~.ledger li{height:auto;gap:4px;font-size:12px;border:0}
+:is(.radar,.line-area,.bars3d,.donut) #stage:has(svg,canvas)~.ledger li:before{display:none}
+.ledger li button{padding:0}
+.architecture:has(#stage svg){display:flex;flex-direction:column;max-height:360px}
+.architecture #stage{display:flex;min-height:0}
+.architecture #stage svg{max-height:240px}

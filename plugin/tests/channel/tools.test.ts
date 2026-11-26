@@ -157,7 +157,7 @@ function callReq(name: string, args: Record<string, unknown>): CallToolRequest {
 }
 
 describe('listTools', () => {
-  test('returns 8 tools with stable order: reply, react, download_attachment, edit_message, status, autonomy, send_widget, edit_widget_data', () => {
+  test('returns 11 tools with stable order: reply, react, download_attachment, edit_message, status, autonomy, send_widget, edit_widget_data, send_component, update_component, component_schema', () => {
     const tools = listTools()
     expect(tools.map(t => t.name)).toEqual([
       'reply',
@@ -168,6 +168,9 @@ describe('listTools', () => {
       'autonomy',
       'send_widget',
       'edit_widget_data',
+      'send_component',
+      'update_component',
+      'component_schema',
     ])
   })
 

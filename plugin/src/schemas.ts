@@ -192,6 +192,73 @@ export const EditWidgetDataArgsSchema = z.object({
 })
 export type EditWidgetDataArgs = z.infer<typeof EditWidgetDataArgsSchema>
 
+// The 16 html-components packs vendored under plugin/vendor/html-components
+// (a test pins this list to the vendored packs/ folder).
+export const COMPONENT_NAMES = [
+  'kpi',
+  'bars',
+  'progress',
+  'steps',
+  'compare',
+  'pros-cons',
+  'faq',
+  'status',
+  'flowchart',
+  'architecture',
+  'line-area',
+  'donut',
+  'timeline-roadmap',
+  'radar',
+  'bars3d',
+  'network3d',
+] as const
+export type ComponentName = (typeof COMPONENT_NAMES)[number]
+
+// `data` is only checked to be a JSON object here: the pack schema is applied
+// by the renderer, and data it rejects still reaches the owner as plain text.
+const componentData = z.record(z.unknown(), {
+  invalid_type_error: 'data must be a JSON object with the component fields (see component_schema)',
+})
+
+// A Telegram message id given as a string: digits only, > 0 and within
+// Number.MAX_SAFE_INTEGER, so Number(id) is exact (a bare /^\d+$/ let "0" and
+// ids past 2^53 through, which Number() silently rounds).
+function messageIdString(field: string) {
+  return z
+    .string()
+    .regex(/^\d+$/, `${field} must be a message id (digits)`)
+    .refine(v => {
+      const n = Number(v)
+      return Number.isSafeInteger(n) && n > 0
+    }, `${field} must be a positive safe integer`)
+}
+
+// Tool args - send_component. caption replaces the generated fallback caption
+// of the widget; reply_to threads it like reply.reply_to.
+export const SendComponentArgsSchema = z.object({
+  chat_id: z.string().min(1),
+  component: z.enum(COMPONENT_NAMES),
+  data: componentData,
+  caption: z.string().min(1).max(1024, 'caption must be at most 1024 characters').optional(),
+  reply_to: messageIdString('reply_to').optional(),
+})
+export type SendComponentArgs = z.infer<typeof SendComponentArgsSchema>
+
+// Tool args - update_component. message_id is the widget to replace.
+export const UpdateComponentArgsSchema = z.object({
+  chat_id: z.string().min(1),
+  message_id: messageIdString('message_id'),
+  component: z.enum(COMPONENT_NAMES),
+  data: componentData,
+})
+export type UpdateComponentArgs = z.infer<typeof UpdateComponentArgsSchema>
+
+// Tool args - component_schema.
+export const ComponentSchemaArgsSchema = z.object({
+  component: z.enum(COMPONENT_NAMES),
+})
+export type ComponentSchemaArgs = z.infer<typeof ComponentSchemaArgsSchema>
+
 // Tool args - status (T11 wires this).
 //   state: which status label to render next.
 //   tool_name: required when state='tool', renders as `🔧 <name>`.

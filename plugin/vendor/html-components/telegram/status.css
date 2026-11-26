@@ -1,0 +1,35 @@
+*{box-sizing:border-box}
+:root{hyphens:auto;overflow-wrap:anywhere;color-scheme:light;background:#fff;color:#242321;font-family:system-ui}
+body{margin:0;padding:8px;background:#fff;font:13px/16px system-ui}
+.card{padding:6px 8px;margin-bottom:6px;border:1px solid #dedcd9;background:#fff;border-radius:0;min-width:0}
+h2{margin:0 0 4px;font-size:12px;line-height:14px;font-weight:500;letter-spacing:.04em;color:#585b50}
+.cut{min-width:0}
+.row,.top{display:flex;align-items:center;gap:6px;min-width:0}
+.row{min-height:12px;font-size:12px;line-height:15px}
+.name{flex:1;min-width:0}
+.pct{flex:none;width:32px;min-width:max-content;white-space:nowrap;text-align:right;font-size:12px;font-weight:500}
+.cells{width:58px;height:4px;flex:none;background:#dedcd9}
+.job{min-height:20px;cursor:pointer}
+.step,.detail{font-size:12px;line-height:15px;color:#585b50}
+.detail{padding:2px 0 4px}
+.state{flex:none;color:#585b50;font-size:12px}
+.bar{height:3px;background:#dedcd9;margin-top:1px}
+.bar i{display:block;height:100%;background:#d4ff00}
+.s-r .bar i{background:#f4511e}
+.s-d .bar i{background:#2f7a4f}
+.s-f .bar i{background:#c8361b}
+.s-q .bar i{background:#585b50}
+.s-b .bar i{background:#242321}
+.empty{padding:8px;background:#f7f6f5;color:#585b50;border:1px solid #dedcd9}
+.foot{padding-top:4px;border-top:1px solid #dedcd9;color:#585b50;font-size:12px;line-height:14px}
+summary{display:block;cursor:pointer}summary::-webkit-details-marker{display:none}
+.bar{display:block}.mean,.job[open] .step{display:none}
+
+.cells{background-image:repeating-linear-gradient(to right,transparent 0 10px,var(--gap,#fff) 10px 12px),linear-gradient(to right,#d4ff00 var(--stop),var(--track,#dedcd9) var(--stop))}
+@media(prefers-color-scheme:dark){
+  :root,body,.card{color-scheme:dark;background:#15150f;color:#faf8f2;--gap:#15150f;--track:#4f5147}
+  .card,.foot,.empty{border-color:#4f5147}.bar,.empty{background:#4f5147}
+  h2,.state,.step,.detail,.foot,.empty{color:#c9c8b8}.s-b .bar i{background:#c9c8b8}
+}
+
+main{max-height:600px;overflow:hidden}.compact>div{height:22px;font:14px/22px monospace}

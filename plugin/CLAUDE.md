@@ -31,6 +31,31 @@ automatically — do not manually re-send it (that double-posts). The invariant
 still holds: terminal-only text is never visible to the user, so put anything
 they must see into the turn's delivered output.
 
+## Компоненты в ответах
+
+`send_component` turns data into a visual widget (16 components; exact fields
+via `component_schema`).
+
+- Use one when the answer IS data, a process or a plan: numbers and shares
+  (kpi, bars, donut), a trend (line-area), steps or a flow (steps, flowchart),
+  a system (architecture, network3d), a plan with dates (timeline-roadmap), a
+  comparison (compare, radar, pros-cons), questions and answers (faq).
+- Do not use one for plain answers: a short reply, an opinion, a yes/no, a
+  conversation. Text is enough there.
+- At most one component per reply.
+- When the result says the component was sent **as a widget** (private chats
+  only), also send 1–2 lines of plain text with `reply` that say what it
+  shows: the owner reads on a phone and the text is what notifies.
+- In a group chat do not call `reply` for that text: the outbox delivers your
+  final text (see above); put the 1–2 lines there.
+- If the result says a plain-text version was sent instead, the owner already
+  has the data: do not resend it.
+- If the result says the delivery status is unknown, the widget may already be
+  on screen: do not resend it blindly.
+- `update_component` works only on a message id returned by `send_component`
+  / `update_component` while the channel has been running; after a restart
+  send a new component instead.
+
 ## Reminders
 
 A UserPromptSubmit hook re-states this on every turn — heed it. This file and

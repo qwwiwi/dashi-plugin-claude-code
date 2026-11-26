@@ -91,6 +91,7 @@ import {
   type PermissionDeps,
 } from './channel/permissions.js'
 import { createAskUserQuestionRelay } from './channel/ask-user-question.js'
+import { ComponentMessageRegistry } from './channel/components.js'
 import {
   createAskUserQuestionUi,
   type AskCallbackContext,
@@ -808,6 +809,10 @@ const toolDeps: ToolDeps = {
   // M1 Rich Messages: the reply tool reads richLatch.sendDisabled to skip
   // rich attempts once a capability error has latched it off.
   richLatch,
+  // send_component / update_component: the ids update_component may replace
+  // (process lifetime), and the configured redaction for their plain text.
+  componentMessages: new ComponentMessageRegistry(),
+  redact: (text: string): string => redactSecrets(text, apiSecrets),
   // H4 fix (2026-05-23): outbound assertAllowedChat now consults the
   // multichat policy when present. Falls back to legacy config-only
   // behaviour when multichat is disabled or policy load failed.

@@ -91,7 +91,7 @@ const OK_HTML = '<div id="w">ok</div>'
 
 describe('listTools — widget tools', () => {
   test('send_widget and edit_widget_data are listed after the existing six, order stable', () => {
-    expect(listTools().map(t => t.name)).toEqual([
+    expect(listTools().map(t => t.name).slice(0, 8)).toEqual([
       'reply',
       'react',
       'download_attachment',
